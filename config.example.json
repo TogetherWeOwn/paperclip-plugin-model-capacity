@@ -35,7 +35,7 @@
     "rateDeadbandRel": 0.15,
     "rateMinDeadbandPerHour": 0.005,
     "rateWindowMin": 60,
-    "rateMinSpanMin": 20
+    "rateMinSpanMin": 10
   },
   "concurrency": {
     "maxTotal": 75,

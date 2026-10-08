@@ -46,7 +46,8 @@ const RUNEVT_KEY = 'run-events-v1';
 /** Recent heartbeat runs for one company (db backfill + event buffer). */
 const RUNS_SQL = `select id, agent_id, status, started_at, finished_at,
        coalesce(usage_json->>'model','') as model,
-       coalesce(usage_json->>'provider','') as provider
+       coalesce(usage_json->>'provider','') as provider,
+       coalesce(context_snapshot->>'issueId','') as issue_id
   from heartbeat_runs
  where company_id = $1
    and started_at > now() - ($2 || ' minutes')::interval
@@ -186,7 +187,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const body = await cliproxyLaneGet(companyId, config);
     const parsed = parseLaneBody(body, nowMs);
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
-    const snapshot = { accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane' };
+    const snapshot = { accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs };
     cache.set('accounts', snapshot, nowMs);
     snapshots.set(companyId, snapshot);
     return snapshot;
@@ -256,9 +257,52 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       agentId: row?.agent_id ? String(row.agent_id) : 'unknown',
       model: row?.model || null,
       provider: row?.provider ? String(row.provider).toLowerCase() : null,
+      issueId: row?.issue_id || row?.issueId || null,
       status: row?.status ?? null,
       at: atMs,
     };
+  }
+
+  /**
+   * The actual model a run used. Heartbeat rows rarely carry one
+   * (model-selection runs advisory), so: heartbeat usage_json first, then
+   * the issue's assignee adapter override (preferred -- it is what the
+   * run was told to use), then the agent's adapter config. Reads use the
+   * already-declared agents.read / issues.read capabilities -- no new
+   * capabilities, no new core tables. Per-tick caches keep this to one
+   * fetch per agent/issue no matter how many runs share them; any denial
+   * degrades to null (unknown), never fails the tick.
+   */
+  async function resolveActualModel(companyId, run, caches) {
+    if (run.model) return { model: run.model, source: 'heartbeat' };
+    const overrideOf = (issue) => {
+      const o = issue?.assigneeAdapterOverrides ?? issue?.assignee_adapter_overrides;
+      const m = o?.adapterConfig?.model ?? o?.adapter_config?.model;
+      return typeof m === 'string' && m.length > 0 ? m : null;
+    };
+    if (run.issueId) {
+      try {
+        let m = caches.issues.get(run.issueId);
+        if (m === undefined) {
+          m = overrideOf(await ctx.issues.get(run.issueId, companyId));
+          caches.issues.set(run.issueId, m);
+        }
+        if (m) return { model: m, source: 'issue-override' };
+      } catch { /* unknown */ }
+    }
+    if (run.agentId && run.agentId !== 'unknown') {
+      try {
+        let m = caches.agents.get(run.agentId);
+        if (m === undefined) {
+          const agent = await ctx.agents.get(run.agentId, companyId);
+          const found = agent?.adapterConfig?.model ?? agent?.adapter_config?.model;
+          m = typeof found === 'string' && found.length > 0 ? found : null;
+          caches.agents.set(run.agentId, m);
+        }
+        if (m) return { model: m, source: 'agent-config' };
+      } catch { /* unknown */ }
+    }
+    return { model: null, source: null };
   }
 
   /**
@@ -310,7 +354,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         byId.set(r.runId, { ...r });
         continue;
       }
-      for (const k of ['model', 'provider', 'agentId']) {
+      for (const k of ['model', 'provider', 'agentId', 'issueId']) {
         if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
       }
       if ((prev.status == null) && r.status != null) prev.status = r.status;
@@ -346,9 +390,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const hoursToReset = resetAtMs != null
         ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
         : null;
-      // Rate inputs: append this reading, then measure over the trailing window.
+      // Rate inputs: append this reading, then measure over the trailing
+      // window. The reading is stamped with the payload's observedAt (not
+      // the tick time) so a cached 45s payload does not fake movement; an
+      // identical (timestamp, value) pair is an exact duplicate and is
+      // skipped, everything else accumulates -- so history grows on every
+      // tick that carries genuinely new data.
       let history = rateHistories[key] ?? [];
-      if (weeklyUsed != null) history = appendUtilReading(history, { atMs: nowMs, usedPct: weeklyUsed }, nowMs);
+      if (weeklyUsed != null) {
+        const readingAtMs = snapshot.observedAtMs ?? nowMs;
+        const dup = history.some(p => p.atMs === readingAtMs && p.usedPct === weeklyUsed);
+        if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
+      }
       rateHistories[key] = history;
       const measured = weeklyUsed != null
         ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
@@ -389,6 +442,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         measuredRatePerHour: measured?.ratePerHour ?? null,
         rateSpanMs: measured?.spanMs ?? null,
         ratePoints: measured?.points ?? 0,
+        rateHistoryPoints: history.length,
         requiredRatePerHour: required,
       });
     }
@@ -461,6 +515,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
     };
     let observed = 0;
+    const modelCaches = { agents: new Map(), issues: new Map() };
     for (const run of candidates) {
       const role = roleOf(config, run.agentId);
       let decision = null;
@@ -491,15 +546,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       if (decision) {
         const wouldModel = `${decision.model}(${decision.effort ?? 'default'})`;
-        const actualModel = run.model ?? 'unknown';
+        const actual = await resolveActualModel(companyId, run, modelCaches);
+        const actualModel = actual.model ?? 'unknown';
         ring.push({
           runId: run.runId,
           agentId: run.agentId,
           actualModel,
+          actualModelSource: actual.source,
           wouldModel,
           // Did shadow agree with reality? Null while the actual model is
-          // still unknown (events-only feed); true/false once known.
-          modelMatch: actualModel === 'unknown' ? null : (actualModel === decision.model || actualModel === wouldModel),
+          // still unknown; true/false once known.
+          modelMatch: actual.model == null ? null : (actual.model === decision.model || actual.model === wouldModel),
           account: decision.accountId,
           accountId: decision.accountId,
           rung: decision.rung,
@@ -640,6 +697,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           agentId: String(p.agentId ?? run.agentId ?? event?.actorId ?? 'unknown'),
           model: p.model ?? run.model ?? null,
           provider: typeof (p.provider ?? run.provider) === 'string' ? String(p.provider ?? run.provider).toLowerCase() : null,
+          issueId: p.issueId ?? run.issueId ?? p.issue_id ?? null,
           at: Date.parse(event?.occurredAt ?? '') || clock(),
         };
         const targets = event?.companyId

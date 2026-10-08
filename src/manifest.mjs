@@ -1,5 +1,5 @@
 /**
- * Plugin manifest. v0.1.4 = SHADOW: no `run.model.resolve` capability.
+ * Plugin manifest. v0.1.5 = SHADOW: no `run.model.resolve` capability.
  * Another plugin currently holds that capability and two holders conflict,
  * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
  * switching to the `modelResolve` variant (capability + modelRouting).
@@ -11,7 +11,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.4';
+export const PLUGIN_VERSION = '0.1.5';
 
 /** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
 export const MODEL_ROUTING_ENV_KEYS = [
@@ -102,7 +102,7 @@ const CONFIG_SCHEMA = {
         rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
         rateMinDeadbandPerHour: { type: 'number', minimum: 0, default: 0.005 },
         rateWindowMin: { type: 'number', minimum: 10, default: 60 },
-        rateMinSpanMin: { type: 'number', minimum: 5, default: 20 },
+        rateMinSpanMin: { type: 'number', minimum: 5, default: 10 },
       },
     },
     concurrency: {
@@ -166,7 +166,7 @@ export function buildManifest({ modelResolve = false } = {}) {
     apiVersion: 1,
     version: PLUGIN_VERSION,
     displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.4 observes only; it changes no runs and holds no resolve capability.',
+    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.5 observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -231,6 +231,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.4 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.1.5 shadow manifest: no resolve capability, no modelRouting. */
 export const manifest = buildManifest();
 export default manifest;

@@ -28,8 +28,8 @@ export const DEFAULT_PACING = Object.freeze({
   rateMinDeadbandPerHour: 0.005,
   /** Utilization history window for the measured rate. */
   rateWindowMin: 60,
-  /** Minimum history span before a measured rate is trusted. */
-  rateMinSpanMin: 20,
+  /** Minimum history span before a measured rate is trusted (~10-15 min after install). */
+  rateMinSpanMin: 10,
 });
 
 /** Utilization history knobs (module constants; operator knobs in DEFAULT_PACING). */

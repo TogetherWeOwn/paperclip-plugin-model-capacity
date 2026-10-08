@@ -116,8 +116,10 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
 export function parseLaneBody(body, nowMs = Date.now()) {
   const list = body?.accounts;
   if (!Array.isArray(list)) return null;
+  const observedAt = typeof body.observedAt === 'string' ? body.observedAt : null;
   return {
-    observedAt: typeof body.observedAt === 'string' ? body.observedAt : null,
+    observedAt,
+    observedAtMs: msOrNull(observedAt),
     accounts: list.filter(a => a && typeof a === 'object').map(a => parseLaneAccount(a, nowMs)),
     atMs: nowMs,
     source: 'cliproxy-lane',

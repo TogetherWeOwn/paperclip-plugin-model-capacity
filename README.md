@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.1.4, shadow)
+# Model Capacity plugin (v0.1.5, shadow)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.4 = SHADOW.** The plugin holds no `run.model.resolve` capability,
+**v0.1.5 = SHADOW.** The plugin holds no `run.model.resolve` capability,
 so it changes no runs. Every minute it records what it *would* have
 decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
 and per-account ladders (`GET /ladder`). The resolve hook is implemented
@@ -35,8 +35,11 @@ v0.2.0 enables enforcement by switching to that variant.
 5. **Rate pacing** compares measured burn rate against required rate:
    `e = measuredRate - requiredRate`, where required = remaining/hoursToReset
    and measured = weekly-used delta per hour over the trailing 60 min of
-   lane readings (needs 2+ readings spanning 20+ min; counter resets are
-   rejected). Deadband is +-15% relative; position vs. the linear schedule
+   lane readings (needs 2+ readings spanning 10+ min, so the measured rate
+   appears ~10-15 min after install; counter resets are
+   rejected). Readings are stamped with the payload's `observedAt`, and only
+   exact duplicates are skipped, so cached payloads never fake movement.
+   Deadband is +-15% relative; position vs. the linear schedule
    only breaks ties while no rate is measured yet. At most one rung per
    10 min. The 5h guard overrides everything: above 80% the account floors
    and sheds load, rejoining below 50%.
@@ -86,8 +89,12 @@ table `heartbeat_runs` (manifest `database` declaration +
 the host schema validator requires it, and the plugin owns no tables).
 Without the capability the tick degrades to events-only and says so
 (`runsSource`, `runsDbError` on `/capacity`). Each shadow entry records
-`actualModel` from the run row plus `modelMatch` (did shadow agree with
-reality; null while the actual model is unknown). Rungs are always
+`actualModel` plus `modelMatch` (did shadow agree with
+reality; null while the actual model is unknown). The actual model
+resolves heartbeat usage_json first, then the issue's assignee adapter
+override (preferred), then the agent's adapter config -- via the
+already-declared `issues.read` / `agents.read`, no new capabilities.
+Rungs are always
 served strictly ascending in cost (stability pins yield to fresh cost
 order whenever they would invert it), and `requiredRatePerHour` is a
 number whenever remaining% and reset are both known -- null (unknown)
