@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   scheduleError, stepController, orderAccounts,
   appendUtilReading, measuredRatePerHour, requiredRatePerHour, stepRateController,
+  DEFAULT_PACING,
 } from '../src/pacing.mjs';
 
 const T0 = Date.parse('2026-10-08T00:00:00Z');
@@ -105,6 +106,34 @@ test('rate guard still floors on the 5h window', () => {
   const step = stepRateController({ pointer: 4, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0.001, requiredRatePerHour: 0.05, positionError: 0, fiveHourUsedPct: 0.9 }, 5000, cfg, 5);
   assert.deepEqual([step.action, step.pointer, step.guardActive], ['floor-guard', 0, true]);
+});
+
+test('position -> measured switch resets the cooldown so the pointer descends', () => {
+  // Live lane-1: the position fallback climbed the pointer to rung 2, then
+  // the measured rate arrived showing over-burn (2.5%/h vs required 1.7%/h).
+  // A fallback move 1 min ago would normally block the correction for 9
+  // more minutes; the switch bypasses it exactly once.
+  const cfg = { ...DEFAULT_PACING };
+  const now = 10 * 600000;
+  const reading = {
+    measuredRatePerHour: 0.025, requiredRatePerHour: 0.017,
+    positionError: -0.2, fiveHourUsedPct: 0.1,
+  };
+  const switched = stepRateController(
+    { pointer: 2, lastMoveAtMs: now - 60000, guardActive: false, rateBasis: 'position' },
+    reading, now, cfg, 5);
+  assert.deepEqual([switched.action, switched.pointer, switched.rateBasis], ['descend', 1, 'measured']);
+  // Same inputs with no switch (already measured last tick): cooldown holds.
+  const cooled = stepRateController(
+    { pointer: 2, lastMoveAtMs: now - 60000, guardActive: false, rateBasis: 'measured' },
+    reading, now, cfg, 5);
+  assert.equal(cooled.action, 'hold-cooldown');
+  assert.equal(cooled.rateBasis, 'measured');
+  // And after the cooldown expires the descend happens without any switch.
+  const later = stepRateController(
+    { pointer: 2, lastMoveAtMs: now - 600000, guardActive: false, rateBasis: 'measured' },
+    reading, now, cfg, 5);
+  assert.deepEqual([later.action, later.pointer], ['descend', 1]);
 });
 
 test('accounts order earliest reset first, largest remainder first', () => {

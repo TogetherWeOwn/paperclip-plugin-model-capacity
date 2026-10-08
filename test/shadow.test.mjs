@@ -23,7 +23,7 @@ test('invalid records are refused, never stored', () => {
   assert.equal(ring.size(), 0);
 });
 
-test('config validation rejects bad secret refs and weights', () => {
+test('config validation rejects bad secret refs, weights, baseUrl, and enforce', () => {
   assert.deepEqual(validateConfigShape({}), []);
   assert.ok(validateConfigShape({ cliproxy: { laneKeySecretRef: 'pasted-key' } }).length > 0);
   assert.deepEqual(validateConfigShape({
@@ -31,6 +31,10 @@ test('config validation rejects bad secret refs and weights', () => {
   }), []);
   assert.ok(validateConfigShape({ pacing: { guardHighPct: 0.4, guardRejoinPct: 0.5 } }).length > 0);
   assert.ok(validateConfigShape({ weights: { terminalBench: -1 } }).length > 0);
+  // Lane endpoint pinned: anything off the allowlist is rejected.
+  assert.ok(validateConfigShape({ cliproxy: { baseUrl: 'https://telemetry.example.com' } }).length > 0);
+  assert.deepEqual(validateConfigShape({ cliproxy: { baseUrl: 'https://router.infextion.net' } }), []);
+  assert.ok(validateConfigShape({ enforce: 'yes' }).length > 0);
 });
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
@@ -46,122 +50,134 @@ const aaRows = () => ([
   { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
 ]);
 
-const laneBody = (weeklyUsed, observedAt = '2026-10-08T22:59:00Z') => ({
-  observedAt,
-  accounts: [{
-    lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
-    weekly: { used: weeklyUsed, resetsAt: '2026-10-15T22:59:00Z' },
-    fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
-    observedAt, quality: 'live',
-  }],
+const acct = (lane, provider, key, weeklyUsed, resetsAt, fiveHourUsed = 0.1, observedAt = '2026-10-08T22:59:00Z') => ({
+  lane, provider, accountKey: key, health: 'healthy',
+  weekly: { used: weeklyUsed, resetsAt },
+  fiveHour: { used: fiveHourUsed, resetsAt: '2026-10-09T03:59:00Z' },
+  observedAt, quality: 'live',
 });
 
-const dbRow = (id, startedAtMs, model = 'claude-sonnet-5-5', provider = 'claude', issueId = null) => ({
-  id, agent_id: 'agent-9', status: 'running',
-  started_at: new Date(startedAtMs).toISOString(), finished_at: null, model, provider,
-  issue_id: issueId,
+const oneClaude = (weeklyUsed, observedAt) => ({
+  observedAt, accounts: [acct('claude-1', 'claude', 'a1', weeklyUsed, '2026-10-15T22:59:00Z', 0.1, observedAt)],
 });
 
-function drive({ nowMs, laneUsed, laneObservedAt = null, laneAccounts = null, dbRows = [], dbError = null, withEvents = null, extraTicks = [], issues = {}, agents = {} }) {
-  const lane = { used: laneUsed, observedAt: laneObservedAt };
+const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
+  type, companyId: 'acme', entityId: runId,
+  payload: { run: { agentId: 'agent-9', ...extra } },
+  occurredAt: new Date(atMs).toISOString(),
+});
+
+function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, failIssueGet = null, failAgentGet = null }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
   const skey = k => JSON.stringify(k);
   let now = nowMs;
+  let tickNo = 0;
+  const resolveLane = () => {
+    const accounts = typeof laneAccounts === 'function' ? laneAccounts(tickNo, now) : laneAccounts;
+    return { observedAt: new Date(now).toISOString(), accounts: accounts ?? oneClaude(0.3, new Date(now).toISOString()).accounts };
+  };
+  let lane = resolveLane();
+  const strictGet = (kind, idKey, table, fail) => async (arg) => {
+    if (!arg || typeof arg !== 'object' || typeof arg[idKey] !== 'string') {
+      throw new Error(`positional-${kind}-get`);
+    }
+    if (fail) throw new Error(fail);
+    return table[arg[idKey]] ?? null;
+  };
   const fake = {
-    config: { get: async () => ({ cliproxy: { laneKeySecretRef: SECRET } }) },
+    config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: {
-      fetch: async () => ({
-        status: 200,
-        json: async () => (laneAccounts
-          ? { observedAt: '2026-10-08T22:59:00Z', accounts: laneAccounts }
-          : laneBody(lane.used, lane.observedAt ?? undefined)),
-      }),
-    },
-    db: { query: async () => { if (dbError) throw new Error(dbError); return dbRows; } },
-    agents: { get: async (id) => agents[id] ?? null },
-    issues: { get: async (id) => issues[id] ?? null },
+    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    agents: { get: strictGet('agents', 'agentId', agentGets, failAgentGet) },
+    issues: { get: strictGet('issues', 'issueId', issueGets, failIssueGet) },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now });
-  const run = async () => {
-    await plugin.setup(fake);
-    store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
-    await plugin.onConfigChanged({}, { companyId: 'acme' });
-    const plan = [{ now: nowMs }, ...extraTicks];
-    for (const t of plan) {
-      now = t.now;
-      if (t.used !== undefined) lane.used = t.used;
-      if (t.observedAt !== undefined) lane.observedAt = t.observedAt;
-      if (withEvents) for (const e of withEvents) await handlers.get('agent.run.started')(e);
-      await jobs.get('shadow-tick')({});
-    }
-    return {
-      shadow: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
-      capacity: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' }),
-    };
+  return {
+    run: async () => {
+      await plugin.setup(fake);
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+      for (const s of steps ?? [{ now: nowMs }]) {
+        now = s.now;
+        if (s.lane !== undefined) lane = s.lane;
+        else lane = resolveLane();
+        tickNo += 1;
+        for (const e of s.fire ?? []) await handlers.get(e.type)(e);
+        await jobs.get('shadow-tick')({});
+      }
+      return {
+        shadow: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+        capacity: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' }),
+      };
+    },
   };
-  return { run };
 }
 
-test('tick backfills the ring from heartbeat runs with no events at all', async () => {
+test('tick records started events; the event model wins outright', async () => {
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3,
-    dbRows: [dbRow('run-1', TICK - 5 * 60000)],
+    nowMs: TICK,
+    steps: [{ now: TICK, fire: [started('run-1', TICK - 5 * 60000, { model: 'claude-sonnet-5-5', provider: 'claude' })] }],
   });
   const { shadow, capacity } = await run();
   assert.equal(shadow.status, 200);
   assert.equal(shadow.body.entries.length, 1);
   const [entry] = shadow.body.entries;
   assert.deepEqual(
-    [entry.runId, entry.agentId, entry.actualModel, entry.account],
-    ['run-1', 'agent-9', 'claude-sonnet-5-5', 'claude:a1'],
+    [entry.runId, entry.agentId, entry.actualModel, entry.actualModelSource, entry.actualModelError],
+    ['run-1', 'agent-9', 'claude-sonnet-5-5', 'run-event', null],
   );
-  assert.match(entry.wouldModel, /^claude-.+\(.+\)$/);
-  assert.equal(capacity.body.runsSource, 'db-only');
+  assert.equal(capacity.body.runsSource, 'events');
   assert.equal(capacity.body.runsObserved, 1);
   // One reading cannot measure a rate: weak, no target, no caps.
   assert.equal(capacity.body.calibration, 'weak');
   assert.equal(capacity.body.target, null);
 });
 
-test('denied db degrades to events-only; odd event shapes are still kept', async () => {
+test('company-less events are ignored, never fanned out', async () => {
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3, dbError: 'db-query-denied',
-    withEvents: [{
-      companyId: 'acme', entityId: 'run-9',
-      payload: { run: { agentId: 'agent-9', model: 'claude-sonnet-5-5' } },
-      occurredAt: new Date(TICK - 2 * 60000).toISOString(),
+    nowMs: TICK,
+    steps: [{
+      now: TICK,
+      fire: [{ ...started('run-x', TICK - 60000, { model: 'm', provider: 'claude' }), companyId: undefined }],
     }],
   });
   const { shadow, capacity } = await run();
-  assert.equal(shadow.body.entries.length, 1);
-  assert.equal(shadow.body.entries[0].runId, 'run-9');
-  assert.equal(capacity.body.runsSource, 'events-only');
-  assert.equal(capacity.body.runsDbError, 'db-query-denied');
-  assert.equal(capacity.body.runEventsSeen, 1);
+  assert.equal(shadow.body.entries.length, 0);
+  assert.equal(capacity.body.runsObserved, 0);
+  assert.equal(capacity.body.runEventsSeen, 0);
+});
+
+test('started + finished for one run dedupe to a single run with terminal status', async () => {
+  const at = TICK - 5 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    steps: [{
+      now: TICK,
+      fire: [
+        started('run-1', at, { provider: 'claude' }),
+        { ...started('run-1', at + 60000, { provider: 'claude' }), type: 'agent.run.finished' },
+      ],
+    }],
+  });
+  const { capacity } = await run();
+  assert.equal(capacity.body.runsObserved, 1);
 });
 
 test('required rate is a number whenever remaining and reset are known', async () => {
-  // Coordinator live example: claude-lane-1, remaining 0.34, weekly reset
-  // 2026-10-09T19:00Z, tick at 2026-10-08T23:00Z => 0.34/20h = 0.017/h.
+  // Coordinator live example: remaining 0.34, reset 2026-10-09T19:00Z,
+  // tick at 2026-10-08T23:00Z => 0.34/20h = 0.017/h.
   const { run } = drive({
     nowMs: TICK,
-    laneAccounts: [{
-      lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
-      weekly: { used: 0.66, resetsAt: '2026-10-09T19:00:00Z' },
-      fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
-      observedAt: '2026-10-08T22:59:00Z', quality: 'live',
-    }],
-    dbRows: [dbRow('run-1', TICK - 5 * 60000)],
+    laneAccounts: [acct('claude-1', 'claude', 'a1', 0.66, '2026-10-09T19:00:00Z')],
   });
   const { capacity } = await run();
   const claude = capacity.body.accounts.find(a => a.accountId === 'claude:a1');
@@ -173,13 +189,7 @@ test('required rate is a number whenever remaining and reset are known', async (
 test('required rate is null (not zero) when the reset is unknown', async () => {
   const { run } = drive({
     nowMs: TICK,
-    laneAccounts: [{
-      lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
-      weekly: { used: 0.5, resetsAt: null },
-      fiveHour: { used: 0.1, resetsAt: null },
-      observedAt: '2026-10-08T22:59:00Z', quality: 'cached',
-    }],
-    dbRows: [],
+    laneAccounts: [acct('claude-1', 'claude', 'a1', 0.5, null)],
   });
   const { capacity } = await run();
   const claude = capacity.body.accounts.find(a => a.accountId === 'claude:a1');
@@ -188,52 +198,80 @@ test('required rate is null (not zero) when the reset is unknown', async () => {
   assert.equal(claude.requiredRatePerHour, null);
 });
 
-test('shadow entry records actualModel and whether shadow agreed with reality', async () => {
+test('three accounts with different deltas get different measured rates', async () => {
+  // Item 1 regression: each account's rate comes from its OWN weekly.used
+  // series -- never a shared history.
+  const uses = [[0.30, 0.34], [0.50, 0.52], [0.10, 0.10]];
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3,
-    dbRows: [
-      // Cheapest rung-0 arm is claude-haiku-5-5: shadow agrees here.
-      dbRow('run-agree', TICK - 5 * 60000, 'claude-haiku-5-5', 'claude'),
-      // A costlier actual model on the same account: shadow disagrees.
-      dbRow('run-other', TICK - 4 * 60000, 'claude-opus-5-5', 'claude'),
-    ],
+    nowMs: TICK,
+    // Each tick is stamped with its own observedAt: same stamp + same
+    // value is an exact duplicate and is skipped, so distinct stamps are
+    // what let each account build its own two-point series.
+    laneAccounts: (t, now) => uses.map(([u0, u1], i) => (
+      acct(`lane-${i + 1}`, i < 2 ? 'claude' : 'codex', `k${i + 1}`, t === 0 ? u0 : u1, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString())
+    )),
+    steps: [{ now: TICK }, { now: TICK + 30 * 60000 }],
   });
-  const { shadow } = await run();
-  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
-  assert.equal(byId.get('run-agree').actualModel, 'claude-haiku-5-5');
-  assert.equal(byId.get('run-agree').modelMatch, true);
-  assert.equal(byId.get('run-other').actualModel, 'claude-opus-5-5');
-  assert.equal(byId.get('run-other').modelMatch, false);
+  const { capacity } = await run();
+  const rates = new Map(capacity.body.accounts.map(a => [a.accountId, a.measuredRatePerHour]));
+  // 30-minute span: (u1-u0)/0.5h.
+  assert.ok(Math.abs(rates.get('claude:k1') - 0.08) < 1e-9);
+  assert.ok(Math.abs(rates.get('claude:k2') - 0.04) < 1e-9);
+  assert.ok(Math.abs(rates.get('codex:k3') - 0) < 1e-9);
 });
 
-test('event-seen run keeps its place but takes its model from the db row', async () => {
-  const at = new Date(TICK - 2 * 60000).toISOString();
+test('entries sharing one account id keep separate series via lane suffix', async () => {
+  // Degenerate payload: same provider + accountKey, different lanes.
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3,
-    dbRows: [dbRow('run-7', TICK - 2 * 60000, 'claude-haiku-5-5', 'claude')],
-    withEvents: [{
-      companyId: 'acme', entityId: 'run-7',
-      payload: { run: { agentId: 'agent-9' } }, // no model on the event
-      occurredAt: at,
-    }],
+    nowMs: TICK,
+    laneAccounts: (t, now) => [
+      acct('x1', 'claude', 'shared', t === 0 ? 0.30 : 0.34, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString()),
+      acct('x2', 'claude', 'shared', t === 0 ? 0.50 : 0.52, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString()),
+    ],
+    steps: [{ now: TICK }, { now: TICK + 30 * 60000 }],
   });
-  const { shadow } = await run();
+  const { capacity } = await run();
+  const rates = new Map(capacity.body.accounts.map(a => [a.accountId, a.measuredRatePerHour]));
+  assert.ok(Math.abs(rates.get('claude:shared') - 0.08) < 1e-9);
+  assert.ok(Math.abs(rates.get('claude:shared#x2') - 0.04) < 1e-9);
+});
+
+test('deficit order: the over-burning account gets no new marginal runs', async () => {
+  // lane-1 rises 0.30 -> 0.34 in 30 min (8%/h vs ~0.4%/h required:
+  // deep into over-burn); lane-2 sits flat (measured 0, deficit ~1).
+  const lanes = (t, now) => [
+    acct('claude-lane-1', 'claude', 'a1', t === 0 ? 0.30 : 0.34, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString()),
+    acct('claude-lane-2', 'claude', 'a2', 0.50, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString()),
+  ];
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: lanes,
+    steps: [
+      { now: TICK },
+      { now: TICK + 30 * 60000, fire: [started('run-1', TICK + 25 * 60000, { provider: 'claude' })] },
+    ],
+  });
+  const { shadow, capacity } = await run();
+  const lane1 = capacity.body.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(lane1.measuredRatePerHour > lane1.requiredRatePerHour * 1.15);
   assert.equal(shadow.body.entries.length, 1);
-  assert.equal(shadow.body.entries[0].actualModel, 'claude-haiku-5-5');
-  assert.equal(shadow.body.entries[0].modelMatch, true);
+  assert.equal(shadow.body.entries[0].account, 'claude:a2');
 });
 
-test('issue override beats agent config; heartbeat row beats both', async () => {
-  const row = (id, extra) => ({ ...dbRow(id, TICK - 5 * 60000, '', 'claude'), ...extra });
+test('issue override beats agent config; the event model beats both', async () => {
+  const at = TICK - 5 * 60000;
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3,
-    dbRows: [
-      row('run-override', { issue_id: 'iss-1' }),
-      row('run-agent', { issue_id: null }),
-      { ...dbRow('run-hb', TICK - 5 * 60000, 'claude-haiku-5-5', 'claude'), issue_id: 'iss-1' },
-    ],
-    issues: { 'iss-1': { assigneeAdapterOverrides: { adapterConfig: { model: 'gpt-6-luna' } } } },
-    agents: { 'agent-9': { adapterConfig: { model: 'claude-sonnet-5-5' } } },
+    nowMs: TICK,
+    steps: [{
+      now: TICK,
+      fire: [
+        started('run-override', at, { issueId: 'iss-1' }),
+        started('run-agent', at, {}),
+        started('run-ev', at, { model: 'claude-haiku-5-5', issueId: 'iss-1' }),
+      ],
+    }],
+    issueGets: { 'iss-1': { assigneeAdapterOverrides: { adapterConfig: { model: 'gpt-6-luna' } } } },
+    agentGets: { 'agent-9': { adapterConfig: { model: 'claude-sonnet-5-5' } } },
   });
   const { shadow } = await run();
   const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
@@ -246,21 +284,43 @@ test('issue override beats agent config; heartbeat row beats both', async () => 
     ['claude-sonnet-5-5', 'agent-config'],
   );
   assert.deepEqual(
-    [byId.get('run-hb').actualModel, byId.get('run-hb').actualModelSource],
-    ['claude-haiku-5-5', 'heartbeat'],
+    [byId.get('run-ev').actualModel, byId.get('run-ev').actualModelSource],
+    ['claude-haiku-5-5', 'run-event'],
   );
 });
 
-test('cached payloads do not fake history: duplicates skipped, fresh data accumulates', async () => {
+test('actualModel failures log codes, never upstream text', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    steps: [{ now: TICK, fire: [started('run-1', TICK - 5 * 60000, { issueId: 'iss-9' })] }],
+    failIssueGet: 'db-query-denied: connection refused (raw upstream text)',
+  });
+  const { shadow } = await run();
+  const [entry] = shadow.body.entries;
+  assert.equal(entry.actualModel, 'unknown');
+  assert.ok(entry.actualModelError.includes('issue-read-unavailable'));
+  assert.ok(!entry.actualModelError.includes('db-query-denied'));
+});
+
+test('runs with no trail log exactly why the model stayed unknown', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    steps: [{ now: TICK, fire: [started('run-1', TICK - 5 * 60000, {})] }],
+  });
+  const { shadow } = await run();
+  assert.equal(shadow.body.entries[0].actualModelError, 'no-issue-id; agent-not-found');
+});
+
+test('exact duplicates are skipped, fresh data accumulates', async () => {
   const iso = (ms) => new Date(ms).toISOString();
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3, laneObservedAt: iso(TICK - 60000),
-    dbRows: [],
-    extraTicks: [
-      // Same observedAt, same value: exact duplicate, skipped.
-      { now: TICK + 60000, observedAt: iso(TICK - 60000) },
-      // Same observedAt is impossible with a new value here; new data:
-      { now: TICK + 120000, used: 0.302, observedAt: iso(TICK + 60000) },
+    nowMs: TICK,
+    laneAccounts: [acct('claude-1', 'claude', 'a1', 0.3, '2026-10-15T22:59:00Z', 0.1, iso(TICK - 60000))],
+    steps: [
+      { now: TICK },
+      // Same stamp + same value is an exact duplicate: skipped, not stored.
+      { now: TICK + 60000, lane: { observedAt: iso(TICK - 60000), accounts: [acct('claude-1', 'claude', 'a1', 0.3, '2026-10-15T22:59:00Z', 0.1, iso(TICK - 60000))] } },
+      { now: TICK + 120000, lane: { observedAt: iso(TICK + 60000), accounts: [acct('claude-1', 'claude', 'a1', 0.302, '2026-10-15T22:59:00Z', 0.1, iso(TICK + 60000))] } },
     ],
   });
   const { capacity } = await run();
@@ -268,14 +328,14 @@ test('cached payloads do not fake history: duplicates skipped, fresh data accumu
 });
 
 test('measured rate appears within ~10-15 min of install on live data', async () => {
-  const ticks = [];
+  const steps = [{ now: TICK }];
   for (let i = 1; i <= 12; i++) {
-    ticks.push({ now: TICK + i * 60000, used: 0.3 + i * 0.002, observedAt: new Date(TICK + i * 60000).toISOString() });
+    steps.push({ now: TICK + i * 60000 });
   }
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.3, laneObservedAt: new Date(TICK).toISOString(),
-    dbRows: [],
-    extraTicks: ticks,
+    nowMs: TICK,
+    laneAccounts: (t, now) => [acct('claude-1', 'claude', 'a1', 0.3 + t * 0.002, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString())],
+    steps,
   });
   const { capacity } = await run();
   const claude = capacity.body.accounts[0];
@@ -286,9 +346,14 @@ test('measured rate appears within ~10-15 min of install on live data', async ()
 
 test('two rising readings plus runs in span calibrate E and recommend a target', async () => {
   const { run } = drive({
-    nowMs: TICK, laneUsed: 0.30, laneObservedAt: new Date(TICK).toISOString(),
-    dbRows: [dbRow('run-a', TICK + 10 * 60000), dbRow('run-b', TICK + 20 * 60000)],
-    extraTicks: [{ now: TICK + 30 * 60000, used: 0.328, observedAt: new Date(TICK + 30 * 60000).toISOString() }],
+    nowMs: TICK,
+    laneAccounts: (t, now) => [acct('claude-1', 'claude', 'a1', t < 3 ? 0.30 : 0.328, '2026-10-15T22:59:00Z', 0.1, new Date(now).toISOString())],
+    steps: [
+      { now: TICK },
+      { now: TICK + 10 * 60000, fire: [started('run-a', TICK + 10 * 60000, { provider: 'claude' })] },
+      { now: TICK + 20 * 60000, fire: [started('run-b', TICK + 20 * 60000, { provider: 'claude' })] },
+      { now: TICK + 30 * 60000 },
+    ],
   });
   const { capacity } = await run();
   // Delta 0.028 over 2 runs in span => E = 0.014.
@@ -303,7 +368,13 @@ test('config resolution applies documented defaults', () => {
   assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
   assert.equal(c.cliproxy.accountsPath, '/telemetry/cliproxy/live/accounts.json');
   assert.equal(c.cliproxy.laneKeySecretRef, null);
+  assert.equal(c.enforce, false);
   assert.equal(c.concurrency.maxTotal, 75);
   assert.equal(c.contextCaps.solLunaMaxTokens, 260000);
   assert.equal(c.armMap.length > 0, true);
+});
+
+test('non-allowlisted baseUrl falls back to the default instead of carrying the key', () => {
+  const c = resolveConfig({ cliproxy: { baseUrl: 'https://telemetry.example.com' } });
+  assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
 });

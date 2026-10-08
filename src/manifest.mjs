@@ -1,5 +1,5 @@
 /**
- * Plugin manifest. v0.2.0 = ENFORCE-CAPABLE: holds `run.model.resolve` with
+ * Plugin manifest. v0.2.1 = ENFORCE-CAPABLE: holds `run.model.resolve` with
  * a minimal modelRouting envKeys list, gated at runtime by the `enforce`
  * config flag (default false: the hook answers `keep` until the operator
  * flips it). `buildManifest({ modelResolve: false })` still builds the
@@ -12,19 +12,25 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.0';
+export const PLUGIN_VERSION = '0.2.1';
+
+/** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
+export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
+  'https://router.infextion.net',
+]);
 
 /**
  * Env keys a run.model.resolve decision may set. Minimal by construction:
- * `decide` returns model/effort first-class and only ever sets the two
- * context-ceiling keys below, so none of model-selection's PIN_LANE /
- * ANCILLARY keys (PAPERCLIP_ASSIGNED_MODEL, CLAUDE_CODE_SUBAGENT_MODEL,
+ * `decide` returns model/effort first-class and only ever sets the keys
+ * below, so none of model-selection's PIN_LANE / ANCILLARY keys
+ * (PAPERCLIP_ASSIGNED_MODEL, CLAUDE_CODE_SUBAGENT_MODEL,
  * ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL,
  * ANTHROPIC_SMALL_FAST_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL) are needed.
  */
 export const MODEL_ROUTING_ENV_KEYS = [
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
 ];
 
 const SECRET_REF = {
@@ -45,7 +51,10 @@ const CONFIG_SCHEMA = {
     cliproxy: {
       type: 'object', additionalProperties: false,
       properties: {
-        baseUrl: { type: 'string', default: 'https://router.infextion.net' },
+        // Pinned: the lane key must never be sent to any other host. The
+        // enum pins it at schema level; validateConfigShape rejects
+        // anything else at config-validation time.
+        baseUrl: { type: 'string', enum: [...LANE_BASE_URL_ALLOWLIST], default: 'https://router.infextion.net' },
         accountsPath: { type: 'string', default: '/telemetry/cliproxy/live/accounts.json' },
         laneKeySecretRef: { ...SECRET_REF, description: 'Paperclip secret holding the lane key for the host-published CLIProxy telemetry endpoint (GET {baseUrl}{accountsPath}, X-Api-Key header).' },
         cacheTtlSec: { type: 'integer', minimum: 5, default: 45 },
@@ -124,6 +133,7 @@ const CONFIG_SCHEMA = {
         solLunaMaxTokens: { type: 'integer', minimum: 1, default: 260000 },
         solLunaAutoCompactTokens: { type: 'integer', minimum: 1, default: 240000 },
         autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW' },
+        haikuMaxOutputTokens: { type: 'integer', minimum: 1, default: 64000 },
       },
     },
     enforce: {
@@ -148,7 +158,7 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. v0.2.0 defaults to the enforcement variant: it holds
+ * Build the manifest. v0.2.1 defaults to the enforcement variant: it holds
  * the `run.model.resolve` capability plus the modelRouting envKeys
  * declaration the host requires with it. Pass `{ modelResolve: false }`
  * for the shadow-only variant (no resolve capability, no modelRouting).
@@ -164,13 +174,10 @@ export function buildManifest({ modelResolve = true } = {}) {
     'agents.read',
     'issues.read',
     'api.routes.register',
-    // Heartbeat-run backfill reads the whitelisted core table
-    // `heartbeat_runs` (SELECT only, via the `database` declaration below).
-    // `migrate` is declared but never exercised: the schema validator pairs
-    // it with `namespace.read` unconditionally, and this plugin owns no
-    // tables (migrations/ is deliberately empty). Never `namespace.write`.
-    'database.namespace.read',
-    'database.namespace.migrate',
+    // No database capabilities: run facts come from SDK surfaces only
+    // (agent.run.* events, issues.get, agents.get). The host executes
+    // plugin SQL unchanged, so a core-table grant's tenant filter would be
+    // plugin-enforced only -- refused scope, removed in v0.2.1.
   ];
   const out = {
     id: PLUGIN_ID,
@@ -184,13 +191,6 @@ export function buildManifest({ modelResolve = true } = {}) {
     categories: ['automation'],
     capabilities,
     entrypoints: { worker: './src/worker.mjs' },
-    database: {
-      namespaceSlug: 'model_capacity',
-      migrationsDir: './migrations',
-      // Exactly the one core table the shadow tick reads (restricted
-      // SELECT in plugin.mjs RUNS_SQL); nothing else is allowlisted.
-      coreReadTables: ['heartbeat_runs'],
-    },
     instanceConfigSchema: CONFIG_SCHEMA,
     jobs: [
       {
@@ -253,6 +253,6 @@ export function buildManifest({ modelResolve = true } = {}) {
   return out;
 }
 
-/** v0.2.0 enforce-capable manifest (runtime-gated by `enforce: false` default). */
+/** v0.2.1 enforce-capable manifest (runtime-gated by `enforce: false` default). */
 export const manifest = buildManifest();
 export default manifest;

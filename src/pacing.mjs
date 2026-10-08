@@ -145,25 +145,35 @@ export function stepRateController(state, reading, nowMs, cfg = DEFAULT_PACING, 
   const fiveHour = reading.fiveHourUsedPct;
   const keepStamp = state.lastMoveAtMs ?? nowMs;
 
+  // Basis is tracked through guard episodes too, so a guard that ends
+  // after rates appear still counts as a position -> measured switch.
+  const guardBasis = (reading.measuredRatePerHour != null && Number.isFinite(reading.measuredRatePerHour)) ? 'measured' : 'position';
   if (fiveHour != null && fiveHour >= c.guardHigh) {
     return {
-      pointer: floor, lastMoveAtMs: nowMs, guardActive: true, action: 'floor-guard',
+      pointer: floor, lastMoveAtMs: nowMs, guardActive: true, rateBasis: guardBasis, action: 'floor-guard',
       reason: `5h at ${Math.round(fiveHour * 100)}% >= guard ${Math.round(c.guardHigh * 100)}%: floor rung, shed load`,
     };
   }
   if (state.guardActive) {
     if (fiveHour != null && fiveHour >= c.guardRejoin) {
-      return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: true, action: 'hold-guard', reason: '5h guard still active' };
+      return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: true, rateBasis: guardBasis, action: 'hold-guard', reason: '5h guard still active' };
     }
-    return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: false, action: 'rejoin', reason: '5h recovered: rejoin at floor' };
+    return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: false, rateBasis: guardBasis, action: 'rejoin', reason: '5h recovered: rejoin at floor' };
   }
 
   const measured = reading.measuredRatePerHour;
   const required = reading.requiredRatePerHour ?? 0;
+  const measuredKnown = measured != null && Number.isFinite(measured);
+  // Persisted basis ('measured' | 'position' | undefined on pre-0.2.1
+  // state): when the basis switches from the position fallback to a real
+  // measured rate, the cooldown resets so the correction a stale fallback
+  // move made necessary is not delayed by that very move.
+  const rateBasis = measuredKnown ? 'measured' : 'position';
+  const basisSwitched = state.rateBasis === 'position' && rateBasis === 'measured';
   let e;
   let band;
   let basis;
-  if (measured != null && Number.isFinite(measured)) {
+  if (measuredKnown) {
     e = measured - required;
     band = Math.max(c.rateDeadbandRel * Math.max(required, 0), c.rateMinDeadbandPerHour);
     basis = `rate ${(measured * 100).toFixed(2)}%/h vs required ${(required * 100).toFixed(2)}%/h`;
@@ -173,18 +183,18 @@ export function stepRateController(state, reading, nowMs, cfg = DEFAULT_PACING, 
     basis = `no measured rate yet: position ${(e * 100).toFixed(1)}%`;
   }
   if (Math.abs(e) <= band) {
-    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, action: 'hold', reason: `${basis}: inside deadband` };
+    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold', reason: `${basis}: inside deadband` };
   }
-  if (nowMs - (state.lastMoveAtMs ?? 0) < c.cooldownMs) {
-    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, action: 'hold-cooldown', reason: `${basis}: rung move inside cooldown` };
+  if (!basisSwitched && nowMs - (state.lastMoveAtMs ?? 0) < c.cooldownMs) {
+    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold-cooldown', reason: `${basis}: rung move inside cooldown` };
   }
   if (e < 0 && pointer < top) {
-    return { pointer: pointer + 1, lastMoveAtMs: nowMs, guardActive: false, action: 'climb', reason: `${basis}: burning too slowly, climb one rung` };
+    return { pointer: pointer + 1, lastMoveAtMs: nowMs, guardActive: false, rateBasis, action: 'climb', reason: `${basis}: burning too slowly, climb one rung` };
   }
   if (e > 0 && pointer > floor) {
-    return { pointer: pointer - 1, lastMoveAtMs: nowMs, guardActive: false, action: 'descend', reason: `${basis}: burning too fast, descend one rung` };
+    return { pointer: pointer - 1, lastMoveAtMs: nowMs, guardActive: false, rateBasis, action: 'descend', reason: `${basis}: burning too fast, descend one rung` };
   }
-  return { pointer, lastMoveAtMs: keepStamp, guardActive: false, action: 'hold-limit', reason: `${basis}: at floor/ceiling bound` };
+  return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold-limit', reason: `${basis}: at floor/ceiling bound` };
 }
 
 /** Serve runs from accounts ordered earliest reset first, largest remainder first. */

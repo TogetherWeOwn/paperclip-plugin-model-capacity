@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY } from '../src/decide.mjs';
+import { decide, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
 
 const arm = (armId, model, effort, family, Q, contextWindow = 1000000) => ({ armId, model, effort, family, Q, C: 1, contextWindow });
 const ladderRungs = [
@@ -38,7 +38,7 @@ test('sol/luna carry the price-cliff context caps', () => {
   assert.equal(d.env[MAX_CONTEXT_ENV_KEY], '260000');
   assert.equal(d.env[AUTO_COMPACT_ENV_KEY], '240000');
   const haiku = decide({ ...base });
-  assert.deepEqual(haiku.env, {});
+  assert.deepEqual(haiku.env, { [MAX_OUTPUT_ENV_KEY]: '64000' });
 });
 
 test('context window filters; rate-limit reroutes', () => {

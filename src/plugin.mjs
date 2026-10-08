@@ -1,7 +1,7 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
- * v0.2.0 = ENFORCE-CAPABLE. The worker refreshes AA data daily, reads
+ * v0.2.1 = ENFORCE-CAPABLE. The worker refreshes AA data daily, reads
  * CLIProxy burn from the host-published lane endpoint (one GET, short
  * in-memory cache), steps per-account pacing pointers, and records what it
  * WOULD have decided for recently started runs. `onResolveRunModel` is
@@ -32,8 +32,9 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS } from './decide.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
+import { orderAccountsForRun } from './select.mjs';
 import { createShadowRing, SHADOW_CAPACITY } from './shadow.mjs';
-import { manifest } from './manifest.mjs';
+import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -44,16 +45,13 @@ const LADDER_KEY = 'ladder-v1';
 const RATE_KEY = 'rate-history-v1';
 const RUNEVT_KEY = 'run-events-v1';
 
-/** Recent heartbeat runs for one company (db backfill + event buffer). */
-const RUNS_SQL = `select id, agent_id, status, started_at, finished_at,
-       coalesce(usage_json->>'model','') as model,
-       coalesce(usage_json->>'provider','') as provider,
-       coalesce(context_snapshot->>'issueId','') as issue_id
-  from heartbeat_runs
- where company_id = $1
-   and started_at > now() - ($2 || ' minutes')::interval
- order by started_at desc
- limit 500`;
+/**
+ * Recent runs for one company, from agent.run.* events only (started,
+ * finished, failed) merged with a persisted ring in plugin state. No db
+ * access: run facts come from SDK surfaces, never core tables.
+ */
+const RUNS_KEY = 'runs-v1';
+const RUNS_CAP = 500;
 
 const scopeKey = (companyId, stateKey) => ({ scopeKind: 'company', scopeId: companyId, namespace: NS, stateKey });
 
@@ -65,6 +63,11 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
+  // The lane key is sent as X-Api-Key to baseUrl: only the hard-coded
+  // allowlist may name it, or config could redirect the key to any host.
+  if (cliproxy?.baseUrl != null && !LANE_BASE_URL_ALLOWLIST.includes(cliproxy.baseUrl)) {
+    errors.push(`cliproxy.baseUrl must be one of: ${LANE_BASE_URL_ALLOWLIST.join(', ')}`);
+  }
   if (cliproxy?.laneKeySecretRef != null && !isSecretRef(cliproxy.laneKeySecretRef)) {
     errors.push('cliproxy.laneKeySecretRef must be a secret_ref object');
   }
@@ -92,7 +95,9 @@ export function validateConfigShape(raw) {
 export function resolveConfig(raw = {}) {
   return {
     cliproxy: {
-      baseUrl: raw.cliproxy?.baseUrl || DEFAULT_BASE_URL,
+      // Belt and braces behind the validator: a non-allowlisted baseUrl
+      // falls back to the default instead of ever carrying the lane key.
+      baseUrl: LANE_BASE_URL_ALLOWLIST.includes(raw.cliproxy?.baseUrl) ? raw.cliproxy.baseUrl : DEFAULT_BASE_URL,
       accountsPath: raw.cliproxy?.accountsPath || DEFAULT_ACCOUNTS_PATH,
       laneKeySecretRef: raw.cliproxy?.laneKeySecretRef ?? null,
       cacheTtlSec: raw.cliproxy?.cacheTtlSec ?? 45,
@@ -209,7 +214,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return config.roles.thinkerAgentIds.includes(agentId) ? 'thinker' : 'doer';
   }
 
-  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders }) {
+  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null }) {
+    const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
     const { arms, skipped } = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
     const byArm = new Map(arms.map(a => [a.armId, a]));
     const refRow = byArm.get(config.calibration.referenceArmId)?.row;
@@ -219,7 +225,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       return config.calibration.referenceBurnPerRunPct * (cost / refCost);
     };
     const ladders = {};
-    for (const account of accounts) {
+    for (let i = 0; i < accounts.length; i++) {
+      const account = accounts[i];
       // Per-account scoring: quality support and cost profile are the
       // account's own arm set, so one provider's gaps never punish another.
       const served = armsForProvider(arms, account.provider);
@@ -236,8 +243,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         C: costs.get(a.armId)?.C ?? null,
         coverage: scored.get(a.armId)?.coverage ?? 0,
       }));
-      const { rungs, dominated, dropped } = buildLadder(eligible, previousLadders?.[accountKey(account)]?.rungs ?? []);
-      ladders[accountKey(account)] = {
+      const { rungs, dominated, dropped } = buildLadder(eligible, previousLadders?.[keyOf(account, i)]?.rungs ?? []);
+      ladders[keyOf(account, i)] = {
         rungs: rungs.map(r => {
           const arm = byArm.get(r.armId);
           return {
@@ -261,76 +268,118 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return account.accountId ?? `${account.provider ?? 'unknown'}:x`;
   }
 
-  function normalizeRunRow(row) {
-    const atMs = Date.parse(row?.started_at ?? '');
-    if (!Number.isFinite(atMs)) return null;
-    return {
-      runId: String(row?.id ?? 'unknown'),
-      agentId: row?.agent_id ? String(row.agent_id) : 'unknown',
-      model: row?.model || null,
-      provider: row?.provider ? String(row.provider).toLowerCase() : null,
-      issueId: row?.issue_id || row?.issueId || null,
-      status: row?.status ?? null,
-      at: atMs,
-    };
+  /**
+   * One state key per snapshot entry. Degenerate payloads can repeat an
+   * account id across entries (e.g. a shared key fingerprint in
+   * `accountKey` while `lane` differs); keying by the raw id would merge
+   * their utilization series into ONE history and every account would
+   * report the same measured rate. Suffix repeats with the lane name so
+   * each entry keeps its OWN weekly.used series. Well-formed payloads
+   * (distinct ids) are untouched: keys equal the plain account ids.
+   */
+  function uniqueAccountKeys(accounts) {
+    const counts = new Map();
+    return (accounts ?? []).map((account) => {
+      const base = accountKey(account);
+      const n = counts.get(base) ?? 0;
+      counts.set(base, n + 1);
+      return n === 0 ? base : `${base}#${account.lane ?? `dup${n}`}`;
+    });
   }
 
   /**
-   * The actual model a run used. Heartbeat rows rarely carry one
-   * (model-selection runs advisory), so: heartbeat usage_json first, then
-   * the issue's assignee adapter override (preferred -- it is what the
-   * run was told to use), then the agent's adapter config. Reads use the
-   * already-declared agents.read / issues.read capabilities -- no new
-   * capabilities, no new core tables. Per-tick caches keep this to one
-   * fetch per agent/issue no matter how many runs share them; any denial
-   * degrades to null (unknown), never fails the tick.
+   * SDK client reads with positional fallback. The SDK contract is object
+   * params (`{ issueId, companyId }` / `{ agentId, companyId }`); a host
+   * that only honors the older positional form still works via the
+   * fallback. Either way the caller gets the entity or a throw -- never a
+   * silent null from a shape mismatch.
+   */
+  async function compatIssueGet(issueId, companyId) {
+    try {
+      return await ctx.issues.get({ issueId, companyId });
+    } catch (first) {
+      try {
+        return await ctx.issues.get(issueId, companyId);
+      } catch {
+        throw first;
+      }
+    }
+  }
+
+  async function compatAgentGet(agentId, companyId) {
+    try {
+      return await ctx.agents.get({ agentId, companyId });
+    } catch (first) {
+      try {
+        return await ctx.agents.get(agentId, companyId);
+      } catch {
+        throw first;
+      }
+    }
+  }
+
+  /**
+   * The actual model a run used. The run.started event carries one when the
+   * emitter knew it; otherwise the issue's assignee adapter override
+   * (preferred -- it is what the run was told to use), then the agent's
+   * adapter config. Reads use the already-declared agents.read /
+   * issues.read capabilities. Per-tick caches keep this to one fetch per
+   * agent/issue no matter how many runs share them.
+   *
+   * Returns { model, source, error }: error is null on success, else a
+   * stable code naming the failed step ('no-issue-id',
+   * 'issue-read-unavailable', 'no-override-on-issue', 'no-agent-id',
+   * 'agent-read-unavailable', 'no-model-on-agent'). Raw upstream text is
+   * NEVER returned -- it is logged server-side only -- so API responses
+   * carry codes, not exception strings.
    */
   async function resolveActualModel(companyId, run, caches) {
-    if (run.model) return { model: run.model, source: 'heartbeat' };
-    const overrideOf = (issue) => {
-      const o = issue?.assigneeAdapterOverrides ?? issue?.assignee_adapter_overrides;
-      const m = o?.adapterConfig?.model ?? o?.adapter_config?.model;
-      return typeof m === 'string' && m.length > 0 ? m : null;
-    };
+    if (run.model) return { model: run.model, source: 'run-event', error: null };
+    const notes = [];
     if (run.issueId) {
       try {
-        let m = caches.issues.get(run.issueId);
-        if (m === undefined) {
-          m = overrideOf(await ctx.issues.get(run.issueId, companyId));
-          caches.issues.set(run.issueId, m);
+        let entry = caches.issues.get(run.issueId);
+        if (entry === undefined) {
+          const issue = await compatIssueGet(run.issueId, companyId);
+          const o = issue?.assigneeAdapterOverrides ?? issue?.assignee_adapter_overrides;
+          const m = o?.adapterConfig?.model ?? o?.adapter_config?.model;
+          entry = {
+            model: typeof m === 'string' && m.length > 0 ? m : null,
+            note: issue == null ? 'issue-not-found' : 'no-override-on-issue',
+          };
+          caches.issues.set(run.issueId, entry);
         }
-        if (m) return { model: m, source: 'issue-override' };
-      } catch { /* unknown */ }
+        if (entry.model) return { model: entry.model, source: 'issue-override', error: null };
+        notes.push(entry.note);
+      } catch (error) {
+        ctx.logger.error('model-capacity: issue read failed', { companyId, error: error?.message ?? String(error) });
+        notes.push('issue-read-unavailable');
+      }
+    } else {
+      notes.push('no-issue-id');
     }
     if (run.agentId && run.agentId !== 'unknown') {
       try {
-        let m = caches.agents.get(run.agentId);
-        if (m === undefined) {
-          const agent = await ctx.agents.get(run.agentId, companyId);
+        let entry = caches.agents.get(run.agentId);
+        if (entry === undefined) {
+          const agent = await compatAgentGet(run.agentId, companyId);
           const found = agent?.adapterConfig?.model ?? agent?.adapter_config?.model;
-          m = typeof found === 'string' && found.length > 0 ? found : null;
-          caches.agents.set(run.agentId, m);
+          entry = {
+            model: typeof found === 'string' && found.length > 0 ? found : null,
+            note: agent == null ? 'agent-not-found' : 'no-model-on-agent',
+          };
+          caches.agents.set(run.agentId, entry);
         }
-        if (m) return { model: m, source: 'agent-config' };
-      } catch { /* unknown */ }
+        if (entry.model) return { model: entry.model, source: 'agent-config', error: null };
+        notes.push(entry.note);
+      } catch (error) {
+        ctx.logger.error('model-capacity: agent read failed', { companyId, error: error?.message ?? String(error) });
+        notes.push('agent-read-unavailable');
+      }
+    } else {
+      notes.push('no-agent-id');
     }
-    return { model: null, source: null };
-  }
-
-  /**
-   * Heartbeat-run backfill: runs started in the trailing window, newest
-   * first. Returns { runs, dbError }. Restricted SELECT on a whitelisted
-   * core table; any denial degrades to the event buffer instead of
-   * failing the tick.
-   */
-  async function readRecentRuns(companyId, windowMin, nowMs) {
-    try {
-      const rows = await ctx.db.query(RUNS_SQL, [companyId, String(windowMin)]);
-      const runs = (rows ?? []).map(normalizeRunRow).filter(Boolean).filter(r => r.at <= nowMs + 60000);
-      return { runs, dbError: null };
-    } catch (error) {
-      return { runs: [], dbError: error?.message ?? String(error) };
-    }
+    return { model: null, source: null, error: notes.join('; ') };
   }
 
   /**
@@ -350,16 +399,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   /**
-   * Merge event-buffered and db runs, newest first, deduped by run id.
-   * The event buffer usually wins the race but carries no model; the db
-   * row does. So on a duplicate id the FIRST record keeps its place while
-   * null fields (model, provider, agentId) are backfilled from the later
-   * duplicate instead of dropping it -- otherwise actualModel stays
-   * 'unknown' forever on runs the event feed saw first.
+   * Merge in-memory buffered and persisted state-ring runs, newest first,
+   * deduped by run id. On a duplicate id the FIRST record keeps its place
+   * while null fields (model, provider, agentId, issueId, status) are
+   * backfilled from the later duplicate instead of dropping it.
    */
-  function mergeRuns(buffered, dbRuns, nowMs, windowMs) {
+  function mergeRuns(buffered, stored, nowMs, windowMs) {
     const byId = new Map();
-    for (const r of [...(buffered ?? []), ...(dbRuns ?? [])]) {
+    for (const r of [...(buffered ?? []), ...(stored ?? [])]) {
       if (!r || r.runId == null || nowMs - r.at > windowMs) continue;
       const prev = byId.get(r.runId);
       if (!prev) {
@@ -369,8 +416,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       for (const k of ['model', 'provider', 'agentId', 'issueId']) {
         if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
       }
+      // Terminal status wins (a finished event after a started one), but
+      // `at` stays the START time: calibration counts runs started in span.
       if ((prev.status == null) && r.status != null) prev.status = r.status;
-      if (r.at > prev.at) prev.at = r.at;
+      if ((r.status === 'finished' || r.status === 'failed') &&
+        prev.status !== 'finished' && prev.status !== 'failed') prev.status = r.status;
     }
     return [...byId.values()].sort((a, b) => b.at - a.at);
   }
@@ -383,13 +433,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const aaSnapshot = await ctx.state.get(scopeKey(companyId, AA_KEY));
     const pacingState = (await ctx.state.get(scopeKey(companyId, PACING_KEY))) ?? {};
     const prevLadders = (await ctx.state.get(scopeKey(companyId, LADDER_KEY)))?.ladders ?? {};
-    const { ladders, skipped } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders });
+    // One state key per snapshot entry (never a merged series): see
+    // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
+    const stateKeys = uniqueAccountKeys(snapshot.accounts);
+    const { ladders, skipped } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys });
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
     const accountViews = [];
-    for (const account of snapshot.accounts) {
-      const key = accountKey(account);
+    for (let i = 0; i < snapshot.accounts.length; i++) {
+      const account = snapshot.accounts[i];
+      const key = stateKeys[i];
       const weeklyUsed = account.weekly?.utilization;
       const fiveHourUsed = account.fiveHour?.utilization;
       // resetsAtMs is parsed once in the lane client (ISO, epoch ms, or
@@ -403,14 +457,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
         : null;
       // Rate inputs: append this reading, then measure over the trailing
-      // window. The reading is stamped with the payload's observedAt (not
-      // the tick time) so a cached 45s payload does not fake movement; an
+      // window. The reading is stamped with the ACCOUNT's own observedAt
+      // (each account's series carries its own time, then the body stamp,
+      // then the tick time) so a cached payload does not fake movement; an
       // identical (timestamp, value) pair is an exact duplicate and is
       // skipped, everything else accumulates -- so history grows on every
       // tick that carries genuinely new data.
       let history = rateHistories[key] ?? [];
       if (weeklyUsed != null) {
-        const readingAtMs = snapshot.observedAtMs ?? nowMs;
+        const readingAtMs = account.signalsAtMs ?? snapshot.observedAtMs ?? nowMs;
         const dup = history.some(p => p.atMs === readingAtMs && p.usedPct === weeklyUsed);
         if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
       }
@@ -437,7 +492,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           positionError,
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
-      nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive };
+      nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive, rateBasis: step.rateBasis ?? null };
       accountViews.push({
         accountId: key,
         provider: account.provider,
@@ -460,14 +515,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     const ordered = orderAccounts(accountViews.map(a => ({ ...a, remainingPct: a.remainingPct ?? 0 })));
 
-    // Runs feed: heartbeat backfill (primary) merged with the event buffer.
-    // The event subscription alone left the ring empty live, so the tick no
-    // longer depends on delivery: db rows are authoritative, events top up.
+    // Runs feed: agent.run.started events buffered in memory, merged with
+    // the persisted run ring in plugin state (no db). Calibration counts
+    // runs that started on each account inside the measured span.
     const rateWindowMs = config.pacing.rateWindowMin * 60000;
-    const { runs: dbRuns, dbError } = await readRecentRuns(companyId, config.pacing.rateWindowMin, nowMs);
     const buffered = recentRuns.get(companyId) ?? [];
-    const runs = mergeRuns(buffered, dbRuns, nowMs, rateWindowMs);
+    const persisted = (await ctx.state.get(scopeKey(companyId, RUNS_KEY))) ?? [];
+    const runs = mergeRuns(buffered, persisted, nowMs, rateWindowMs);
     recentRuns.set(companyId, buffered.filter(r => nowMs - r.at < 15 * 60 * 1000).slice(-200));
+    await ctx.state.set(scopeKey(companyId, RUNS_KEY), runs.slice(0, RUNS_CAP));
     const runsByAccount = new Map();
     let unmappedRuns = 0;
     for (const run of runs) {
@@ -537,10 +593,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
           headroomPct: view?.fiveHourUsedPct != null ? Math.max(0, 1 - view.fiveHourUsedPct) : null,
           remainingKnown: view?.remainingPct != null,
+          resetAtMs: view?.resetAtMs ?? null,
+          measuredRatePerHour: view?.measuredRatePerHour ?? null,
+          requiredRatePerHour: view?.requiredRatePerHour ?? null,
           ladderRungs: groupByRung(ladder?.rungs ?? []),
           burnPerRunPct: ladder?.burnPerRunPct ?? {},
         };
       }),
+      rateDeadbandRel: config.pacing.rateDeadbandRel,
     });
 
     // Shadow decisions for recently started runs (db + event feed).
@@ -561,15 +621,27 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
       doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
     };
+    // Deficit order: hungriest qualified account first, over-burning
+    // last, unknown headroom never. Same order the hook uses.
+    const selectionOrder = orderAccountsForRun(
+      accountViews.map(v => ({
+        accountId: v.accountId,
+        resetAtMs: v.resetAtMs,
+        headroomPct: v.fiveHourUsedPct != null ? Math.max(0, 1 - v.fiveHourUsedPct) : null,
+        measuredRatePerHour: v.measuredRatePerHour,
+        requiredRatePerHour: v.requiredRatePerHour,
+      })),
+      { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel },
+    );
     let observed = 0;
     const modelCaches = { agents: new Map(), issues: new Map() };
     for (const run of candidates) {
       const role = roleOf(config, run.agentId);
       let decision = null;
-      for (const view of ordered) {
-        const ladder = ladders[view.accountId];
-        if (!ladder || view.remainingPct == null) continue;
-        const headroom = view.fiveHourUsedPct != null ? Math.max(0, 1 - view.fiveHourUsedPct) : null;
+      for (const sel of selectionOrder) {
+        const view = viewById.get(sel.accountId);
+        const ladder = ladders[sel.accountId];
+        if (!view || !ladder || view.remainingPct == null) continue;
         const d = decide({
           runId: run.runId,
           agentId: run.agentId,
@@ -579,10 +651,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           retryCount: 0,
           failureClass: 'none',
           contextTokens: null,
-          fiveHourHeadroomPct: headroom,
+          fiveHourHeadroomPct: sel.headroomPct,
           burnPerRunPct: ladder.burnPerRunPct,
           reservePct: 0.05,
-          accountId: view.accountId,
+          accountId: sel.accountId,
           roleBands,
           contextCaps: config.contextCaps,
         });
@@ -600,6 +672,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           agentId: run.agentId,
           actualModel,
           actualModelSource: actual.source,
+          // Why the actual model is unknown (codes only, never upstream
+          // text); null when the actual model resolved.
+          actualModelError: actual.error,
           wouldModel,
           // Did shadow agree with reality? Null while the actual model is
           // still unknown; true/false once known.
@@ -637,8 +712,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       skippedArms: skipped,
       runsObserved: runs.length,
       runsCandidates: candidates.length,
-      runsSource: dbError ? 'events-only' : (buffered.length > 0 ? 'db+events' : 'db-only'),
-      runsDbError: dbError,
+      runsSource: 'events',
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
@@ -646,7 +720,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,
-      calibration: concurrency.calibration, observed, runs: runs.length, runsSource: dbError ? 'events-only' : 'db',
+      calibration: concurrency.calibration, observed, runs: runs.length, runsSource: 'events',
     });
     return { status: 'shadow', observed };
   }
@@ -733,11 +807,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           })));
         if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
       });
-      ctx.events.on('agent.run.started', async event => {
-        // Tolerant extraction: the live ring stayed empty on the strict
-        // shape, so accept every known placement and never drop an event
-        // for a missing id. The heartbeat backfill covers delivery gaps;
-        // events are the fast path.
+      // Run facts come from agent.run.* events only (started, finished,
+      // failed): the sole run feed since the db grant was removed. Events
+      // WITHOUT a companyId are ignored outright -- fanning a company-less
+      // event out to every configured company would misattribute runs.
+      const onRunEvent = (status) => async event => {
+        const companyId = event?.companyId;
+        if (typeof companyId !== 'string' || companyId.length === 0) return;
+        if (!configured.has(companyId)) return;
+        // Tolerant extraction: accept every known placement and never drop
+        // an event for a missing id.
         const p = event?.payload && typeof event.payload === 'object' ? event.payload : {};
         const run = p.run && typeof p.run === 'object' ? p.run : {};
         const entry = {
@@ -746,23 +825,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           model: p.model ?? run.model ?? null,
           provider: typeof (p.provider ?? run.provider) === 'string' ? String(p.provider ?? run.provider).toLowerCase() : null,
           issueId: p.issueId ?? run.issueId ?? p.issue_id ?? null,
+          status,
           at: Date.parse(event?.occurredAt ?? '') || clock(),
         };
-        const targets = event?.companyId
-          ? [event.companyId]
-          : [...configured].sort();
-        for (const companyId of targets) {
-          if (!configured.has(companyId)) continue;
-          const list = recentRuns.get(companyId) ?? [];
-          list.push(entry);
-          recentRuns.set(companyId, list.slice(-200));
-          const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
-          st.seen += 1;
-          st.lastAtMs = entry.at;
-          st.lastRunId = entry.runId;
-          runEventStats.set(companyId, st);
-        }
-      });
+        const list = recentRuns.get(companyId) ?? [];
+        list.push(entry);
+        recentRuns.set(companyId, list.slice(-200));
+        const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
+        st.seen += 1;
+        st.lastAtMs = entry.at;
+        st.lastRunId = entry.runId;
+        runEventStats.set(companyId, st);
+      };
+      ctx.events.on('agent.run.started', onRunEvent('running'));
+      ctx.events.on('agent.run.finished', onRunEvent('finished'));
+      ctx.events.on('agent.run.failed', onRunEvent('failed'));
     },
 
     async onConfigChanged(raw, context) {
@@ -846,7 +923,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             }
           }
         } catch (error) {
-          return { status: 200, body: { atMs, calibration, target, agents: [], capsError: error?.message ?? String(error) } };
+          // Sanitized: callers get a stable code, never upstream text.
+          // Details go server-side only.
+          ctx.logger.error('model-capacity: caps issues read failed', { companyId, error: error?.message ?? String(error) });
+          return { status: 200, body: { atMs, calibration, target, agents: [], capsError: 'issues-unavailable' } };
         }
         const agents = distributeWeightedCaps(
           target,
@@ -859,7 +939,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     },
 
     /**
-     * v0.2.0 enforcement hook. MEMORY-ONLY: it reads the in-memory live view
+     * v0.2.1 enforcement hook. MEMORY-ONLY: it reads the in-memory live view
      * the last tick published and performs zero I/O -- no config, state,
      * network, or db reads -- so it always answers inside the host's 1.5s
      * RPC deadline. Fail-safe order: unknown company, enforce off, human
@@ -881,7 +961,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
       const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(params.agentId) ? 'thinker' : 'doer';
-      for (const view of live.accounts) {
+      // Same deficit order as the shadow tick: hungriest qualified first,
+      // over-burning last. Unknown headroom (null weekly or 5h) never
+      // qualifies -- without a 5h signal the hook cannot verify headroom.
+      const order = orderAccountsForRun(live.accounts, { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 });
+      for (const view of order) {
         if (!view.remainingKnown || view.ladderRungs.length === 0) continue;
         const d = decide({
           runId: params.runId,

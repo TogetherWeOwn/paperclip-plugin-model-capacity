@@ -1,34 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS } from '../src/manifest.mjs';
+import { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
 
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.0');
-  assert.equal(PLUGIN_VERSION, '0.2.0');
+  assert.equal(manifest.version, '0.2.1');
+  assert.equal(PLUGIN_VERSION, '0.2.1');
 });
 
-test('heartbeat read: database declaration plus paired capabilities, never write', () => {
-  assert.deepEqual(manifest.database, {
-    namespaceSlug: 'model_capacity',
-    migrationsDir: './migrations',
-    coreReadTables: ['heartbeat_runs'],
-  });
-  assert.ok(manifest.capabilities.includes('database.namespace.read'));
-  // Declared-but-unexercised: the host schema validator pairs migrate
-  // with read for any manifest declaring `database`.
-  assert.ok(manifest.capabilities.includes('database.namespace.migrate'));
-  assert.ok(!manifest.capabilities.includes('database.namespace.write'));
-  assert.deepEqual(buildManifest({ modelResolve: true }).database, manifest.database);
+test('no database grant: no database block, no db capabilities', () => {
+  assert.equal(manifest.database, undefined);
+  for (const cap of manifest.capabilities) {
+    assert.ok(!cap.startsWith('database.'), `db capability ${cap}`);
+  }
+  assert.deepEqual(buildManifest({ modelResolve: false }).database, undefined);
 });
 
-test('v0.2.0 default manifest holds run.model.resolve with the exact env keys', () => {
+test('lane endpoint pinned to the allowlist in schema', () => {
+  assert.deepEqual([...LANE_BASE_URL_ALLOWLIST], ['https://router.infextion.net']);
+  assert.deepEqual(
+    manifest.instanceConfigSchema.properties.cliproxy.properties.baseUrl.enum,
+    ['https://router.infextion.net'],
+  );
+});
+
+test('v0.2.1 default manifest holds run.model.resolve with the exact env keys', () => {
   assert.ok(manifest.capabilities.includes('run.model.resolve'));
   // Exactly the env keys decide may set: nothing more, nothing less.
   assert.deepEqual(MODEL_ROUTING_ENV_KEYS, [
     'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+    'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
   ]);
   assert.deepEqual(manifest.modelRouting.envKeys, MODEL_ROUTING_ENV_KEYS);
 });

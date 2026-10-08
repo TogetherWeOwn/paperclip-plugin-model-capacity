@@ -44,7 +44,8 @@
   "contextCaps": {
     "solLunaMaxTokens": 260000,
     "solLunaAutoCompactTokens": 240000,
-    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "haikuMaxOutputTokens": 64000
   },
   "enforce": false,
   "calibration": {

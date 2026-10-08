@@ -12,6 +12,7 @@
 
 export const MAX_CONTEXT_ENV_KEY = 'CLAUDE_CODE_MAX_CONTEXT_TOKENS';
 export const AUTO_COMPACT_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
+export const MAX_OUTPUT_ENV_KEY = 'CLAUDE_CODE_MAX_OUTPUT_TOKENS';
 
 export const DEFAULT_ROLE_BANDS = Object.freeze({
   thinker: { floorRung: 2, ceilingRung: null },
@@ -24,6 +25,8 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
   solLunaAutoCompactTokens: 240000,
   /** Auto-compact watermark key (operator-overridable, null omits it). */
   autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
+  /** Haiku hit the 32k output cap live; raise it to 64k on haiku arms. */
+  haikuMaxOutputTokens: 64000,
 });
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -84,6 +87,9 @@ export function decide({
     if (arm.family === 'sol' || arm.family === 'luna') {
       env[MAX_CONTEXT_ENV_KEY] = String(contextCaps.solLunaMaxTokens);
       if (contextCaps.autoCompactEnvKey) env[contextCaps.autoCompactEnvKey] = String(contextCaps.solLunaAutoCompactTokens);
+    }
+    if (arm.family === 'haiku') {
+      env[MAX_OUTPUT_ENV_KEY] = String(contextCaps.haikuMaxOutputTokens);
     }
     const weak = fiveHourHeadroomPct == null || burnPerRunPct[arm.armId] == null;
     return {

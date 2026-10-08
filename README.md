@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.2.0, enforce-capable)
+# Model Capacity plugin (v0.2.1, enforce-capable)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.2.0 = ENFORCE-CAPABLE, default off.** The manifest holds
+**v0.2.1 = ENFORCE-CAPABLE, default off.** The manifest holds
 `run.model.resolve` with a minimal `modelRouting.envKeys` list (only the
 two context-ceiling keys `decide` ever sets). The hook itself is gated by
 the `enforce` config flag (default `false`): with enforcement off it

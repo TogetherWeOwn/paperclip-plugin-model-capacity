@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
-import { decide, DEFAULT_CONTEXT_CAPS } from '../src/decide.mjs';
+import { decide, DEFAULT_CONTEXT_CAPS, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
 import { MODEL_ROUTING_ENV_KEYS } from '../src/manifest.mjs';
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
@@ -32,9 +32,28 @@ const hookParams = (extra = {}) => ({
   deadlineMs: 1500, ...extra,
 });
 
-function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, dbRows = [], issueLists = {}, issuesListError = null }) {
+const runEvent = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
+  type, companyId: 'acme', entityId: runId,
+  payload: { run: { agentId: 'agent-9', provider: 'claude', ...extra } },
+  occurredAt: new Date(atMs).toISOString(),
+});
+
+// Runs facts come from SDK surfaces only: agent.run.* events plus strict
+// object-form issues/agents reads ({issueId, companyId} / {agentId,
+// companyId}). Positional calls are a host-contract violation, so the fakes
+// throw on them -- any regression back to positional reads fails the suite.
+const strictGet = (idKey, table, fail) => async (arg) => {
+  if (!arg || typeof arg !== 'object' || typeof arg[idKey] !== 'string') {
+    throw new Error(`positional-get:${idKey}`);
+  }
+  if (fail) throw new Error(fail);
+  return table[arg[idKey]] ?? null;
+};
+
+function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGets = {}, agentGets = {}, issueLists = {}, issuesListError = null, failIssueGet = null, failAgentGet = null }) {
   const store = new Map();
   const jobs = new Map();
+  const handlers = new Map();
   const skey = k => JSON.stringify(k);
   let now = nowMs;
   let lane = laneBody(laneUsed, fiveHourUsed, new Date(now).toISOString());
@@ -46,17 +65,16 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, dbRows 
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => lane }) },
-    db: { query: async () => dbRows },
-    agents: { get: async () => null },
+    agents: { get: strictGet('agentId', agentGets, failAgentGet) },
     issues: {
-      get: async () => null,
+      get: strictGet('issueId', issueGets, failIssueGet),
       list: async ({ status } = {}) => {
         if (issuesListError) throw new Error(issuesListError);
         return issueLists[status] ?? [];
       },
     },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
-    events: { on() {} },
+    events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now });
@@ -70,12 +88,13 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, dbRows 
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
+    fire: (e) => handlers.get(e.type)(e),
     hook: (p) => plugin.onResolveRunModel(hookParams(p)),
     api: (routeKey) => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     // Prove the hook path is memory-only: every I/O surface throws, so any
     // read past memory fails the call instead of hiding latency.
     killIo: () => {
-      for (const k of ['config', 'state', 'secrets', 'http', 'db', 'agents', 'issues']) {
+      for (const k of ['config', 'state', 'secrets', 'http', 'agents', 'issues']) {
         io[k] = new Proxy({}, { get: () => { throw new Error(`io-forbidden:${k}`); } });
       }
     },
@@ -150,8 +169,30 @@ test('decide sets exactly the declared env keys on sol/luna arms', () => {
     accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
   assert.equal(d.kind, 'decide');
-  assert.deepEqual(Object.keys(d.env).sort(), [...MODEL_ROUTING_ENV_KEYS].sort());
+  // Sol/luna arms set the two context keys; the third declared key
+  // (max output) is haiku-only. Everything set must be declared.
+  assert.deepEqual(Object.keys(d.env).sort(), [
+    'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+    'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  ]);
+  for (const k of Object.keys(d.env)) {
+    assert.ok(MODEL_ROUTING_ENV_KEYS.includes(k), `undeclared env key ${k}`);
+  }
   assert.equal(d.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '260000');
+});
+
+test('decide sets the 64k output cap on haiku-family arms', () => {
+  const d = decide({
+    runId: 'r', agentId: 'a', role: 'doer',
+    ladderRungs: [{ rung: 0, arms: [{ armId: 'haiku', model: 'claude-haiku-5-5', effort: 'max', family: 'haiku', contextWindow: 200000, Q: 1, C: 1 }] }],
+    pointer: 0, fiveHourHeadroomPct: null, burnPerRunPct: {},
+    accountId: 'claude:a1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
+  assert.equal(d.kind, 'decide');
+  assert.equal(d.env[MAX_OUTPUT_ENV_KEY], '64000');
+  for (const k of Object.keys(d.env)) {
+    assert.ok(MODEL_ROUTING_ENV_KEYS.includes(k), `undeclared env key ${k}`);
+  }
 });
 
 test('enforce flag resolves false by default and validates boolean', () => {
@@ -159,12 +200,6 @@ test('enforce flag resolves false by default and validates boolean', () => {
   assert.equal(resolveConfig({ enforce: true }).enforce, true);
   assert.ok(validateConfigShape({ enforce: 'yes' }).length > 0);
   assert.deepEqual(validateConfigShape({ enforce: false }), []);
-});
-
-const dbRow = (id, startedAtMs) => ({
-  id, agent_id: 'agent-9', status: 'running',
-  started_at: new Date(startedAtMs).toISOString(), finished_at: null,
-  model: 'claude-sonnet-5-5', provider: 'claude', issue_id: null,
 });
 
 test('caps: weak calibration returns no agents', async () => {
@@ -181,7 +216,6 @@ test('caps: weak calibration returns no agents', async () => {
 test('caps: measured target spreads over queued agents weighted by count', async () => {
   const d = drive({
     nowMs: TICK, config: { enforce: true },
-    dbRows: [dbRow('run-a', TICK + 10 * 60000), dbRow('run-b', TICK + 20 * 60000)],
     issueLists: {
       todo: [
         { id: 'i1', status: 'todo', assigneeAgentId: 'agent-a' },
@@ -199,7 +233,11 @@ test('caps: measured target spreads over queued agents weighted by count', async
   });
   await d.setup();
   await d.tick();
-  // Second tick with a rising reading calibrates E and sets a target.
+  // Two runs in span plus a rising reading calibrate E and set a target.
+  d.setNow(TICK + 10 * 60000);
+  await d.fire(runEvent('run-a', TICK + 10 * 60000));
+  d.setNow(TICK + 20 * 60000);
+  await d.fire(runEvent('run-b', TICK + 20 * 60000));
   d.setNow(TICK + 30 * 60000);
   d.setLane(0.328);
   await d.tick();
@@ -214,18 +252,21 @@ test('caps: measured target spreads over queued agents weighted by count', async
   assert.ok(a.get('agent-a') >= a.get('agent-b'));
 });
 
-test('caps: issues denial degrades to no recommendation with a reason', async () => {
+test('caps: issues denial degrades to a sanitized code, never upstream text', async () => {
   const d = drive({
     nowMs: TICK, config: { enforce: true },
-    dbRows: [dbRow('run-a', TICK + 10 * 60000), dbRow('run-b', TICK + 20 * 60000)],
-    issuesListError: 'issues-list-denied',
+    issuesListError: 'db-query-denied: connection refused (raw upstream text)',
   });
   await d.setup();
   await d.tick();
+  d.setNow(TICK + 10 * 60000);
+  await d.fire(runEvent('run-a', TICK + 10 * 60000));
+  d.setNow(TICK + 20 * 60000);
+  await d.fire(runEvent('run-b', TICK + 20 * 60000));
   d.setNow(TICK + 30 * 60000);
   d.setLane(0.328);
   await d.tick();
   const caps = await d.api('caps');
   assert.deepEqual(caps.body.agents, []);
-  assert.equal(caps.body.capsError, 'issues-list-denied');
+  assert.equal(caps.body.capsError, 'issues-unavailable');
 });
