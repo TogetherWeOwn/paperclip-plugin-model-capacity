@@ -1,0 +1,51 @@
+{
+  "cliproxy": {
+    "baseUrl": "http://cliproxy:8317",
+    "managementKeySecretRef": null,
+    "staleAfterSec": 300,
+    "cacheTtlSec": 45
+  },
+  "aa": {
+    "apiKeySecretRef": null,
+    "maxSnapshotAgeHours": 30
+  },
+  "armMap": [],
+  "roles": {
+    "thinkerAgentIds": [],
+    "thinkerFloorRung": 2,
+    "thinkerCeilingRung": null,
+    "doerFloorRung": 0,
+    "doerCeilingRung": null
+  },
+  "weights": {
+    "terminalBench": 0.4,
+    "scicode": 0.2,
+    "tau2": 0.1,
+    "apexAgents": 0.1,
+    "intelligenceIndex": 0.1,
+    "omniscience": 0.05,
+    "lcr": 0.05
+  },
+  "pacing": {
+    "deadband": 0.02,
+    "rungCooldownMs": 600000,
+    "guardHighPct": 0.8,
+    "guardRejoinPct": 0.5
+  },
+  "concurrency": {
+    "maxTotal": 75,
+    "meanRunDurationHours": 0.3333333333333333
+  },
+  "contextCaps": {
+    "solLunaMaxTokens": 260000,
+    "solLunaAutoCompactTokens": 240000,
+    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_TOKENS"
+  },
+  "calibration": {
+    "referenceArmId": "claude-haiku-5-5",
+    "referenceBurnPerRunPct": 0.0005
+  },
+  "shadow": {
+    "maxEntries": 2000
+  }
+}

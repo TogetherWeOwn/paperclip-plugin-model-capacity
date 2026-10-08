@@ -1,0 +1,12 @@
+{
+  "name": "@togetherweown/paperclip-plugin-model-capacity",
+  "version": "0.1.0",
+  "description": "Shadow model-capacity decisions: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.1.0 observes only.",
+  "license": "MIT",
+  "type": "module",
+  "paperclipPlugin": { "manifest": "./src/manifest.mjs", "worker": "./src/worker.mjs" },
+  "files": ["src", "test", "README.md", "LICENSE", "config.example.json"],
+  "peerDependencies": { "@paperclipai/plugin-sdk": "*" },
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}
