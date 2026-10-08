@@ -1,7 +1,7 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
- * v0.1.2 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
+ * v0.1.3 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
  * from the host-published lane endpoint (one GET, short in-memory cache),
  * steps per-account pacing pointers, and records what it WOULD have
  * decided for recently started runs. It never changes a run:
@@ -21,11 +21,14 @@ import {
   CliproxyCache,
 } from './cliproxy.mjs';
 import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows } from './aa.mjs';
-import { DEFAULT_ARM_MAP, resolveArms, armsForProvider } from './arms.mjs';
+import { DEFAULT_ARM_MAP, resolveArms, armsForProvider, providerForModelName } from './arms.mjs';
 import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
 import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
-import { scheduleError, stepController, orderAccounts, DEFAULT_PACING } from './pacing.mjs';
+import {
+  scheduleError, stepController, stepRateController, appendUtilReading,
+  measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
+} from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS } from './decide.mjs';
 import { computeConcurrencyTarget, distributeCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
 import { createShadowRing, SHADOW_CAPACITY } from './shadow.mjs';
@@ -37,6 +40,18 @@ const PACING_KEY = 'pacing-v1';
 const RING_KEY = 'shadow-ring-v1';
 const CAPACITY_KEY = 'capacity-v1';
 const LADDER_KEY = 'ladder-v1';
+const RATE_KEY = 'rate-history-v1';
+const RUNEVT_KEY = 'run-events-v1';
+
+/** Recent heartbeat runs for one company (db backfill + event buffer). */
+const RUNS_SQL = `select id, agent_id, status, started_at, finished_at,
+       coalesce(usage_json->>'model','') as model,
+       coalesce(usage_json->>'provider','') as provider
+  from heartbeat_runs
+ where company_id = $1
+   and started_at > now() - ($2 || ' minutes')::interval
+ order by started_at desc
+ limit 500`;
 
 const scopeKey = (companyId, stateKey) => ({ scopeKind: 'company', scopeId: companyId, namespace: NS, stateKey });
 
@@ -98,6 +113,10 @@ export function resolveConfig(raw = {}) {
       guardHigh: raw.pacing?.guardHighPct ?? DEFAULT_PACING.guardHigh,
       guardRejoin: raw.pacing?.guardRejoinPct ?? DEFAULT_PACING.guardRejoin,
       floorRung: DEFAULT_PACING.floorRung,
+      rateDeadbandRel: raw.pacing?.rateDeadbandRel ?? DEFAULT_PACING.rateDeadbandRel,
+      rateMinDeadbandPerHour: raw.pacing?.rateMinDeadbandPerHour ?? DEFAULT_PACING.rateMinDeadbandPerHour,
+      rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
+      rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
     },
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
@@ -128,6 +147,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const configured = new Set();
   const snapshots = new Map(); // companyId -> { atMs, accounts }
   const recentRuns = new Map(); // companyId -> [{ runId, agentId, model, at }]
+  const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
 
   const cacheFor = (companyId, ttlSec) => {
@@ -228,6 +248,63 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return account.accountId ?? `${account.provider ?? 'unknown'}:x`;
   }
 
+  function normalizeRunRow(row) {
+    const atMs = Date.parse(row?.started_at ?? '');
+    if (!Number.isFinite(atMs)) return null;
+    return {
+      runId: String(row?.id ?? 'unknown'),
+      agentId: row?.agent_id ? String(row.agent_id) : 'unknown',
+      model: row?.model || null,
+      provider: row?.provider ? String(row.provider).toLowerCase() : null,
+      status: row?.status ?? null,
+      at: atMs,
+    };
+  }
+
+  /**
+   * Heartbeat-run backfill: runs started in the trailing window, newest
+   * first. Returns { runs, dbError }. Restricted SELECT on a whitelisted
+   * core table; any denial degrades to the event buffer instead of
+   * failing the tick.
+   */
+  async function readRecentRuns(companyId, windowMin, nowMs) {
+    try {
+      const rows = await ctx.db.query(RUNS_SQL, [companyId, String(windowMin)]);
+      const runs = (rows ?? []).map(normalizeRunRow).filter(Boolean).filter(r => r.at <= nowMs + 60000);
+      return { runs, dbError: null };
+    } catch (error) {
+      return { runs: [], dbError: error?.message ?? String(error) };
+    }
+  }
+
+  /**
+   * Map a run to an account key: direct provider match first, model-family
+   * hint second. Null when neither resolves (counted, never misattributed).
+   */
+  function accountForRun(run, accounts) {
+    const byProvider = new Map();
+    for (const a of accounts) {
+      const p = (a.provider ?? '').toLowerCase();
+      if (p && !byProvider.has(p)) byProvider.set(p, accountKey(a));
+    }
+    if (run.provider && byProvider.has(run.provider)) return byProvider.get(run.provider);
+    const hinted = providerForModelName(run.model);
+    if (hinted && byProvider.has(hinted)) return byProvider.get(hinted);
+    return null;
+  }
+
+  /** Merge event-buffered and db runs, newest first, deduped by run id. */
+  function mergeRuns(buffered, dbRuns, nowMs, windowMs) {
+    const seen = new Set();
+    const out = [];
+    for (const r of [...(buffered ?? []), ...(dbRuns ?? [])]) {
+      if (!r || seen.has(r.runId) || nowMs - r.at > windowMs) continue;
+      seen.add(r.runId);
+      out.push(r);
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+
   async function runShadowTick(companyId, job) {
     const nowMs = clock();
     const raw = await ctx.config.get(companyId);
@@ -239,19 +316,37 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const { ladders, skipped } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders });
 
     const nextPacing = { ...pacingState };
+    const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
     const accountViews = [];
     for (const account of snapshot.accounts) {
       const key = accountKey(account);
       const weeklyUsed = account.weekly?.utilization;
       const fiveHourUsed = account.fiveHour?.utilization;
       const resetAtMs = account.weekly?.resetsAt ? Date.parse(account.weekly.resetsAt) : null;
+      const remaining = weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null;
+      const hoursToReset = resetAtMs != null && !Number.isNaN(resetAtMs)
+        ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
+        : 168;
+      // Rate inputs: append this reading, then measure over the trailing window.
+      let history = rateHistories[key] ?? [];
+      if (weeklyUsed != null) history = appendUtilReading(history, { atMs: nowMs, usedPct: weeklyUsed }, nowMs);
+      rateHistories[key] = history;
+      const measured = weeklyUsed != null
+        ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
+        : null;
+      const required = remaining != null ? requiredRatePerHour({ remainingPct: remaining, hoursToReset }) : 0;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
-      const error = weeklyUsed != null && startMs != null && resetAtMs != null
+      const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
         : 0;
       const ceiling = (ladders[key]?.rungs.length ?? 1) - 1;
-      const step = stepController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
-        { weeklyUsedPct: weeklyUsed, fiveHourUsedPct: fiveHourUsed, error }, nowMs, config.pacing, ceiling);
+      const step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
+        {
+          measuredRatePerHour: measured?.ratePerHour ?? null,
+          requiredRatePerHour: required,
+          positionError,
+          fiveHourUsedPct: fiveHourUsed,
+        }, nowMs, config.pacing, ceiling);
       nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive };
       accountViews.push({
         accountId: key,
@@ -259,14 +354,44 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         weeklyUsedPct: weeklyUsed,
         fiveHourUsedPct: fiveHourUsed,
         resetAtMs,
-        remainingPct: weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null,
+        remainingPct: remaining,
+        hoursToReset,
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,
+        reason: step.reason,
+        rateBasis: measured ? 'measured' : 'position',
+        measuredRatePerHour: measured?.ratePerHour ?? null,
+        rateSpanMs: measured?.spanMs ?? null,
+        ratePoints: measured?.points ?? 0,
+        requiredRatePerHour: required,
       });
     }
     const ordered = orderAccounts(accountViews.map(a => ({ ...a, remainingPct: a.remainingPct ?? 0 })));
 
+    // Runs feed: heartbeat backfill (primary) merged with the event buffer.
+    // The event subscription alone left the ring empty live, so the tick no
+    // longer depends on delivery: db rows are authoritative, events top up.
+    const rateWindowMs = config.pacing.rateWindowMin * 60000;
+    const { runs: dbRuns, dbError } = await readRecentRuns(companyId, config.pacing.rateWindowMin, nowMs);
+    const buffered = recentRuns.get(companyId) ?? [];
+    const runs = mergeRuns(buffered, dbRuns, nowMs, rateWindowMs);
+    recentRuns.set(companyId, buffered.filter(r => nowMs - r.at < 15 * 60 * 1000).slice(-200));
+    const runsByAccount = new Map();
+    let unmappedRuns = 0;
+    for (const run of runs) {
+      const key = accountForRun(run, snapshot.accounts);
+      if (!key) {
+        unmappedRuns += 1;
+        continue;
+      }
+      if (!runsByAccount.has(key)) runsByAccount.set(key, []);
+      runsByAccount.get(key).push(run);
+    }
+
+    // E_a calibration: weekly-used delta over the measured span divided by
+    // runs that started on the account inside that span.
+    const runsInSpan = (key, spanMs) => (runsByAccount.get(key) ?? []).filter(r => nowMs - r.at <= spanMs).length;
     const burnOf = key => {
       const b = ladders[key]?.burnPerRunPct ?? {};
       const vals = Object.values(b).filter(v => v != null);
@@ -274,27 +399,44 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       return vals.reduce((s, v) => s + v, 0) / vals.length;
     };
     const concurrency = computeConcurrencyTarget({
-      accounts: ordered.map(a => ({
-        accountId: a.accountId,
-        remainingPct: a.remainingPct ?? 0,
-        hoursToReset: a.resetAtMs != null ? Math.max((a.resetAtMs - nowMs) / 3600000, 0.25) : 168,
-        burnPerRunPct: burnOf(a.accountId),
-        guardActive: a.guardActive,
-      })),
+      accounts: ordered.map(a => {
+        const view = accountViews.find(v => v.accountId === a.accountId);
+        const spanMs = view?.rateSpanMs ?? null;
+        let measuredE = null;
+        if (spanMs != null && spanMs > 0 && view?.weeklyUsedPct != null) {
+          const hist = rateHistories[a.accountId] ?? [];
+          const inSpan = hist.filter(p => nowMs - p.atMs <= spanMs);
+          if (inSpan.length >= 2) {
+            const delta = inSpan[inSpan.length - 1].usedPct - inSpan[0].usedPct;
+            const n = runsInSpan(a.accountId, spanMs);
+            if (delta > 0 && n > 0) measuredE = delta / n;
+          }
+        }
+        return {
+          accountId: a.accountId,
+          remainingPct: a.remainingPct ?? 0,
+          hoursToReset: a.resetAtMs != null ? Math.max((a.resetAtMs - nowMs) / 3600000, 0.25) : 168,
+          burnPerRunPct: burnOf(a.accountId),
+          measuredBurnPerRunPct: measuredE,
+          runsInWindow: runsInSpan(a.accountId, rateWindowMs),
+          guardActive: a.guardActive,
+        };
+      }),
       meanRunDurationHours: config.concurrency.meanRunDurationHours,
       maxTotal: config.concurrency.maxTotal,
     });
 
-    // Shadow decisions for recently started runs.
+    // Shadow decisions for recently started runs (db + event feed).
     const ring = createShadowRing(config.shadowMaxEntries);
     ring.load(await ctx.state.get(scopeKey(companyId, RING_KEY)));
-    const runs = (recentRuns.get(companyId) ?? []).filter(r => nowMs - r.at < 15 * 60 * 1000);
+    const recorded = new Set(ring.list(500).map(e => e.runId));
+    const candidates = runs.filter(r => nowMs - r.at < 15 * 60 * 1000 && !recorded.has(r.runId)).slice(0, 100);
     const roleBands = {
       thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
       doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
     };
     let observed = 0;
-    for (const run of runs.slice(-50)) {
+    for (const run of candidates) {
       const role = roleOf(config, run.agentId);
       let decision = null;
       for (const view of ordered) {
@@ -337,13 +479,40 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         observed += 1;
       }
     }
-    recentRuns.set(companyId, []);
+
+    const evtStats = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
+    const persistedEvt = (await ctx.state.get(scopeKey(companyId, RUNEVT_KEY))) ?? { seen: 0, lastAtMs: null, lastRunId: null };
+    const mergedEvt = {
+      seen: (persistedEvt.seen ?? 0) + (evtStats.seen ?? 0),
+      lastAtMs: evtStats.lastAtMs ?? persistedEvt.lastAtMs ?? null,
+      lastRunId: evtStats.lastRunId ?? persistedEvt.lastRunId ?? null,
+    };
+    runEventStats.set(companyId, { seen: 0, lastAtMs: mergedEvt.lastAtMs, lastRunId: mergedEvt.lastRunId });
 
     await ctx.state.set(scopeKey(companyId, PACING_KEY), nextPacing);
+    await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
     await ctx.state.set(scopeKey(companyId, RING_KEY), ring.toJSON());
-    await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), { atMs: nowMs, target: concurrency.target, perAccount: concurrency.perAccount, accounts: accountViews, skippedArms: skipped });
+    await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
+    await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
+      atMs: nowMs,
+      target: concurrency.target,
+      calibration: concurrency.calibration,
+      perAccount: concurrency.perAccount,
+      accounts: accountViews,
+      skippedArms: skipped,
+      runsObserved: runs.length,
+      runsCandidates: candidates.length,
+      runsSource: dbError ? 'events-only' : (buffered.length > 0 ? 'db+events' : 'db-only'),
+      runsDbError: dbError,
+      unmappedRuns,
+      runEventsSeen: mergedEvt.seen,
+      lastRunEventAtMs: mergedEvt.lastAtMs,
+    });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
-    ctx.logger.info('model-capacity: shadow tick', { companyId, accounts: accountViews.length, target: concurrency.target, observed });
+    ctx.logger.info('model-capacity: shadow tick', {
+      companyId, accounts: accountViews.length, target: concurrency.target,
+      calibration: concurrency.calibration, observed, runs: runs.length, runsSource: dbError ? 'events-only' : 'db',
+    });
     return { status: 'shadow', observed };
   }
 
@@ -430,16 +599,33 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
       });
       ctx.events.on('agent.run.started', async event => {
-        const companyId = event.companyId;
-        if (!configured.has(companyId)) return;
-        const list = recentRuns.get(companyId) ?? [];
-        list.push({
-          runId: event.entityId ?? event.payload?.runId ?? 'unknown',
-          agentId: event.payload?.agentId ?? event.actorId ?? 'unknown',
-          model: event.payload?.model ?? null,
-          at: clock(),
-        });
-        recentRuns.set(companyId, list.slice(-200));
+        // Tolerant extraction: the live ring stayed empty on the strict
+        // shape, so accept every known placement and never drop an event
+        // for a missing id. The heartbeat backfill covers delivery gaps;
+        // events are the fast path.
+        const p = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+        const run = p.run && typeof p.run === 'object' ? p.run : {};
+        const entry = {
+          runId: String(event?.entityId ?? p.runId ?? run.id ?? p.id ?? 'unknown'),
+          agentId: String(p.agentId ?? run.agentId ?? event?.actorId ?? 'unknown'),
+          model: p.model ?? run.model ?? null,
+          provider: typeof (p.provider ?? run.provider) === 'string' ? String(p.provider ?? run.provider).toLowerCase() : null,
+          at: Date.parse(event?.occurredAt ?? '') || clock(),
+        };
+        const targets = event?.companyId
+          ? [event.companyId]
+          : [...configured].sort();
+        for (const companyId of targets) {
+          if (!configured.has(companyId)) continue;
+          const list = recentRuns.get(companyId) ?? [];
+          list.push(entry);
+          recentRuns.set(companyId, list.slice(-200));
+          const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
+          st.seen += 1;
+          st.lastAtMs = entry.at;
+          st.lastRunId = entry.runId;
+          runEventStats.set(companyId, st);
+        }
       });
     },
 

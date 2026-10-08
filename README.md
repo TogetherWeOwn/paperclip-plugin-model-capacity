@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.1.2, shadow)
+# Model Capacity plugin (v0.1.3, shadow)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.2 = SHADOW.** The plugin holds no `run.model.resolve` capability,
+**v0.1.3 = SHADOW.** The plugin holds no `run.model.resolve` capability,
 so it changes no runs. Every minute it records what it *would* have
 decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
 and per-account ladders (`GET /ladder`). The resolve hook is implemented
@@ -32,14 +32,24 @@ v0.2.0 enables enforcement by switching to that variant.
 4. **Pareto filter** drops dominated arms; survivors are rungs L0..Ln.
    Low-coverage arms (< 0.6) cap at one rung above cheapest; incumbents
    keep rungs unless a strictly-dominating newcomer appears.
-5. **Pacing pointer** tracks a linear burn schedule (deadband 2%, at most
-   one rung per 10 min). The 5h guard overrides everything: above 80% the
-   account floors and sheds load, rejoining below 50%.
+5. **Rate pacing** compares measured burn rate against required rate:
+   `e = measuredRate - requiredRate`, where required = remaining/hoursToReset
+   and measured = weekly-used delta per hour over the trailing 60 min of
+   lane readings (needs 2+ readings spanning 20+ min; counter resets are
+   rejected). Deadband is +-15% relative; position vs. the linear schedule
+   only breaks ties while no rate is measured yet. At most one rung per
+   10 min. The 5h guard overrides everything: above 80% the account floors
+   and sheds load, rejoining below 50%.
 6. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
    test-fail +1, rate-limit reroutes, context-window filter. `defer`
    happens only when no account has headroom.
-7. **Concurrency** `C* = sum((R_a/T_a)/E_a[mix]) x D` (Little's law),
-   capped by the 5h guard and a 75 hard ceiling.
+7. **Concurrency** `C* = sum(requiredRate_a/E_a) x D` (Little's law,
+   `D = 0.186h` measured fleet mean run duration). `E_a` is calibrated
+   per account from lane weekly-used deltas divided by heartbeat runs
+   started on the account in the span (runs mapped by provider, falling
+   back to model-family hints). Until any `E` is measured the result is
+   `calibration: weak` with no target and no caps. Guard-capped accounts
+   contribute zero; a 75 hard ceiling binds the total.
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
 under the 272k price cliff. The auto-compact watermark key name is
@@ -88,4 +98,9 @@ server-side. Readings are cached 45s (`cliproxy.cacheTtlSec`).
 - Verify the AA `omniscience` field direction (currently treated as a
   hallucination rate and negated per spec).
 - Per-run burn calibration starts from a configured reference anchor
-  (flagged `weak`) until CLIProxy usage deltas per run are observed.
+  (flagged `weak`) until lane usage deltas over heartbeat runs are
+  observed; then `E_a` is measured per account (see step 7).
+- zai/xai/opencode accounts are unmapped: AA carries candidate slugs
+  (grok-*, kimi, qwen, deepseek, glm, minimax) but the CLIProxy model ids
+  for those lanes are unconfirmed, so no arm rows are invented for them.
+  Runs on those providers are counted as unmapped, never misattributed.

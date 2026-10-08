@@ -1,5 +1,5 @@
 /**
- * Plugin manifest. v0.1.2 = SHADOW: no `run.model.resolve` capability.
+ * Plugin manifest. v0.1.3 = SHADOW: no `run.model.resolve` capability.
  * Another plugin currently holds that capability and two holders conflict,
  * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
  * switching to the `modelResolve` variant (capability + modelRouting).
@@ -11,7 +11,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.2';
+export const PLUGIN_VERSION = '0.1.3';
 
 /** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
 export const MODEL_ROUTING_ENV_KEYS = [
@@ -99,13 +99,17 @@ const CONFIG_SCHEMA = {
         rungCooldownMs: { type: 'integer', minimum: 60000, default: 600000 },
         guardHighPct: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
         guardRejoinPct: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+        rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
+        rateMinDeadbandPerHour: { type: 'number', minimum: 0, default: 0.005 },
+        rateWindowMin: { type: 'number', minimum: 10, default: 60 },
+        rateMinSpanMin: { type: 'number', minimum: 5, default: 20 },
       },
     },
     concurrency: {
       type: 'object', additionalProperties: false,
       properties: {
         maxTotal: { type: 'integer', minimum: 1, default: 75 },
-        meanRunDurationHours: { type: 'number', exclusiveMinimum: 0, default: 1 / 3 },
+        meanRunDurationHours: { type: 'number', exclusiveMinimum: 0, default: 0.186 },
       },
     },
     contextCaps: {
@@ -155,7 +159,7 @@ export function buildManifest({ modelResolve = false } = {}) {
     apiVersion: 1,
     version: PLUGIN_VERSION,
     displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.2 observes only; it changes no runs and holds no resolve capability.',
+    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.3 observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -213,6 +217,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.2 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.1.3 shadow manifest: no resolve capability, no modelRouting. */
 export const manifest = buildManifest();
 export default manifest;

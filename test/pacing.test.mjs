@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scheduleError, stepController, orderAccounts } from '../src/pacing.mjs';
+import {
+  scheduleError, stepController, orderAccounts,
+  appendUtilReading, measuredRatePerHour, requiredRatePerHour, stepRateController,
+} from '../src/pacing.mjs';
 
 const T0 = Date.parse('2026-10-08T00:00:00Z');
 const WEEK = 7 * 24 * 3600 * 1000;
@@ -39,6 +42,69 @@ test('5h guard floors and sheds; rejoin below the rejoin line', () => {
   assert.equal(held.action, 'hold-guard');
   const rejoined = stepController(held, { error: -0.3, fiveHourUsedPct: 0.4 }, 7000, cfg, 4);
   assert.deepEqual([rejoined.action, rejoined.guardActive], ['rejoin', false]);
+});
+
+test('history appends, sorts, prunes, and caps', () => {
+  const now = T0 + 3600000;
+  let h = appendUtilReading([], { atMs: now - 600000, usedPct: 0.3 }, now);
+  h = appendUtilReading(h, { atMs: now - 1200000, usedPct: 0.29 }, now);
+  assert.deepEqual(h.map(p => p.usedPct), [0.29, 0.3]);
+  const stale = appendUtilReading(h, { atMs: now - 100 * 60000, usedPct: 0.1 }, now);
+  assert.ok(stale.every(p => p.atMs > now - 100 * 60000));
+  assert.equal(appendUtilReading(h, { atMs: now, usedPct: NaN }, now).length, h.length);
+});
+
+test('measured rate needs two points spanning the minimum span', () => {
+  const now = T0 + 3600000;
+  // 0.30 -> 0.356 over 60min = 5.6%/h across 7 points.
+  let h = [];
+  for (let i = 6; i >= 0; i--) h = appendUtilReading(h, { atMs: now - i * 600000, usedPct: 0.356 - i * (0.056 / 6) }, now);
+  const m = measuredRatePerHour(h, now, 60, 20);
+  assert.ok(Math.abs(m.ratePerHour - 0.056) < 1e-9);
+  assert.equal(m.points, 7);
+  assert.equal(measuredRatePerHour(h.slice(-1), now, 60, 20), null);
+  assert.equal(measuredRatePerHour(h.slice(-2), now, 60, 20), null);
+  // Counter reset (provider restarted the week) is rejected, not trusted.
+  const reset = appendUtilReading(h, { atMs: now + 60000, usedPct: 0.01 }, now + 60000);
+  assert.equal(measuredRatePerHour(reset, now + 60000, 60, 20), null);
+});
+
+test('required rate is remaining over hours to reset', () => {
+  assert.ok(Math.abs(requiredRatePerHour({ remainingPct: 0.34, hoursToReset: 20 }) - 0.017) < 1e-9);
+  assert.equal(requiredRatePerHour({ remainingPct: 0, hoursToReset: 20 }), 0);
+  assert.equal(requiredRatePerHour({ remainingPct: 0.5, hoursToReset: 0 }), 0);
+});
+
+test('live case: position says climb but the rate says descend', () => {
+  // claude-lane-1: 66% used with 88% elapsed => position error is
+  // negative ("behind", climb). But it burns 5.6%/h against required
+  // 1.7%/h, so climbing would blow the 5h window.
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const reading = {
+    measuredRatePerHour: 0.056, requiredRatePerHour: 0.017,
+    positionError: -0.22, fiveHourUsedPct: 0.3,
+  };
+  const step = stepRateController({ pointer: 2, lastMoveAtMs: 0, guardActive: false }, reading, 10 * 600000, cfg, 5);
+  assert.deepEqual([step.action, step.pointer], ['descend', 1]);
+  assert.match(step.reason, /5\.60%\/h vs required 1\.70%\/h/);
+});
+
+test('rate deadband holds within +-15%; position breaks ties when unmeasured', () => {
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const hold = stepRateController({ pointer: 2, lastMoveAtMs: 0, guardActive: false },
+    { measuredRatePerHour: 0.018, requiredRatePerHour: 0.017, positionError: -0.2, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 5);
+  assert.equal(hold.action, 'hold');
+  const tiebreak = stepRateController({ pointer: 2, lastMoveAtMs: 0, guardActive: false },
+    { measuredRatePerHour: null, requiredRatePerHour: 0.017, positionError: -0.2, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 5);
+  assert.deepEqual([tiebreak.action, tiebreak.pointer], ['climb', 3]);
+  assert.match(tiebreak.reason, /no measured rate yet/);
+});
+
+test('rate guard still floors on the 5h window', () => {
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const step = stepRateController({ pointer: 4, lastMoveAtMs: 0, guardActive: false },
+    { measuredRatePerHour: 0.001, requiredRatePerHour: 0.05, positionError: 0, fiveHourUsedPct: 0.9 }, 5000, cfg, 5);
+  assert.deepEqual([step.action, step.pointer, step.guardActive], ['floor-guard', 0, true]);
 });
 
 test('accounts order earliest reset first, largest remainder first', () => {
