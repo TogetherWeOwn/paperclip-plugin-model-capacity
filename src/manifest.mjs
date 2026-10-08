@@ -1,17 +1,17 @@
 /**
- * Plugin manifest. v0.1.1 = SHADOW: no `run.model.resolve` capability.
+ * Plugin manifest. v0.1.2 = SHADOW: no `run.model.resolve` capability.
  * Another plugin currently holds that capability and two holders conflict,
  * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
  * switching to the `modelResolve` variant (capability + modelRouting).
  *
- * v0.1.1: burn telemetry comes from ONE host-published lane endpoint
+ * v0.1.2: burn telemetry comes from ONE host-published lane endpoint
  * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
  * cannot reach CLIProxy directly (private IPs are blocked) and the
  * management key stays on the host.
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.1';
+export const PLUGIN_VERSION = '0.1.2';
 
 /** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
 export const MODEL_ROUTING_ENV_KEYS = [
@@ -80,15 +80,16 @@ const CONFIG_SCHEMA = {
     },
     weights: {
       type: 'object', additionalProperties: false,
-      description: 'Quality composite weights (research defaults summed to 1).',
+      description: 'Quality composite weights (research defaults summed to 1; v0.1.2 adds hle with the rest scaled x0.9).',
       properties: {
-        terminalBench: { type: 'number', minimum: 0, default: 0.4 },
-        scicode: { type: 'number', minimum: 0, default: 0.2 },
-        tau2: { type: 'number', minimum: 0, default: 0.1 },
-        apexAgents: { type: 'number', minimum: 0, default: 0.1 },
-        intelligenceIndex: { type: 'number', minimum: 0, default: 0.1 },
-        omniscience: { type: 'number', minimum: 0, default: 0.05 },
-        lcr: { type: 'number', minimum: 0, default: 0.05 },
+        terminalBench: { type: 'number', minimum: 0, default: 0.36 },
+        scicode: { type: 'number', minimum: 0, default: 0.18 },
+        tau2: { type: 'number', minimum: 0, default: 0.09 },
+        apexAgents: { type: 'number', minimum: 0, default: 0.09 },
+        intelligenceIndex: { type: 'number', minimum: 0, default: 0.09 },
+        hle: { type: 'number', minimum: 0, default: 0.1 },
+        omniscience: { type: 'number', minimum: 0, default: 0.045 },
+        lcr: { type: 'number', minimum: 0, default: 0.045 },
       },
     },
     pacing: {
@@ -154,7 +155,7 @@ export function buildManifest({ modelResolve = false } = {}) {
     apiVersion: 1,
     version: PLUGIN_VERSION,
     displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.1 observes only; it changes no runs and holds no resolve capability.',
+    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.2 observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -164,7 +165,7 @@ export function buildManifest({ modelResolve = false } = {}) {
       {
         jobKey: 'aa-refresh',
         displayName: 'Refresh AA free-list snapshot',
-        description: 'Daily fetch of the Artificial Analysis free model list into plugin state. Keeps the prior snapshot on any fetch failure. Free API only.',
+        description: 'Daily fetch of the Artificial Analysis free model list plus the public leaderboard page (full flat fields incl. cost), merged per slug into plugin state. Keeps the prior snapshot on any fetch failure. Free API only.',
         schedule: '17 4 * * *',
       },
       {
@@ -212,6 +213,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.1 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.1.2 shadow manifest: no resolve capability, no modelRouting. */
 export const manifest = buildManifest();
 export default manifest;

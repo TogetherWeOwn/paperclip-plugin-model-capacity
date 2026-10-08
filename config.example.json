@@ -18,13 +18,14 @@
     "doerCeilingRung": null
   },
   "weights": {
-    "terminalBench": 0.4,
-    "scicode": 0.2,
-    "tau2": 0.1,
-    "apexAgents": 0.1,
-    "intelligenceIndex": 0.1,
-    "omniscience": 0.05,
-    "lcr": 0.05
+    "terminalBench": 0.36,
+    "scicode": 0.18,
+    "tau2": 0.09,
+    "apexAgents": 0.09,
+    "intelligenceIndex": 0.09,
+    "hle": 0.1,
+    "omniscience": 0.045,
+    "lcr": 0.045
   },
   "pacing": {
     "deadband": 0.02,

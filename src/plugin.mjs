@@ -1,7 +1,7 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
- * v0.1.1 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
+ * v0.1.2 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
  * from the host-published lane endpoint (one GET, short in-memory cache),
  * steps per-account pacing pointers, and records what it WOULD have
  * decided for recently started runs. It never changes a run:
@@ -20,9 +20,10 @@ import {
   parseLaneBody,
   CliproxyCache,
 } from './cliproxy.mjs';
-import { fetchAaFreeList, parseAaFreeList } from './aa.mjs';
+import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows } from './aa.mjs';
 import { DEFAULT_ARM_MAP, resolveArms, armsForProvider } from './arms.mjs';
 import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
+import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
 import { scheduleError, stepController, orderAccounts, DEFAULT_PACING } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS } from './decide.mjs';
@@ -177,31 +178,47 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
 
   function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders }) {
     const { arms, skipped } = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
-    const scored = new Map(computeComposite(arms, config.weights).map(s => [s.armId, s]));
-    const byCost = new Map(arms.map(a => [a.armId, a.row.intelligenceIndexCostPerTask]));
-    const refCost = byCost.get(config.calibration.referenceArmId);
-    const burnFor = armId => {
-      const c = byCost.get(armId);
-      if (c == null || !(refCost > 0)) return null;
-      return config.calibration.referenceBurnPerRunPct * (c / refCost);
+    const byArm = new Map(arms.map(a => [a.armId, a]));
+    const refRow = byArm.get(config.calibration.referenceArmId)?.row;
+    const refCost = typeof refRow?.intelligenceIndexCostPerTask === 'number' ? refRow.intelligenceIndexCostPerTask : null;
+    const burnFor = cost => {
+      if (cost == null || !(refCost > 0)) return null;
+      return config.calibration.referenceBurnPerRunPct * (cost / refCost);
     };
     const ladders = {};
     for (const account of accounts) {
-      const eligible = armsForProvider(arms, account.provider).map(a => ({
+      // Per-account scoring: quality support and cost profile are the
+      // account's own arm set, so one provider's gaps never punish another.
+      const served = armsForProvider(arms, account.provider);
+      const scored = new Map(computeComposite(served, config.weights).map(s => [s.armId, s]));
+      const costs = fillCosts(served.map(a => ({
+        armId: a.armId,
+        cost: a.row.intelligenceIndexCostPerTask,
+        priceIn: a.row.price1mInputTokens,
+        priceOut: a.row.price1mOutputTokens,
+      })));
+      const eligible = served.map(a => ({
         armId: a.armId,
         Q: scored.get(a.armId)?.Q ?? null,
-        C: byCost.get(a.armId) ?? null,
+        C: costs.get(a.armId)?.C ?? null,
         coverage: scored.get(a.armId)?.coverage ?? 0,
       }));
       const { rungs, dominated, dropped } = buildLadder(eligible, previousLadders?.[accountKey(account)]?.rungs ?? []);
       ladders[accountKey(account)] = {
         rungs: rungs.map(r => {
-          const arm = arms.find(x => x.armId === r.armId);
-          return { ...r, model: arm.model, effort: arm.effort, family: arm.family, contextWindow: arm.row.contextWindowTokens ?? null };
+          const arm = byArm.get(r.armId);
+          return {
+            ...r,
+            model: arm.model,
+            effort: arm.effort,
+            family: arm.family,
+            contextWindow: arm.row.contextWindowTokens ?? null,
+            costEstimated: costs.get(r.armId)?.estimated ?? false,
+          };
         }),
         dominated,
         dropped,
-        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(e.armId)])),
+        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
     return { ladders, skipped, arms: arms.map(a => a.armId) };
@@ -349,7 +366,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       return { status: 'skipped', reason: 'no-aa-key' };
     }
     const apiKey = await ctx.secrets.resolve(config.aa.apiKeySecretRef, { companyId, configPath: 'aa.apiKeySecretRef' });
-    const fetched = await fetchAaFreeList({ http: ctx.http, apiKey });
+    const [fetched, board] = await Promise.all([
+      fetchAaFreeList({ http: ctx.http, apiKey }),
+      fetchAaLeaderboard({ http: ctx.http }),
+    ]);
     if (!fetched.ok || !fetched.text) {
       await ctx.state.set(scopeKey(companyId, AA_KEY), { ...previous, lastAttemptAt: nowIso, lastError: fetched.error ?? 'aa-fetch-failed' });
       ctx.logger.error('model-capacity: AA refresh failed; keeping prior snapshot', { companyId, error: fetched.error });
@@ -361,9 +381,35 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       ctx.logger.error('model-capacity: AA parse failed; keeping prior snapshot', { companyId });
       return { status: 'error', error: 'aa-parse-failed' };
     }
-    await ctx.state.set(scopeKey(companyId, AA_KEY), { fetchedAt: nowIso, rows: parsed.rows, duplicateSlugs: parsed.duplicateSlugs, lastAttemptAt: nowIso, lastError: null });
-    ctx.logger.info('model-capacity: AA snapshot refreshed', { companyId, rows: parsed.rows.length });
-    return { status: 'ok', rows: parsed.rows.length };
+    // Second source is best-effort: a leaderboard failure degrades to
+    // API-only rows, never to dropping the fresh API snapshot.
+    let leaderboardRows = [];
+    let leaderboardError = null;
+    if (!board.ok || !board.html) {
+      leaderboardError = board.error ?? 'aa-leaderboard-fetch-failed';
+    } else {
+      const boardParsed = parseAaLeaderboardHtml(board.html);
+      if (!boardParsed) {
+        leaderboardError = 'aa-leaderboard-parse-failed';
+      } else {
+        leaderboardRows = boardParsed;
+      }
+    }
+    const merged = mergeAaRows(parsed.rows, leaderboardRows);
+    await ctx.state.set(scopeKey(companyId, AA_KEY), {
+      fetchedAt: nowIso,
+      rows: merged.rows,
+      duplicateSlugs: merged.duplicateSlugs,
+      leaderboardSlugs: merged.leaderboardSlugs,
+      leaderboardAt: leaderboardRows.length > 0 ? nowIso : (previous.leaderboardAt ?? null),
+      lastAttemptAt: nowIso,
+      lastError: null,
+      lastLeaderboardError: leaderboardError,
+    });
+    ctx.logger.info('model-capacity: AA snapshot refreshed', {
+      companyId, rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError,
+    });
+    return { status: 'ok', rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError };
   }
 
   return {

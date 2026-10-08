@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.1.1, shadow)
+# Model Capacity plugin (v0.1.2, shadow)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.1 = SHADOW.** The plugin holds no `run.model.resolve` capability,
+**v0.1.2 = SHADOW.** The plugin holds no `run.model.resolve` capability,
 so it changes no runs. Every minute it records what it *would* have
 decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
 and per-account ladders (`GET /ladder`). The resolve hook is implemented
@@ -15,19 +15,30 @@ v0.2.0 enables enforcement by switching to that variant.
 ## How it decides (per account, per run)
 
 1. **Arms** (model x effort) the account's provider can serve, joined to
-   the AA snapshot by slug. Ladders never cross providers.
+   the AA snapshot by slug. Ladders never cross providers. The snapshot
+   merges two sources per slug: the free API list plus the public
+   leaderboard page (full flat fields incl. cost and prices). The
+   leaderboard wins for fields it has; the API fills gaps.
 2. **Quality Q** = z-scored AA composite with null-renormalization
-   (missing metrics are excluded, never zero-imputed).
-3. **Pareto filter** drops dominated arms; survivors are rungs L0..Ln.
+   (missing metrics are excluded, never zero-imputed). Terminal-bench
+   reads Hard, falling back to V40 then V21; hle scores at weight .10.
+   Coverage is measured against the metrics actually present among that
+   account's arms (common support), so a free-tier gap hitting every arm
+   shrinks the denominator instead of failing every arm.
+3. **Cost C** = `intelligenceIndexCostPerTask` when present, else an
+   estimate from per-million-token prices x the median effective
+   tokens-per-task of arms that have both (flagged `costEstimated` on
+   the rung). A priced arm is never dropped for missing cost.
+4. **Pareto filter** drops dominated arms; survivors are rungs L0..Ln.
    Low-coverage arms (< 0.6) cap at one rung above cheapest; incumbents
    keep rungs unless a strictly-dominating newcomer appears.
-4. **Pacing pointer** tracks a linear burn schedule (deadband 2%, at most
+5. **Pacing pointer** tracks a linear burn schedule (deadband 2%, at most
    one rung per 10 min). The 5h guard overrides everything: above 80% the
    account floors and sheds load, rejoining below 50%.
-5. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
+6. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
    test-fail +1, rate-limit reroutes, context-window filter. `defer`
    happens only when no account has headroom.
-6. **Concurrency** `C* = sum((R_a/T_a)/E_a[mix]) x D` (Little's law),
+7. **Concurrency** `C* = sum((R_a/T_a)/E_a[mix]) x D` (Little's law),
    capped by the 5h guard and a 75 hard ceiling.
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
