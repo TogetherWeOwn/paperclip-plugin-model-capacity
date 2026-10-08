@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeConcurrencyTarget, distributeCaps, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
 
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
@@ -84,4 +84,45 @@ test('hard ceiling binds; distribution spreads whole slots', () => {
     { agentId: 'agent-c', maxConcurrentRuns: 2 },
   ]);
   assert.deepEqual(distributeCaps(0, ['x']), []);
+});
+
+test('weighted spread: floor 1 per active agent, largest remainder by queued', () => {
+  // Total 7 over queues 5/2/1: floors take 3, remainder 4 splits 3/1/0.
+  const caps = distributeWeightedCaps(7, [
+    { agentId: 'a', queued: 5 },
+    { agentId: 'b', queued: 2 },
+    { agentId: 'c', queued: 1 },
+  ]);
+  assert.deepEqual(caps, [
+    { agentId: 'a', maxConcurrentRuns: 4 },
+    { agentId: 'b', maxConcurrentRuns: 2 },
+    { agentId: 'c', maxConcurrentRuns: 1 },
+  ]);
+  assert.equal(caps.reduce((s, c) => s + c.maxConcurrentRuns, 0), 7);
+});
+
+test('weighted spread: short total grows to fit floors; idle agents excluded', () => {
+  // Target 2 across 3 active agents: floors win, total becomes 3.
+  assert.deepEqual(
+    distributeWeightedCaps(2, [
+      { agentId: 'a', queued: 4 },
+      { agentId: 'b', queued: 1 },
+      { agentId: 'c', queued: 1 },
+      { agentId: 'idle', queued: 0 },
+    ]).map(c => c.maxConcurrentRuns),
+    [1, 1, 1],
+  );
+});
+
+test('weighted spread: never exceeds maxTotal; shed target zeroes actives', () => {
+  const many = Array.from({ length: 10 }, (_, i) => ({ agentId: `a${i}`, queued: i + 1 }));
+  const capped = distributeWeightedCaps(1000, many, 5);
+  assert.equal(capped.length, 5);
+  assert.ok(capped.every(c => c.maxConcurrentRuns === 1));
+  assert.deepEqual(
+    distributeWeightedCaps(0, [{ agentId: 'a', queued: 3 }]),
+    [{ agentId: 'a', maxConcurrentRuns: 0 }],
+  );
+  assert.deepEqual(distributeWeightedCaps(9, []), []);
+  assert.deepEqual(distributeWeightedCaps(null, [{ agentId: 'a', queued: 1 }]), []);
 });

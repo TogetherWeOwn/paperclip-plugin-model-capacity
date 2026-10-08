@@ -1,8 +1,9 @@
 /**
- * Plugin manifest. v0.1.5 = SHADOW: no `run.model.resolve` capability.
- * Another plugin currently holds that capability and two holders conflict,
- * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
- * switching to the `modelResolve` variant (capability + modelRouting).
+ * Plugin manifest. v0.2.0 = ENFORCE-CAPABLE: holds `run.model.resolve` with
+ * a minimal modelRouting envKeys list, gated at runtime by the `enforce`
+ * config flag (default false: the hook answers `keep` until the operator
+ * flips it). `buildManifest({ modelResolve: false })` still builds the
+ * v0.1.5 shadow variant for tests.
  *
  * v0.1.2: burn telemetry comes from ONE host-published lane endpoint
  * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
@@ -11,14 +12,19 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.5';
+export const PLUGIN_VERSION = '0.2.0';
 
-/** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
+/**
+ * Env keys a run.model.resolve decision may set. Minimal by construction:
+ * `decide` returns model/effort first-class and only ever sets the two
+ * context-ceiling keys below, so none of model-selection's PIN_LANE /
+ * ANCILLARY keys (PAPERCLIP_ASSIGNED_MODEL, CLAUDE_CODE_SUBAGENT_MODEL,
+ * ANTHROPIC_DEFAULT_OPUS_MODEL, ANTHROPIC_DEFAULT_SONNET_MODEL,
+ * ANTHROPIC_SMALL_FAST_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL) are needed.
+ */
 export const MODEL_ROUTING_ENV_KEYS = [
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
-  // Provisional: no auto-compact watermark key was found in the host
-  // codebase; the name below is configurable and unverified.
-  'CLAUDE_CODE_AUTO_COMPACT_TOKENS',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
 ];
 
 const SECRET_REF = {
@@ -117,8 +123,12 @@ const CONFIG_SCHEMA = {
       properties: {
         solLunaMaxTokens: { type: 'integer', minimum: 1, default: 260000 },
         solLunaAutoCompactTokens: { type: 'integer', minimum: 1, default: 240000 },
-        autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_TOKENS' },
+        autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW' },
       },
+    },
+    enforce: {
+      type: 'boolean', default: false,
+      description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
     },
     calibration: {
       type: 'object', additionalProperties: false,
@@ -138,11 +148,12 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. Pass `{ modelResolve: true }` for the v0.2.0
- * enforcement variant: it adds the `run.model.resolve` capability and the
- * modelRouting envKeys declaration the host requires with it.
+ * Build the manifest. v0.2.0 defaults to the enforcement variant: it holds
+ * the `run.model.resolve` capability plus the modelRouting envKeys
+ * declaration the host requires with it. Pass `{ modelResolve: false }`
+ * for the shadow-only variant (no resolve capability, no modelRouting).
  */
-export function buildManifest({ modelResolve = false } = {}) {
+export function buildManifest({ modelResolve = true } = {}) {
   const capabilities = [
     'jobs.schedule',
     'plugin.state.read',
@@ -165,8 +176,10 @@ export function buildManifest({ modelResolve = false } = {}) {
     id: PLUGIN_ID,
     apiVersion: 1,
     version: PLUGIN_VERSION,
-    displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.5 observes only; it changes no runs and holds no resolve capability.',
+    displayName: modelResolve ? 'Model Capacity' : 'Model Capacity (Shadow)',
+    description: modelResolve
+      ? 'Model-capacity routing: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Enforces run models only when the `enforce` config flag is true (default false: hook answers keep).'
+      : 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -221,6 +234,15 @@ export function buildManifest({ modelResolve = false } = {}) {
         checkoutPolicy: 'none',
         companyResolution: { from: 'query', key: 'companyId' },
       },
+      {
+        routeKey: 'caps',
+        method: 'GET',
+        path: '/caps',
+        auth: 'board-or-agent',
+        capability: 'api.routes.register',
+        checkoutPolicy: 'none',
+        companyResolution: { from: 'query', key: 'companyId' },
+      },
     ],
   };
   if (modelResolve) {
@@ -231,6 +253,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.5 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.2.0 enforce-capable manifest (runtime-gated by `enforce: false` default). */
 export const manifest = buildManifest();
 export default manifest;

@@ -11,7 +11,7 @@
  */
 
 export const MAX_CONTEXT_ENV_KEY = 'CLAUDE_CODE_MAX_CONTEXT_TOKENS';
-export const AUTO_COMPACT_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_TOKENS';
+export const AUTO_COMPACT_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
 
 export const DEFAULT_ROLE_BANDS = Object.freeze({
   thinker: { floorRung: 2, ceilingRung: null },
@@ -22,7 +22,7 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
   /** Sol/Luna stay under the 272k price cliff. */
   solLunaMaxTokens: 260000,
   solLunaAutoCompactTokens: 240000,
-  /** Provisional: harness key for the auto-compact watermark is unverified. */
+  /** Auto-compact watermark key (operator-overridable, null omits it). */
   autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
 });
 

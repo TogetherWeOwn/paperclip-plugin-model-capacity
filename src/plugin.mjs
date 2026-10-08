@@ -1,14 +1,15 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
- * v0.1.3 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
- * from the host-published lane endpoint (one GET, short in-memory cache),
- * steps per-account pacing pointers, and records what it WOULD have
- * decided for recently started runs. It never changes a run:
- * `onResolveRunModel` is implemented for the v0.2.0 variant but the shadow
- * manifest holds no `run.model.resolve` capability, so the host never
- * calls it yet. The resolve path itself is cache-only by construction --
- * it never fetches remote data.
+ * v0.2.0 = ENFORCE-CAPABLE. The worker refreshes AA data daily, reads
+ * CLIProxy burn from the host-published lane endpoint (one GET, short
+ * in-memory cache), steps per-account pacing pointers, and records what it
+ * WOULD have decided for recently started runs. `onResolveRunModel` is
+ * memory-only by construction -- it reads the in-memory live view the tick
+ * populated and never touches config, state, network, or db (the host
+ * deadline is 1.5s). It answers `keep` unless the `enforce` config flag is
+ * true for the company. Every enforced decision is queued in memory and
+ * merged into the shadow ring (flagged `enforced:true`) on the next tick.
  */
 
 import {
@@ -30,7 +31,7 @@ import {
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS } from './decide.mjs';
-import { computeConcurrencyTarget, distributeCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
 import { createShadowRing, SHADOW_CAPACITY } from './shadow.mjs';
 import { manifest } from './manifest.mjs';
 
@@ -84,6 +85,7 @@ export function validateConfigShape(raw) {
       if (k in roles && !Array.isArray(roles[k])) errors.push(`roles.${k} must be an array`);
     }
   }
+  if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
   return errors;
 }
 
@@ -124,6 +126,9 @@ export function resolveConfig(raw = {}) {
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
     contextCaps: { ...DEFAULT_CONTEXT_CAPS, ...(raw.contextCaps ?? {}) },
+    // Kill switch for run.model.resolve enforcement. False (default): the
+    // hook answers keep and no run is ever changed.
+    enforce: raw.enforce === true,
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
     // for an account (research example value; flagged calibration: weak).
@@ -146,10 +151,18 @@ function windowStartMs(resetsAtMs) {
 export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   let ctx;
   const configured = new Set();
-  const snapshots = new Map(); // companyId -> { atMs, accounts }
   const recentRuns = new Map(); // companyId -> [{ runId, agentId, model, at }]
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
+  // Live view per company, populated by every tick for the memory-only
+  // resolve hook: { atMs, enforce, thinkerAgentIds, roleBands, contextCaps,
+  //   accounts: [{ accountId, pointer, headroomPct, remainingKnown,
+  //   ladderRungs, burnPerRunPct }] } in reset order.
+  const liveViews = new Map();
+  // Enforced hook decisions queued in memory, merged into the shadow ring
+  // (flagged enforced:true) on the next tick. companyId -> [records].
+  const pendingEnforced = new Map();
+  const enforceCompanies = new Set(); // companyIds with enforce: true
 
   const cacheFor = (companyId, ttlSec) => {
     let c = caches.get(companyId);
@@ -189,7 +202,6 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
     const snapshot = { accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs };
     cache.set('accounts', snapshot, nowMs);
-    snapshots.set(companyId, snapshot);
     return snapshot;
   }
 
@@ -505,10 +517,45 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       maxTotal: config.concurrency.maxTotal,
     });
 
+    // Publish the live view the memory-only resolve hook reads. No I/O
+    // happens in the hook, so everything it needs is frozen here.
+    const viewById = new Map(accountViews.map(v => [v.accountId, v]));
+    liveViews.set(companyId, {
+      atMs: nowMs,
+      enforce: config.enforce === true,
+      thinkerAgentIds: config.roles.thinkerAgentIds,
+      roleBands: {
+        thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
+        doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
+      },
+      contextCaps: config.contextCaps,
+      accounts: ordered.map(a => {
+        const view = viewById.get(a.accountId);
+        const ladder = ladders[a.accountId];
+        return {
+          accountId: a.accountId,
+          pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
+          headroomPct: view?.fiveHourUsedPct != null ? Math.max(0, 1 - view.fiveHourUsedPct) : null,
+          remainingKnown: view?.remainingPct != null,
+          ladderRungs: groupByRung(ladder?.rungs ?? []),
+          burnPerRunPct: ladder?.burnPerRunPct ?? {},
+        };
+      }),
+    });
+
     // Shadow decisions for recently started runs (db + event feed).
     const ring = createShadowRing(config.shadowMaxEntries);
     ring.load(await ctx.state.get(scopeKey(companyId, RING_KEY)));
     const recorded = new Set(ring.list(500).map(e => e.runId));
+    // Enforced hook decisions since the last tick merge first (flagged
+    // enforced:true), so the shadow feed never re-decides the same run.
+    for (const pending of pendingEnforced.get(companyId) ?? []) {
+      if (!recorded.has(pending.runId)) {
+        ring.push(pending);
+        recorded.add(pending.runId);
+      }
+    }
+    pendingEnforced.set(companyId, []);
     const candidates = runs.filter(r => nowMs - r.at < 15 * 60 * 1000 && !recorded.has(r.runId)).slice(0, 100);
     const roleBands = {
       thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
@@ -583,6 +630,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
+      maxTotal: config.concurrency.maxTotal,
       calibration: concurrency.calibration,
       perAccount: concurrency.perAccount,
       accounts: accountViews,
@@ -726,6 +774,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         throw new Error('invalid-config');
       }
       configured.add(companyId);
+      if (raw?.enforce === true) enforceCompanies.add(companyId);
+      else enforceCompanies.delete(companyId);
     },
 
     async onValidateConfig(raw) {
@@ -734,10 +784,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     },
 
     async onHealth() {
+      const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
       return {
         status: configured.size === 0 ? 'degraded' : 'ok',
-        message: 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, manifest: manifest.id },
+        message: enforcing > 0
+          ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
+          : 'Shadow only; no runs are changed.',
+        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, manifest: manifest.id },
       };
     },
 
@@ -756,66 +809,125 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (input.routeKey === 'ladder') {
         return { status: 200, body: (await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} } };
       }
+      if (input.routeKey === 'caps') {
+        const cap = (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? {};
+        const atMs = cap.atMs ?? null;
+        const calibration = cap.calibration ?? 'weak';
+        const target = cap.target ?? null;
+        // Weak calibration means no target at all: no caps, never zeros
+        // masquerading as a recommendation.
+        if (target == null || calibration === 'weak') {
+          return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
+        }
+        // Agents with queued/ready work: assigned non-terminal issues
+        // (todo + in_progress), grouped by assignee and weighted by count.
+        // issues.read is already declared; any denial degrades to no
+        // recommendation instead of failing the request.
+        let counts;
+        try {
+          const lists = await Promise.all([
+            ctx.issues.list({ companyId, status: 'todo' }),
+            ctx.issues.list({ companyId, status: 'in_progress' }),
+          ]);
+          counts = new Map();
+          const seen = new Set();
+          for (const issue of lists.flat()) {
+            if (!issue || typeof issue !== 'object') continue;
+            const id = issue.id ?? issue.issueId;
+            if (id != null) {
+              if (seen.has(id)) continue;
+              seen.add(id);
+            }
+            const status = String(issue.status ?? '').toLowerCase();
+            if (status === 'done' || status === 'blocked' || status === 'cancelled') continue;
+            const agentId = issue.assigneeAgentId ?? issue.assignee_agent_id ?? null;
+            if (typeof agentId === 'string' && agentId.length > 0) {
+              counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
+            }
+          }
+        } catch (error) {
+          return { status: 200, body: { atMs, calibration, target, agents: [], capsError: error?.message ?? String(error) } };
+        }
+        const agents = distributeWeightedCaps(
+          target,
+          [...counts].map(([agentId, queued]) => ({ agentId, queued })),
+          cap.maxTotal ?? 75,
+        );
+        return { status: 200, body: { atMs, calibration, target, agents } };
+      }
       return { status: 404, body: { error: 'unknown-route' } };
     },
 
     /**
-     * Implemented for the v0.2.0 enforcement variant. Cache-only: it reads
-     * the in-memory CLIProxy snapshot refreshed by shadow-tick and the
-     * stored AA snapshot, and never fetches remote data on this path
-     * (past the host deadline the run defers). Fail-safe: with no fresh
-     * data it answers `keep` so the agent default runs.
+     * v0.2.0 enforcement hook. MEMORY-ONLY: it reads the in-memory live view
+     * the last tick published and performs zero I/O -- no config, state,
+     * network, or db reads -- so it always answers inside the host's 1.5s
+     * RPC deadline. Fail-safe order: unknown company, enforce off, human
+     * operator override, and stale/freshness gaps all answer `keep` (the
+     * agent default runs). Only when no account has headroom does it
+     * `defer` (~60s retry). Every enforced decision is queued in memory and
+     * merged into the shadow ring with `enforced:true` on the next tick.
+     *
+     * Note: ResolveRunModelParams carries no retry/context signals, so each
+     * call is decided fresh (retryCount 0, failureClass none, contextTokens
+     * null) -- determinism comes from the cached tick state, which is
+     * identical for identical params until the next tick moves it.
      */
     async onResolveRunModel(params) {
-      const companyId = params.companyId;
-      const snapshot = snapshots.get(companyId);
-      if (!snapshot || clock() - snapshot.atMs > 120000) return { kind: 'keep' };
-      const raw = await ctx.config.get(companyId).catch(() => null);
-      const config = resolveConfig(raw ?? {});
-      const aaSnapshot = await ctx.state.get(scopeKey(companyId, AA_KEY)).catch(() => null);
-      if (!aaSnapshot?.rows?.length) return { kind: 'keep' };
-      const pacingState = (await ctx.state.get(scopeKey(companyId, PACING_KEY)).catch(() => null)) ?? {};
-      const prevLadders = (await ctx.state.get(scopeKey(companyId, LADDER_KEY)).catch(() => null))?.ladders ?? {};
-      const { ladders } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders });
-      const views = snapshot.accounts.map(a => {
-        const key = accountKey(a);
-        const st = pacingState[key] ?? { pointer: 0 };
-        return {
-          accountId: key,
-          resetAtMs: a.weekly?.resetsAtMs ?? null,
-          remainingPct: a.weekly?.utilization != null ? Math.max(0, 1 - a.weekly.utilization) : 0,
-          fiveHourUsedPct: a.fiveHour?.utilization ?? null,
-          pointer: st.guardActive ? 0 : st.pointer ?? 0,
-        };
-      });
-      const role = roleOf(config, params.agentId);
-      const roleBands = {
-        thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
-        doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
-      };
-      for (const view of orderAccounts(views)) {
-        const ladder = ladders[view.accountId];
-        if (!ladder) continue;
-        const headroom = view.fiveHourUsedPct != null ? Math.max(0, 1 - view.fiveHourUsedPct) : null;
+      const live = params?.companyId ? liveViews.get(params.companyId) : null;
+      if (!live || live.enforce !== true) return { kind: 'keep' };
+      if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+        return { kind: 'keep' };
+      }
+      if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
+      const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(params.agentId) ? 'thinker' : 'doer';
+      for (const view of live.accounts) {
+        if (!view.remainingKnown || view.ladderRungs.length === 0) continue;
         const d = decide({
           runId: params.runId,
           agentId: params.agentId,
           role,
-          ladderRungs: groupByRung(ladder.rungs),
+          ladderRungs: view.ladderRungs,
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
           contextTokens: null,
-          fiveHourHeadroomPct: headroom,
-          burnPerRunPct: ladder.burnPerRunPct,
+          fiveHourHeadroomPct: view.headroomPct,
+          burnPerRunPct: view.burnPerRunPct,
           reservePct: 0.05,
           accountId: view.accountId,
-          roleBands,
-          contextCaps: config.contextCaps,
+          roleBands: live.roleBands,
+          contextCaps: live.contextCaps,
         });
-        if (d.kind === 'decide') return d;
+        if (d.kind === 'decide') {
+          const queue = pendingEnforced.get(params.companyId) ?? [];
+          queue.push({
+            runId: String(params.runId ?? 'unknown'),
+            agentId: String(params.agentId ?? 'unknown'),
+            actualModel: 'unknown',
+            actualModelSource: null,
+            wouldModel: `${d.model}(${d.effort ?? 'default'})`,
+            modelMatch: null,
+            account: d.accountId,
+            accountId: d.accountId,
+            rung: d.rung,
+            reason: d.reason,
+            at: clock(),
+            enforced: true,
+          });
+          pendingEnforced.set(params.companyId, queue.slice(-200));
+          return {
+            kind: 'decide',
+            decisionId: d.decisionId,
+            model: d.model,
+            effort: d.effort,
+            env: d.env,
+            source: d.source,
+            reason: d.reason,
+          };
+        }
       }
-      return { kind: 'defer', retryAfterMs: 20000, reason: 'no account has headroom right now' };
+      return { kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' };
     },
   };
 }

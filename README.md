@@ -1,16 +1,19 @@
-# Model Capacity plugin (v0.1.5, shadow)
+# Model Capacity plugin (v0.2.0, enforce-capable)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.5 = SHADOW.** The plugin holds no `run.model.resolve` capability,
-so it changes no runs. Every minute it records what it *would* have
-decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
-and per-account ladders (`GET /ladder`). The resolve hook is implemented
-behind the manifest variant (`buildManifest({ modelResolve: true })`);
-v0.2.0 enables enforcement by switching to that variant.
+**v0.2.0 = ENFORCE-CAPABLE, default off.** The manifest holds
+`run.model.resolve` with a minimal `modelRouting.envKeys` list (only the
+two context-ceiling keys `decide` ever sets). The hook itself is gated by
+the `enforce` config flag (default `false`): with enforcement off it
+answers `keep` and nothing changes. Every minute the tick records what it
+*would* have decided (`GET /shadow`), the concurrency target
+(`GET /capacity`), per-account ladders (`GET /ladder`), and the per-agent
+cap spread (`GET /caps`). `buildManifest({ modelResolve: false })` still
+builds the shadow-only variant for tests.
 
 ## How it decides (per account, per run)
 
@@ -55,9 +58,24 @@ v0.2.0 enables enforcement by switching to that variant.
    contribute zero; a 75 hard ceiling binds the total.
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
-under the 272k price cliff. The auto-compact watermark key name is
-provisional (no such key was found in the host codebase) and configurable
-via `contextCaps.autoCompactEnvKey` (null omits it).
+under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+watermark (configurable via `contextCaps.autoCompactEnvKey`; null omits
+it). These two keys are exactly the manifest's `modelRouting.envKeys`:
+`decide` returns model/effort first-class and sets nothing else.
+
+The resolve hook is memory-only: it reads the live view the last tick
+published and performs zero I/O, so it always answers inside the host's
+1.5s RPC deadline. Unknown company, `enforce: false`, a human operator
+override (`issueOverrideModel`), and tick staleness over 120s all answer
+`keep`. Only an all-accounts-no-headroom fleet answers `defer`
+(`retryAfterMs` 60000). Every enforced decision lands in the shadow ring
+with `enforced:true` on the next tick.
+
+`GET /caps` spreads the concurrency target over agents with queued/ready
+work (assigned `todo` + `in_progress` issues, grouped by assignee):
+floor 1 per active agent, largest-remainder weighting by queued count,
+never above `maxTotal` (75). Weak calibration (no target) returns
+`agents: []`.
 
 ## Configuration
 
@@ -102,7 +120,7 @@ otherwise, never a silent zero.
 
 ## Layout
 
-- `src/manifest.mjs` -- shadow manifest + `buildManifest` variant flag
+- `src/manifest.mjs` -- enforce-capable manifest + `buildManifest` variant flag
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control

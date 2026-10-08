@@ -75,6 +75,52 @@ export function computeConcurrencyTarget({ accounts, meanRunDurationHours, deman
   };
 }
 
+/**
+ * Spread an integer slot target across agents weighted by queued work.
+ *
+ * demands: [{ agentId, queued }] (queued = assigned non-terminal issues).
+ * Only agents with queued > 0 are active and each gets a floor of 1; the
+ * remainder splits by largest remainder on queued weights. The total never
+ * exceeds maxTotal; when more agents are active than fit, the top agents by
+ * queued count keep 1 each. A null target (weak calibration, nothing
+ * recommended) returns []. A non-positive target is an explicit shed:
+ * every active agent gets 0.
+ */
+export function distributeWeightedCaps(target, demands, maxTotal = 75) {
+  const active = (demands ?? [])
+    .filter(d => d && typeof d.agentId === 'string' && d.agentId.length > 0 && (d.queued ?? 0) > 0)
+    .sort((a, b) => (b.queued - a.queued) || (a.agentId < b.agentId ? -1 : a.agentId > b.agentId ? 1 : 0));
+  if (active.length === 0) return [];
+  const cap = Math.max(1, Math.floor(maxTotal));
+  if (target == null) return [];
+  if (!(target > 0)) return active.map(a => ({ agentId: a.agentId, maxConcurrentRuns: 0 }));
+  // Floors first: the total grows to fit every active agent's floor of 1
+  // (unless more agents are active than the ceiling allows).
+  let total = Math.min(Math.max(Math.round(target), active.length), cap);
+  if (active.length > cap) {
+    return active.slice(0, cap).map(a => ({ agentId: a.agentId, maxConcurrentRuns: 1 }));
+  }
+  const queuedTotal = active.reduce((s, a) => s + a.queued, 0);
+  let remainder = total - active.length;
+  const extras = new Array(active.length).fill(0);
+  if (remainder > 0 && queuedTotal > 0) {
+    const frac = active.map((a, i) => ({ i, share: (remainder * a.queued) / queuedTotal }));
+    const base = frac.map(f => Math.floor(f.share));
+    let given = 0;
+    for (let i = 0; i < base.length; i++) { extras[i] = base[i]; given += base[i]; }
+    const order = frac
+      .map((f, i) => ({ i, rest: f.share - base[i], queued: active[i].queued, id: active[i].agentId }))
+      .sort((a, b) => (b.rest - a.rest) || (b.queued - a.queued) || (a.id < b.id ? -1 : 1));
+    let left = remainder - given;
+    for (const o of order) {
+      if (left <= 0) break;
+      extras[o.i] += 1;
+      left -= 1;
+    }
+  }
+  return active.map((a, i) => ({ agentId: a.agentId, maxConcurrentRuns: 1 + extras[i] }));
+}
+
 /** Spread an integer slot target across agents with queued/ready work. */
 export function distributeCaps(target, agentIds) {
   const ids = [...new Set(agentIds ?? [])].sort();

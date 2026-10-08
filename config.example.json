@@ -44,8 +44,9 @@
   "contextCaps": {
     "solLunaMaxTokens": 260000,
     "solLunaAutoCompactTokens": 240000,
-    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_TOKENS"
+    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
   },
+  "enforce": false,
   "calibration": {
     "referenceArmId": "claude-haiku-5-5",
     "referenceBurnPerRunPct": 0.0005
