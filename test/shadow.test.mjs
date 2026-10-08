@@ -25,9 +25,9 @@ test('invalid records are refused, never stored', () => {
 
 test('config validation rejects bad secret refs and weights', () => {
   assert.deepEqual(validateConfigShape({}), []);
-  assert.ok(validateConfigShape({ cliproxy: { managementKeySecretRef: 'pasted-key' } }).length > 0);
+  assert.ok(validateConfigShape({ cliproxy: { laneKeySecretRef: 'pasted-key' } }).length > 0);
   assert.deepEqual(validateConfigShape({
-    cliproxy: { managementKeySecretRef: { type: 'secret_ref', secretId: 'cd121e86-3899-4720-9a04-a89b73e9e1' } },
+    cliproxy: { laneKeySecretRef: { type: 'secret_ref', secretId: 'cd121e86-3899-4720-9a04-a89b73e9e1' } },
   }), []);
   assert.ok(validateConfigShape({ pacing: { guardHighPct: 0.4, guardRejoinPct: 0.5 } }).length > 0);
   assert.ok(validateConfigShape({ weights: { terminalBench: -1 } }).length > 0);
@@ -35,8 +35,9 @@ test('config validation rejects bad secret refs and weights', () => {
 
 test('config resolution applies documented defaults', () => {
   const c = resolveConfig({});
-  assert.equal(c.cliproxy.baseUrl, 'http://cliproxy:8317');
-  assert.equal(c.cliproxy.staleAfterSec, 300);
+  assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
+  assert.equal(c.cliproxy.accountsPath, '/telemetry/cliproxy/live/accounts.json');
+  assert.equal(c.cliproxy.laneKeySecretRef, null);
   assert.equal(c.concurrency.maxTotal, 75);
   assert.equal(c.contextCaps.solLunaMaxTokens, 260000);
   assert.equal(c.armMap.length > 0, true);

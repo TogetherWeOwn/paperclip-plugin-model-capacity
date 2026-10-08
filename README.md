@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.1.0, shadow)
+# Model Capacity plugin (v0.1.1, shadow)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.0 = SHADOW.** The plugin holds no `run.model.resolve` capability,
+**v0.1.1 = SHADOW.** The plugin holds no `run.model.resolve` capability,
 so it changes no runs. Every minute it records what it *would* have
 decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
 and per-account ladders (`GET /ladder`). The resolve hook is implemented
@@ -42,19 +42,22 @@ resolved at call time and never stored:
 
 - `aa.apiKeySecretRef` -- existing company secret
   `ARTIFICIALANALYSIS_API_KEY` (free tier) fits here.
-- `cliproxy.managementKeySecretRef` -- **no suitable secret exists yet.**
-  The client key (`cliproxy/agent/api-key`) is inference-transport only
-  and cannot call management endpoints; the lane key
-  (`cliproxy-usage-lane-key`) reads sanitized telemetry files, not
-  CLIProxy. Placing the management key as a Paperclip secret is a
-  security-sensitive owner decision (that key can read provider
-  credentials in clear). Until then the plugin runs degraded: no live
-  reads, ladders frozen, shadow records the gap.
+- `cliproxy.laneKeySecretRef` -- Paperclip secret holding the lane key
+  for the host-published CLIProxy telemetry endpoint:
+  `GET {cliproxy.baseUrl}{cliproxy.accountsPath}`
+  (defaults `https://router.infextion.net` +
+  `/telemetry/cliproxy/live/accounts.json`), sent as the `X-Api-Key`
+  header. The response carries per-account `weekly`/`fiveHour`
+  `{ used (0..1|null), resetsAt (ISO|null) }` plus a `quality`
+  flag. Until the ref is wired the plugin runs degraded: no live reads,
+  ladders frozen, shadow records the gap.
 
-The CLIProxy client only ever issues `GET /v0/management/auth-files`
-and `POST /v0/management/api-call` with an allowlisted usage URL
-(Anthropic oauth/usage, Codex wham/usage). Reset-consuming endpoints are
-blocked in code and covered by the allowlist test.
+The CLIProxy client only ever issues that one GET. Anything else is
+blocked in code and covered by the allowlist test. The plugin worker
+never touches CLIProxy directly (private IPs are blocked from
+`ctx.http.fetch`) and the CLIProxy management key stays on the host --
+the host service does passive-first plus single-account live pull,
+server-side. Readings are cached 45s (`cliproxy.cacheTtlSec`).
 
 ## Layout
 
@@ -68,9 +71,9 @@ blocked in code and covered by the allowlist test.
 
 ## Open questions
 
-- CLIProxy management-key placement (owner decision, see above), and
-  whether `http://cliproxy:8317` is reachable from the plugin worker
-  network (configurable via `cliproxy.baseUrl`).
+- Wire `cliproxy.laneKeySecretRef` to the lane key (owner decision, see
+  above). `cliproxy.baseUrl`/`accountsPath` are configurable but default
+  to the live lane.
 - Verify the AA `omniscience` field direction (currently treated as a
   hallucination rate and negated per spec).
 - Per-run burn calibration starts from a configured reference anchor

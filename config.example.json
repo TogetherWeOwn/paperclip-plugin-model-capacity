@@ -1,8 +1,8 @@
 {
   "cliproxy": {
-    "baseUrl": "http://cliproxy:8317",
-    "managementKeySecretRef": null,
-    "staleAfterSec": 300,
+    "baseUrl": "https://router.infextion.net",
+    "accountsPath": "/telemetry/cliproxy/live/accounts.json",
+    "laneKeySecretRef": null,
     "cacheTtlSec": 45
   },
   "aa": {

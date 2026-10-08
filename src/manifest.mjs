@@ -1,12 +1,17 @@
 /**
- * Plugin manifest. v0.1.0 = SHADOW: no `run.model.resolve` capability.
+ * Plugin manifest. v0.1.1 = SHADOW: no `run.model.resolve` capability.
  * Another plugin currently holds that capability and two holders conflict,
  * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
  * switching to the `modelResolve` variant (capability + modelRouting).
+ *
+ * v0.1.1: burn telemetry comes from ONE host-published lane endpoint
+ * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
+ * cannot reach CLIProxy directly (private IPs are blocked) and the
+ * management key stays on the host.
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.0';
+export const PLUGIN_VERSION = '0.1.1';
 
 /** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
 export const MODEL_ROUTING_ENV_KEYS = [
@@ -34,9 +39,9 @@ const CONFIG_SCHEMA = {
     cliproxy: {
       type: 'object', additionalProperties: false,
       properties: {
-        baseUrl: { type: 'string', default: 'http://cliproxy:8317' },
-        managementKeySecretRef: { ...SECRET_REF, description: 'Paperclip secret holding the CLIProxy management key (auth-files + api-call only).' },
-        staleAfterSec: { type: 'integer', minimum: 30, default: 300 },
+        baseUrl: { type: 'string', default: 'https://router.infextion.net' },
+        accountsPath: { type: 'string', default: '/telemetry/cliproxy/live/accounts.json' },
+        laneKeySecretRef: { ...SECRET_REF, description: 'Paperclip secret holding the lane key for the host-published CLIProxy telemetry endpoint (GET {baseUrl}{accountsPath}, X-Api-Key header).' },
         cacheTtlSec: { type: 'integer', minimum: 5, default: 45 },
       },
     },
@@ -110,6 +115,14 @@ const CONFIG_SCHEMA = {
         autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_TOKENS' },
       },
     },
+    calibration: {
+      type: 'object', additionalProperties: false,
+      description: 'Reference anchor for per-run burn before per-run deltas are observed (flagged weak).',
+      properties: {
+        referenceArmId: { type: 'string', default: 'claude-haiku-5-5' },
+        referenceBurnPerRunPct: { type: 'number', exclusiveMinimum: 0, default: 0.0005 },
+      },
+    },
     shadow: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -141,7 +154,7 @@ export function buildManifest({ modelResolve = false } = {}) {
     apiVersion: 1,
     version: PLUGIN_VERSION,
     displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.0 observes only; it changes no runs and holds no resolve capability.',
+    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.1 observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -199,6 +212,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.0 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.1.1 shadow manifest: no resolve capability, no modelRouting. */
 export const manifest = buildManifest();
 export default manifest;

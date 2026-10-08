@@ -1,27 +1,24 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
- * v0.1.0 = SHADOW. The worker refreshes AA data daily, reads CLIProxy on
- * demand with a short in-memory cache, steps per-account pacing pointers,
- * and records what it WOULD have decided for recently started runs. It
- * never changes a run: `onResolveRunModel` is implemented for the v0.2.0
- * variant but the shadow manifest holds no `run.model.resolve`
- * capability, so the host never calls it yet. The resolve path itself is
- * cache-only by construction -- it never fetches remote data.
+ * v0.1.1 = SHADOW. The worker refreshes AA data daily, reads CLIProxy burn
+ * from the host-published lane endpoint (one GET, short in-memory cache),
+ * steps per-account pacing pointers, and records what it WOULD have
+ * decided for recently started runs. It never changes a run:
+ * `onResolveRunModel` is implemented for the v0.2.0 variant but the shadow
+ * manifest holds no `run.model.resolve` capability, so the host never
+ * calls it yet. The resolve path itself is cache-only by construction --
+ * it never fetches remote data.
  */
 
 import {
   DEFAULT_BASE_URL,
-  buildAuthFilesRequest,
-  buildApiCallRequest,
-  assertAllowedRequest,
-  parseAuthFile,
-  isStale,
-  parseAnthropicUsageBody,
-  parseCodexWhamBody,
+  DEFAULT_ACCOUNTS_PATH,
+  LANE_KEY_HEADER,
+  buildLaneRequest,
+  assertLaneRequest,
+  parseLaneBody,
   CliproxyCache,
-  FIVE_HOUR_SECONDS,
-  WEEK_SECONDS,
 } from './cliproxy.mjs';
 import { fetchAaFreeList, parseAaFreeList } from './aa.mjs';
 import { DEFAULT_ARM_MAP, resolveArms, armsForProvider } from './arms.mjs';
@@ -50,8 +47,8 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
-  if (cliproxy?.managementKeySecretRef != null && !isSecretRef(cliproxy.managementKeySecretRef)) {
-    errors.push('cliproxy.managementKeySecretRef must be a secret_ref object');
+  if (cliproxy?.laneKeySecretRef != null && !isSecretRef(cliproxy.laneKeySecretRef)) {
+    errors.push('cliproxy.laneKeySecretRef must be a secret_ref object');
   }
   if (aa?.apiKeySecretRef != null && !isSecretRef(aa.apiKeySecretRef)) errors.push('aa.apiKeySecretRef must be a secret_ref object');
   for (const [k, v] of Object.entries(weights ?? {})) {
@@ -77,8 +74,8 @@ export function resolveConfig(raw = {}) {
   return {
     cliproxy: {
       baseUrl: raw.cliproxy?.baseUrl || DEFAULT_BASE_URL,
-      managementKeySecretRef: raw.cliproxy?.managementKeySecretRef ?? null,
-      staleAfterSec: raw.cliproxy?.staleAfterSec ?? 300,
+      accountsPath: raw.cliproxy?.accountsPath || DEFAULT_ACCOUNTS_PATH,
+      laneKeySecretRef: raw.cliproxy?.laneKeySecretRef ?? null,
       cacheTtlSec: raw.cliproxy?.cacheTtlSec ?? 45,
     },
     aa: {
@@ -116,11 +113,13 @@ export function resolveConfig(raw = {}) {
   };
 }
 
-const WINDOW_SECONDS = { fiveHour: FIVE_HOUR_SECONDS, weekly: WEEK_SECONDS };
+// Weekly window length for schedule-error math (the lane reports `used`
+// fractions plus reset timestamps; the host owns staleness/live-pull).
+const WEEKLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
 
-function windowStartMs(resetsAtMs, windowName) {
+function windowStartMs(resetsAtMs) {
   if (resetsAtMs == null) return null;
-  return resetsAtMs - (WINDOW_SECONDS[windowName] ?? WEEK_SECONDS) * 1000;
+  return resetsAtMs - WEEKLY_WINDOW_MS;
 }
 
 export function createModelCapacityPlugin({ clock = Date.now } = {}) {
@@ -139,17 +138,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return c;
   };
 
-  async function cliproxyGet(companyId, config, path, body) {
-    const key = await ctx.secrets.resolve(config.cliproxy.managementKeySecretRef, { companyId, configPath: 'cliproxy.managementKeySecretRef' });
-    const url = `${config.cliproxy.baseUrl}${path}`;
-    const method = body == null ? 'GET' : 'POST';
-    // Last line of defense: every outbound CLIProxy call re-passes the
-    // allowlist, so no code path can reach a reset-consuming endpoint.
-    assertAllowedRequest({ method, url, body });
-    const init = body == null
-      ? { method, headers: { Authorization: `Bearer ${key}` } }
-      : { method, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-    const res = await ctx.http.fetch(url, init);
+  /**
+   * The ONE outbound CLIProxy read: GET {baseUrl}{accountsPath} with the
+   * lane key in X-Api-Key. The key is resolved at call time, never stored.
+   * Last line of defense: the request re-passes the lane allowlist, so no
+   * code path can fetch anywhere else.
+   */
+  async function cliproxyLaneGet(companyId, config) {
+    const laneKey = await ctx.secrets.resolve(config.cliproxy.laneKeySecretRef, { companyId, configPath: 'cliproxy.laneKeySecretRef' });
+    const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
+    assertLaneRequest({ method: req.method, url: req.url, body: null },
+      { baseUrl: config.cliproxy.baseUrl, accountsPath: config.cliproxy.accountsPath });
+    const res = await ctx.http.fetch(req.url, { method: 'GET', headers: { [LANE_KEY_HEADER]: laneKey } });
     if (res.status === 401 || res.status === 403) throw new Error('cliproxy-access-denied');
     if (res.status < 200 || res.status >= 300) throw new Error(`cliproxy-http-${res.status}`);
     return res.json();
@@ -159,37 +159,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const cache = cacheFor(companyId, config.cliproxy.cacheTtlSec);
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
-    if (!isSecretRef(config.cliproxy.managementKeySecretRef)) {
+    if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
       return { accounts: [], source: 'no-secret', atMs: nowMs };
     }
-    const { method, url } = buildAuthFilesRequest(config.cliproxy.baseUrl);
-    void method;
-    void url;
-    const data = await cliproxyGet(companyId, config, '/v0/management/auth-files', null);
-    const files = data?.files ?? [];
-    const accounts = [];
-    for (const auth of files) {
-      const account = parseAuthFile(auth, nowMs);
-      if (!account.enabled) continue;
-      if (isStale(account, config.cliproxy.staleAfterSec, nowMs)) {
-        try {
-          const pull = buildApiCallRequest(config.cliproxy.baseUrl, { authIndex: account.authIndex, provider: account.provider });
-          const live = await cliproxyGet(companyId, config, '/v0/management/api-call', pull.body);
-          const parsed = account.provider === 'claude' ? parseAnthropicUsageBody(live?.body) : parseCodexWhamBody(live?.body);
-          if (parsed) {
-            if (parsed.fiveHour) account.fiveHour = parsed.fiveHour;
-            if (parsed.weekly) account.weekly = parsed.weekly;
-            if (parsed.monthly) account.monthly = parsed.monthly;
-            account.signalsAtMs = nowMs;
-            account.livePulled = true;
-          }
-        } catch {
-          account.livePullFailed = true;
-        }
-      }
-      accounts.push(account);
-    }
-    const snapshot = { accounts, atMs: nowMs, source: 'cliproxy' };
+    const body = await cliproxyLaneGet(companyId, config);
+    const parsed = parseLaneBody(body, nowMs);
+    if (!parsed) throw new Error('cliproxy-lane-parse-failed');
+    const snapshot = { accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane' };
     cache.set('accounts', snapshot, nowMs);
     snapshots.set(companyId, snapshot);
     return snapshot;
@@ -232,7 +208,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   function accountKey(account) {
-    return `${account.provider}:${account.authIndex ?? 'x'}`;
+    return account.accountId ?? `${account.provider ?? 'unknown'}:x`;
   }
 
   async function runShadowTick(companyId, job) {
@@ -252,7 +228,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const weeklyUsed = account.weekly?.utilization;
       const fiveHourUsed = account.fiveHour?.utilization;
       const resetAtMs = account.weekly?.resetsAt ? Date.parse(account.weekly.resetsAt) : null;
-      const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs, 'weekly') : null;
+      const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
       const error = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
         : 0;
