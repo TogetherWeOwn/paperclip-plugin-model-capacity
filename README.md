@@ -1,11 +1,11 @@
-# Model Capacity plugin (v0.1.3, shadow)
+# Model Capacity plugin (v0.1.4, shadow)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.1.3 = SHADOW.** The plugin holds no `run.model.resolve` capability,
+**v0.1.4 = SHADOW.** The plugin holds no `run.model.resolve` capability,
 so it changes no runs. Every minute it records what it *would* have
 decided (`GET /shadow`), plus the concurrency target (`GET /capacity`)
 and per-account ladders (`GET /ladder`). The resolve hook is implemented
@@ -79,6 +79,19 @@ never touches CLIProxy directly (private IPs are blocked from
 `ctx.http.fetch`) and the CLIProxy management key stays on the host --
 the host service does passive-first plus single-account live pull,
 server-side. Readings are cached 45s (`cliproxy.cacheTtlSec`).
+
+Heartbeat runs come from a restricted SELECT on the whitelisted core
+table `heartbeat_runs` (manifest `database` declaration +
+`database.namespace.read`; `migrate` is declared-but-unexercised because
+the host schema validator requires it, and the plugin owns no tables).
+Without the capability the tick degrades to events-only and says so
+(`runsSource`, `runsDbError` on `/capacity`). Each shadow entry records
+`actualModel` from the run row plus `modelMatch` (did shadow agree with
+reality; null while the actual model is unknown). Rungs are always
+served strictly ascending in cost (stability pins yield to fresh cost
+order whenever they would invert it), and `requiredRatePerHour` is a
+number whenever remaining% and reset are both known -- null (unknown)
+otherwise, never a silent zero.
 
 ## Layout
 

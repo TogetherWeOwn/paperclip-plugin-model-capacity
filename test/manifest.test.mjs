@@ -5,11 +5,25 @@ import { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_K
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.1.3');
-  assert.equal(PLUGIN_VERSION, '0.1.3');
+  assert.equal(manifest.version, '0.1.4');
+  assert.equal(PLUGIN_VERSION, '0.1.4');
 });
 
-test('v0.1.3 shadow declares NO run.model.resolve capability and no modelRouting', () => {
+test('heartbeat read: database declaration plus paired capabilities, never write', () => {
+  assert.deepEqual(manifest.database, {
+    namespaceSlug: 'model_capacity',
+    migrationsDir: './migrations',
+    coreReadTables: ['heartbeat_runs'],
+  });
+  assert.ok(manifest.capabilities.includes('database.namespace.read'));
+  // Declared-but-unexercised: the host schema validator pairs migrate
+  // with read for any manifest declaring `database`.
+  assert.ok(manifest.capabilities.includes('database.namespace.migrate'));
+  assert.ok(!manifest.capabilities.includes('database.namespace.write'));
+  assert.deepEqual(buildManifest({ modelResolve: true }).database, manifest.database);
+});
+
+test('v0.1.4 shadow declares NO run.model.resolve capability and no modelRouting', () => {
   assert.ok(!manifest.capabilities.includes('run.model.resolve'));
   assert.equal(manifest.modelRouting, undefined);
 });

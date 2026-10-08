@@ -9,6 +9,7 @@ import {
   usedRatio,
   parseLaneAccount,
   parseLaneBody,
+  resetAtMsOf,
   CliproxyCache,
 } from '../src/cliproxy.mjs';
 
@@ -97,6 +98,27 @@ test('lane body parses to account snapshots; gaps stay null', () => {
   assert.equal(odd.weekly.utilization, null);
   assert.equal(odd.weekly.resetsAt, null);
   assert.equal(odd.signalsAtMs, NOW);
+});
+
+test('reset timestamps accept ISO, epoch ms, and epoch s', () => {
+  assert.equal(resetAtMsOf('2026-10-09T19:00:00Z'), Date.parse('2026-10-09T19:00:00Z'));
+  assert.equal(resetAtMsOf(1760046000000), 1760046000000);
+  assert.equal(resetAtMsOf(1760046000), 1760046000000);
+  assert.equal(resetAtMsOf(123), null);
+  assert.equal(resetAtMsOf('not-a-date'), null);
+  assert.equal(resetAtMsOf(null), null);
+  assert.equal(resetAtMsOf(undefined), null);
+});
+
+test('numeric resets survive parsing instead of being dropped', () => {
+  const a = parseLaneAccount({
+    lane: 'claude-1', provider: 'claude', accountKey: 'a1',
+    weekly: { used: 0.66, resetsAt: 1760046000000 },
+    fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
+  }, NOW);
+  assert.equal(a.weekly.utilization, 0.66);
+  assert.equal(a.weekly.resetsAt, 1760046000000);
+  assert.equal(a.weekly.resetsAtMs, 1760046000000);
 });
 
 test('lane body with no accounts array is rejected', () => {

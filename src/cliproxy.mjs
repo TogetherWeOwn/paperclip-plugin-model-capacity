@@ -64,10 +64,26 @@ export function usedRatio(used) {
   return v;
 }
 
+/**
+ * Tolerant reset-timestamp parse: ISO string, epoch millis, or epoch
+ * seconds. Null when unparseable. The lane has sent resets in more than
+ * one of these shapes; dropping a numeric reset silently zeroes the
+ * required-rate math downstream, so every shape is accepted here.
+ */
+export function resetAtMsOf(value) {
+  if (typeof value === 'string') {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value >= 1e12) return value;
+    if (value >= 1e9) return value * 1000;
+  }
+  return null;
+}
+
 function msOrNull(iso) {
-  if (iso == null) return null;
-  const ms = Date.parse(iso);
-  return Number.isNaN(ms) ? null : ms;
+  return resetAtMsOf(iso);
 }
 
 /**
@@ -78,7 +94,8 @@ function msOrNull(iso) {
 export function parseLaneAccount(entry, nowMs = Date.now()) {
   const window = (w) => {
     if (!w || typeof w !== 'object') return { utilization: null, resetsAt: null };
-    return { utilization: usedRatio(w.used), resetsAt: typeof w.resetsAt === 'string' ? w.resetsAt : null };
+    const raw = (typeof w.resetsAt === 'string' || typeof w.resetsAt === 'number') ? w.resetsAt : null;
+    return { utilization: usedRatio(w.used), resetsAt: resetAtMsOf(raw) != null ? raw : null };
   };
   const weekly = window(entry?.weekly);
   const fiveHour = window(entry?.fiveHour);

@@ -1,5 +1,5 @@
 /**
- * Plugin manifest. v0.1.3 = SHADOW: no `run.model.resolve` capability.
+ * Plugin manifest. v0.1.4 = SHADOW: no `run.model.resolve` capability.
  * Another plugin currently holds that capability and two holders conflict,
  * so the resolve hook ships implemented but unwired. v0.2.0 enables it by
  * switching to the `modelResolve` variant (capability + modelRouting).
@@ -11,7 +11,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.1.3';
+export const PLUGIN_VERSION = '0.1.4';
 
 /** Env keys a run.model.resolve decision may set (v0.2.0 variant only). */
 export const MODEL_ROUTING_ENV_KEYS = [
@@ -153,17 +153,31 @@ export function buildManifest({ modelResolve = false } = {}) {
     'agents.read',
     'issues.read',
     'api.routes.register',
+    // Heartbeat-run backfill reads the whitelisted core table
+    // `heartbeat_runs` (SELECT only, via the `database` declaration below).
+    // `migrate` is declared but never exercised: the schema validator pairs
+    // it with `namespace.read` unconditionally, and this plugin owns no
+    // tables (migrations/ is deliberately empty). Never `namespace.write`.
+    'database.namespace.read',
+    'database.namespace.migrate',
   ];
   const out = {
     id: PLUGIN_ID,
     apiVersion: 1,
     version: PLUGIN_VERSION,
     displayName: 'Model Capacity (Shadow)',
-    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.3 observes only; it changes no runs and holds no resolve capability.',
+    description: 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. v0.1.4 observes only; it changes no runs and holds no resolve capability.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
     entrypoints: { worker: './src/worker.mjs' },
+    database: {
+      namespaceSlug: 'model_capacity',
+      migrationsDir: './migrations',
+      // Exactly the one core table the shadow tick reads (restricted
+      // SELECT in plugin.mjs RUNS_SQL); nothing else is allowlisted.
+      coreReadTables: ['heartbeat_runs'],
+    },
     instanceConfigSchema: CONFIG_SCHEMA,
     jobs: [
       {
@@ -217,6 +231,6 @@ export function buildManifest({ modelResolve = false } = {}) {
   return out;
 }
 
-/** v0.1.3 shadow manifest: no resolve capability, no modelRouting. */
+/** v0.1.4 shadow manifest: no resolve capability, no modelRouting. */
 export const manifest = buildManifest();
 export default manifest;

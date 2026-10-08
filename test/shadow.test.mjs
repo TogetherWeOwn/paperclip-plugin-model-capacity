@@ -61,7 +61,7 @@ const dbRow = (id, startedAtMs, model = 'claude-sonnet-5-5', provider = 'claude'
   started_at: new Date(startedAtMs).toISOString(), finished_at: null, model, provider,
 });
 
-function drive({ nowMs, laneUsed, dbRows = [], dbError = null, withEvents = null, secondNowMs = null, secondLaneUsed = null }) {
+function drive({ nowMs, laneUsed, laneAccounts = null, dbRows = [], dbError = null, withEvents = null, secondNowMs = null, secondLaneUsed = null }) {
   const lane = { used: laneUsed };
   const store = new Map();
   const jobs = new Map();
@@ -75,7 +75,14 @@ function drive({ nowMs, laneUsed, dbRows = [], dbError = null, withEvents = null
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => laneBody(lane.used) }) },
+    http: {
+      fetch: async () => ({
+        status: 200,
+        json: async () => (laneAccounts
+          ? { observedAt: '2026-10-08T22:59:00Z', accounts: laneAccounts }
+          : laneBody(lane.used)),
+      }),
+    },
     db: { query: async () => { if (dbError) throw new Error(dbError); return dbRows; } },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -138,6 +145,79 @@ test('denied db degrades to events-only; odd event shapes are still kept', async
   assert.equal(capacity.body.runsSource, 'events-only');
   assert.equal(capacity.body.runsDbError, 'db-query-denied');
   assert.equal(capacity.body.runEventsSeen, 1);
+});
+
+test('required rate is a number whenever remaining and reset are known', async () => {
+  // Coordinator live example: claude-lane-1, remaining 0.34, weekly reset
+  // 2026-10-09T19:00Z, tick at 2026-10-08T23:00Z => 0.34/20h = 0.017/h.
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [{
+      lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
+      weekly: { used: 0.66, resetsAt: '2026-10-09T19:00:00Z' },
+      fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
+      observedAt: '2026-10-08T22:59:00Z', quality: 'live',
+    }],
+    dbRows: [dbRow('run-1', TICK - 5 * 60000)],
+  });
+  const { capacity } = await run();
+  const claude = capacity.body.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(claude.remainingPct - 0.34) < 1e-9);
+  assert.ok(Math.abs(claude.hoursToReset - 20) < 1e-9);
+  assert.ok(Math.abs(claude.requiredRatePerHour - 0.017) < 1e-9);
+});
+
+test('required rate is null (not zero) when the reset is unknown', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [{
+      lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
+      weekly: { used: 0.5, resetsAt: null },
+      fiveHour: { used: 0.1, resetsAt: null },
+      observedAt: '2026-10-08T22:59:00Z', quality: 'cached',
+    }],
+    dbRows: [],
+  });
+  const { capacity } = await run();
+  const claude = capacity.body.accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(claude.remainingPct, 0.5);
+  assert.equal(claude.hoursToReset, null);
+  assert.equal(claude.requiredRatePerHour, null);
+});
+
+test('shadow entry records actualModel and whether shadow agreed with reality', async () => {
+  const { run } = drive({
+    nowMs: TICK, laneUsed: 0.3,
+    dbRows: [
+      // Cheapest rung-0 arm is claude-haiku-5-5: shadow agrees here.
+      dbRow('run-agree', TICK - 5 * 60000, 'claude-haiku-5-5', 'claude'),
+      // A costlier actual model on the same account: shadow disagrees.
+      dbRow('run-other', TICK - 4 * 60000, 'claude-opus-5-5', 'claude'),
+    ],
+  });
+  const { shadow } = await run();
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  assert.equal(byId.get('run-agree').actualModel, 'claude-haiku-5-5');
+  assert.equal(byId.get('run-agree').modelMatch, true);
+  assert.equal(byId.get('run-other').actualModel, 'claude-opus-5-5');
+  assert.equal(byId.get('run-other').modelMatch, false);
+});
+
+test('event-seen run keeps its place but takes its model from the db row', async () => {
+  const at = new Date(TICK - 2 * 60000).toISOString();
+  const { run } = drive({
+    nowMs: TICK, laneUsed: 0.3,
+    dbRows: [dbRow('run-7', TICK - 2 * 60000, 'claude-haiku-5-5', 'claude')],
+    withEvents: [{
+      companyId: 'acme', entityId: 'run-7',
+      payload: { run: { agentId: 'agent-9' } }, // no model on the event
+      occurredAt: at,
+    }],
+  });
+  const { shadow } = await run();
+  assert.equal(shadow.body.entries.length, 1);
+  assert.equal(shadow.body.entries[0].actualModel, 'claude-haiku-5-5');
+  assert.equal(shadow.body.entries[0].modelMatch, true);
 });
 
 test('two rising readings plus runs in span calibrate E and recommend a target', async () => {

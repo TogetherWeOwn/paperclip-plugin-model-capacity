@@ -293,16 +293,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return null;
   }
 
-  /** Merge event-buffered and db runs, newest first, deduped by run id. */
+  /**
+   * Merge event-buffered and db runs, newest first, deduped by run id.
+   * The event buffer usually wins the race but carries no model; the db
+   * row does. So on a duplicate id the FIRST record keeps its place while
+   * null fields (model, provider, agentId) are backfilled from the later
+   * duplicate instead of dropping it -- otherwise actualModel stays
+   * 'unknown' forever on runs the event feed saw first.
+   */
   function mergeRuns(buffered, dbRuns, nowMs, windowMs) {
-    const seen = new Set();
-    const out = [];
+    const byId = new Map();
     for (const r of [...(buffered ?? []), ...(dbRuns ?? [])]) {
-      if (!r || seen.has(r.runId) || nowMs - r.at > windowMs) continue;
-      seen.add(r.runId);
-      out.push(r);
+      if (!r || r.runId == null || nowMs - r.at > windowMs) continue;
+      const prev = byId.get(r.runId);
+      if (!prev) {
+        byId.set(r.runId, { ...r });
+        continue;
+      }
+      for (const k of ['model', 'provider', 'agentId']) {
+        if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
+      }
+      if ((prev.status == null) && r.status != null) prev.status = r.status;
+      if (r.at > prev.at) prev.at = r.at;
     }
-    return out.sort((a, b) => b.at - a.at);
+    return [...byId.values()].sort((a, b) => b.at - a.at);
   }
 
   async function runShadowTick(companyId, job) {
@@ -322,11 +336,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const key = accountKey(account);
       const weeklyUsed = account.weekly?.utilization;
       const fiveHourUsed = account.fiveHour?.utilization;
-      const resetAtMs = account.weekly?.resetsAt ? Date.parse(account.weekly.resetsAt) : null;
+      // resetsAtMs is parsed once in the lane client (ISO, epoch ms, or
+      // epoch s); never re-parse the raw shape here.
+      const resetAtMs = account.weekly?.resetsAtMs ?? null;
       const remaining = weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null;
-      const hoursToReset = resetAtMs != null && !Number.isNaN(resetAtMs)
+      // Unknown reset means unknown horizon: null, never a silent 168h.
+      // Internal math that needs a finite horizon falls back to 168h
+      // separately; the reported required rate stays honest.
+      const hoursToReset = resetAtMs != null
         ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
-        : 168;
+        : null;
       // Rate inputs: append this reading, then measure over the trailing window.
       let history = rateHistories[key] ?? [];
       if (weeklyUsed != null) history = appendUtilReading(history, { atMs: nowMs, usedPct: weeklyUsed }, nowMs);
@@ -334,7 +353,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const measured = weeklyUsed != null
         ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
         : null;
-      const required = remaining != null ? requiredRatePerHour({ remainingPct: remaining, hoursToReset }) : 0;
+      // Required rate needs no history and no calibration: whenever the
+      // remaining fraction and the reset are both known it is a number.
+      // Null (unknown) only when an input is missing -- never a 0 that
+      // would read as "burn nothing".
+      const required = remaining != null && hoursToReset != null
+        ? requiredRatePerHour({ remainingPct: remaining, hoursToReset })
+        : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
       const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
@@ -343,7 +368,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
         {
           measuredRatePerHour: measured?.ratePerHour ?? null,
-          requiredRatePerHour: required,
+          requiredRatePerHour: required ?? 0,
           positionError,
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
@@ -465,11 +490,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
       }
       if (decision) {
+        const wouldModel = `${decision.model}(${decision.effort ?? 'default'})`;
+        const actualModel = run.model ?? 'unknown';
         ring.push({
           runId: run.runId,
           agentId: run.agentId,
-          actualModel: run.model ?? 'unknown',
-          wouldModel: `${decision.model}(${decision.effort ?? 'default'})`,
+          actualModel,
+          wouldModel,
+          // Did shadow agree with reality? Null while the actual model is
+          // still unknown (events-only feed); true/false once known.
+          modelMatch: actualModel === 'unknown' ? null : (actualModel === decision.model || actualModel === wouldModel),
           account: decision.accountId,
           accountId: decision.accountId,
           rung: decision.rung,
@@ -694,7 +724,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         const st = pacingState[key] ?? { pointer: 0 };
         return {
           accountId: key,
-          resetAtMs: a.weekly?.resetsAt ? Date.parse(a.weekly.resetsAt) : null,
+          resetAtMs: a.weekly?.resetsAtMs ?? null,
           remainingPct: a.weekly?.utilization != null ? Math.max(0, 1 - a.weekly.utilization) : 0,
           fiveHourUsedPct: a.fiveHour?.utilization ?? null,
           pointer: st.guardActive ? 0 : st.pointer ?? 0,
