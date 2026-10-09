@@ -310,6 +310,32 @@ test('rung gate: one newcomer held against TWO incumbents keeps both', () => {
   assert.deepEqual(t3.dominated, []);
 });
 
+test('rung gate: aliasing held pairs stay distinct (NUL join)', () => {
+  // "ab"+"cd" and "a"+"bcd" alias under bare concatenation: a persisted hold
+  // on (a, bcd) must NOT gate the (ab, cd) pair. All arms are incumbents
+  // here, so the gate applies ONLY via held -- fixed code drops cd by strict
+  // dominance, the aliased code wrongly keeps it within noise.
+  const entries = () => ([
+    { armId: 'ab', Q: 1.5, C: 4, coverage: 1 },
+    { armId: 'cd', Q: 1.0, C: 5, coverage: 1 },
+    { armId: 'a', Q: 0.5, C: 3, coverage: 1 },
+    { armId: 'bcd', Q: 1.6, C: 9, coverage: 1 },
+  ]);
+  const prev = () => ([
+    { armId: 'ab', rung: 1 }, { armId: 'cd', rung: 2 },
+    { armId: 'a', rung: 0 }, { armId: 'bcd', rung: 3 },
+  ]);
+  const gate = new Map([
+    ['ab', { score: 66.0, se: se(62.9, 69.1) }],
+    ['cd', { score: 64.85, se: se(61.74, 67.96) }],
+  ]);
+  const { rungs, dominated, withinNoise } = buildLadder(
+    entries(), prev(), gate, [{ challenger: 'a', incumbent: 'bcd' }]);
+  assert.deepEqual(rungs.map(r => r.armId), ['a', 'ab', 'bcd']);
+  assert.deepEqual(dominated, ['cd']);
+  assert.deepEqual(withinNoise, []);
+});
+
 test('rung gate: a 25-point gap knocks out; missing SE keeps today behavior', () => {
   const gate = new Map([
     ['i', { score: 41.82, se: se(38.59, 45.05) }],
