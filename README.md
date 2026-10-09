@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.16, all-providers)
+# Model Capacity plugin (v0.2.17, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -224,11 +224,19 @@ anchor-less records are marked `unverified` and excluded (never
 deleted). The clamp backstop is retired (`clampedInFlightDropped` always
 0): single-counting is structural now.
 
-`GET /caps` spreads the concurrency target over agents with queued/ready
-work (assigned `todo` + `in_progress` issues, grouped by assignee):
-floor 1 per active agent, largest-remainder weighting by queued count,
-never above `maxTotal` (75). Weak calibration (no target) returns
-`agents: []`.
+`GET /caps` splits the concurrency target across agents in proportion to
+CURRENT demand (ledger `running` + assigned `todo`/`in_progress` issues),
+never historical share. Below target every agent covers its full demand
+(idle agents keep `running + 1` headroom) while the want-sum fits the
+fleet ceiling; a wider spike shares the ceiling out by demand instead,
+so one more queued item never halves the fleet and the fleet sum stays
+within `maxTotal` (75). Every shed is running-first: each agent keeps its
+running count, then only the remaining new slots split by demand share --
+at/above target the fleet starts nothing new. No cap lands below
+`running`; only pre-existing running can hold a total over target.
+Each entry reports `demand`, `running`, `allocated`, and `reason`
+(`full-demand` | `headroom` | `proportional` | `floor-running` |
+`capped-ceiling`). Weak calibration (no target) returns `agents: []`.
 
 ## Configuration
 

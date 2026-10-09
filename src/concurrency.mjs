@@ -132,6 +132,117 @@ export function distributeWeightedCaps(target, demands, maxTotal = 75) {
   return active.map((a, i) => ({ agentId: a.agentId, maxConcurrentRuns: 1 + extras[i] }));
 }
 
+/**
+ * Demand-aware per-agent caps. Demand is current, never historical:
+ * demand = running + queued. Below the fleet target there is no throttle
+ * pressure, so every agent covers its full demand (idlers keep running+1
+ * headroom) -- a cap below running would throttle work that already exists
+ * while the fleet idles -- but only while the want-sum fits the fleet
+ * ceiling: a wider spike shares the ceiling out instead. Every shed is
+ * running-first: each agent keeps its running count, then only the
+ * remaining new slots split by demand share (largest remainder). Floors
+ * therefore cannot overshoot the split (running is subtracted before
+ * splitting, never floored after): at/above target the fleet starts
+ * nothing new, and only pre-existing running can hold a total over the
+ * split or ceiling. Reported as-is, never hidden.
+ *
+ * agents: [{ agentId, running, queued, overPace }].
+ * Returns [{ agentId, demand, running, queued, allocated, maxConcurrentRuns,
+ * reason }] with reason in full-demand | headroom | proportional |
+ * floor-running | capped-ceiling. maxConcurrentRuns mirrors allocated for
+ * the existing /caps consumer.
+ */
+export function allocateDemandCaps(target, agents, maxTotal = 75) {
+  const list = (agents ?? [])
+    .filter(a => a && typeof a.agentId === 'string' && a.agentId.length > 0)
+    .map(a => ({
+      agentId: a.agentId,
+      running: Math.max(0, Math.floor(a.running ?? 0)),
+      queued: Math.max(0, Math.floor(a.queued ?? 0)),
+      overPace: a.overPace === true,
+    }))
+    .filter(a => a.running + a.queued > 0)
+    .sort((x, y) => ((y.running + y.queued) - (x.running + x.queued)) || (x.agentId < y.agentId ? -1 : 1));
+  if (list.length === 0 || target == null) return [];
+  const ceiling = Math.max(1, Math.floor(maxTotal));
+  const T = Math.max(0, Math.round(target));
+  const totalRunning = list.reduce((s, a) => s + a.running, 0);
+  const out = list.map(a => ({ ...a, demand: a.running + a.queued, allocated: 0, reason: 'proportional' }));
+  // The ceiling never undercuts running: a cap below running is fiction.
+  const applyCeiling = (e, computed, reason) => {
+    if (computed <= ceiling) { e.allocated = computed; e.reason = reason; }
+    else if (ceiling <= e.running) { e.allocated = e.running; e.reason = 'floor-running'; }
+    else { e.allocated = ceiling; e.reason = 'capped-ceiling'; }
+  };
+  // Running-first shed shared by the at/above-target branch and the
+  // below-target queue-spike fallback: every agent keeps its running count,
+  // then only R = max(0, S - totalRunning) NEW slots split by demand share
+  // (largest remainder). Subtracting running before splitting (instead of
+  // flooring after) means floored agents never inflate the others' shares:
+  // at/above target R = 0 and the fleet starts nothing new. S clamps to the
+  // ceiling here (unconditional fleet bound, like the predecessor;
+  // production C* arrives pre-clamped anyway); the per-agent ceiling in
+  // applyCeiling stays as backstop. The old over-pace trim is retired: with
+  // running subtracted first every trim candidate is already at running,
+  // so there is nothing left to trim (and the below-target fallback skips
+  // it per review). Only pre-existing running can hold a total over S.
+  const shedProportionally = (S) => {
+    S = Math.min(S, ceiling);
+    const R = Math.max(0, S - totalRunning);
+    // New slots follow UNSATISFIED demand (queued + 1 so an idle agent keeps
+    // its running+1 headroom claim): weighting by full demand would let
+    // already-held running outshout real queue, starving the agents that
+    // actually wait while over-feeding agents past their own want.
+    const needWeights = out.map(e => e.queued + 1);
+    const needTotal = needWeights.reduce((s, w) => s + w, 0);
+    const extras = needTotal > 0 ? largestRemainder(R, needWeights) : out.map(() => 0);
+    out.forEach((e, i) => applyCeiling(e, e.running + extras[i], 'proportional'));
+  };
+  if (T <= 0) {
+    // Explicit shed: hold running, start nothing.
+    for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
+  } else if (totalRunning < T) {
+    const wants = out.map(e => Math.max(e.demand, e.running + 1));
+    // A lone spike can still be capped per-agent under the ceiling (keeps
+    // the capped-ceiling label); a fleet-wide spike sheds proportionally.
+    const cappedWants = wants.map(w => Math.min(w, ceiling));
+    if (cappedWants.reduce((s, w) => s + w, 0) <= ceiling) {
+      out.forEach((e, i) => applyCeiling(e, wants[i], e.demand >= e.running + 1 ? 'full-demand' : 'headroom'));
+    } else {
+      // Fleet-wide queue spike: full demand would overshoot the fleet
+      // ceiling, so share the CEILING out (not the target -- one more
+      // queued item must never halve the fleet) instead of treating
+      // maxTotal as per-agent. Running kept first, as above.
+      shedProportionally(ceiling);
+    }
+  } else {
+    shedProportionally(T);
+  }
+  return out.map(e => ({
+    agentId: e.agentId, demand: e.demand, running: e.running, queued: e.queued,
+    allocated: e.allocated, maxConcurrentRuns: e.allocated, reason: e.reason,
+  }));
+}
+
+/** Integer split of total by weights, largest remainder, index-stable. */
+function largestRemainder(total, weights) {
+  const wTotal = weights.reduce((s, w) => s + w, 0);
+  if (wTotal <= 0) return weights.map(() => 0);
+  const raw = weights.map(w => (total * w) / wTotal);
+  const base = raw.map(Math.floor);
+  let left = total - base.reduce((s, b) => s + b, 0);
+  const extra = new Array(weights.length).fill(0);
+  const order = raw
+    .map((r, i) => ({ i, rest: r - base[i], w: weights[i] }))
+    .sort((a, b) => (b.rest - a.rest) || (b.w - a.w) || (a.i - b.i));
+  for (const o of order) {
+    if (left <= 0) break;
+    extra[o.i] += 1;
+    left -= 1;
+  }
+  return base.map((b, i) => b + extra[i]);
+}
+
 /** Spread an integer slot target across agents with queued/ready work. */
 export function distributeCaps(target, agentIds) {
   const ids = [...new Set(agentIds ?? [])].sort();

@@ -5,8 +5,8 @@ import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MO
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.16');
-  assert.equal(PLUGIN_VERSION, '0.2.16');
+  assert.equal(manifest.version, '0.2.17');
+  assert.equal(PLUGIN_VERSION, '0.2.17');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -78,4 +78,10 @@ test('v0.2.13 schema declares trials and modelAaOverrides', () => {
   assert.deepEqual(props.trials.properties.adapters.default, { claude_local: ['*'], 'claude-code': ['*'] });
   assert.deepEqual(props.modelAaOverrides.default, {});
   assert.deepEqual(buildManifest({ modelResolve: false }).instanceConfigSchema.properties.trials, props.trials);
+});
+
+test('package.json version tracks PLUGIN_VERSION (no release drift)', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
+  assert.equal(pkg.version, PLUGIN_VERSION);
 });

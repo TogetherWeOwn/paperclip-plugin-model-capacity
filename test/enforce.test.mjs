@@ -239,17 +239,30 @@ test('caps: measured target spreads over queued agents weighted by count', async
   d.setNow(TICK + 20 * 60000);
   await d.fire(runEvent('run-b', TICK + 20 * 60000));
   d.setNow(TICK + 30 * 60000);
-  d.setLane(0.328);
+  // Small burn delta over the two runs = efficient runs = a target (about 8)
+  // comfortably above the 2 in-flight runs, so the below-target branch holds.
+  d.setLane(0.3002);
   await d.tick();
   const caps = await d.api('caps');
   assert.ok(caps.body.target > 0);
   // agent-a queues 3, agent-b queues 2 (i2 deduped); unassigned and done excluded.
-  assert.deepEqual(caps.body.agents.map(a => a.agentId), ['agent-a', 'agent-b']);
-  const total = caps.body.agents.reduce((s, a) => s + a.maxConcurrentRuns, 0);
-  assert.equal(total, Math.min(Math.max(Math.round(caps.body.target), 2), 75));
-  assert.ok(caps.body.agents.every(a => a.maxConcurrentRuns >= 1));
-  const a = new Map(caps.body.agents.map(x => [x.agentId, x.maxConcurrentRuns]));
-  assert.ok(a.get('agent-a') >= a.get('agent-b'));
+  // The two fired runs (agent-9, still running) join via ledger running counts.
+  assert.deepEqual(caps.body.agents.map(a => a.agentId), ['agent-a', 'agent-9', 'agent-b']);
+  // Demand-aware: below target every agent covers its full demand (no
+  // running here), so the total is demand, not the target.
+  const byId = new Map(caps.body.agents.map(x => [x.agentId, x]));
+  assert.deepEqual(byId.get('agent-a'), {
+    agentId: 'agent-a', demand: 3, running: 0, queued: 3,
+    allocated: 3, maxConcurrentRuns: 3, reason: 'full-demand',
+  });
+  assert.equal(byId.get('agent-b').allocated, 2);
+  assert.equal(byId.get('agent-b').reason, 'full-demand');
+  assert.ok(byId.get('agent-a').allocated >= byId.get('agent-b').allocated);
+  // Running-only agent: no queue, keeps running+1 headroom below target.
+  assert.deepEqual(byId.get('agent-9'), {
+    agentId: 'agent-9', demand: 2, running: 2, queued: 0,
+    allocated: 3, maxConcurrentRuns: 3, reason: 'headroom',
+  });
 });
 
 test('caps: issues denial degrades to a sanitized code, never upstream text', async () => {

@@ -242,3 +242,17 @@ test('merge keeps base records the overlay never saw', () => {
   assert.equal(merged.get('x').decidedAccount, 'kimi:k2');
   assert.ok(merged.has('y'));
 });
+
+test("trialInflight counts a '__proto__' family without polluting Object.prototype", () => {
+  const ledger = createLedger();
+  const now = 1_750_000_000_000;
+  recordStart(ledger, { runId: 'p1', agentId: 'a' }, now - 1000);
+  recordStart(ledger, { runId: 'p2', agentId: 'a' }, now - 1000);
+  Object.assign(ledger.get('p1'), { trial: true, family: '__proto__' });
+  Object.assign(ledger.get('p2'), { trial: true, family: 'kimi' });
+  const counts = trialInflight(ledger, { nowMs: now });
+  assert.equal(counts['__proto__'], 1);
+  assert.equal(counts.kimi, 1);
+  assert.equal({}.__proto__, Object.prototype);
+  assert.equal(Object.prototype.trial, undefined);
+});
