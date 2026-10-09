@@ -1,6 +1,5 @@
 {
   "cliproxy": {
-    "baseUrl": "https://lane-host.invalid",
     "accountsPath": "/telemetry/cliproxy/live/accounts.json",
     "laneKeySecretRef": null,
     "cacheTtlSec": 45

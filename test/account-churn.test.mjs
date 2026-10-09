@@ -78,7 +78,7 @@ function drive({ config = {}, lanes = [], agentGets = {}, aa = baseAa(), ringSee
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: (ms) => { now = ms; },
     setLanes: (next) => { currentLanes = next; },

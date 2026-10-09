@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { DEFAULT_BASE_URL, isPlaceholderLaneHost, buildLaneRequest } from '../src/cliproxy.mjs';
+import { DEFAULT_BASE_URL, isPlaceholderLaneHost, assertLaneHostPinned, buildLaneRequest } from '../src/cliproxy.mjs';
 import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 import { LANE_BASE_URL_ALLOWLIST, manifest, enforceManifest } from '../src/manifest.mjs';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
@@ -50,6 +50,58 @@ test('placeholder detection covers only RFC 2606 .invalid hosts', () => {
   assert.equal(isPlaceholderLaneHost('https://lane.example.com'), false);
   assert.equal(isPlaceholderLaneHost('https://invalid.example.com'), false);
   assert.equal(isPlaceholderLaneHost('not a url'), false);
+});
+
+test('assertLaneHostPinned throws only for a placeholder host', () => {
+  assert.throws(() => assertLaneHostPinned('https://lane-host.invalid'), /cliproxy-lane-host-unpinned/);
+  assert.throws(() => assertLaneHostPinned('https://a.b.invalid'), /cliproxy-lane-host-unpinned/);
+  assert.doesNotThrow(() => assertLaneHostPinned('https://lane.example.com'));
+  // The default argument is the build pin: an unpinned build throws.
+  if (isPlaceholderLaneHost()) assert.throws(() => assertLaneHostPinned(), /cliproxy-lane-host-unpinned/);
+  else assert.doesNotThrow(() => assertLaneHostPinned());
+});
+
+const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
+const AA_STATE_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
+
+test('the lane secret is read only after the pin check, by default', async () => {
+  const now = Date.parse('2026-10-08T23:00:00Z');
+  const store = new Map();
+  const jobs = new Map();
+  const calls = { resolve: 0, fetch: [], errors: [] };
+  const fake = {
+    config: { get: async () => ({ cliproxy: { laneKeySecretRef: SECRET } }) },
+    state: { get: async k => store.get(JSON.stringify(k)) ?? null, set: async (k, v) => { store.set(JSON.stringify(k), v); } },
+    secrets: { resolve: async () => { calls.resolve += 1; return 'lane-key'; } },
+    http: { fetch: async url => { calls.fetch.push(url); return { status: 200, json: async () => ({ accounts: [] }) }; } },
+    agents: { get: async () => null },
+    issues: { get: async () => null },
+    jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+    events: { on() {} },
+    logger: { info() {}, error: (_m, e) => calls.errors.push(e?.error) },
+  };
+  // No requirePinnedLaneHost override: this is the deployed configuration.
+  const plugin = createModelCapacityPlugin({ clock: () => now });
+  await plugin.setup(fake);
+  store.set(JSON.stringify(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: [], duplicateSlugs: [] });
+  await plugin.onConfigChanged({ cliproxy: { laneKeySecretRef: SECRET } }, { companyId: 'acme' });
+  if (isPlaceholderLaneHost()) {
+    await assert.rejects(() => jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+    assert.deepEqual(calls.errors, ['cliproxy-lane-host-unpinned']);
+    assert.equal(calls.resolve, 0, 'unpinned build must not resolve the lane secret');
+    assert.deepEqual(calls.fetch, [], 'unpinned build must not issue any request');
+  } else {
+    await jobs.get('shadow-tick')({});
+    assert.equal(calls.resolve, 1);
+    assert.equal(calls.fetch.length, 1);
+    assert.ok(calls.fetch[0].startsWith(LANE_BASE_URLS[0]));
+  }
+});
+
+test('the worker entry never disables the pin guard', () => {
+  const worker = readFileSync(join(ROOT, 'src', 'worker.mjs'), 'utf8');
+  assert.match(worker, /createModelCapacityPlugin\(\)/);
+  assert.doesNotMatch(worker, /requirePinnedLaneHost/);
 });
 
 test('onHealth degrades when the build did not pin a lane host', async () => {
@@ -114,7 +166,9 @@ test('public files name only allowlisted hosts (no internal host in the tree)', 
   assert.deepEqual(offenders, []);
 });
 
-test('example config pins the placeholder, not a real host', () => {
+test('example config validates against any pin: it does not set baseUrl', () => {
   const example = JSON.parse(readFileSync(join(ROOT, 'config.example.json'), 'utf8'));
-  assert.equal(isPlaceholderLaneHost(example.cliproxy.baseUrl), true);
+  assert.equal(example.cliproxy.baseUrl, undefined);
+  assert.deepEqual(validateConfigShape(example), []);
+  assert.equal(resolveConfig(example).cliproxy.baseUrl, LANE_BASE_URLS[0]);
 });

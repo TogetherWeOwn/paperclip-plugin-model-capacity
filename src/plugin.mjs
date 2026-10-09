@@ -28,6 +28,7 @@ import {
   LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
   isPlaceholderLaneHost,
+  assertLaneHostPinned,
   buildLaneRequest,
   assertLaneRequest,
   parseLaneBody,
@@ -474,7 +475,11 @@ function windowStartMs(resetsAtMs) {
   return resetsAtMs - WEEKLY_WINDOW_MS;
 }
 
-export function createModelCapacityPlugin({ clock = Date.now } = {}) {
+// `requirePinnedLaneHost` is a test seam: the unit suite drives the lane
+// read against the public placeholder pin with a fake http client. The
+// worker entry never passes it, so every deployed plugin refuses to read
+// the lane key unless the build pinned a real host.
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true } = {}) {
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -525,6 +530,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * code path can fetch anywhere else.
    */
   async function cliproxyLaneGet(companyId, config) {
+    if (requirePinnedLaneHost) assertLaneHostPinned(config.cliproxy.baseUrl);
     const laneKey = await ctx.secrets.resolve(config.cliproxy.laneKeySecretRef, { companyId, configPath: 'cliproxy.laneKeySecretRef' });
     const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
     assertLaneRequest({ method: req.method, url: req.url, body: null },
