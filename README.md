@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-# Model Capacity plugin (v0.2.16, all-providers)
-=======
-# Model Capacity plugin (v0.2.15, all-providers)
->>>>>>> 3ef3f76 (feat(model-capacity): demand-aware per-agent caps from current demand)
+# Model Capacity plugin (v0.2.17, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
