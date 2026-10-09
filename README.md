@@ -228,15 +228,15 @@ deleted). The clamp backstop is retired (`clampedInFlightDropped` always
 CURRENT demand (ledger `running` + assigned `todo`/`in_progress` issues),
 never historical share. Below target every agent covers its full demand
 (idle agents keep `running + 1` headroom) while the want-sum fits the
-fleet ceiling; a queue spike that would overshoot it sheds
-proportionally instead, so the fleet sum stays within `maxTotal` (75).
-At/above target the split is proportional by demand share, floored at
-`running`, trimming over-pace burners with the most in-flight first.
-No cap lands below `running`.
+fleet ceiling; a wider spike shares the ceiling out by demand instead,
+so one more queued item never halves the fleet and the fleet sum stays
+within `maxTotal` (75). Every shed is running-first: each agent keeps its
+running count, then only the remaining new slots split by demand share --
+at/above target the fleet starts nothing new. No cap lands below
+`running`; only pre-existing running can hold a total over target.
 Each entry reports `demand`, `running`, `allocated`, and `reason`
 (`full-demand` | `headroom` | `proportional` | `floor-running` |
-`trimmed-over-pace` | `capped-ceiling`). Weak calibration (no target)
-returns `agents: []`.
+`capped-ceiling`). Weak calibration (no target) returns `agents: []`.
 
 ## Configuration
 

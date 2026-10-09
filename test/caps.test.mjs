@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { allocateDemandCaps } from '../src/concurrency.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 
-const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'trimmed-over-pace', 'capped-ceiling']);
+const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'capped-ceiling']);
 
 // The live 08:00Z shape: DevOps 6 running + 11 queued with total running 15
 // far below target 35. No throttle pressure: DevOps covers its full demand.
@@ -47,19 +47,35 @@ test('at/above target: proportional shares floored at running', () => {
   assert.ok(agents.every(a => a.reason === 'proportional'));
 });
 
-test('above target: over-pace agent with most in-flight trims to running', () => {
+test('above target: firewall holds, fleet starts nothing new', () => {
+  // Review round 3: A and B run 20 each, C has 60 queued, target 35. The old
+  // floor-after-split handed C 21 new slots (sum 61 on 40 running). Running
+  // is now subtracted before splitting, so R = 0 and every agent holds.
+  const agents = allocateDemandCaps(35, [
+    { agentId: 'a', running: 20, queued: 0, overPace: false },
+    { agentId: 'b', running: 20, queued: 0, overPace: true },
+    { agentId: 'c', running: 0, queued: 60, overPace: false },
+  ]);
+  const byId = new Map(agents.map(a => [a.agentId, a]));
+  assert.equal(byId.get('a').allocated, 20);
+  assert.equal(byId.get('b').allocated, 20);
+  assert.equal(byId.get('c').allocated, 0);
+  assert.ok(agents.every(a => a.reason === 'proportional'));
+  // Zero new slots: the sum is exactly the pre-existing running count.
+  assert.equal(agents.reduce((s, a) => s + a.allocated, 0), 40);
+  assert.equal(agents.reduce((s, a) => s + Math.max(0, a.allocated - a.running), 0), 0);
+});
+
+test('above target with headroom in target still grants nothing new past running', () => {
+  // totalRunning 15 >= T 12: R = 0, both agents hold running, over-pace or not.
   const agents = allocateDemandCaps(12, [
     { agentId: 'hot', running: 4, queued: 16, overPace: true },
     { agentId: 'steady', running: 11, queued: 0, overPace: false },
   ]);
   const byId = new Map(agents.map(a => [a.agentId, a]));
-  // Shares split 12 by 20:11 -> 8/4; hot trims 8 -> 4, steady floors at 11.
   assert.equal(byId.get('hot').allocated, 4);
-  assert.equal(byId.get('hot').reason, 'trimmed-over-pace');
   assert.equal(byId.get('steady').allocated, 11);
-  assert.equal(byId.get('steady').reason, 'floor-running');
-  // Floors hold the sum above target; reported, never hidden.
-  assert.ok(agents.reduce((s, a) => s + a.allocated, 0) > 12);
+  assert.ok(agents.every(a => a.reason === 'proportional'));
 });
 
 test('floors are absolute: shed target and ceiling never undercut running', () => {
@@ -80,9 +96,11 @@ test('empty and null targets allocate nothing', () => {
   assert.deepEqual(allocateDemandCaps(10, [{ agentId: '', running: 1, queued: 1 }]), []);
 });
 
-test('below-target queue spike sheds proportionally within maxTotal', () => {
+test('below-target queue spike shares the ceiling, not the target', () => {
   // Review PoC: 5 x {running:1, queued:20} at target 35, maxTotal 75 had
-  // allocated [21 x 5] = 105, overshooting the fleet ceiling.
+  // allocated [21 x 5] = 105, overshooting the fleet ceiling. Running-first
+  // shares the ceiling out: R = 75 - 5 = 70 by demand, 14 each on top of
+  // running 1.
   const spike = Array.from({ length: 5 }, (_, i) => ({ agentId: `a${i}`, running: 1, queued: 20, overPace: false }));
   const agents = allocateDemandCaps(35, spike, 75);
   const sum = agents.reduce((s, a) => s + a.allocated, 0);
@@ -92,8 +110,42 @@ test('below-target queue spike sheds proportionally within maxTotal', () => {
     assert.equal(a.maxConcurrentRuns, a.allocated);
     assert.ok(REASONS.has(a.reason), a.reason);
   }
-  // Equal demands split the target evenly.
-  assert.deepEqual(agents.map(a => a.allocated), [7, 7, 7, 7, 7]);
+  // Equal demands split the ceiling remainder evenly.
+  assert.deepEqual(agents.map(a => a.allocated), [15, 15, 15, 15, 15]);
+});
+
+test('one more queued item never halves the fleet (14 -> 15 stays 15)', () => {
+  // Review round 3: 5 x {running:1, queued:14} got 15 each (wants fit the
+  // ceiling exactly); one more queued item each fell back to sharing the
+  // target and every agent dropped to 7. The fallback now shares the
+  // ceiling, so both land on 15.
+  for (const queued of [14, 15]) {
+    const agents = allocateDemandCaps(35,
+      Array.from({ length: 5 }, (_, i) => ({ agentId: `a${i}`, running: 1, queued, overPace: i === 0 })),
+      75);
+    assert.deepEqual(agents.map(a => a.allocated), [15, 15, 15, 15, 15], `queued=${queued}`);
+  }
+});
+
+test("more queued never lowers an agent's own cap (monotone sweep)", () => {
+  // Deterministic sweep across the fit/fallback boundary: own queued rises
+  // 0..30 against fixed teammates, own allocation never drops.
+  const teammates = [
+    { agentId: 't0', running: 3, queued: 18, overPace: false },
+    { agentId: 't1', running: 0, queued: 22, overPace: true },
+    { agentId: 't2', running: 7, queued: 2, overPace: false },
+  ];
+  let prev = -1;
+  for (let q = 0; q <= 30; q++) {
+    const agents = allocateDemandCaps(35, [
+      { agentId: 'me', running: 2, queued: q, overPace: q % 2 === 0 },
+      ...teammates,
+    ], 75);
+    const me = agents.find(a => a.agentId === 'me');
+    assert.ok(me.allocated >= me.running, `q=${q}: cap below running`);
+    assert.ok(me.allocated >= prev, `q=${q}: cap ${me.allocated} < prev ${prev} (non-monotone)`);
+    prev = me.allocated;
+  }
 });
 
 test("a '__proto__' agentId counts in caps without polluting Object.prototype", () => {

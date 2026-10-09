@@ -2208,10 +2208,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
         // Demand-aware caps: C* splits across agents in proportion to
         // CURRENT demand (running + queued), never historical share. Below
-        // the target every agent covers its full demand; at/above it the
-        // allocator sheds over-pace burners first. No cap lands below an
-        // agent's running count -- throttling existing runs while the fleet
-        // idles is the failure this replaces.
+        // the target every agent covers its full demand; every shed is
+        // running-first (at/above target the fleet starts nothing new). No
+        // cap lands below an agent's running count -- throttling existing
+        // runs while the fleet idles is the failure this replaces.
         const runningByAgent = cap.agentRunning ?? {};
         const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
         const agents = allocateDemandCaps(
