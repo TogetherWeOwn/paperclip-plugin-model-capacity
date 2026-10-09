@@ -1,19 +1,23 @@
-# Model Capacity plugin (v0.2.4, all-providers)
+# Model Capacity plugin (v0.2.5, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-**v0.2.1 = ENFORCE-CAPABLE, default off.** The manifest holds
-`run.model.resolve` with a minimal `modelRouting.envKeys` list (only the
-two context-ceiling keys `decide` ever sets). The hook itself is gated by
-the `enforce` config flag (default `false`): with enforcement off it
-answers `keep` and nothing changes. Every minute the tick records what it
-*would* have decided (`GET /shadow`), the concurrency target
-(`GET /capacity`), per-account ladders (`GET /ladder`), and the per-agent
-cap spread (`GET /caps`). `buildManifest({ modelResolve: false })` still
-builds the shadow-only variant for tests.
+**v0.2.5 = SHADOW BY DEFAULT, enforce-capable opt-in.** The default
+manifest (`manifest`, the one `package.json` points at) holds NO
+`run.model.resolve` capability and no `modelRouting`: the plugin observes
+and changes nothing. Every minute the tick records what it *would* have
+decided (`GET /shadow`), the concurrency target (`GET /capacity`),
+per-account ladders (`GET /ladder`), and the per-agent cap spread
+(`GET /caps`); decisions are recorded event-time from `agent.run.started`.
+The enforce-capable variant is `enforceManifest` (= `buildManifest({
+modelResolve: true })`): it adds `run.model.resolve` with a minimal
+`modelRouting.envKeys` list (only the context-ceiling keys `decide` ever
+sets) and is installed only after security sign-off. Even then the hook is
+gated by the `enforce` config flag (default `false`): with enforcement off
+it answers `keep` and nothing changes.
 
 **v0.2.2 = ALL-PROVIDERS.** Arms are data-driven: the lane feed's per-account
 `models` lists are the ONLY provider->models source -- no provider list is
@@ -194,7 +198,7 @@ otherwise, never a silent zero.
 
 ## Layout
 
-- `src/manifest.mjs` -- enforce-capable manifest + `buildManifest` variant flag
+- `src/manifest.mjs` -- shadow-default manifest, opt-in `enforceManifest`, `buildManifest` variant flag
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control

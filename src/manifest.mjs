@@ -1,10 +1,11 @@
 /**
  * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
- * reactive-account eligibility, event-time shadow). v0.2.1 = ENFORCE-CAPABLE: holds `run.model.resolve` with
- * a minimal modelRouting envKeys list, gated at runtime by the `enforce`
- * config flag (default false: the hook answers `keep` until the operator
- * flips it). `buildManifest({ modelResolve: false })` still builds the
- * v0.1.5 shadow variant for tests.
+ * reactive-account eligibility, event-time shadow). v0.2.5 = SHADOW BY
+ * DEFAULT: the default export holds NO `run.model.resolve` capability and no
+ * modelRouting; it observes and records only. The enforce-capable variant
+ * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
+ * ships only after security sign-off; even then the `enforce` config flag
+ * (default false) keeps the hook answering `keep` until the operator flips it.
  *
  * v0.1.2: burn telemetry comes from ONE host-published lane endpoint
  * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
@@ -13,7 +14,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.4';
+export const PLUGIN_VERSION = '0.2.5';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -179,12 +180,12 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. v0.2.1 defaults to the enforcement variant: it holds
- * the `run.model.resolve` capability plus the modelRouting envKeys
- * declaration the host requires with it. Pass `{ modelResolve: false }`
- * for the shadow-only variant (no resolve capability, no modelRouting).
+ * Build the manifest. Defaults to the shadow-only variant (no resolve
+ * capability, no modelRouting). Pass `{ modelResolve: true }` for the
+ * enforcement variant: it holds the `run.model.resolve` capability plus the
+ * modelRouting envKeys declaration the host requires with it.
  */
-export function buildManifest({ modelResolve = true } = {}) {
+export function buildManifest({ modelResolve = false } = {}) {
   const capabilities = [
     'jobs.schedule',
     'plugin.state.read',
@@ -274,6 +275,9 @@ export function buildManifest({ modelResolve = true } = {}) {
   return out;
 }
 
-/** v0.2.1 enforce-capable manifest (runtime-gated by `enforce: false` default). */
+/** Default (and installed-by-default) manifest: shadow only, no resolve capability. */
 export const manifest = buildManifest();
+
+/** Opt-in enforce-capable manifest (runtime-gated by the `enforce: false` default). */
+export const enforceManifest = buildManifest({ modelResolve: true });
 export default manifest;

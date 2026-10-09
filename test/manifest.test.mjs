@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
+import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
 
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.4');
-  assert.equal(PLUGIN_VERSION, '0.2.4');
+  assert.equal(manifest.version, '0.2.5');
+  assert.equal(PLUGIN_VERSION, '0.2.5');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -25,22 +25,27 @@ test('lane endpoint pinned to the allowlist in schema', () => {
   );
 });
 
-test('v0.2.4 default manifest holds run.model.resolve with the exact env keys', () => {
-  assert.ok(manifest.capabilities.includes('run.model.resolve'));
+test('default manifest is shadow-only: no run.model.resolve, no modelRouting', () => {
+  assert.ok(!manifest.capabilities.includes('run.model.resolve'));
+  assert.equal(manifest.modelRouting, undefined);
+  assert.deepEqual(manifest, buildManifest({ modelResolve: false }));
+  assert.deepEqual(manifest, buildManifest());
+});
+
+test('opt-in enforceManifest holds run.model.resolve with the exact env keys', () => {
+  assert.ok(enforceManifest.capabilities.includes('run.model.resolve'));
   // Exactly the env keys decide may set: nothing more, nothing less.
   assert.deepEqual(MODEL_ROUTING_ENV_KEYS, [
     'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
     'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
   ]);
-  assert.deepEqual(manifest.modelRouting.envKeys, MODEL_ROUTING_ENV_KEYS);
-});
-
-test('shadow variant still builds without resolve for comparison tests', () => {
-  const shadow = buildManifest({ modelResolve: false });
-  assert.ok(!shadow.capabilities.includes('run.model.resolve'));
-  assert.equal(shadow.modelRouting, undefined);
-  assert.deepEqual(shadow.database, manifest.database);
+  assert.deepEqual(enforceManifest.modelRouting.envKeys, MODEL_ROUTING_ENV_KEYS);
+  // The only capability the enforce variant adds over the default.
+  assert.deepEqual(
+    enforceManifest.capabilities.filter(c => !manifest.capabilities.includes(c)),
+    ['run.model.resolve'],
+  );
 });
 
 test('enforce kill switch defaults false in schema', () => {
@@ -64,7 +69,7 @@ test('shadow entrypoints use no build step', () => {
   assert.equal(manifest.entrypoints.worker, './src/worker.mjs');
 });
 
-test('v0.2.4 schema declares trials and modelAaOverrides', () => {
+test('v0.2.5 schema declares trials and modelAaOverrides', () => {
   const props = manifest.instanceConfigSchema.properties;
   assert.equal(props.trials.properties.maxInFlightPerAccount.default, 2);
   assert.equal(props.trials.properties.maxInFlightPerFamily.default, 2);
