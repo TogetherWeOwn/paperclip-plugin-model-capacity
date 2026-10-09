@@ -586,24 +586,36 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    */
   // Single-flight loads: concurrent ticks (restart, overlapping runs)
   // share one load promise per company instead of each reading state and
-  // last-writer-wins clobbering the other's in-memory overlay.
+  // last-writer-wins clobbering the other's in-memory overlay. The merge
+  // reads the CURRENT map entry AFTER the awaits, so runs recorded while
+  // the state read was pending (run events, event-time and hook decisions
+  // below) are merged in, never overwritten. Every writer goes through
+  // getOrLoadLedger -- nothing else calls ledgers.set.
   const ledgerLoads = new Map();
+  function ensureLedger(companyId) {
+    let ledger = ledgers.get(companyId);
+    if (!ledger) {
+      ledger = createLedger();
+      ledgers.set(companyId, ledger);
+    }
+    return ledger;
+  }
   async function loadLedger(companyId) {
     const ready = ledgers.get(companyId);
-    if (ledgerReady.has(companyId)) return ready ?? createLedger();
+    if (ledgerReady.has(companyId)) return ready ?? ensureLedger(companyId);
     let pending = ledgerLoads.get(companyId);
     if (!pending) {
       pending = (async () => {
-        let ledger = ledgers.get(companyId);
         const persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
+        let ledger;
         if (persisted.size > 0) {
-          ledger = mergeLedger(persisted, ledger);
+          ledger = mergeLedger(persisted, ledgers.get(companyId));
         } else {
           const legacy = migrateLegacy({
             runs: await ctx.state.get(scopeKey(companyId, LEGACY_RUNS_KEY)),
             ringEntries: await ctx.state.get(scopeKey(companyId, LEGACY_RING_KEY)),
           });
-          ledger = mergeLedger(legacy, ledger);
+          ledger = mergeLedger(legacy, ledgers.get(companyId));
         }
         ledgers.set(companyId, ledger);
         ledgerReady.add(companyId);
@@ -616,6 +628,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       );
     }
     return pending;
+  }
+  // The one entry point for run recording. A state outage must never block
+  // run starts: a failed load falls back to the memory ledger and logs.
+  async function getOrLoadLedger(companyId) {
+    if (ledgerReady.has(companyId)) return ledgers.get(companyId) ?? ensureLedger(companyId);
+    try {
+      return await loadLedger(companyId);
+    } catch (error) {
+      ctx.logger.error('model-capacity: ledger load failed, memory-only', { companyId, error: error?.message ?? String(error) });
+      return ensureLedger(companyId);
+    }
   }
 
   async function runShadowTick(companyId, job) {
@@ -761,7 +784,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // account's quota inside the measured span (model-mapped, never the
     // decision); in-flight pressure attributes decided-first (see below).
     const rateWindowMs = config.pacing.rateWindowMin * 60000;
-    const ledger = await loadLedger(companyId);
+    const ledger = await getOrLoadLedger(companyId);
     const modelCaches = { agents: new Map(), issues: new Map() };
     const accountOfModel = (model) => (model != null && model !== 'unknown'
       ? accountForRun({ model }, snapshot.accounts)
@@ -1422,7 +1445,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return out;
   }
 
-  function recordEventTimeShadow(companyId, run) {
+  async function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
     if (!live || !config) return null;
@@ -1469,13 +1492,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       });
       if (d.kind !== 'decide') continue;
       const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
-      // Straight into the ledger (memory-only here; the next tick
-      // persists the same record). actualPending until a tick backfills it.
-      let ledger = ledgers.get(companyId);
-      if (!ledger) {
-        ledger = createLedger();
-        ledgers.set(companyId, ledger);
-      }
+      // Straight into the ledger via the shared helper (joins the pending
+      // load when one is in flight, so this decision survives it; the next
+      // tick persists the same record). actualPending until a tick backfills it.
+      const ledger = await getOrLoadLedger(companyId);
       recordDecision(ledger, {
         runId: String(run.runId ?? 'unknown'),
         agentId: String(run.agentId ?? 'unknown'),
@@ -1597,15 +1617,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           status,
           at: Date.parse(event?.occurredAt ?? '') || clock(),
         };
-        // Every run fact lands in the ledger (memory-only here; the next
-        // tick persists the same records). The terminal modelDecision --
-        // what the run actually used -- is tagged source run-decision, so
+        // Every run fact lands in the ledger via the shared helper (joins
+        // the pending load when one is in flight; the next tick persists
+        // the same records). The terminal modelDecision -- what the run
+        // actually used -- is tagged source run-decision, so
         // recordTerminal treats it as authoritative over earlier guesses.
-        let evtLedger = ledgers.get(companyId);
-        if (!evtLedger) {
-          evtLedger = createLedger();
-          ledgers.set(companyId, evtLedger);
-        }
+        const evtLedger = await getOrLoadLedger(companyId);
         if (status === 'running') {
           recordStart(evtLedger, entry, entry.at);
         } else {
@@ -1621,7 +1638,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // is absent, so the ledger has no minute-long blind spot.
         if (status === 'running') {
           try {
-            recordEventTimeShadow(companyId, entry);
+            await recordEventTimeShadow(companyId, entry);
           } catch (error) {
             ctx.logger.error('model-capacity: event-time shadow failed', { companyId, error: error?.message ?? String(error) });
           }
@@ -1800,15 +1817,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           trialAdapters: live.trialAdapters ?? {},
         });
         if (d.kind === 'decide') {
-          // Straight into the ledger: the enforced (hook) decision
-          // overwrites any event-time entry for this runId (host order:
-          // started fires before the hook resolves), so the run counts
-          // exactly once. Memory-only here; the next tick persists it.
-          let hookLedger = ledgers.get(params.companyId);
-          if (!hookLedger) {
-            hookLedger = createLedger();
-            ledgers.set(params.companyId, hookLedger);
-          }
+          // Straight into the ledger via the shared helper: the enforced
+          // (hook) decision overwrites any event-time entry for this runId
+          // (host order: started fires before the hook resolves), so the run
+          // counts exactly once, and it survives a load in flight.
+          // Memory-only here; the next tick persists it.
+          const hookLedger = await getOrLoadLedger(params.companyId);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
           recordDecision(hookLedger, {

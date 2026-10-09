@@ -7,6 +7,10 @@
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
+ * v0.2.12 = LOAD RACE FIX: all run recording routes through one
+ * get-or-load helper; the load merges the post-await map entry, so runs
+ * recorded while the state read is pending survive.
+ *
  * v0.2.10 = LEDGER ACCOUNTING: run accounting lives in one pure module
  * (src/ledger.mjs), one record per runId; restart reconcile marks but never
  * deletes; the shadow log is append-only.
@@ -25,7 +29,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.11';
+export const PLUGIN_VERSION = '0.2.12';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

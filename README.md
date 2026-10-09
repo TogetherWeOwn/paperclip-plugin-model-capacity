@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.11, all-providers)
+# Model Capacity plugin (v0.2.12, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
