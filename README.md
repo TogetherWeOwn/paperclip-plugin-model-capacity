@@ -28,8 +28,8 @@ effort) plus a small `MODEL_AA_OVERRIDES` table for verified mismatches
 (operator-extendable via `modelAaOverrides`). Models with no AA match build
 no arm and are reported `unscored` on `/capacity` (with the serving
 accounts), never silently dropped and never invented. Families without fleet
-success history route as capped trials (doer-only, adapter-gated) until
-measured success graduates them; reactive accounts (vendor publishes no
+success history route as capped trials (doer and other roles by default;
+thinkers never; adapter-gated) until measured success graduates them; reactive accounts (vendor publishes no
 meter) are eligible while healthy. Shadow decisions are recorded event-time
 from `agent.run.started` when the resolver is absent, and run->account
 mapping uses resolved actual models.
@@ -129,7 +129,8 @@ frozen clock can never double-count.
 6. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
    test-fail +1, rate-limit reroutes, context-window filter. Trial arms
    (families without fleet success: gemini, kimi, grok, claude-4-6, ...)
-   are doer-only, need an opted-in `adapterType` (`trials.adapters`;
+   take only the `trials.roles` roles (default doer and other; thinkers
+   never), need an opted-in `adapterType` (`trials.adapters`;
    unlisted adapters get no trial arms), a free per-family in-flight slot
    (`trials.maxInFlightPerFamily`, default 2), and bypass the burn check
    (their burn is unmeasured by definition; the in-flight cap bounds the

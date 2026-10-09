@@ -187,3 +187,38 @@ test('/capacity exposes the per-role effective exclusions', async () => {
   await d0.tick();
   assert.deepEqual((await d0.capacity()).body.roleExclusions, { doer: [], thinker: [], other: [] });
 });
+
+// trials.roles: setting doerAgentIds reclassifies everyone else as `other`,
+// and the trial gate must not drop them. Default is doer + other;
+// thinkers never take trial traffic (unmeasured by definition).
+const trialArm = {
+  armId: 'kimi-arm', model: 'kimi-k3', effort: 'max', family: 'kimi',
+  trial: true, Q: 50, C: 50, contextWindow: 1000000,
+};
+const trialBase = {
+  runId: 'run-t', agentId: 'agent-9', pointer: 0,
+  ladderRungs: [{ rung: 0, arms: [trialArm] }],
+  fiveHourHeadroomPct: null, burnPerRunPct: {}, reservePct: 0.05,
+  accountId: 'meta:m1', adapterType: 'claude-code',
+  trialBudget: { kimi: 2 }, trialAdapters: { 'claude-code': ['*'] },
+};
+
+test('trial arms route to other by default, never to thinkers', () => {
+  const d = decide({ ...trialBase, role: 'other' });
+  assert.equal(d.kind, 'decide');
+  assert.equal(d.trial, true);
+  assert.equal(decide({ ...trialBase, role: 'doer' }).kind, 'decide');
+  assert.equal(decide({ ...trialBase, role: 'thinker' }).kind, 'defer');
+});
+
+test('explicit trials.roles pins the old doer-only gate', () => {
+  assert.equal(decide({ ...trialBase, role: 'other', trialRoles: ['doer'] }).kind, 'defer');
+  assert.equal(decide({ ...trialBase, role: 'thinker', trialRoles: ['doer', 'other', 'thinker'] }).kind, 'decide');
+  assert.equal(decide({ ...trialBase, role: 'doer', trialRoles: ['doer'] }).kind, 'decide');
+});
+
+test('resolveConfig defaults trials.roles to doer + other; validator rejects non-arrays', () => {
+  assert.deepEqual(resolveConfig({}).trials.roles, ['doer', 'other']);
+  assert.deepEqual(resolveConfig({ trials: { roles: ['doer'] } }).trials.roles, ['doer']);
+  assert.ok(validateConfigShape({ trials: { roles: 'doer' } }).some(e => e.includes('trials.roles')));
+});

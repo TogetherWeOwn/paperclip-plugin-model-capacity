@@ -188,6 +188,9 @@ export function validateConfigShape(raw) {
     if ('adapters' in raw.trials && (raw.trials.adapters == null || typeof raw.trials.adapters !== 'object' || Array.isArray(raw.trials.adapters))) {
       errors.push('trials.adapters must be an object of adapter type to families');
     }
+    if ('roles' in raw.trials && (!Array.isArray(raw.trials.roles) || raw.trials.roles.some(r => typeof r !== 'string'))) {
+      errors.push('trials.roles must be an array of role names');
+    }
   }
   if (raw.modelAaOverrides != null && (typeof raw.modelAaOverrides !== 'object' || Array.isArray(raw.modelAaOverrides))) {
     errors.push('modelAaOverrides must be an object of CLIProxy model id to AA slug');
@@ -307,14 +310,16 @@ export function resolveConfig(raw = {}) {
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
     // Trial lanes and arms: families without fleet success history route
-    // doer-only through adapters that opt in, capped in flight per account
-    // and per family, until measured success graduates them.
+    // through adapters that opt in for roles that opt in (default doer +
+    // other; thinkers never), capped in flight per account and per family,
+    // until measured success graduates them.
     trials: {
       maxInFlightPerAccount: raw.trials?.maxInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount,
       maxInFlightPerFamily: raw.trials?.maxInFlightPerFamily ?? DEFAULT_TRIALS.maxInFlightPerFamily,
       minRuns: raw.trials?.minRuns ?? DEFAULT_TRIALS.minRuns,
       minSuccessRate: raw.trials?.minSuccessRate ?? DEFAULT_TRIALS.minSuccessRate,
       adapters: raw.trials?.adapters ?? DEFAULT_TRIALS.adapters,
+      roles: (Array.isArray(raw.trials?.roles) ? raw.trials.roles : [...DEFAULT_TRIALS.roles]).filter(r => typeof r === 'string'),
     },
     // Operator extensions to the AA-slug override table (CLIProxy model
     // id -> AA slug or { slug, effort }); merged over the built-in table.
@@ -1495,6 +1500,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           adapterType: run.adapterType ?? null,
           trialBudget: freshTrialBudget(),
           trialAdapters: config.trials.adapters,
+          trialRoles: config.trials.roles,
         });
         if (d.kind === 'decide') {
           decision = d;
@@ -1609,6 +1615,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       contextCaps: config.contextCaps,
       trialBudget: liveTrialBudget,
       trialAdapters: config.trials.adapters,
+      trialRoles: config.trials.roles,
       maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
       accounts: ordered.map(a => {
         const view = viewById.get(a.accountId);
@@ -1910,6 +1917,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         adapterType: run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null,
         trialBudget: budget,
         trialAdapters: live.trialAdapters ?? {},
+        trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
       });
       if (d.kind !== 'decide') continue;
       const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
@@ -2257,6 +2265,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
           trialBudget: budget,
           trialAdapters: live.trialAdapters ?? {},
+          trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
         });
         if (d.kind === 'decide') {
           // Straight into the ledger via the shared helper: the enforced

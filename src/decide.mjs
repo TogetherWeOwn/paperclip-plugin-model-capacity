@@ -51,6 +51,12 @@ export const DEFAULT_TRIALS = Object.freeze({
     claude_local: ['*'],
     'claude-code': ['*'],
   }),
+  // Roles that may take trial arms. 'other' exists only when
+  // roles.doerAgentIds is set (absent that config every non-thinker is a
+  // doer, so the default is bit-identical to the old doer-only gate).
+  // Thinkers stay excluded by default: trial traffic is unmeasured by
+  // definition and never belongs on the thinker blend.
+  roles: Object.freeze(['doer', 'other']),
 });
 
 /** True when the adapter type may run trial arms of the family. */
@@ -116,9 +122,10 @@ function sanitizeId(part) {
  * burnPerRunPct: armId -> expected weekly % consumed by one run (E_a[m]);
  *   missing entries mean uncalibrated: the arm is skipped when headroom is
  *   known, allowed (flagged weak) when headroom is unknown.
- * Trial arms (trial: true) are exploration traffic: doer role only, the
- * adapter must allow the family, and the family needs a free in-flight
- * slot in trialBudget. Trial picks bypass the burn check (their burn is
+ * Trial arms (trial: true) are exploration traffic: only roles listed in
+ * trialRoles (default doer + other; thinkers never), the adapter must
+ * allow the family, and the family needs a free in-flight slot in
+ * trialBudget. Trial picks bypass the burn check (their burn is
  * unmeasured by definition; the in-flight cap bounds the blast radius)
  * and always report weak calibration.
  */
@@ -140,6 +147,7 @@ export function decide({
   adapterType = null,
   trialBudget = null,
   trialAdapters = null,
+  trialRoles = DEFAULT_TRIALS.roles,
   excludedFamilies = [],
 } = {}) {
   if (failureClass === 'rate-limit') {
@@ -156,7 +164,7 @@ export function decide({
 
   const trialOk = (arm) => {
     if (!arm.trial) return true;
-    if (role !== 'doer') return false;
+    if (!(Array.isArray(trialRoles) ? trialRoles : []).includes(role)) return false;
     if (!adapterAllowsTrial(trialAdapters, adapterType, arm.family)) return false;
     return (trialBudget?.[arm.family] ?? 0) > 0;
   };

@@ -216,12 +216,16 @@ const CONFIG_SCHEMA = {
     },
     trials: {
       type: 'object', additionalProperties: false,
-      description: 'Trial lanes for model families without fleet success history (doer-only, adapter-gated, in-flight-capped until measured success graduates them).',
+      description: 'Trial lanes for model families without fleet success history (roles-gated, adapter-gated, in-flight-capped until measured success graduates them).',
       properties: {
         maxInFlightPerAccount: { type: 'integer', minimum: 1, default: 2 },
         maxInFlightPerFamily: { type: 'integer', minimum: 1, default: 2 },
         minRuns: { type: 'integer', minimum: 1, default: 10 },
         minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
+        roles: {
+          type: 'array', items: { type: 'string' }, default: ['doer', 'other'],
+          description: 'Roles that may take trial arms. Default doer + other; thinkers never take trial traffic (unmeasured by definition).',
+        },
         adapters: {
           type: 'object', default: { claude_local: ['*'], 'claude-code': ['*'] },
           description: 'Adapter type to trial-eligible families ("*" means any family). Unlisted adapters get no trial arms.',
