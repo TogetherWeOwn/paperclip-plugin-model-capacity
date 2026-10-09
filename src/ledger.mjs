@@ -108,6 +108,7 @@ export function recordDecision(ledger, decision, atMs) {
   r.decidedAccount = decision?.accountId ?? null;
   r.decidedAt = atMs;
   r.enforced = enforced;
+  if (decision?.armId != null) r.armId = String(decision.armId);
   if (decision?.wouldModel != null) r.wouldModel = decision.wouldModel;
   if (decision?.rung != null) r.rung = decision.rung;
   if (decision?.trial === true) r.trial = true;
@@ -139,6 +140,11 @@ export function recordTerminal(ledger, event, status, atMs) {
   r.status = status;
   if (r.terminalAt == null) r.terminalAt = atMs;
   fill(r, 'agentId', event?.agentId);
+  // Provider-side failure text, failed runs only (feeds the arm circuit
+  // breaker; bounded so one verbose error cannot bloat the ledger blob).
+  if (status === 'failed' && event?.errorText != null) {
+    r.errorText = String(event.errorText).slice(0, 500);
+  }
   if (r.provider == null && event?.provider != null) r.provider = String(event.provider).toLowerCase();
   const authoritative = event?.modelSource === 'run-decision' && event?.model != null;
   if (authoritative) {

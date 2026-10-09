@@ -56,6 +56,13 @@ import {
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS } from './decide.mjs';
+import {
+  BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
+  sanitizeBreakers, classifyArmError, breakerState,
+  filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
+  resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
+  breakerStoreToJSON, createBreakerStore,
+} from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
 import { orderAccountsForRun } from './select.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
@@ -172,6 +179,24 @@ export function validateConfigShape(raw) {
     errors.push('modelAaOverrides must be an object of CLIProxy model id to AA slug');
   }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
+  if (raw.breakers != null && (typeof raw.breakers !== 'object' || Array.isArray(raw.breakers))) {
+    errors.push('breakers must be an object');
+  } else if (raw.breakers) {
+    const b = raw.breakers;
+    if (b.enabled != null && typeof b.enabled !== 'boolean') errors.push('breakers.enabled must be a boolean');
+    if (b.tripCount != null && (!Number.isInteger(b.tripCount) || b.tripCount < 1)) errors.push('breakers.tripCount must be an integer >= 1');
+    if (b.windowMin != null && !(b.windowMin > 0)) errors.push('breakers.windowMin must be a positive number');
+    if (b.cooloffHours != null && !(b.cooloffHours > 0)) errors.push('breakers.cooloffHours must be a positive number');
+    if (b.maxCooloffHours != null && !(b.maxCooloffHours > 0)) errors.push('breakers.maxCooloffHours must be a positive number');
+    if (b.maxCooloffHours != null && b.cooloffHours != null && b.maxCooloffHours < b.cooloffHours) {
+      errors.push('breakers.maxCooloffHours must be >= breakers.cooloffHours');
+    }
+    if (b.probeTimeoutMs != null && !(b.probeTimeoutMs > 0)) errors.push('breakers.probeTimeoutMs must be a positive number');
+    for (const k of ['fatalPatterns', 'vetoPatterns']) {
+      if (k in b && !Array.isArray(b[k])) errors.push(`breakers.${k} must be an array of strings`);
+      else if (Array.isArray(b[k]) && b[k].some(s => typeof s !== 'string')) errors.push(`breakers.${k} must be an array of strings`);
+    }
+  }
   return errors;
 }
 
@@ -189,6 +214,33 @@ function sanitizeEeeWeights(weights) {
     }
   }
   return out;
+}
+
+/**
+ * Provider-side failure text from a run event, across every known placement
+ * (payload, payload.run). Codes ride along: a bare `auth_unavailable` code
+ * classifies on its own. Joined unique parts, bounded; null when absent. The
+ * ledger stores it on failed records only, where the breaker reads it.
+ */
+export function extractRunErrorText(event) {
+  const FIELDS = ['error', 'errorMessage', 'error_message', 'errorText', 'error_text',
+    'failureReason', 'failure_reason', 'code', 'errorCode', 'error_code'];
+  const parts = [];
+  const seen = new Set();
+  const p = event?.payload && typeof event.payload === 'object' ? event.payload : null;
+  const scopes = [p, p?.run && typeof p.run === 'object' ? p.run : null];
+  for (const s of scopes) {
+    if (!s) continue;
+    for (const f of FIELDS) {
+      const v = s[f];
+      if ((typeof v !== 'string' && typeof v !== 'number') || seen.has(String(v))) continue;
+      const t = String(v).trim();
+      if (t.length === 0) continue;
+      seen.add(String(v));
+      parts.push(t);
+    }
+  }
+  return parts.length > 0 ? parts.join(' | ').slice(0, BREAKER_ERROR_TEXT_MAX) : null;
 }
 
 export function resolveConfig(raw = {}) {
@@ -267,6 +319,10 @@ export function resolveConfig(raw = {}) {
       referenceArmId: raw.calibration?.referenceArmId ?? 'claude-haiku-5-5',
       referenceBurnPerRunPct: raw.calibration?.referenceBurnPerRunPct ?? 0.0005,
     },
+    // Arm circuit breaker: provider-side model errors open a per-arm breaker
+    // (2 arm-fatal failures in 30 min -> 6h cool-off, doubling to 48h) with a
+    // half-open single-probe recovery. Nested only; sanitizeBreakers coerces.
+    breakers: sanitizeBreakers(raw.breakers),
   };
 }
 
@@ -284,6 +340,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
   const ledgerReady = new Set(); // companyIds whose memory ledger absorbed persisted state
+  const breakerStores = new Map(); // companyId -> breaker store (memory truth; tick persists)
+  const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
@@ -828,6 +886,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // resolved config feeds the memory-only event-time path (see setup).
     const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
     lastConfig.set(companyId, config);
+    // Arm circuit breaker: memory truth loaded once per worker start (like the
+    // ledger); every tick reuses it and persists it below. Finished-run
+    // failed events feed it after the ledger load -- never in the event path,
+    // which performs zero I/O -- via the error text recordTerminal stamps on
+    // failed records. A throw here aborts the tick before any persist, same
+    // as the ledger direct load.
+    if (!breakerReady.has(companyId)) {
+      breakerReady.add(companyId);
+      breakerStores.set(companyId,
+        breakerStoreFromJSON(await ctx.state.get(scopeKey(companyId, BREAKER_KEY))));
+    }
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
@@ -835,6 +904,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accounts: snapshot.accounts, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
+    // Breaker state rides each rung arm so ops can see why an arm is
+    // unpickable; decide-time filtering (tick loop, live view) does the actual
+    // excluding. Breaker account space is the ladder key (view accountId).
+    {
+      const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
+      const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+      for (const [key, ladder] of Object.entries(ladders ?? {})) {
+        for (const r of ladder?.rungs ?? []) {
+          r.breaker = breakerState(breakers, key, r?.armId, nowMs, breakersCfg);
+        }
+      }
+    }
     // Tier-derived compact windows ride each rung arm (arm.cap, keyed by
     // model) into the hook and event-time paths via the live view below as
     // well as this tick's own decisions. No family-keyed merge: one model's
@@ -934,6 +1015,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         arms: (ladders[key]?.rungs ?? []).map(r => ({
           armId: r.armId, model: r.model, effort: r.effort, family: r.family,
           rung: r.rung, trial: r.trial,
+          breaker: r.breaker ?? 'closed',
           cap: r.cap ?? null,
           costBase: r.costBase ?? null,
           costMultiplier: r.costMultiplier ?? 1,
@@ -976,6 +1058,47 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // failed post-restart read can never wipe the saved ledger. The next
     // tick retries the load (rejected loads are not cached).
     const ledger = await loadLedger(companyId);
+    // Arm circuit breaker: memory truth loaded once per worker start (like the
+    // ledger); every tick reuses it and persists it below. Finished-run
+    // failed events feed it here -- never in the event path, which performs
+    // zero I/O -- via the error text recordTerminal stamps on failed records.
+    const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
+    const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+    breakerStores.set(companyId, breakers);
+    const breakerTransitions = [...breakerHousekeep(breakers, nowMs, breakersCfg)];
+    {
+      const seen = new Set(breakers.seen ?? []);
+      for (const rec of terminalRecords(ledger)) {
+        if (rec?.runId == null || seen.has(rec.runId)) continue;
+        seen.add(rec.runId);
+        const acct = rec.decidedAccount ?? rec.actualAccount ?? null;
+        const arm = rec.armId ?? null;
+        // Only plugin-decided runs feed the breaker: without our (account,
+        // arm) attribution there is nothing to exclude.
+        if (acct == null || arm == null) continue;
+        if (rec.status === 'finished') {
+          const t = resolveProbe(breakers, acct, arm, rec.runId, 'success', null, nowMs, breakersCfg);
+          if (t) breakerTransitions.push(t);
+        } else if (rec.status === 'failed') {
+          const fatal = classifyArmError(rec.errorText, breakersCfg) === 'fatal';
+          if (breakerProbeRunId(breakers, acct, arm, nowMs, breakersCfg) === rec.runId) {
+            const t = resolveProbe(breakers, acct, arm, rec.runId, fatal ? 'arm-fatal' : 'other', rec.errorText, nowMs, breakersCfg);
+            if (t) breakerTransitions.push(t);
+          } else if (fatal) {
+            const t = recordArmFailure(breakers, acct, arm,
+              { atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText }, nowMs, breakersCfg);
+            if (t) breakerTransitions.push(t);
+          }
+        } else if (rec.status === 'cancelled') {
+          const t = resolveProbe(breakers, acct, arm, rec.runId, 'other', null, nowMs, breakersCfg);
+          if (t) breakerTransitions.push(t);
+        }
+      }
+      breakers.seen = [...seen].slice(-BREAKER_MAX_SEEN);
+    }
+    for (const t of breakerTransitions) {
+      ctx.logger.info(`model-capacity: arm breaker ${t.transition}`, { companyId, ...t });
+    }
     const modelCaches = { agents: new Map(), issues: new Map() };
     const accountOfModel = (model) => (model != null && model !== 'unknown'
       ? accountForRun({ model }, snapshot.accounts)
@@ -1297,7 +1420,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           runId: run.runId,
           agentId: run.agentId,
           role,
-          ladderRungs: groupByRung(ladder.rungs),
+          // Open breakers (and occupied half-open probes) are excluded: the
+          // ladder skips them and decide falls to the next rung or account.
+          // Shadow picks never occupy the probe slot -- only enforced hook
+          // runs route real traffic, so only the hook calls startProbe.
+          ladderRungs: filterBreakerRungs(groupByRung(ladder.rungs), breakers, sel.accountId, nowMs, breakersCfg),
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -1331,6 +1458,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         const actualModel = actual.model ?? run.actualModel ?? 'unknown';
         recordDecision(ledger, {
           runId: run.runId, agentId: run.agentId, accountId: decision.accountId,
+          armId: decision.armId ?? null,
           enforced: false, wouldModel, rung: decision.rung,
           trial: decision.trial === true,
           family: inferFamily(canonicalModelName(decision.model)),
@@ -1443,7 +1571,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           resetAtMs: view?.resetAtMs ?? null,
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
-          ladderRungs: groupByRung(ladder?.rungs ?? []),
+          // Breaker-filtered like the tick loop, so the hook and the
+          // event-time path never pick an arm the tick would skip.
+          ladderRungs: filterBreakerRungs(groupByRung(ladder?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg),
           burnPerRunPct: ladder?.burnPerRunPct ?? {},
         };
       }),
@@ -1507,6 +1637,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       throw new Error('model-capacity: refusing ledger persist without a successful load');
     }
     await ctx.state.set(scopeKey(companyId, LEDGER_KEY), ledgerToJSON(ledger));
+    await ctx.state.set(scopeKey(companyId, BREAKER_KEY), breakerStoreToJSON(breakers, { nowMs, cfg: breakersCfg }));
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
     await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
@@ -1521,6 +1652,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
       trialTransitions,
+      // Arm circuit breakers: open/half-open arms plus closed arms with
+      // recent arm-fatal fails. Bounded (500 arms) by construction.
+      armBreakers: breakerReport(breakers, nowMs, breakersCfg),
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -1714,6 +1848,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         runId: String(run.runId ?? 'unknown'),
         agentId: String(run.agentId ?? 'unknown'),
         accountId: d.accountId,
+        armId: d.armId ?? null,
         enforced: false,
         wouldModel: decoratedModelFor(d, emitAdapter) ?? `${d.model}(${d.effort ?? 'default'})`,
         rung: d.rung,
@@ -1830,6 +1965,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           adapterType: p.adapterType ?? run.adapterType ?? null,
           status,
           at: Date.parse(event?.occurredAt ?? '') || clock(),
+          // Provider-side failure text (codes included). recordTerminal
+          // stores it on failed records only, where the tick's breaker scan
+          // reads it. Never persisted from this path (memory-only events).
+          errorText: extractRunErrorText(event),
         };
         // Every run fact lands in the ledger via the shared helper (joins
         // the pending load when one is in flight; the next tick persists
@@ -2036,6 +2175,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // (host order: started fires before the hook resolves), so the run
           // counts exactly once, and it survives a load in flight.
           // Memory-only here; the next tick persists it.
+          // Half-open probe: only enforced runs route real traffic, so only
+          // the hook occupies the probe slot (shadow picks never do). First
+          // caller wins; a racing second run may slip through and both
+          // terminals resolve the same way.
+          if (d.armId != null && params?.runId != null) {
+            startProbe(breakerStores.get(params.companyId) ?? createBreakerStore(),
+              d.accountId, d.armId, params.runId, clock(),
+              lastConfig.get(params.companyId)?.breakers ?? DEFAULT_BREAKERS);
+          }
           const hookLedger = await getOrLoadLedger(params.companyId);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
@@ -2043,6 +2191,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             runId: String(params.runId ?? 'unknown'),
             agentId: String(params.agentId ?? 'unknown'),
             accountId: d.accountId,
+            armId: d.armId ?? null,
             enforced: true,
             wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
             rung: d.rung,

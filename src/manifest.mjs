@@ -7,6 +7,15 @@
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
+ * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
+ * learns from finished-run failed events. Two arm-fatal failures (provider-
+ * side model errors: unknown provider/model, auth_unavailable, missing
+ * entity, 400-about-model) in 30 min open the breaker for 6h (doubling per
+ * consecutive reopen, capped at 48h); a half-open single enforced probe
+ * closes it on success. Transients (429, overload, disconnects, context
+ * exhaustion) never trip. State persists bounded per company; /capacity
+ * surfaces `armBreakers`.
+ *
  * v0.2.13 = LOAD-GUARD FIX: the tick calls loadLedger directly, so a
  * failed ledger-v1 read aborts before any persist (plus a loadedOk persist
  * guard); the memory-only fallback stays on the event / event-time / hook
@@ -33,7 +42,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.13';
+export const PLUGIN_VERSION = '0.2.14';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -215,6 +224,28 @@ const CONFIG_SCHEMA = {
       type: 'object', default: {},
       description: 'Operator extensions to the AA-slug override table: CLIProxy model id to AA slug (or { slug, effort }). Merged over the built-in table.',
       additionalProperties: { anyOf: [{ type: 'string' }, { type: 'object' }] },
+    },
+    breakers: {
+      type: 'object', additionalProperties: false,
+      description: 'Arm circuit breaker: provider-side model errors open a per-arm breaker (cool-off, half-open single probe). enabled:false is the kill switch.',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        tripCount: { type: 'integer', minimum: 1, default: 2 },
+        windowMin: { type: 'number', exclusiveMinimum: 0, default: 30 },
+        cooloffHours: { type: 'number', exclusiveMinimum: 0, default: 6 },
+        maxCooloffHours: { type: 'number', exclusiveMinimum: 0, default: 48 },
+        probeTimeoutMs: { type: 'integer', minimum: 60000, default: 7200000 },
+        fatalPatterns: {
+          type: 'array', default: ['unknown provider for model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model'],
+          description: 'Case-insensitive substring hits; entries with "+" need every part ("400+model") and are vetoed by transient patterns.',
+          items: { type: 'string' },
+        },
+        vetoPatterns: {
+          type: 'array', default: ['context length', 'maximum context', 'context window', 'too many tokens', 'max_tokens', 'rate limit', 'rate_limit', '429', 'overload', 'disconnect', 'timeout', 'temporar', 'try again'],
+          description: 'Transient guard: vetoes generic ("+") fatal patterns only, never specific ones.',
+          items: { type: 'string' },
+        },
+      },
     },
     calibration: {
       type: 'object', additionalProperties: false,
