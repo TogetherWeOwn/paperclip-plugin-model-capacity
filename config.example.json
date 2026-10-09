@@ -1,6 +1,6 @@
 {
   "cliproxy": {
-    "baseUrl": "https://router.infextion.net",
+    "baseUrl": "https://lane-host.invalid",
     "accountsPath": "/telemetry/cliproxy/live/accounts.json",
     "laneKeySecretRef": null,
     "cacheTtlSec": 45

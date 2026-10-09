@@ -27,6 +27,7 @@ import {
   DEFAULT_ACCOUNTS_PATH,
   LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
+  isPlaceholderLaneHost,
   buildLaneRequest,
   assertLaneRequest,
   parseLaneBody,
@@ -2136,12 +2137,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
 
     async onHealth() {
       const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
+      // A build that did not pin a real lane host cannot read the feed.
+      const laneHostPinned = !isPlaceholderLaneHost();
       return {
-        status: configured.size === 0 ? 'degraded' : 'ok',
-        message: enforcing > 0
-          ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
-          : 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, manifest: manifest.id },
+        status: configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok',
+        message: !laneHostPinned
+          ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
+          : enforcing > 0
+            ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
+            : 'Shadow only; no runs are changed.',
+        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id },
       };
     },
 

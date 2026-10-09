@@ -28,8 +28,22 @@
  * blocked in code and covered by the allowlist test.
  */
 
-export const DEFAULT_BASE_URL = 'https://router.infextion.net';
+import { LANE_BASE_URLS } from './lane-host.mjs';
+
+export const DEFAULT_BASE_URL = LANE_BASE_URLS[0];
 export const DEFAULT_ACCOUNTS_PATH = '/telemetry/cliproxy/live/accounts.json';
+
+/**
+ * True when `baseUrl` is the public placeholder (an RFC 2606 `.invalid`
+ * host): the build did not pin a real lane host, so no read can succeed.
+ */
+export function isPlaceholderLaneHost(baseUrl = DEFAULT_BASE_URL) {
+  try {
+    return new URL(baseUrl).hostname.endsWith('.invalid');
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Lane feed path allowlist: the ONLY `cliproxy.accountsPath` the config may
