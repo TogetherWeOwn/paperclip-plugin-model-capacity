@@ -165,6 +165,7 @@ export function decide({
     return {
       kind: 'decide',
       decisionId: `mc-${sanitizeId(runId)}-${sanitizeId(accountId)}-r${rung}-${sanitizeId(arm.model)}`,
+      armId: arm.armId,
       model: arm.model,
       effort: arm.effort,
       trial: arm.trial === true,
