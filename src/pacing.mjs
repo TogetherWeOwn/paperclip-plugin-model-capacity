@@ -7,8 +7,9 @@
  * (used vs linear target) is only a tie-break while no measured rate
  * exists yet. A position-only controller climbs when quota merely *looks*
  * behind even while the current burn already overshoots what's needed --
- * the rate form cannot make that mistake. Deadband is ±15% relative with
- * an absolute floor; the 5h guard still overrides everything because the
+ * the rate form cannot make that mistake. Deadband is ±15% relative, with
+ * no absolute floor (a floor swallows real shortfalls on small-required
+ * accounts); the 5h guard still overrides everything because the
  * 5h window binds before the weekly one.
  */
 
@@ -22,10 +23,8 @@ export const DEFAULT_PACING = Object.freeze({
   /** Guard releases when 5h used% drops below this. */
   guardRejoin: 0.5,
   floorRung: 0,
-  /** Rate mode: hold while |measured - required| is within this fraction of required. */
+  /** Rate mode: hold while |measured - required| is within this fraction of required. Relative-only. */
   rateDeadbandRel: 0.15,
-  /** Absolute floor for the rate deadband, fraction/hour (covers ~exhausted windows). */
-  rateMinDeadbandPerHour: 0.005,
   /** Utilization history window for the measured rate. */
   rateWindowMin: 60,
   /** Minimum history span before a measured rate is trusted (~10-15 min after install). */
@@ -132,7 +131,8 @@ export function requiredRatePerHour({ remainingPct, hoursToReset }) {
  * Rate-mode controller tick. Same state, actions, guard, and cooldown as
  * stepController; only the error differs:
  * - measured known: e = measured - required, deadband ±rateDeadbandRel
- *   relative (absolute floor rateMinDeadbandPerHour);
+ *   relative, no floor -- so a total stall (|e| = required) and any real
+ *   shortfall on a small-required account read as behind plan;
  * - measured unknown: e = positionError with the absolute deadband.
  * Reasons always name the rates so the shadow log shows the controller's
  * actual inputs.
@@ -175,7 +175,10 @@ export function stepRateController(state, reading, nowMs, cfg = DEFAULT_PACING, 
   let basis;
   if (measuredKnown) {
     e = measured - required;
-    band = Math.max(c.rateDeadbandRel * Math.max(required, 0), c.rateMinDeadbandPerHour);
+    // Relative-only: no absolute floor. A floor at 0.5%/h swallowed whole
+    // required rates (live: measured 0 vs required 0.49%/h read "inside
+    // deadband"); any real shortfall must read as deficit.
+    band = c.rateDeadbandRel * Math.max(required, 0);
     basis = `rate ${(measured * 100).toFixed(2)}%/h vs required ${(required * 100).toFixed(2)}%/h`;
   } else {
     e = reading.positionError ?? 0;

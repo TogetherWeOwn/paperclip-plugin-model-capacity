@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.7, all-providers)
+# Model Capacity plugin (v0.2.8, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -53,6 +53,19 @@ keep steering); the lane feed path is pinned like baseUrl. Separately, 1M
 claude arms on Claude-CLI adapters emit `<model>(<effort>)[1m]` (the CLI
 ignores MAX_CONTEXT_TOKENS for claude-* ids; it is never set for them),
 and run mapping normalizes `[1m]` and effort parens away.
+
+**v0.2.8 = CARRIED-RING RECONCILE + RELATIVE-ONLY DEADBAND + ACCOUNT
+CHURN.** On a worker's first tick per company the carried ring reconciles
+against the run feed: entries whose runs are not verifiably non-terminal
+count 0 (`reconciledRingDropped`; the persisted ring self-heals), because
+the clamp bound includes the carry and cannot catch dead-run inflation
+itself. The rate deadband is relative-only (±15% of required, no absolute
+floor, `rateMinDeadbandPerHour` retired): a stall reads as maximum deficit
+and any real shortfall on a small-required account climbs. Accounts are
+fully feed-driven: vanished accounts get no decisions and drop out of the
+report and target, brand-new providers/models are eligible on the next
+tick with zero config, and non-healthy accounts freeze their pointer and
+report action `excluded` instead of a misleading hold.
 
 ## How it decides (per account, per run)
 

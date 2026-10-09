@@ -80,7 +80,7 @@ test('live case: position says climb but the rate says descend', () => {
   // claude-lane-1: 66% used with 88% elapsed => position error is
   // negative ("behind", climb). But it burns 5.6%/h against required
   // 1.7%/h, so climbing would blow the 5h window.
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
   const reading = {
     measuredRatePerHour: 0.056, requiredRatePerHour: 0.017,
     positionError: -0.22, fiveHourUsedPct: 0.3,
@@ -91,7 +91,7 @@ test('live case: position says climb but the rate says descend', () => {
 });
 
 test('rate deadband holds within +-15%; position breaks ties when unmeasured', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
   const hold = stepRateController({ pointer: 2, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0.018, requiredRatePerHour: 0.017, positionError: -0.2, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 5);
   assert.equal(hold.action, 'hold');
@@ -102,7 +102,7 @@ test('rate deadband holds within +-15%; position breaks ties when unmeasured', (
 });
 
 test('rate guard still floors on the 5h window', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, rateMinDeadbandPerHour: 0.005 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
   const step = stepRateController({ pointer: 4, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0.001, requiredRatePerHour: 0.05, positionError: 0, fiveHourUsedPct: 0.9 }, 5000, cfg, 5);
   assert.deepEqual([step.action, step.pointer, step.guardActive], ['floor-guard', 0, true]);
@@ -143,4 +143,28 @@ test('accounts order earliest reset first, largest remainder first', () => {
     { accountId: 'c', resetAtMs: 1000, remainingPct: 0.5 },
   ]);
   assert.deepEqual(ordered.map(a => a.accountId), ['c', 'a', 'b']);
+});
+
+test('total stall reads as behind plan, never inside deadband', () => {
+  // Live codex-lane-1: measured 0 vs required 0.49%/h read "inside deadband"
+  // because the 0.5%/h absolute floor swallowed the whole required rate. A
+  // stalled account (zero burn because it got no runs) is maximum deficit.
+  const cfg = { ...DEFAULT_PACING };
+  const now = 10 * 600000;
+  const stalled = { measuredRatePerHour: 0, requiredRatePerHour: 0.0049, positionError: -0.05, fiveHourUsedPct: 0.1 };
+  const step = stepRateController({ pointer: 1, lastMoveAtMs: 0, guardActive: false }, stalled, now, cfg, 5);
+  assert.deepEqual([step.action, step.pointer], ['climb', 2]);
+  assert.match(step.reason, /0\.00%\/h vs required 0\.49%\/h/);
+  // At the ceiling the same stall reads behind-plan-but-bounded, not hold.
+  const capped = stepRateController({ pointer: 5, lastMoveAtMs: 0, guardActive: false }, stalled, now, cfg, 5);
+  assert.equal(capped.action, 'hold-limit');
+  // Relative-only, no floor: measured 0.40 vs required 0.49 is an 18%
+  // shortfall, outside +-15%, so it climbs too.
+  const nicked = stepRateController({ pointer: 1, lastMoveAtMs: 0, guardActive: false },
+    { measuredRatePerHour: 0.0040, requiredRatePerHour: 0.0049, positionError: -0.05, fiveHourUsedPct: 0.1 }, now, cfg, 5);
+  assert.deepEqual([nicked.action, nicked.pointer], ['climb', 2]);
+  // Exhausted window (nothing required) still holds: no deficit, no move.
+  const done = stepRateController({ pointer: 1, lastMoveAtMs: 0, guardActive: false },
+    { measuredRatePerHour: 0, requiredRatePerHour: 0, positionError: 0, fiveHourUsedPct: 0.1 }, now, cfg, 5);
+  assert.equal(done.action, 'hold');
 });

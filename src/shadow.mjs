@@ -29,6 +29,19 @@ export function createShadowRing(capacity = SHADOW_CAPACITY) {
     size() {
       return entries.length;
     },
+    // Drop every entry matching pred (startup/upgrade reconciliation uses
+    // this to evict carried entries that verify against nothing). Returns
+    // the number removed.
+    prune(pred) {
+      let removed = 0;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (pred(entries[i])) {
+          entries.splice(i, 1);
+          removed += 1;
+        }
+      }
+      return removed;
+    },
     toJSON() {
       return entries.map(e => ({ ...e }));
     },

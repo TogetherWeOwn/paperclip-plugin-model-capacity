@@ -33,7 +33,6 @@
     "guardHighPct": 0.8,
     "guardRejoinPct": 0.5,
     "rateDeadbandRel": 0.15,
-    "rateMinDeadbandPerHour": 0.005,
     "rateWindowMin": 60,
     "rateMinSpanMin": 10
   },

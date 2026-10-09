@@ -190,7 +190,8 @@ export function resolveConfig(raw = {}) {
       guardRejoin: raw.pacing?.guardRejoinPct ?? DEFAULT_PACING.guardRejoin,
       floorRung: DEFAULT_PACING.floorRung,
       rateDeadbandRel: raw.pacing?.rateDeadbandRel ?? DEFAULT_PACING.rateDeadbandRel,
-      rateMinDeadbandPerHour: raw.pacing?.rateMinDeadbandPerHour ?? DEFAULT_PACING.rateMinDeadbandPerHour,
+      // rateMinDeadbandPerHour retired (v0.2.8): the rate deadband is
+      // relative-only, so a legacy value here is accepted and ignored.
       rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
       rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
     },
@@ -256,6 +257,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  // Companies whose carried ring state has been reconciled against the run
+  // feed. Once per worker lifetime, on the first tick (startup or upgrade):
+  // entries persisted by older versions for runs whose terminal events will
+  // never arrive must verify or count 0.
+  const reconciledCompanies = new Set();
   // Agent adapter types, resolved from the agent record when run events
   // omit adapterType (trial arms are adapter-gated). companyId:agentId ->
   // { adapterType, atMs }, 10-min TTL, 500-entry cap. Failures and empty
@@ -705,13 +711,28 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
         : 0;
       const ceiling = (ladders[key]?.rungs.length ?? 1) - 1;
-      const step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
+      let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
         {
           measuredRatePerHour: measured?.ratePerHour ?? null,
           requiredRatePerHour: required ?? 0,
           positionError,
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
+      // Unhealthy accounts allocate nothing (the order filter drops them),
+      // so the controller must not narrate them as holding a bound: freeze
+      // the pointer and report excluded, resuming from the frozen pointer
+      // when the account returns.
+      if (account.health !== 'healthy') {
+        const prev = nextPacing[key] ?? {};
+        step = {
+          pointer: Math.min(Math.max(prev.pointer ?? step.pointer, 0), Math.max(ceiling, 0)),
+          lastMoveAtMs: prev.lastMoveAtMs ?? step.lastMoveAtMs,
+          guardActive: false,
+          rateBasis: prev.rateBasis ?? null,
+          action: 'excluded',
+          reason: `excluded: health is ${account.health ?? 'unknown'} -- only healthy accounts allocate`,
+        };
+      }
       nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive, rateBasis: step.rateBasis ?? null };
       // Effective headroom: the 5h meter when present, else the weekly
       // remaining as a fallback pool guard -- but ONLY for accounts whose
@@ -948,6 +969,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const viewById = new Map(accountViews.map(v => [v.accountId, v]));
     const ring = createShadowRing(config.shadowMaxEntries);
     ring.load(await ctx.state.get(scopeKey(companyId, RING_KEY)));
+    // Startup/upgrade reconciliation: the loaded entries were carried in
+    // persisted state (possibly written by older versions for runs whose
+    // terminal events will never arrive). A carried entry counts only when
+    // its run is verifiably non-terminal in the current run feed; the rest
+    // count 0 (dropped here, so the persisted ring self-heals on write).
+    // This deliberately reverses the over-count-is-fail-safe choice for
+    // carried state: without it dead runs inflate pools until they age out,
+    // and the clamp bound (which includes the carry) cannot catch them.
+    // Entries decided live by THIS worker are trusted -- the worker just
+    // saw those runs start -- so reconciliation runs exactly once.
+    let reconciledRingDropped = 0;
+    if (!reconciledCompanies.has(companyId)) {
+      reconciledCompanies.add(companyId);
+      const verifiable = new Set(runs.filter(r => !isTerminalStatus(r.status)).map(r => r.runId));
+      reconciledRingDropped = ring.prune(e => !verifiable.has(e.runId));
+    }
     const recorded = new Set(ring.list(500).map(e => e.runId));
     // Enforced hook decisions since the last tick merge first (flagged
     // enforced:true), so the shadow feed never re-decides the same run.
@@ -1386,11 +1423,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       inFlightByAccount: capInFlightByAccount,
       inFlightByPool,
       // Ring-carry accounting: entries dropped as stale (older than the
-      // in-flight horizon with no terminal event) and by the defensive
+      // in-flight horizon with no terminal event), by the defensive
       // clamp backstop (bound = observed running runs in the window PLUS
-      // non-terminal carry inside the horizon; oldest carry drops first).
+      // non-terminal carry inside the horizon; oldest carry drops first),
+      // and by startup/upgrade reconciliation (carried entries whose runs
+      // are not verifiably non-terminal; nonzero only on a worker's first
+      // tick per company).
       staleInFlightDropped,
       clampedInFlightDropped,
+      reconciledRingDropped,
       reactiveAccounts: accountViews.filter(v => v.reactive).length,
       runsObserved: runs.length,
       runsCandidates: candidates.length,

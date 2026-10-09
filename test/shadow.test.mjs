@@ -378,3 +378,12 @@ test('non-allowlisted baseUrl falls back to the default instead of carrying the 
   const c = resolveConfig({ cliproxy: { baseUrl: 'https://telemetry.example.com' } });
   assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
 });
+
+test('prune drops only matching entries and reports the count', () => {
+  const ring = createShadowRing();
+  for (const id of ['keep-1', 'drop-1', 'keep-2', 'drop-2']) ring.push(record(id));
+  assert.equal(ring.prune(e => e.runId.startsWith('drop-')), 2);
+  assert.deepEqual(ring.list(10).map(r => r.runId), ['keep-2', 'keep-1']);
+  assert.equal(ring.prune(() => true), 2);
+  assert.equal(ring.size(), 0);
+});
