@@ -71,6 +71,22 @@ export function adapterAllowsTrial(trialAdapters, adapterType, family) {
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
+/**
+ * Exclusion tokens. An exclusion list holds family names (`muse`) and
+ * single-arm tokens (`arm:<armId>`): the quality gate removes individual
+ * arms (one family spans arms of very different Q), the outcome gate and
+ * the emergency override remove whole families. One list, one matcher, so
+ * every path that already honors family exclusions honors arm exclusions.
+ */
+export const ARM_TOKEN_PREFIX = 'arm:';
+export const armToken = (armId) => `${ARM_TOKEN_PREFIX}${String(armId ?? '').toLowerCase()}`;
+
+/** True when the arm's family or the arm itself is in the (normalized) exclusion set. */
+function armExcluded(arm, excludedSet) {
+  if (excludedSet.size === 0) return false;
+  return excludedSet.has(String(arm?.family ?? '').toLowerCase()) || excludedSet.has(armToken(arm?.armId));
+}
+
 /** Normalize a family-exclusion list: lowercase strings, deduped. */
 export function normalizeExcludedFamilies(list) {
   const out = [];
@@ -95,7 +111,7 @@ export function filterRungsByExcludedFamilies(ladderRungs, excludedFamilies) {
   if (excluded.size === 0) return ladderRungs;
   return (ladderRungs ?? []).map(g => ({
     ...g,
-    arms: (g?.arms ?? []).filter(a => !excluded.has(String(a?.family ?? '').toLowerCase())),
+    arms: (g?.arms ?? []).filter(a => !armExcluded(a, excluded)),
   }));
 }
 
@@ -140,7 +156,7 @@ export function roleLadderAccess(ladderRungs, {
   for (const g of groups) {
     if (!(g?.rung >= floor && g?.rung <= ceiling)) continue;
     for (const a of g?.arms ?? []) {
-      if (!excluded.has(String(a?.family ?? '').toLowerCase())) reachable.push(a);
+      if (!armExcluded(a, excluded)) reachable.push(a);
     }
   }
   if (reachable.length === 0) return { eligible: false, trialOnly: false };
@@ -173,7 +189,7 @@ export function placementArm(ladderRungs, {
   for (let rung = clamp(pointer ?? floor, floor, ceiling); rung >= floor; rung--) {
     const entry = groups.find(g => g.rung === rung);
     const arms = (entry?.arms ?? []).filter(a =>
-      !excluded.has(String(a?.family ?? '').toLowerCase()) && (a?.trial !== true || trialOk));
+      !armExcluded(a, excluded) && (a?.trial !== true || trialOk));
     if (arms.length === 0) continue;
     arms.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = arms[0];
@@ -249,7 +265,7 @@ export function decide({
     const entry = ladderRungs.find(r => r.rung === rung);
     const arms = (entry?.arms ?? []).filter(a => (a.contextWindow ?? Number.MAX_SAFE_INTEGER) >= requiredWindow);
     const fitting = arms.filter(a => {
-      if (excludedFamilySet.has(String(a?.family ?? '').toLowerCase())) return false;
+      if (armExcluded(a, excludedFamilySet)) return false;
       if (!trialOk(a)) return false;
       // Trial picks bypass the burn check: unmeasured by definition.
       if (a.trial) return true;

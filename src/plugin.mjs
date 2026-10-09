@@ -70,6 +70,7 @@ import {
   issueSnapshot, classifyOutcome, familyOutcomes,
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
 } from './outcomes.mjs';
+import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
 import { orderAccountsForRun, DEFAULT_PLACEMENT } from './select.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
@@ -184,6 +185,40 @@ export function validateConfigShape(raw) {
           } else if (!Array.isArray(rv) || rv.some(f => typeof f !== 'string')) {
             errors.push(`roles.excludeFamilies.${rk} must be an array of strings`);
           }
+        }
+      }
+    }
+    if ('minQuality' in roles) {
+      const mq = roles.minQuality;
+      if (mq == null || typeof mq !== 'object' || Array.isArray(mq)) {
+        errors.push('roles.minQuality must be an object of role to number or null');
+      } else {
+        for (const [rk, rv] of Object.entries(mq)) {
+          if (!['doer', 'thinker', 'other'].includes(rk)) {
+            errors.push(`roles.minQuality.${rk} is not a known role`);
+          } else if (rv !== null && !(typeof rv === 'number' && Number.isFinite(rv))) {
+            errors.push(`roles.minQuality.${rk} must be a finite number or null`);
+          }
+        }
+      }
+    }
+    if ('outcomeGate' in roles) {
+      const og = roles.outcomeGate;
+      if (og == null || typeof og !== 'object' || Array.isArray(og)) {
+        errors.push('roles.outcomeGate must be an object');
+      } else {
+        if ('enabled' in og && typeof og.enabled !== 'boolean') errors.push('roles.outcomeGate.enabled must be a boolean');
+        for (const k of ['minRuns', 'lastRuns']) {
+          if (k in og && !(Number.isInteger(og[k]) && og[k] >= 1)) errors.push(`roles.outcomeGate.${k} must be an integer >= 1`);
+        }
+        for (const k of ['minProgressRate', 'relativeToBest']) {
+          if (k in og && !(typeof og[k] === 'number' && og[k] >= 0 && og[k] <= 1)) errors.push(`roles.outcomeGate.${k} must be a number in [0, 1]`);
+        }
+        if ('windowHours' in og && !(typeof og.windowHours === 'number' && og.windowHours > 0 && og.windowHours <= MAX_WINDOW_HOURS)) {
+          errors.push(`roles.outcomeGate.windowHours must be a number in (0, ${MAX_WINDOW_HOURS}] (the ledger keeps terminal runs that long)`);
+        }
+        if (Number.isInteger(og.minRuns) && Number.isInteger(og.lastRuns) && og.lastRuns < og.minRuns) {
+          errors.push('roles.outcomeGate.lastRuns must be >= roles.outcomeGate.minRuns (a shorter slice can never gate)');
         }
       }
     }
@@ -304,6 +339,11 @@ export function resolveConfig(raw = {}) {
         thinker: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.thinker),
         other: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.other),
       },
+      // Eligibility from data (see eligibility.mjs): a per-role Q minimum
+      // and a measured-outcome gate decide which arms serve a role. The
+      // excludeFamilies list above is the emergency override.
+      minQuality: normalizeMinQuality(raw.roles?.minQuality),
+      outcomeGate: normalizeOutcomeGate(raw.roles?.outcomeGate),
       thinkerFloorRung: raw.roles?.thinkerFloorRung ?? 2,
       thinkerCeilingRung: raw.roles?.thinkerCeilingRung ?? null,
       doerFloorRung: raw.roles?.doerFloorRung ?? 0,
@@ -480,11 +520,32 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return doers.includes(agentId) ? 'doer' : 'other';
   }
 
-  /** Effective family exclusions for a role (already sanitized by resolveConfig). */
-  function excludedFamiliesForRole(config, role) {
-    const ef = config?.roles?.excludeFamilies ?? {};
-    const list = ef?.[role] ?? [];
-    return Array.isArray(list) ? list : [];
+  /**
+   * Family a finished run is judged under: the resolved actual model's
+   * family, else the family the decision recorded. 'unknown' (an unresolved
+   * model id) never stands in for a family.
+   */
+  function outcomeFamilyOf(r) {
+    const inferred = inferFamily(canonicalModelName(r?.actualModel));
+    return inferred && inferred !== 'unknown' ? inferred : (r?.family ?? null);
+  }
+
+  // Eligibility warnings (operator list non-empty; a role's data gates
+  // suspended), logged at most once an hour per company and kind so a
+  // standing override is visible in the log without a line per tick.
+  const eligibilityWarnedAt = new Map();
+  const ELIGIBILITY_WARN_EVERY_MS = 60 * 60 * 1000;
+  function warnEligibility(companyId, warnings, nowMs) {
+    for (const w of warnings ?? []) {
+      const key = `${companyId}:${w.code}:${w.role ?? ''}`;
+      const last = eligibilityWarnedAt.get(key);
+      if (last != null && nowMs - last >= 0 && nowMs - last < ELIGIBILITY_WARN_EVERY_MS) continue;
+      eligibilityWarnedAt.set(key, nowMs);
+      const log = typeof ctx.logger?.warn === 'function' ? ctx.logger.warn : ctx.logger?.info;
+      log?.call(ctx.logger, `model-capacity: ${w.message}`, {
+        companyId, code: w.code, ...(w.role ? { role: w.role } : {}), ...(w.roles ? { roles: w.roles } : {}),
+      });
+    }
   }
 
   // One issue read for run-outcome tracking (issues.read, positional args
@@ -790,7 +851,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     const blocked = Object.entries(ladders).flatMap(([key, l]) =>
       (l.withinNoise ?? []).map(w => ({ account: key, ...w })));
-    return { ladders, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline, withinNoise: blocked };
+    // Every served arm with its fleet Q (not only the ladder survivors):
+    // the eligibility gates and their audit view judge the whole fleet.
+    const fleet = fleetArms.map(a => ({
+      armId: a.armId, family: a.family, model: a.model, effort: a.effort,
+      qFleet: fleetQ(a.armId, fleetAlphaDoer), qFleetThinker: fleetQ(a.armId, fleetAlphaThinker),
+    }));
+    return { ladders, fleet, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline, withinNoise: blocked };
   }
 
   function accountKey(account) {
@@ -1084,7 +1151,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, skipped, unscored, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
+    const { ladders, fleet: fleetArmScores, skipped, unscored, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
       accounts: snapshot.accounts, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
@@ -1555,13 +1622,32 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
       doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
     };
+    // Eligibility from data: per-role Q minimum + measured-outcome gate,
+    // folded with the operator's emergency list into one exclusion-token
+    // list per role. Everything below (target, placement, picks) and the
+    // published live view read this list, so the gates act on every path.
+    const eligibility = buildEligibility({
+      arms: fleetArmScores,
+      records: terminalRecords(ledger),
+      nowMs,
+      minQuality: config.roles.minQuality,
+      outcomeGate: config.roles.outcomeGate,
+      manual: config.roles.excludeFamilies,
+      roleOf: agentId => roleOf(config, agentId),
+      familyOf: outcomeFamilyOf,
+      accountGroups: ordered.map(a => groupByRung(ladders[a.accountId]?.rungs ?? [])),
+      roleBands,
+      trialRoles: config.trials.roles,
+    });
+    const roleExclusions = eligibility.exclusions;
+    warnEligibility(companyId, eligibility.report.warnings, nowMs);
     const roleAccess = Object.create(null);
     for (const a of ordered) {
       const groups = filterBreakerRungs(groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg);
       const entry = {};
       for (const role of ROLES) {
         entry[role] = roleLadderAccess(groups, {
-          role, roleBands, excludedFamilies: excludedFamiliesForRole(config, role), trialRoles: config.trials.roles,
+          role, roleBands, excludedFamilies: roleExclusions[role], trialRoles: config.trials.roles,
         });
       }
       roleAccess[a.accountId] = entry;
@@ -1658,7 +1744,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (placementQuality.has(memoKey)) return placementQuality.get(memoKey);
       const groups = filterBreakerRungs(groupByRung(ladders[accountId]?.rungs ?? []), breakers, accountId, nowMs, breakersCfg);
       const q = placementArm(groups, {
-        role, roleBands, excludedFamilies: excludedFamiliesForRole(config, role),
+        role, roleBands, excludedFamilies: roleExclusions[role],
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
       placementQuality.set(memoKey, q);
@@ -1737,7 +1823,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
         const roleRungs = filterRungsByExcludedFamilies(
-          groupByRung(ladder.rungs), excludedFamiliesForRole(config, role));
+          groupByRung(ladder.rungs), roleExclusions[role]);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
@@ -1749,7 +1835,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // probe slot -- only enforced hook runs route real traffic, so
           // only the hook calls startProbe.
           ladderRungs: filterBreakerRungs(roleRungs, breakers, sel.accountId, nowMs, breakersCfg),
-          excludedFamilies: excludedFamiliesForRole(config, role),
+          excludedFamilies: roleExclusions[role],
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -1874,7 +1960,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       adapterByAgent,
       thinkerAgentIds: config.roles.thinkerAgentIds,
       doerAgentIds: config.roles.doerAgentIds,
-      excludeFamilies: config.roles.excludeFamilies,
+      // Effective exclusion tokens per role (operator list + quality and
+      // outcome gates): the hook and the event-time path read these.
+      excludeFamilies: roleExclusions,
       roleBands: {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
         doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
@@ -2016,7 +2104,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // created by the run), per resolved model family, last 24h.
       familyOutcomes: familyOutcomes(terminalRecords(ledger), {
         nowMs,
-        familyOf: r => inferFamily(canonicalModelName(r.actualModel)) ?? r.family ?? null,
+        familyOf: outcomeFamilyOf,
       }),
       // Per-role usable capacity and the queued demand that weights it.
       roles: concurrency.roles ?? null,
@@ -2039,12 +2127,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Arm circuit breakers: open/half-open arms plus closed arms with
       // recent arm-fatal fails. Bounded (500 arms) by construction.
       armBreakers: breakerReport(breakers, nowMs, breakersCfg),
-      // Per-role effective family exclusions (resolved config values).
+      // Per-role operator exclusions (the emergency override, resolved
+      // config values) and the effective tokens the picks actually honor.
       roleExclusions: {
         doer: config.roles.excludeFamilies.doer,
         thinker: config.roles.excludeFamilies.thinker,
         other: config.roles.excludeFamilies.other,
       },
+      roleExclusionsEffective: roleExclusions,
+      // Eligibility from data, auditable: every arm's fleet Q and its
+      // verdict per role (with reasons), the outcome gate's per-family
+      // evidence, warnings (manual list non-empty, a role's gates suspended).
+      eligibility: eligibility.report,
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
@@ -2207,7 +2301,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (ledgers.get(companyId)?.get(String(run.runId))?.decidedAccount != null) return null;
     }
     const role = roleOf(config, run.agentId);
-    const roleExcluded = excludedFamiliesForRole(config, role);
+    const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
     const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered

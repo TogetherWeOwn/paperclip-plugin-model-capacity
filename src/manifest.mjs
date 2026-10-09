@@ -133,10 +133,32 @@ const CONFIG_SCHEMA = {
         doerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
+          description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',
           properties: {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },
             other: { type: 'array', default: [], items: { type: 'string' } },
+          },
+        },
+        minQuality: {
+          type: 'object', additionalProperties: false,
+          description: 'Per-role minimum on the fleet-scored quality Q (AA plus the EEE prior, the ladder\'s weights and blend). An arm below the minimum is ineligible for that role on every account. null turns the minimum off for the role. Defaults: doer -1.0, thinker 0.4, other -1.0.',
+          properties: {
+            doer: { type: ['number', 'null'], default: -1.0 },
+            thinker: { type: ['number', 'null'], default: 0.4 },
+            other: { type: ['number', 'null'], default: -1.0 },
+          },
+        },
+        outcomeGate: {
+          type: 'object', additionalProperties: false,
+          description: 'Measured-outcome gate per (family, role): a family whose recent finished runs made progress on their issue below minProgressRate, and below relativeToBest of the best-measured family for the role, is ineligible for that role until its evidence ages out of the window.',
+          properties: {
+            enabled: { type: 'boolean', default: true },
+            minRuns: { type: 'integer', minimum: 1, default: 12 },
+            minProgressRate: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+            relativeToBest: { type: 'number', minimum: 0, maximum: 1, default: 0.75 },
+            windowHours: { type: 'number', exclusiveMinimum: 0, maximum: 24, default: 24 },
+            lastRuns: { type: 'integer', minimum: 1, default: 40 },
           },
         },
         thinkerFloorRung: { type: 'integer', minimum: 0, default: 2 },

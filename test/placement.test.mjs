@@ -226,7 +226,7 @@ function drive({ config = {} } = {}) {
     events: { on() {} },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => TICK });
+  const plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
   return {
     setup: async () => {
       await plugin.setup(io);
