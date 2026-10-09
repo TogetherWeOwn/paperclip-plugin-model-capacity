@@ -39,6 +39,13 @@ import {
   canonicalModelName, inferFamily, familyOfModelName, PROVEN_FAMILIES,
 } from './arms.mjs';
 import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
+import {
+  computeEeeComposite, blendQ, blendAlphaForRole, eeeUsable, eeeFamilyPrior,
+  eeeGateDatum,
+  DEFAULT_EEE_WEIGHTS, DEFAULT_EEE_BLEND_DOER, DEFAULT_EEE_BLEND_THINKER,
+  DEFAULT_EEE_MAX_AGE_DAYS, DEFAULT_EEE_FIRST_PARTY_DISCOUNT,
+  DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
+} from './eee.mjs';
 import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
 import {
@@ -218,6 +225,17 @@ export function resolveConfig(raw = {}) {
     // Operator extensions to the AA-slug override table (CLIProxy model
     // id -> AA slug or { slug, effort }); merged over the built-in table.
     modelAaOverrides: raw.modelAaOverrides ?? {},
+    // EEE benchmark prior (Phase 2): secondary quality signal blended beside
+    // AA. Every default keeps today's AA-only behavior when the artifact is
+    // absent or stale (> eeeMaxAgeDays): bit-for-bit identical output.
+    eee: {
+      blendDoer: raw.eee?.blendDoer ?? raw.eeeBlendDoer ?? DEFAULT_EEE_BLEND_DOER,
+      blendThinker: raw.eee?.blendThinker ?? raw.eeeBlendThinker ?? DEFAULT_EEE_BLEND_THINKER,
+      weights: { ...DEFAULT_EEE_WEIGHTS, ...(raw.eee?.weights ?? raw.eeeWeights ?? {}) },
+      maxAgeDays: raw.eee?.maxAgeDays ?? raw.eeeMaxAgeDays ?? DEFAULT_EEE_MAX_AGE_DAYS,
+      firstPartyDiscount: raw.eee?.firstPartyDiscount ?? raw.eeeFirstPartyDiscount ?? DEFAULT_EEE_FIRST_PARTY_DISCOUNT,
+      decayHalfLifeDays: raw.eee?.decayHalfLifeDays ?? raw.eeeDecayHalfLifeDays ?? DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
+    },
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
     // for an account (research example value; flagged calibration: weak).
@@ -299,14 +317,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
-      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [] };
+      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null };
     }
     const body = await cliproxyLaneGet(companyId, config);
     const parsed = parseLaneBody(body, nowMs);
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
+    // EEE prior rides the same lane body (`eeeScores` key, same pattern as
+    // the existing `modelStats`/`pricingTiers` keys): absent or malformed
+    // means AA-only.
+    const eee = body?.eeeScores && typeof body.eeeScores === 'object' ? body.eeeScores : null;
     const snapshot = {
       accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs,
-      modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers,
+      modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers, eeeSnapshot: eee,
     };
     cache.set('accounts', snapshot, nowMs);
     return snapshot;
@@ -341,7 +363,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return (trialState?.graduated ?? []).includes(family);
   }
 
-  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null }) {
+  function buildAccountLadders({ accounts, aaSnapshot, eeeSnapshot = null, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null, nowMs = null }) {
+    // EEE prior: usable only when the artifact is fresh; otherwise every
+    // arm keeps its AA-only score (bit-for-bit identical to today).
+    const tickNow = nowMs ?? clock();
+    const eeeLive = eeeUsable(eeeSnapshot, { nowMs: tickNow, maxAgeDays: config.eee.maxAgeDays })
+      ? eeeSnapshot.scores : null;
     const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
     const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
     // Dynamic arms from the models the feed reports served, minus ids the
@@ -402,18 +429,36 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // account's own arm set, so one provider's gaps never punish another.
       const served = armsForAccount(arms, account);
       const scored = new Map(computeComposite(served, config.weights).map(s => [s.armId, s]));
+      // EEE blend: null Q_eee (no informing rows) keeps Q_aa untouched, so
+      // unmeasured arms (e.g. haiku-5-5) are neither helped nor harmed. The
+      // doer alpha applies on the ladder path (role bands pick rungs later);
+      // thinker blending is identical except for its smaller alpha -- both
+      // are exposed per arm below so /ladder shows each side.
+      const eeeScored = eeeLive
+        ? computeEeeComposite(served, eeeLive, {
+          weights: config.eee.weights, nowMs: tickNow,
+          firstPartyDiscount: config.eee.firstPartyDiscount,
+          decayHalfLifeDays: config.eee.decayHalfLifeDays,
+        })
+        : null;
+      const alphaDoer = eeeLive ? blendAlphaForRole('doer', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
+      const alphaThinker = eeeLive ? blendAlphaForRole('thinker', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
       const costs = fillCosts(served.map(a => ({
         armId: a.armId,
         cost: a.row.intelligenceIndexCostPerTask,
         priceIn: a.row.price1mInputTokens,
         priceOut: a.row.price1mOutputTokens,
       })));
+      const eeeByArm = new Map();
       const eligible = served.map(a => {
         const base = costs.get(a.armId)?.C ?? null;
         const tier = tierCostOf(a, base);
+        const qAa = scored.get(a.armId)?.Q ?? null;
+        const qEee = eeeScored?.get(a.armId)?.Qeee ?? null;
+        eeeByArm.set(a.armId, { qAa, qEee, qBlended: blendQ(qAa, qEee, alphaDoer), eeePrior: eeeScored?.get(a.armId) ?? null });
         return {
           armId: a.armId,
-          Q: scored.get(a.armId)?.Q ?? null,
+          Q: blendQ(qAa, qEee, alphaDoer),
           // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
           // below stays on base cost: price cliffs change money, not tokens.
           C: tier.costEffective ?? base,
@@ -426,11 +471,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         };
       });
       const eligibleByArm = new Map(eligible.map(e => [e.armId, e]));
-      const { rungs, dominated, dropped } = buildLadder(eligible, previousLadders?.[keyOf(account, i)]?.rungs ?? []);
+      // Rung-level CI gate (§5): newcomer displacements blocked within noise
+      // need the comparison-metric datum per arm. Null map (no fresh EEE
+      // artifact) keeps pinning bit-for-bit identical to today.
+      const gateByArm = eeeScored
+        ? new Map([...eeeScored].map(([armId, e]) => [armId, eeeGateDatum(e)]))
+        : null;
+      const { rungs, dominated, dropped, withinNoise } = buildLadder(eligible, previousLadders?.[keyOf(account, i)]?.rungs ?? [], gateByArm);
       ladders[keyOf(account, i)] = {
         rungs: rungs.map(r => {
           const arm = byArm.get(r.armId);
           const tier = eligibleByArm.get(r.armId);
+          const eq = eeeByArm.get(r.armId) ?? {};
           return {
             ...r,
             model: arm.model,
@@ -444,10 +496,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             costEffective: tier?.costEffective ?? tier?.costBase ?? null,
             tierSource: tier?.tierSource ?? 'none',
             statsRequests: tier?.statsRequests ?? 0,
+            // EEE blend audit trail: null qEee / null eeePrior means the arm
+            // scored AA-only (no informing rows or no fresh artifact).
+            qAa: eq.qAa ?? null,
+            qEee: eq.qEee ?? null,
+            qBlended: eq.qBlended ?? r.Q,
+            eeePrior: eq.eeePrior?.Qeee ?? null,
           };
         }),
         dominated,
         dropped,
+        withinNoise,
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
@@ -467,7 +526,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         r.cap = tierCaps[tierModelKey(r.model)] ?? null;
       }
     }
-    return { ladders, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline };
+    const blocked = Object.entries(ladders).flatMap(([key, l]) =>
+      (l.withinNoise ?? []).map(w => ({ account: key, ...w })));
+    return { ladders, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline, withinNoise: blocked };
   }
 
   function accountKey(account) {
@@ -736,15 +797,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, skipped, unscored, tierCaps, tierBaseline } = buildAccountLadders({
-      accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys, trialState,
-      tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers },
+    const { ladders, skipped, unscored, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
+      accounts: snapshot.accounts, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
+      tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
     // Tier-derived compact windows ride each rung arm (arm.cap, keyed by
     // model) into the hook and event-time paths via the live view below as
     // well as this tick's own decisions. No family-keyed merge: one model's
     // window must never scope onto its siblings. tierCaps (by model) still
     // rides the /capacity body below for visibility.
+    // §5 audit trail: challengers held at the incumbent's rung by the CI
+    // gate are logged, never silent.
+    if ((withinNoise ?? []).length > 0) {
+      ctx.logger.info('model-capacity: EEE rung challenges within noise', { companyId, withinNoise });
+    }
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
@@ -1362,17 +1428,36 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
 
     // Trial family report: counters plus graduation status plus live
     // in-flight, so /api/capacity shows what would need to happen for each
-    // trial family to graduate.
+    // trial family to graduate. Phase 3 (display-only): a Beta `eeePrior`
+    // per trial family from the benchmark Q_eee -- shown, never acted on.
     const trialFamilies = {};
     {
       const fams = new Set([...Object.keys(trialState.counters ?? {}), ...Object.keys(liveTrialBudget)]);
+      const eeeLiveForPrior = eeeUsable(snapshot.eeeSnapshot, { nowMs, maxAgeDays: config.eee.maxAgeDays })
+        ? snapshot.eeeSnapshot.scores : null;
+      const eeeForPrior = eeeLiveForPrior
+        ? computeEeeComposite(
+          Object.values(ladders).flatMap(l => l?.rungs ?? [])
+            .map(r => ({ armId: `${r.family}:${r.armId}`, model: r.model, effort: r.effort })),
+          eeeLiveForPrior,
+          { weights: config.eee.weights, nowMs, firstPartyDiscount: config.eee.firstPartyDiscount, decayHalfLifeDays: config.eee.decayHalfLifeDays })
+        : null;
       for (const fam of fams) {
         const st = trialFamilyStats(trialState, fam);
+        let eeePrior = null;
+        if (eeeForPrior) {
+          const vals = [...eeeForPrior]
+            .filter(([armId]) => armId.startsWith(`${fam}:`))
+            .map(([, s]) => s.Qeee)
+            .filter(v => v != null);
+          eeePrior = eeeFamilyPrior(vals);
+        }
         trialFamilies[fam] = {
           ...st,
           proven: isProvenFamily(trialState, fam),
           inFlight: liveTrialInFlight[fam] ?? 0,
           budget: liveTrialBudget[fam] ?? 0,
+          eeePrior,
         };
       }
     }

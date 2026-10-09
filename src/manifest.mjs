@@ -131,6 +131,39 @@ const CONFIG_SCHEMA = {
         lcr: { type: 'number', minimum: 0, default: 0.045 },
       },
     },
+    eee: {
+      type: 'object', additionalProperties: false,
+      description: 'EEE benchmark prior (Phase 2): secondary quality signal blended beside AA. Absent/stale artifact keeps AA-only behavior bit-for-bit.',
+      properties: {
+        blendDoer: { type: 'number', minimum: 0, maximum: 1, default: 0.25 },
+        blendThinker: { type: 'number', minimum: 0, maximum: 1, default: 0.1 },
+        weights: {
+          type: 'object', additionalProperties: false,
+          description: 'EEE composite weights (research §3 defaults summed to 1).',
+          properties: {
+            tb4: { type: 'number', minimum: 0, default: 0.35 },
+            bfcl: { type: 'number', minimum: 0, default: 0.15 },
+            sweVerified: { type: 'number', minimum: 0, default: 0.1 },
+            hle: { type: 'number', minimum: 0, default: 0.1 },
+            aaCoding: { type: 'number', minimum: 0, default: 0.1 },
+            aaIntel: { type: 'number', minimum: 0, default: 0.15 },
+            vals: { type: 'number', minimum: 0, default: 0.05 },
+          },
+        },
+        maxAgeDays: { type: 'number', minimum: 1, default: 7 },
+        firstPartyDiscount: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+        decayHalfLifeDays: { type: 'number', minimum: 1, default: 120 },
+      },
+    },
+    eeeBlendDoer: { type: 'number', minimum: 0, maximum: 1, default: 0.25 },
+    eeeBlendThinker: { type: 'number', minimum: 0, maximum: 1, default: 0.1 },
+    eeeWeights: {
+      type: 'object', additionalProperties: true,
+      description: 'Flat overrides for EEE composite weights (merged over eee.weights).',
+    },
+    eeeMaxAgeDays: { type: 'number', minimum: 1, default: 7 },
+    eeeFirstPartyDiscount: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+    eeeDecayHalfLifeDays: { type: 'number', minimum: 1, default: 120 },
     pacing: {
       type: 'object', additionalProperties: false,
       properties: {
