@@ -15,16 +15,69 @@
 export const LOW_COVERAGE_THRESHOLD = 0.6;
 export const LOW_COVERAGE_MAX_RUNG = 1;
 
+import { ciGateAllowsReorder } from './eee.mjs';
+
 /**
  * Pareto filter + rung assignment. Input entries: [{ armId, Q, C,
  * coverage }]. Arms with null Q or C are dropped (reported, not scored).
  * Deterministic tie-break: Q desc, C asc, armId lexical.
+ *
+ * opts.incurrestraint (research §5): { incumbents: Set<armId>, gateByArm }
+ * arms the rung-level CI gate. A NEWCOMER (absent from incumbents) knocks a
+ * surviving incumbent out of the ladder only when its comparison-metric gap
+ * clears the combined 95% bar; otherwise the incumbent keeps its rung and
+ * the pair is reported challenger-within-noise. Every other dominance pair
+ * (incumbent-incumbent, newcomer-newcomer, incumbent-over-newcomer) and any
+ * pair without an error model on both sides uses strict dominance exactly as
+ * today. Omit opts for bit-for-bit AA-only behavior.
+ *
+ * opts.heldPairs persists the gate across ticks: [{ challenger, incumbent }]
+ * carried over from the previous ladder's withinNoise. A challenger that
+ * survived only because the gate held it is still gated against THAT
+ * incumbent even though both now count as incumbents -- otherwise the hold
+ * lasts exactly one tick (tick 2 sees incumbent-vs-incumbent and drops the
+ * old arm on identical inputs). Re-blocked pairs are re-reported in
+ * withinNoise, so the caller re-persists them and the hold lasts until the
+ * CI bar clears; a cleared bar (or any other displacement) ends the hold
+ * naturally by dropping the pair from the report.
  */
-export function paretoFilter(entries) {
+export function paretoFilter(entries, opts = {}) {
   const usable = (entries ?? []).filter(e => e.Q != null && e.C != null);
   const dropped = (entries ?? []).filter(e => e.Q == null || e.C == null).map(e => e.armId);
+  const incumbents = opts.incumbents instanceof Set ? opts.incumbents : null;
+  const gateByArm = opts.gateByArm instanceof Map ? opts.gateByArm
+    : (opts.gateByArm && typeof opts.gateByArm === 'object' ? opts.gateByArm : null);
+  const gateOf = armId => gateByArm?.get?.(armId) ?? gateByArm?.[armId] ?? null;
+  // Persisted holds: one entry per (challenger, incumbent) pair held last
+  // tick -- a SET, not a challenger-keyed map, because one challenger can sit
+  // within noise of several incumbents at once and a map keeps only the last.
+  // Pairs join on NUL (arm ids never contain it): bare concatenation aliases
+  // ("ab"+"cd" vs "a"+"bcd"), and a phantom hold would gate the wrong pair.
+  const heldPairKey = (c, i) => `${c}\u0000${i}`;
+  const held = new Set();
+  for (const w of opts.heldPairs ?? []) {
+    if (w && typeof w.challenger === 'string' && typeof w.incumbent === 'string') {
+      held.add(heldPairKey(w.challenger, w.incumbent));
+    }
+  }
+  const noisyBlocks = [];
+  const dominatesForDrop = (o, m) => {
+    if (!strictlyDominates(o, m)) return false;
+    const newcomer = incumbents && !incumbents.has(o.armId);
+    const heldAgainst = incumbents && held.has(heldPairKey(o.armId, m.armId));
+    if (incumbents && gateByArm && incumbents.has(m.armId) && (newcomer || heldAgainst)) {
+      const n = gateOf(o.armId);
+      const r = gateOf(m.armId);
+      if (n && r && n.se != null && r.se != null
+        && !ciGateAllowsReorder(n.se, r.se, n.score - r.score)) {
+        noisyBlocks.push({ challenger: o.armId, incumbent: m.armId });
+        return false;
+      }
+    }
+    return true;
+  };
   const survivors = usable.filter(
-    m => !usable.some(o => o !== m && o.Q >= m.Q && o.C <= m.C && (o.Q > m.Q || o.C < m.C)),
+    m => !usable.some(o => o !== m && dominatesForDrop(o, m)),
   );
   survivors.sort((a, b) => (b.Q - a.Q) || (a.C - b.C) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
   // Rungs run cheapest-first: re-sort survivors by cost ascending with the
@@ -41,7 +94,11 @@ export function paretoFilter(entries) {
     maxRung: (arm.coverage ?? 1) < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : byCost.length - 1,
   }));
   const dominated = usable.filter(u => !survivors.includes(u)).map(u => u.armId);
-  return { rungs, dominated, dropped };
+  const survived = new Set(survivors.map(s => s.armId));
+  // Only report pairs where the incumbent actually kept its rung: a block
+  // followed by a drop at someone else's hands is not a kept rung.
+  const withinNoise = noisyBlocks.filter(w => survived.has(w.incumbent));
+  return { rungs, dominated, dropped, withinNoise };
 }
 
 function strictlyDominates(a, b) {
@@ -93,9 +150,18 @@ export function pinRungs(freshRungs, previousRungs) {
   return byFinal().map((r, rung) => ({ ...r, rung }));
 }
 
-/** Full ladder build for one account: filter, pin against previous, cap. */
-export function buildLadder(entries, previousRungs = []) {
-  const { rungs, dominated, dropped } = paretoFilter(entries);
+/** Full ladder build for one account: filter, pin against previous, cap.
+ * gateByArm (Map armId -> { score, se } | null) arms the rung-level CI gate
+ * (see paretoFilter); omit it (or pass null) for bit-for-bit AA-only
+ * behavior. heldPairs ([{ challenger, incumbent }], usually the previous
+ * ladder's withinNoise) keeps a held challenger gated against its incumbent
+ * across ticks until the CI bar clears. Returns
+ * { rungs, dominated, dropped, withinNoise }. */
+export function buildLadder(entries, previousRungs = [], gateByArm = null, heldPairs = []) {
+  const incumbents = (previousRungs ?? []).length > 0
+    ? new Set(previousRungs.map(r => r.armId))
+    : null;
+  const { rungs, dominated, dropped, withinNoise } = paretoFilter(entries, { incumbents, gateByArm, heldPairs });
   const pinned = pinRungs(rungs, previousRungs);
-  return { rungs: pinned, dominated, dropped };
+  return { rungs: pinned, dominated, dropped, withinNoise };
 }
