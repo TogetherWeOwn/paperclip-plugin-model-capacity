@@ -104,6 +104,85 @@ export function rungsHaveEligibleArms(ladderRungs) {
   return (ladderRungs ?? []).some(g => (g?.arms ?? []).length > 0);
 }
 
+/**
+ * The rung window a role can reach on a ladder of `groupCount` rung groups:
+ * the same floor/ceiling math decide() runs, so eligibility checks and the
+ * decision agree on which rungs exist for the role.
+ */
+export function roleRungWindow(band, groupCount) {
+  const topRung = Math.max(0, (groupCount ?? 1) - 1);
+  const floor = clamp(band?.floorRung ?? 0, 0, topRung);
+  const ceiling = band?.ceilingRung == null ? topRung : clamp(band.ceilingRung, floor, topRung);
+  return { topRung, floor, ceiling };
+}
+
+/**
+ * Can this role be placed on this ladder at all? Mirrors decide()'s
+ * reachability (family exclusions, the role's floor..ceiling rung window,
+ * trial-role gating) without the per-run inputs (headroom, burn, adapter,
+ * trial budget): the question is "does the account have an arm this role
+ * can ever take", not "does it have one right now".
+ *
+ * Returns { eligible, trialOnly }: trialOnly means every reachable arm is a
+ * trial arm, whose traffic is capped in flight, so the account cannot
+ * sustain its quota-derived slot count for this role.
+ */
+export function roleLadderAccess(ladderRungs, {
+  role = 'doer',
+  roleBands = DEFAULT_ROLE_BANDS,
+  excludedFamilies = [],
+  trialRoles = DEFAULT_TRIALS.roles,
+} = {}) {
+  const groups = ladderRungs ?? [];
+  const { floor, ceiling } = roleRungWindow(roleBands[role] ?? roleBands.doer, groups.length);
+  const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
+  const reachable = [];
+  for (const g of groups) {
+    if (!(g?.rung >= floor && g?.rung <= ceiling)) continue;
+    for (const a of g?.arms ?? []) {
+      if (!excluded.has(String(a?.family ?? '').toLowerCase())) reachable.push(a);
+    }
+  }
+  if (reachable.length === 0) return { eligible: false, trialOnly: false };
+  if (reachable.some(a => a?.trial !== true)) return { eligible: true, trialOnly: false };
+  const trialOk = (Array.isArray(trialRoles) ? trialRoles : []).includes(role);
+  return trialOk ? { eligible: true, trialOnly: true } : { eligible: false, trialOnly: false };
+}
+
+/**
+ * The arm decide() would pick on this ladder for a role, ignoring the
+ * per-run gates (headroom, burn, adapter, trial budget): walk from the
+ * pointer down to the role floor, take the first rung with a reachable arm,
+ * rank by the role's account-relative Q exactly as decide() does. Returns
+ * that arm's FLEET-comparable quality (qFleet / qFleetThinker, ride the
+ * rungs) so placement can compare arms across accounts, or null when no arm
+ * is reachable or the arm carries no fleet score.
+ */
+export function placementArm(ladderRungs, {
+  role = 'doer',
+  roleBands = DEFAULT_ROLE_BANDS,
+  excludedFamilies = [],
+  trialRoles = DEFAULT_TRIALS.roles,
+  pointer = null,
+} = {}) {
+  const groups = ladderRungs ?? [];
+  const { floor, ceiling } = roleRungWindow(roleBands[role] ?? roleBands.doer, groups.length);
+  const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
+  const trialOk = (Array.isArray(trialRoles) ? trialRoles : []).includes(role);
+  const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
+  for (let rung = clamp(pointer ?? floor, floor, ceiling); rung >= floor; rung--) {
+    const entry = groups.find(g => g.rung === rung);
+    const arms = (entry?.arms ?? []).filter(a =>
+      !excluded.has(String(a?.family ?? '').toLowerCase()) && (a?.trial !== true || trialOk));
+    if (arms.length === 0) continue;
+    arms.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
+    const arm = arms[0];
+    const q = role === 'thinker' ? (arm.qFleetThinker ?? arm.qFleet) : arm.qFleet;
+    return { armId: arm.armId, family: arm.family ?? null, rung, quality: Number.isFinite(q) ? q : null };
+  }
+  return null;
+}
+
 function sanitizeId(part) {
   return String(part).replace(/[^a-zA-Z0-9-]+/g, '-').slice(0, 80) || 'x';
 }
@@ -154,9 +233,7 @@ export function decide({
     return { kind: 'defer', retryAfterMs: 20000, reason: 'previous run rate-limited: reroute to next account' };
   }
   const band = roleBands[role] ?? roleBands.doer;
-  const topRung = Math.max(0, (ladderRungs?.length ?? 1) - 1);
-  const floor = clamp(band.floorRung ?? 0, 0, topRung);
-  const ceiling = band.ceilingRung == null ? topRung : clamp(band.ceilingRung, floor, topRung);
+  const { floor, ceiling } = roleRungWindow(band, ladderRungs?.length);
   const escalation = Math.max(0, retryCount) + (failureClass === 'test-fail' ? 1 : 0);
   const target = clamp((pointer ?? floor) + escalation, floor, ceiling);
   const excludedFamilySet = new Set(normalizeExcludedFamilies(excludedFamilies));

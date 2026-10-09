@@ -46,6 +46,10 @@
     "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "haikuMaxOutputTokens": 64000
   },
+  "placement": {
+    "qualityWeight": 1,
+    "allowanceWeight": 0.35
+  },
   "enforce": false,
   "trials": {
     "maxInFlightPerAccount": 2,

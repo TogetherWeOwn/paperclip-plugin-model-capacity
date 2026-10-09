@@ -55,7 +55,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms } from './decide.mjs';
+import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
@@ -63,8 +63,14 @@ import {
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, createBreakerStore,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
-import { orderAccountsForRun } from './select.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
+import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
+import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
+import {
+  issueSnapshot, classifyOutcome, familyOutcomes,
+  OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
+} from './outcomes.mjs';
+import { orderAccountsForRun, DEFAULT_PLACEMENT } from './select.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
@@ -83,6 +89,10 @@ const CAPACITY_KEY = 'capacity-v1';
 const LADDER_KEY = 'ladder-v1';
 const RATE_KEY = 'rate-history-v1';
 const RUNEVT_KEY = 'run-events-v1';
+/** EWMA state for the pooled burn per run and the fleet target (tick-owned). */
+const SMOOTH_KEY = 'smoothing-v1';
+/** Per-agent cap hysteresis state (written by GET /caps). */
+const CAPS_HOLD_KEY = 'caps-hold-v1';
 
 /**
  * Run ledger persisted per company: one record per runId (starts, decisions,
@@ -194,6 +204,17 @@ export function validateConfigShape(raw) {
   }
   if (raw.modelAaOverrides != null && (typeof raw.modelAaOverrides !== 'object' || Array.isArray(raw.modelAaOverrides))) {
     errors.push('modelAaOverrides must be an object of CLIProxy model id to AA slug');
+  }
+  if (raw.placement != null) {
+    if (typeof raw.placement !== 'object' || Array.isArray(raw.placement)) {
+      errors.push('placement must be an object');
+    } else {
+      for (const k of ['qualityWeight', 'allowanceWeight']) {
+        if (k in raw.placement && !(typeof raw.placement[k] === 'number' && raw.placement[k] >= 0)) {
+          errors.push(`placement.${k} must be a non-negative number`);
+        }
+      }
+    }
   }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
   if (raw.breakers != null && (typeof raw.breakers !== 'object' || Array.isArray(raw.breakers))) {
@@ -337,6 +358,11 @@ export function resolveConfig(raw = {}) {
       firstPartyDiscount: raw.eeeFirstPartyDiscount ?? raw.eee?.firstPartyDiscount ?? DEFAULT_EEE_FIRST_PARTY_DISCOUNT,
       decayHalfLifeDays: raw.eeeDecayHalfLifeDays ?? raw.eee?.decayHalfLifeDays ?? DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
     },
+    // Placement blend (#2): qualityWeight 0 restores pure water-filling.
+    placement: {
+      qualityWeight: raw.placement?.qualityWeight ?? DEFAULT_PLACEMENT.qualityWeight,
+      allowanceWeight: raw.placement?.allowanceWeight ?? DEFAULT_PLACEMENT.allowanceWeight,
+    },
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
     // for an account (research example value; flagged calibration: weak).
@@ -461,6 +487,77 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return Array.isArray(list) ? list : [];
   }
 
+  // One issue read for run-outcome tracking (issues.read, positional args
+  // like every other SDK read here). Null when unreadable; callers retry
+  // on a later tick up to a bound.
+  async function readIssueSnapshot(companyId, issueId, caches = null) {
+    if (caches?.snapshots?.has(issueId)) return caches.snapshots.get(issueId);
+    try {
+      const snap = issueSnapshot(await ctx.issues.get(issueId, companyId));
+      caches?.snapshots?.set(issueId, snap);
+      return snap;
+    } catch (error) {
+      ctx.logger.error('model-capacity: outcome issue read failed', { companyId, error: error?.message ?? String(error) });
+      return null;
+    }
+  }
+
+  // Queued work per agent: assigned open issues (todo + in_progress, grouped
+  // by assignee). Shared by the tick (role-weighted target) and GET /caps,
+  // behind a short memo so the two read one snapshot instead of doubling
+  // issue reads. Throws when issues.read is unavailable; callers degrade.
+  const queuedCache = new Map(); // companyId -> { atMs, counts: Map(agentId -> n) }
+  const QUEUED_TTL_MS = 20000;
+  async function queuedByAgent(companyId, nowMs) {
+    const hit = queuedCache.get(companyId);
+    if (hit && nowMs - hit.atMs >= 0 && nowMs - hit.atMs < QUEUED_TTL_MS) return hit.counts;
+    const lists = await Promise.all([
+      ctx.issues.list({ companyId, status: 'todo' }),
+      ctx.issues.list({ companyId, status: 'in_progress' }),
+    ]);
+    const counts = new Map();
+    const seen = new Set();
+    for (const issue of lists.flat()) {
+      if (!issue || typeof issue !== 'object') continue;
+      const id = issue.id ?? issue.issueId;
+      if (id != null) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+      }
+      const status = String(issue.status ?? '').toLowerCase();
+      if (status === 'done' || status === 'blocked' || status === 'cancelled') continue;
+      const agentId = issue.assigneeAgentId ?? issue.assignee_agent_id ?? null;
+      if (typeof agentId === 'string' && agentId.length > 0) {
+        counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
+      }
+    }
+    queuedCache.set(companyId, { atMs: nowMs, counts });
+    return counts;
+  }
+
+  // Queued demand per role for the role-weighted target. With no queued work
+  // (or issues unreadable) the roles that exist weigh equally: the target
+  // then counts any capacity some role can use, instead of collapsing to 0
+  // on an empty queue or hollowing out on a read failure.
+  async function roleDemandFor(companyId, config, nowMs) {
+    const roles = config?.roles ?? {};
+    const prior = {
+      doer: 1,
+      thinker: Array.isArray(roles.thinkerAgentIds) && roles.thinkerAgentIds.length > 0 ? 1 : 0,
+      other: Array.isArray(roles.doerAgentIds) && roles.doerAgentIds.length > 0 ? 1 : 0,
+    };
+    try {
+      const counts = await queuedByAgent(companyId, nowMs);
+      const byRole = { doer: 0, thinker: 0, other: 0 };
+      for (const [agentId, n] of counts) byRole[roleOf(config, agentId)] += n;
+      const total = byRole.doer + byRole.thinker + byRole.other;
+      return total > 0 ? { byRole, source: 'issues' } : { byRole: prior, source: 'idle-prior' };
+    } catch (error) {
+      ctx.logger.error('model-capacity: role demand read failed', { companyId, error: error?.message ?? String(error) });
+      return { byRole: prior, source: 'unavailable' };
+    }
+  }
+
   /**
    * Trial state: per-family fleet success counters plus the graduated set.
    * { counters: { family: { finished, failed } }, graduated: [family],
@@ -545,6 +642,36 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (cost == null || !(refCost > 0)) return null;
       return config.calibration.referenceBurnPerRunPct * (cost / refCost);
     };
+    // Fleet-comparable quality for PLACEMENT. The per-account Q below is
+    // z-scored against that account's own arm set (a one-arm lane scores 0,
+    // a lane of strong models scores its strongest arm near +1), so Q cannot
+    // rank arms ACROSS accounts. qFleet scores every served arm against the
+    // whole served fleet once, with the same weights and EEE blend, and
+    // rides each rung for the placement score. Ladders and decide() stay on
+    // the per-account Q: this adds a field, it changes no rung.
+    const fleetArms = [];
+    {
+      const seenArm = new Set();
+      for (const account of accounts ?? []) {
+        for (const a of armsForAccount(arms, account)) {
+          if (!seenArm.has(a.armId)) {
+            seenArm.add(a.armId);
+            fleetArms.push(a);
+          }
+        }
+      }
+    }
+    const fleetAa = new Map(computeComposite(fleetArms, config.weights).map(sc => [sc.armId, sc.Q]));
+    const fleetEee = eeeLive
+      ? computeEeeComposite(fleetArms, eeeLive, {
+        weights: config.eee.weights, nowMs: tickNow,
+        firstPartyDiscount: config.eee.firstPartyDiscount,
+        decayHalfLifeDays: config.eee.decayHalfLifeDays,
+      })
+      : null;
+    const fleetAlphaDoer = eeeLive ? blendAlphaForRole('doer', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
+    const fleetAlphaThinker = eeeLive ? blendAlphaForRole('thinker', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
+    const fleetQ = (armId, alpha) => blendQ(fleetAa.get(armId) ?? null, fleetEee?.get(armId)?.Qeee ?? null, alpha);
     const ladders = {};
     for (let i = 0; i < accounts.length; i++) {
       const account = accounts[i];
@@ -634,6 +761,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             qEee: eq.qEee ?? null,
             qBlended: eq.qBlended ?? r.Q,
             qThinker: eq.qThinker ?? null,
+            qFleet: fleetQ(r.armId, fleetAlphaDoer),
+            qFleetThinker: fleetQ(r.armId, fleetAlphaThinker),
             eeePrior: eq.eeePrior?.Qeee ?? null,
           };
         }),
@@ -767,6 +896,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             note: issue == null ? 'issue-not-found' : 'no-override-on-issue',
           };
           caches.issues.set(run.issueId, entry);
+          caches.snapshots?.set(run.issueId, issueSnapshot(issue));
         }
         if (entry.model) return { model: entry.model, source: 'issue-override', error: null };
         notes.push(entry.note);
@@ -1076,6 +1206,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           costEffective: r.costEffective ?? r.costBase ?? null,
           tierSource: r.tierSource ?? 'none',
           statsRequests: r.statsRequests ?? 0,
+          qFleet: r.qFleet ?? null,
         })),
         provider: account.provider,
         health: account.health,
@@ -1153,7 +1284,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     for (const t of breakerTransitions) {
       ctx.logger.info(`model-capacity: arm breaker ${t.transition}`, { companyId, ...t });
     }
-    const modelCaches = { agents: new Map(), issues: new Map() };
+    // snapshots: per-tick issue snapshots (outcome tracking) filled by the
+    // same issue read the model resolution makes, so one tick never reads an
+    // issue twice.
+    const modelCaches = { agents: new Map(), issues: new Map(), snapshots: new Map() };
     const accountOfModel = (model) => (model != null && model !== 'unknown'
       ? accountForRun({ model }, snapshot.accounts)
       : null);
@@ -1220,6 +1354,51 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (t) for (const r of list) r.adapterType = t;
       }
     }
+    // Run outcomes (#2): did a finished run do its job? Baseline the issue
+    // status while the run is in flight, then classify the finished run by
+    // what changed on its issue (see outcomes.mjs). Bounded issue reads per
+    // tick; a run the window passes is closed as unknown, never re-read.
+    {
+      let reads = 0;
+      const inFlightNeedingBaseline = [...ledger.values()]
+        .filter(r => r?.status === 'running' && r?.unverified !== true && typeof r.issueId === 'string'
+          && r.issueStatus0 == null && r.baselineSkipped !== true && (r.baselineTries ?? 0) < OUTCOME_MAX_TRIES)
+        .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+      for (const r of inFlightNeedingBaseline) {
+        if (reads >= OUTCOME_READS_PER_TICK) break;
+        // First seen late (restart, tick gap): the issue may already carry
+        // the run's own status move. Leave the baseline unset -- the run
+        // scores unknown unless it created a work product.
+        if (r.startedAt == null || nowMs - r.startedAt > OUTCOME_BASELINE_MAX_AGE_MS) {
+          r.baselineSkipped = true;
+          continue;
+        }
+        reads += 1;
+        const snap = await readIssueSnapshot(companyId, r.issueId, modelCaches);
+        if (snap?.status != null) r.issueStatus0 = snap.status;
+        else r.baselineTries = (r.baselineTries ?? 0) + 1;
+      }
+      reads = 0;
+      for (const r of ledger.values()) {
+        if (r?.status !== 'finished' || r.progress != null) continue;
+        if (typeof r.issueId !== 'string' || nowMs - (r.terminalAt ?? 0) > OUTCOME_EVAL_WINDOW_MS) {
+          r.progress = 'unknown';
+          continue;
+        }
+        if (reads >= OUTCOME_READS_PER_TICK) continue;
+        reads += 1;
+        const snap = await readIssueSnapshot(companyId, r.issueId, modelCaches);
+        if (snap == null) {
+          r.evalTries = (r.evalTries ?? 0) + 1;
+          if (r.evalTries >= OUTCOME_MAX_TRIES) r.progress = 'unknown';
+          continue;
+        }
+        const res = classifyOutcome({ runId: r.runId, baselineStatus: r.issueStatus0 ?? null, after: snap });
+        r.progress = res.outcome;
+        r.handoffOwed = res.signals.handoffOwed;
+        r.progressAt = nowMs;
+      }
+    }
     // Terminal-id memory is the ledger itself: terminal records persist
     // until the shadow TTL trims them, so finished runs never haunt
     // in-flight no matter how stale the rate window is.
@@ -1250,34 +1429,76 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (calibrationAccountOf(r) == null) unmappedRuns += 1;
     }
 
+    // Pooled-provider calibration. CLIProxy round-robins a
+    // provider's credentials, but a run maps to ONE lane (the first serving
+    // its model), so per-lane E divided one lane's delta by every pool run
+    // (~pool-width too low) and left sibling lanes uncalibrated. E is
+    // therefore measured per calibration GROUP: summed lane deltas over runs
+    // started on any member (see pools.mjs), EWMA-smoothed (#3), and read
+    // identically by every member.
+    const { groupOf: calibGroupOf, members: calibMembers } = buildCalibrationGroups(snapshot.accounts, stateKeys);
+    const groupOfRun = (r) => calibGroupOf.get(calibrationAccountOf(r)) ?? null;
+    const runsInGroupSpan = (gid, spanMs) => startedOnCountWhere(ledger, gid, nowMs - spanMs, groupOfRun);
+    const viewByKey = new Map(accountViews.map(v => [v.accountId, v]));
+    const smoothState = (await ctx.state.get(scopeKey(companyId, SMOOTH_KEY))) ?? {};
+    const smoothOpts = {
+      halfLifeMs: SMOOTHING_DEFAULTS.halfLifeMin * 60000,
+      staleMs: SMOOTHING_DEFAULTS.staleHours * 3600000,
+    };
+    // The target falls on a shorter half-life than it rises (see smoothing.mjs).
+    const targetSmoothOpts = { ...smoothOpts, downHalfLifeMs: SMOOTHING_DEFAULTS.targetDownHalfLifeMin * 60000 };
+    const prevSmoothE = smoothState.E != null && typeof smoothState.E === 'object' ? smoothState.E : {};
+    const nextSmoothE = new Map();
+    const groupE = new Map(); // gid -> smoothed pooled burn per run
+    const calibrationGroups = {};
+    for (const [gid, memberKeys] of calibMembers) {
+      const pooled = pooledBurnPerRun({
+        memberKeys,
+        historyOf: k => rateHistories[k] ?? [],
+        spanMsOf: k => viewByKey.get(k)?.rateSpanMs ?? null,
+        runsInSpan: spanMs => runsInGroupSpan(gid, spanMs),
+        nowMs,
+      });
+      const entry = smoothValue(Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
+        pooled?.burnPerRunPct ?? null, nowMs, smoothOpts);
+      if (entry) {
+        groupE.set(gid, entry.value);
+        nextSmoothE.set(gid, entry);
+      }
+      if (memberKeys.length > 1 || pooled) {
+        calibrationGroups[gid] = {
+          members: memberKeys.length,
+          contributing: pooled?.contributing ?? 0,
+          runs: pooled?.runs ?? 0,
+          rawBurnPerRunPct: pooled?.burnPerRunPct ?? null,
+          burnPerRunPct: entry?.value ?? null,
+        };
+      }
+    }
+    const medianMeasuredE = medianPositive([...groupE.values()]);
+
     // Each account's target share is requiredRate / E (runs/hour it can
     // sustain; proportions match the per-account C* concurrency targets).
-    // E prefers measured burn-per-run, then the ladder-average burn, then
-    // the calibration reference anchor.
+    // E prefers the group's measured burn-per-run, then the ladder-average
+    // burn, then the calibration reference anchor; the guessed fallbacks are
+    // floored at the median measured burn so an uncalibrated anchor cannot
+    // claim a bigger share than a measured peer (#1).
     {
       const refAnchor = config.calibration?.referenceBurnPerRunPct ?? 0.0005;
-      const runsInSpan = (key, spanMs) => startedOnCountWhere(ledger, key, nowMs - spanMs, calibrationAccountOf);
       for (let i = 0; i < snapshot.accounts.length; i++) {
         const key = stateKeys[i];
         const view = accountViews[i];
         if (!view) continue;
         view.pool = poolOfKey(key);
-        let E = null;
-        const spanMs = view.rateSpanMs ?? null;
-        if (spanMs != null && spanMs > 0 && view.weeklyUsedPct != null) {
-          const hist = rateHistories[key] ?? [];
-          const inSpan = hist.filter(p => nowMs - p.atMs <= spanMs);
-          if (inSpan.length >= 2) {
-            const delta = inSpan[inSpan.length - 1].usedPct - inSpan[0].usedPct;
-            const n = runsInSpan(key, spanMs);
-            if (delta > 0 && n > 0) E = delta / n;
-          }
-        }
+        view.calibrationGroup = calibGroupOf.get(key) ?? key;
+        let E = groupE.get(view.calibrationGroup) ?? null;
+        view.burnCalibrated = E != null;
         if (E == null) {
           const vals = Object.values(ladders[key]?.burnPerRunPct ?? {}).filter(v => v != null);
           if (vals.length > 0) E = vals.reduce((s, v) => s + v, 0) / vals.length;
+          if (E == null || !(E > 0)) E = refAnchor;
+          if (medianMeasuredE != null && E < medianMeasuredE) E = medianMeasuredE;
         }
-        if (E == null || !(E > 0)) E = refAnchor;
         view.effectiveBurnPerRunPct = E;
         view.targetShare = view.requiredRatePerHour != null && view.requiredRatePerHour > 0
           ? view.requiredRatePerHour / E
@@ -1318,43 +1539,67 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     trialState.graduated = [...graduated];
 
-    // E_a calibration: weekly-used delta over the measured span divided by
-    // runs that started on the account inside that span.
-    const runsInSpan = (key, spanMs) => startedOnCountWhere(ledger, key, nowMs - spanMs, calibrationAccountOf);
+    // Concurrency target from the pooled burn above. Role-aware (#1): each
+    // account's slots count only for roles with a reachable arm there
+    // (family exclusions, the role's floor..ceiling window, trial gating),
+    // weighted by each role's queued demand, so capacity the roles cannot
+    // use never inflates the target. Smoothed (#3) so a one-tick burn or
+    // queue swing does not flap the caps.
     const burnOf = key => {
       const b = ladders[key]?.burnPerRunPct ?? {};
       const vals = Object.values(b).filter(v => v != null);
       if (vals.length === 0) return null;
-      return vals.reduce((s, v) => s + v, 0) / vals.length;
+      return vals.reduce((sum, v) => sum + v, 0) / vals.length;
     };
+    const roleBands = {
+      thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
+      doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
+    };
+    const roleAccess = Object.create(null);
+    for (const a of ordered) {
+      const groups = filterBreakerRungs(groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg);
+      const entry = {};
+      for (const role of ROLES) {
+        entry[role] = roleLadderAccess(groups, {
+          role, roleBands, excludedFamilies: excludedFamiliesForRole(config, role), trialRoles: config.trials.roles,
+        });
+      }
+      roleAccess[a.accountId] = entry;
+    }
+    const demand = await roleDemandFor(companyId, config, nowMs);
     const concurrency = computeConcurrencyTarget({
       accounts: ordered.map(a => {
-        const view = accountViews.find(v => v.accountId === a.accountId);
-        const spanMs = view?.rateSpanMs ?? null;
-        let measuredE = null;
-        if (spanMs != null && spanMs > 0 && view?.weeklyUsedPct != null) {
-          const hist = rateHistories[a.accountId] ?? [];
-          const inSpan = hist.filter(p => nowMs - p.atMs <= spanMs);
-          if (inSpan.length >= 2) {
-            const delta = inSpan[inSpan.length - 1].usedPct - inSpan[0].usedPct;
-            const n = runsInSpan(a.accountId, spanMs);
-            if (delta > 0 && n > 0) measuredE = delta / n;
-          }
-        }
+        const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
         return {
           accountId: a.accountId,
+          calibrationGroup: gid,
           remainingPct: a.remainingPct ?? 0,
           hoursToReset: a.resetAtMs != null ? Math.max((a.resetAtMs - nowMs) / 3600000, 0.25) : 168,
           burnPerRunPct: burnOf(a.accountId),
-          measuredBurnPerRunPct: measuredE,
-          runsInWindow: runsInSpan(a.accountId, rateWindowMs),
+          measuredBurnPerRunPct: groupE.get(gid) ?? null,
+          runsInWindow: runsInGroupSpan(gid, rateWindowMs),
           guardActive: a.guardActive,
           healthy: a.health === 'healthy',
         };
       }),
       meanRunDurationHours: config.concurrency.meanRunDurationHours,
       maxTotal: config.concurrency.maxTotal,
+      roleAccess,
+      roleDemand: demand.byRole,
+      trialSlotCap: config.trials.maxInFlightPerAccount,
     });
+    for (const row of concurrency.perAccount) row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
+    // EWMA the served target. A zero (everything guarded: shed now) and a
+    // null (weak: nothing measured) pass through unsmoothed and reset the
+    // series, so safety sheds are never lagged.
+    const rawTarget = concurrency.target;
+    let nextSmoothTarget = null;
+    if (rawTarget != null && rawTarget > 0) {
+      const prevT = Object.hasOwn(smoothState, 'target') ? smoothState.target : null;
+      nextSmoothTarget = smoothValue(prevT, rawTarget, nowMs, targetSmoothOpts);
+      concurrency.target = Math.min(nextSmoothTarget.value, config.concurrency.maxTotal);
+    }
+    concurrency.targetRaw = rawTarget;
 
     // Ledger first: hook and event-time decisions since the last tick are
     // already in it (no queues to merge). Restart reconciliation only marks
@@ -1400,8 +1645,27 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       return { pools, byAccount: cur.byAccount };
     };
-    const allocationOrder = () => {
-      const { pools } = freshPressure();
+    // Fleet quality of the arm each account would run for this role (see
+    // placementArm): the placement blend ranks accounts by it, so unspent
+    // allowance breaks ties between similar arms instead of picking the
+    // account with the most room regardless of what runs there.
+    // Memoized per (role, account): pointer, ladders and breakers are fixed
+    // for the whole tick (shadow picks never occupy a probe slot), and the
+    // candidate loop asks once per run.
+    const placementQuality = new Map();
+    const placementQualityFor = (accountId, pointer, role) => {
+      const memoKey = `${role}\u0000${accountId}`;
+      if (placementQuality.has(memoKey)) return placementQuality.get(memoKey);
+      const groups = filterBreakerRungs(groupByRung(ladders[accountId]?.rungs ?? []), breakers, accountId, nowMs, breakersCfg);
+      const q = placementArm(groups, {
+        role, roleBands, excludedFamilies: excludedFamiliesForRole(config, role),
+        trialRoles: config.trials.roles, pointer,
+      })?.quality ?? null;
+      placementQuality.set(memoKey, q);
+      return q;
+    };
+    const allocationOrder = (role) => {
+      const { pools, byAccount } = freshPressure();
       return orderAccountsForRun(
         accountViews.map(v => ({
           accountId: v.accountId,
@@ -1414,8 +1678,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           meter: v.meter,
           quality: v.quality,
           inFlight: pools[v.pool] ?? 0,
+          pool: v.pool,
+          laneInFlight: byAccount[v.accountId] ?? 0,
+          placementQ: placementQualityFor(v.accountId, v.pointer, role),
         })),
-        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel },
+        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement },
       );
     };
     // Fresh trial budgets per candidate: decisions write through to the
@@ -1446,10 +1713,6 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         && r?.unverified !== true && r?.startedAt != null && nowMs - r.startedAt < 15 * 60 * 1000)
       .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
       .slice(0, 100);
-    const roleBands = {
-      thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
-      doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
-    };
     let observed = 0;
     let shadowSkippedNoDecision = 0;
     for (const run of candidates) {
@@ -1459,7 +1722,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // straight into the ledger, so earlier decisions in this tick already
       // narrow the winner's shortfall and consume budget structurally --
       // the next run spreads elsewhere without any pending-side state.
-      for (const sel of allocationOrder()) {
+      for (const sel of allocationOrder(role)) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
         if (!view || !ladder) continue;
@@ -1648,6 +1911,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         };
       }),
       rateDeadbandRel: config.pacing.rateDeadbandRel,
+      placement: config.placement,
     });
     // Event-time decisions that landed since the previous tick (memory-only
     // reporting stat; the ledger itself is the merge).
@@ -1697,6 +1961,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     await ctx.state.set(scopeKey(companyId, PACING_KEY), nextPacing);
     await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
+    await ctx.state.set(scopeKey(companyId, SMOOTH_KEY), {
+      atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
+    });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
     // idempotent) on the next run. Trim bounds the persisted blob at
@@ -1739,8 +2006,29 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
+      // Unsmoothed usable target, and the quota-only sum with no role
+      // filtering (what the target used to read), so the gap stays visible.
+      targetRaw: concurrency.targetRaw ?? concurrency.target,
+      targetUnweighted: concurrency.slotsTotal ?? null,
       maxTotal: config.concurrency.maxTotal,
       calibration: concurrency.calibration,
+      // Did finished runs do their job (issue status moved / work product
+      // created by the run), per resolved model family, last 24h.
+      familyOutcomes: familyOutcomes(terminalRecords(ledger), {
+        nowMs,
+        familyOf: r => inferFamily(canonicalModelName(r.actualModel)) ?? r.family ?? null,
+      }),
+      // Per-role usable capacity and the queued demand that weights it.
+      roles: concurrency.roles ?? null,
+      demandSource: demand.source,
+      medianMeasuredBurnPct: concurrency.medianMeasuredBurnPct ?? null,
+      // Calibration groups: pooled providers measured as one (members > 1).
+      calibrationGroups,
+      smoothing: {
+        halfLifeMin: SMOOTHING_DEFAULTS.halfLifeMin,
+        targetDownHalfLifeMin: SMOOTHING_DEFAULTS.targetDownHalfLifeMin,
+        staleHours: SMOOTHING_DEFAULTS.staleHours,
+      },
       perAccount: concurrency.perAccount,
       accounts: accountViews,
       skippedArms: skipped,
@@ -1846,15 +2134,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * per-account cap is checked separately against per-account counts
    * (see the hook and event-time loops).
    */
-  function allocationOrderFromLive(live, companyId, excludeRunId = null) {
+  function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = []) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
       [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
     const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
     const poolPending = {};
+    const lanePending = new Map();
     for (const q of decisionsSinceTick(live, companyId, excludeRunId)) {
       if (!q?.decidedAccount) continue;
       const p = poolOf(q.decidedAccount);
       poolPending[p] = (poolPending[p] ?? 0) + 1;
+      lanePending.set(q.decidedAccount, (lanePending.get(q.decidedAccount) ?? 0) + 1);
     }
     return orderAccountsForRun(
       (live.accounts ?? []).map(a => {
@@ -1863,9 +2153,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           ...a,
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
+          pool: p,
+          laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
+          placementQ: placementArm(a.ladderRungs ?? [], {
+            role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
+            trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles, pointer: a.pointer ?? 0,
+          })?.quality ?? null,
         };
       }),
-      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 },
+      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null },
     );
   }
 
@@ -1912,7 +2208,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     const role = roleOf(config, run.agentId);
     const roleExcluded = excludedFamiliesForRole(config, role);
-    const order = allocationOrderFromLive(live, companyId);
+    const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
     // views drives ordering only -- comparing the pool total against the
@@ -2180,26 +2476,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // recommendation instead of failing the request.
         let counts;
         try {
-          const lists = await Promise.all([
-            ctx.issues.list({ companyId, status: 'todo' }),
-            ctx.issues.list({ companyId, status: 'in_progress' }),
-          ]);
-          counts = new Map();
-          const seen = new Set();
-          for (const issue of lists.flat()) {
-            if (!issue || typeof issue !== 'object') continue;
-            const id = issue.id ?? issue.issueId;
-            if (id != null) {
-              if (seen.has(id)) continue;
-              seen.add(id);
-            }
-            const status = String(issue.status ?? '').toLowerCase();
-            if (status === 'done' || status === 'blocked' || status === 'cancelled') continue;
-            const agentId = issue.assigneeAgentId ?? issue.assignee_agent_id ?? null;
-            if (typeof agentId === 'string' && agentId.length > 0) {
-              counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
-            }
-          }
+          counts = await queuedByAgent(companyId, clock());
         } catch (error) {
           // Sanitized: callers get a stable code, never upstream text.
           // Details go server-side only.
@@ -2214,7 +2491,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // runs while the fleet idles is the failure this replaces.
         const runningByAgent = cap.agentRunning ?? {};
         const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
-        const agents = allocateDemandCaps(
+        const unheld = allocateDemandCaps(
           target,
           [...agentIds].map(agentId => ({
             agentId,
@@ -2224,6 +2501,25 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           })),
           cap.maxTotal ?? 75,
         );
+        // Hysteresis (#3): wants follow the instantaneous queue, so served
+        // caps fall on a half-life instead of tracking every dip (increases
+        // pass at once; a cap under demand would throttle real work). The
+        // hold state is advisory: if it cannot be read or written the
+        // unheld allocation is served.
+        const nowMs = clock();
+        let agents = unheld;
+        try {
+          const prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
+          const held = holdCaps(unheld, prevHold, nowMs, {
+            halfLifeMs: SMOOTHING_DEFAULTS.halfLifeMin * 60000,
+            staleMs: SMOOTHING_DEFAULTS.staleHours * 3600000,
+            ceiling: cap.maxTotal ?? 75,
+          });
+          agents = held.entries;
+          await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+        } catch (error) {
+          ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
+        }
         return { status: 200, body: { atMs, calibration, target, agents } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
@@ -2268,7 +2564,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // this hook resolves, so a queued shadow entry for THIS runId must not
       // count against it in ordering, caps, or budgets.
       const selfId = params?.runId != null ? String(params.runId) : null;
-      const order = allocationOrderFromLive(live, params.companyId, selfId);
+      const order = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;

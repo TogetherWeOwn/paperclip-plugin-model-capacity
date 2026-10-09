@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.17, all-providers)
+# Model Capacity plugin (v0.2.19, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -41,6 +41,51 @@ while provider-pool totals order allocation only; terminal runIds are
 retained for the full ring horizon; `agent.run.cancelled` is subscribed
 and terminal; terminal `payload.modelDecision.model` is authoritative for
 attribution and graduation.
+
+**v0.2.19 = USABLE TARGET, POOLED CALIBRATION, SMOOTHING, QUALITY-AWARE
+PLACEMENT.** Four fixes found while the enforce install ran live:
+
+1. *The target counts only capacity the roles can use.* An account's slots
+   count for a role when, after `excludeFamilies`, the role's floor..ceiling
+   rung window and trial-role gating, it has a reachable arm
+   (`roleLadderAccess`, checked against `decide()` in the tests). The target
+   is the sum over roles of (the role's share of queued demand) x (slots of
+   the accounts that role can use), so a lane no role can use, or one only
+   the idle role can use, adds nothing. A trial-only account is clipped to the
+   trial in-flight cap. An uncalibrated (anchor) burn estimate is floored at
+   the median measured per-run burn, so a guessed-cheap anchor cannot mint
+   more slots than a measured peer. `/capacity` shows `target` (usable),
+   `targetRaw` (before smoothing), `targetUnweighted` (quota only, the old
+   sum), per-role `roles`, and per-account `eligibleRoles` / `usableSlots`.
+2. *Pooled providers calibrate and place as one pool.* CLIProxy round-robins
+   a provider's credentials but a run maps to one lane, so per-lane E was one
+   lane's delta over every pool run (about pool-width too low) and the
+   sibling lanes never calibrated. Same-provider lanes that share a served
+   model (or lack a model list) now form a calibration group:
+   `E = sum(lane deltas) / runs on any member`, read by every member
+   (`calibrationGroups` on `/capacity`). Placement treats a provider's lanes
+   as one candidate (shares sum against the pooled in-flight) and spreads
+   decisions over the pool's lanes.
+3. *Smoothing.* The pooled E and the served target are EWMA-smoothed (30 min
+   half-life, six hour staleness; a zero target or a weak calibration passes
+   through so a safety shed is never lagged). Per-agent caps on `GET /caps`
+   get asymmetric hysteresis: increases pass at once (a cap under demand
+   throttles real work), decreases decay on the half-life and never below
+   `running` or the new want (reason `held`, with `baseAllocated`).
+4. *Placement weighs arm quality; outcomes are reported.* Inside a need band
+   accounts rank by `qualityWeight x fleet quality + allowanceWeight x
+   allowance`: fleet quality is the arm's z-score across every served arm
+   (per-account Q cannot compare across accounts), allowance is the pool's
+   unspent share on [-1, 1]. The allowance term spans at most
+   `2 x allowanceWeight` (default 0.7 z), so spare allowance breaks ties
+   between similar arms and cannot outbid a larger quality gap; bands (pace)
+   still come first. `placement.qualityWeight: 0` restores pure
+   water-filling. `/capacity` -> `familyOutcomes` reports per family whether
+   finished runs did their job: the run's issue moved to a disposition
+   (done / in_review / blocked / cancelled) or the run created a work
+   product. A comment-only disposition needs `issue.comments.read`, which
+   this plugin does not hold, so it reads `noChange`; the rate compares
+   families on equal terms rather than measuring absolute progress.
 
 **v0.2.7 = DECIDED-ACCOUNT PRESSURE + 1M CLAUDE EMIT.** The per-account
 in-flight the caps check now includes decided (ring-carry) pressure per
@@ -142,12 +187,13 @@ frozen clock can never double-count.
    An agent that does not resolve keeps trial arms gated (stable defer).
 7. **Concurrency** `C* = sum(requiredRate_a/E_a) x D` (Little's law,
    `D = 0.186h` measured fleet mean run duration). `E_a` is calibrated
-   per account from lane weekly-used deltas divided by event runs
-   started on the account in the span (runs mapped by exact served-model
-   match off resolved actuals, falling back to provider, then
-   model-family hints). Until any `E` is measured the result is
-   `calibration: weak` with no target and no caps. Guard-capped accounts
-   contribute zero; a 75 hard ceiling binds the total.
+   per calibration group (pooled lanes together, see v0.2.19) from lane
+   weekly-used deltas divided by event runs started on the group in the
+   span (runs mapped by exact served-model match off resolved actuals,
+   falling back to provider, then model-family hints). Until any `E` is
+   measured the result is `calibration: weak` with no target and no caps.
+   Guard-capped accounts contribute zero; a 75 hard ceiling binds the
+   total. Slots count only for roles that can use the account (v0.2.19).
 8. **Allocation (water-filling, v0.2.3)**: each decision goes to the
    largest `(targetShare_a - inFlight_a)` inside the need band
    (metered-behind, then reactive, then metered-ahead/over-burning).
@@ -240,6 +286,10 @@ Each entry reports `demand`, `running`, `allocated`, and `reason`
 
 ## Configuration
 
+`placement.qualityWeight` (default 1) and `placement.allowanceWeight`
+(default 0.35) tune the placement blend; `qualityWeight: 0` is the kill
+switch back to pure water-filling.
+
 See `config.example.json`. Secrets are Paperclip `secret_ref` objects,
 resolved at call time and never stored:
 
@@ -291,6 +341,9 @@ otherwise, never a silent zero.
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
+- `src/pools.mjs` -- calibration groups and pooled burn per run
+- `src/smoothing.mjs` -- EWMA and per-agent cap hysteresis
+- `src/outcomes.mjs` -- run outcome classification and per-family report
 - `src/shadow.mjs` -- bounded shadow ring (unit-tested legacy helper)
 - `src/ledger.mjs` -- the run ledger: one record per runId, decided-first
   attribution, mark-but-never-delete reconcile, append-only shadow view
