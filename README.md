@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.6, all-providers)
+# Model Capacity plugin (v0.2.7, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -41,6 +41,18 @@ while provider-pool totals order allocation only; terminal runIds are
 retained for the full ring horizon; `agent.run.cancelled` is subscribed
 and terminal; terminal `payload.modelDecision.model` is authoritative for
 attribution and graduation.
+
+**v0.2.7 = DECIDED-ACCOUNT PRESSURE + 1M CLAUDE EMIT.** The per-account
+in-flight the caps check now includes decided (ring-carry) pressure per
+accountId, so enforced runs count against their lane until a terminal event
+instead of resetting every tick; the tick moves (never duplicates) a mapped
+run's pressure unit onto the decided pool/account; the hook ignores the
+run's own started-before-hook shadow entry and its enforced entry replaces
+it; the clamp bound covers non-terminal carry inside the horizon (long runs
+keep steering); the lane feed path is pinned like baseUrl. Separately, 1M
+claude arms on Claude-CLI adapters emit `<model>(<effort>)[1m]` (the CLI
+ignores MAX_CONTEXT_TOKENS for claude-* ids; it is never set for them),
+and run mapping normalizes `[1m]` and effort parens away.
 
 ## How it decides (per account, per run)
 
@@ -113,7 +125,10 @@ attribution and graduation.
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
 under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
 watermark (configurable via `contextCaps.autoCompactEnvKey`; null omits
-it). These two keys are exactly the manifest's `modelRouting.envKeys`:
+it). Claude-* ids never get MAX_CONTEXT_TOKENS (the CLI ignores it for
+them and runs haiku at a 200k window): when the arm's AA context window is
+>= 1M and the run's adapter is `claude_local`/`claude-code`, the plugin
+emits `<model>(<effort>)[1m]` instead, which the CLI strips and runs at 1M.
 `decide` returns model/effort first-class and sets nothing else.
 
 The resolve hook is memory-only: it reads the live view the last tick
@@ -163,9 +178,10 @@ came from), and never re-decides a recorded runId. Terminal runIds
 persist for the full ring horizon, so a run that finished more than 60
 minutes ago still clears its slot after aging out of the rate window;
 ring entries older than max(3 x mean run duration, 2h) with no terminal
-event are stale-dropped (`/capacity` -> `staleInFlightDropped`), and
-total pooled in-flight is clamped to observed running runs
-(`clampedInFlightDropped`).
+event are stale-dropped (`/capacity` -> `staleInFlightDropped`); the
+clamp backstop bounds total pooled in-flight by observed running runs
+PLUS non-terminal carry inside the horizon (`clampedInFlightDropped`,
+normally zero).
 
 `GET /caps` spreads the concurrency target over agents with queued/ready
 work (assigned `todo` + `in_progress` issues, grouped by assignee):

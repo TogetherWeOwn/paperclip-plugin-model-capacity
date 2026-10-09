@@ -28,6 +28,16 @@
 export const DEFAULT_BASE_URL = 'https://router.infextion.net';
 export const DEFAULT_ACCOUNTS_PATH = '/telemetry/cliproxy/live/accounts.json';
 
+/**
+ * Lane feed path allowlist: the ONLY `cliproxy.accountsPath` the config may
+ * name. The lane key rides on this request, so a configurable path without
+ * a pin would let config redirect the key to an attacker-chosen endpoint
+ * on the same host (same class of issue as baseUrl, now closed both ways).
+ */
+export const LANE_ACCOUNTS_PATH_ALLOWLIST = Object.freeze([
+  DEFAULT_ACCOUNTS_PATH,
+]);
+
 export const LANE_KEY_HEADER = 'X-Api-Key';
 
 /**

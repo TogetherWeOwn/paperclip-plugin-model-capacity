@@ -1,6 +1,6 @@
 /**
  * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
- * reactive-account eligibility, event-time shadow). v0.2.6 = SHADOW BY
+ * reactive-account eligibility, event-time shadow). v0.2.7 = SHADOW BY
  * DEFAULT: the default export holds NO `run.model.resolve` capability and no
  * modelRouting; it observes and records only. The enforce-capable variant
  * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
@@ -13,8 +13,10 @@
  * management key stays on the host.
  */
 
+import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
+
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.6';
+export const PLUGIN_VERSION = '0.2.7';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -57,7 +59,10 @@ const CONFIG_SCHEMA = {
         // enum pins it at schema level; validateConfigShape rejects
         // anything else at config-validation time.
         baseUrl: { type: 'string', enum: [...LANE_BASE_URL_ALLOWLIST], default: 'https://router.infextion.net' },
-        accountsPath: { type: 'string', default: '/telemetry/cliproxy/live/accounts.json' },
+        // Pinned like baseUrl: the lane key is sent on this request, so
+        // the schema pins the feed path and config validation rejects
+        // anything else.
+        accountsPath: { type: 'string', enum: [...LANE_ACCOUNTS_PATH_ALLOWLIST], default: DEFAULT_ACCOUNTS_PATH },
         laneKeySecretRef: { ...SECRET_REF, description: 'Paperclip secret holding the lane key for the host-published CLIProxy telemetry endpoint (GET {baseUrl}{accountsPath}, X-Api-Key header).' },
         cacheTtlSec: { type: 'integer', minimum: 5, default: 45 },
       },

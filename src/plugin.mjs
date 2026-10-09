@@ -25,6 +25,7 @@
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
+  LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
   buildLaneRequest,
   assertLaneRequest,
@@ -77,6 +78,30 @@ const TERMINAL_CAP = 5000;
 const TERMINAL_STATUSES = new Set(['finished', 'failed', 'cancelled']);
 const isTerminalStatus = (s) => TERMINAL_STATUSES.has(s);
 
+/** Adapters whose runs execute through the Claude Code CLI. */
+const CLAUDE_CLI_ADAPTERS = new Set(['claude_local', 'claude-code']);
+/** AA context window at or above which a claude run needs the 1M suffix. */
+const ONE_M_CONTEXT_TOKENS = 1000000;
+
+/**
+ * Decorated model string for 1M-context claude runs, or null when the
+ * decision needs no decoration. The CLI runs claude-haiku-5-5 at a 200k
+ * window and IGNORES CLAUDE_CODE_MAX_CONTEXT_TOKENS for claude-* ids;
+ * emitting `<model>(<effort>)[1m]` makes the CLI strip `[1m]` and run the
+ * `(effort)` id at 1M. Only for claude-* ids on Claude-CLI adapters with a
+ * known >= 1M arm window -- everything else renders exactly as before.
+ * (MAX_CONTEXT_TOKENS is never set for claude-* ids; decide() only sets it
+ * for sol/luna arms.)
+ */
+function decoratedModelFor(decision, adapterType) {
+  const model = decision?.model;
+  if (typeof model !== 'string' || !model.startsWith('claude-')) return null;
+  if (!CLAUDE_CLI_ADAPTERS.has(adapterType)) return null;
+  const window = decision?.contextWindow;
+  if (!Number.isFinite(window) || window < ONE_M_CONTEXT_TOKENS) return null;
+  return `${model}(${decision?.effort ?? 'default'})[1m]`;
+}
+
 const scopeKey = (companyId, stateKey) => ({ scopeKind: 'company', scopeId: companyId, namespace: NS, stateKey });
 
 function isSecretRef(v) {
@@ -91,6 +116,11 @@ export function validateConfigShape(raw) {
   // allowlist may name it, or config could redirect the key to any host.
   if (cliproxy?.baseUrl != null && !LANE_BASE_URL_ALLOWLIST.includes(cliproxy.baseUrl)) {
     errors.push(`cliproxy.baseUrl must be one of: ${LANE_BASE_URL_ALLOWLIST.join(', ')}`);
+  }
+  // Same pin for the feed path: the lane key is sent on this request, so
+  // config must not redirect it to another endpoint on the host.
+  if (cliproxy?.accountsPath != null && !LANE_ACCOUNTS_PATH_ALLOWLIST.includes(cliproxy.accountsPath)) {
+    errors.push(`cliproxy.accountsPath must be one of: ${LANE_ACCOUNTS_PATH_ALLOWLIST.join(', ')}`);
   }
   if (cliproxy?.laneKeySecretRef != null && !isSecretRef(cliproxy.laneKeySecretRef)) {
     errors.push('cliproxy.laneKeySecretRef must be a secret_ref object');
@@ -136,7 +166,7 @@ export function resolveConfig(raw = {}) {
       // Belt and braces behind the validator: a non-allowlisted baseUrl
       // falls back to the default instead of ever carrying the lane key.
       baseUrl: LANE_BASE_URL_ALLOWLIST.includes(raw.cliproxy?.baseUrl) ? raw.cliproxy.baseUrl : DEFAULT_BASE_URL,
-      accountsPath: raw.cliproxy?.accountsPath || DEFAULT_ACCOUNTS_PATH,
+      accountsPath: LANE_ACCOUNTS_PATH_ALLOWLIST.includes(raw.cliproxy?.accountsPath) ? raw.cliproxy.accountsPath : DEFAULT_ACCOUNTS_PATH,
       laneKeySecretRef: raw.cliproxy?.laneKeySecretRef ?? null,
       cacheTtlSec: raw.cliproxy?.cacheTtlSec ?? 45,
     },
@@ -974,6 +1004,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const ringCarry = [];
     let staleInFlightDropped = 0;
     const countedRunning = new Set();
+    // Where each counted running run sits: runId -> { pool, accountId }.
+    // The candidate loop moves (not duplicates) this pressure when it
+    // decides the run onto a different pool/account (see below).
+    const runMapped = new Map();
     {
       const finishedIds = new Set(runs.filter(r => isTerminalStatus(r.status)).map(r => r.runId));
       for (const id of terminalIds) finishedIds.add(id);
@@ -983,6 +1017,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           const p = poolOfKey(key);
           inFlightByPool[p] = (inFlightByPool[p] ?? 0) + 1;
           countedRunning.add(r.runId);
+          if (!runMapped.has(r.runId)) runMapped.set(r.runId, { pool: p, accountId: key });
         }
       }
       for (const e of ring.list(500)) {
@@ -995,26 +1030,49 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         const p = poolOfKey(e.accountId);
         inFlightByPool[p] = (inFlightByPool[p] ?? 0) + 1;
         countedRunning.add(e.runId);
-        ringCarry.push({ pool: p, at: e.at });
+        ringCarry.push({ pool: p, accountId: e.accountId, at: e.at, runId: e.runId });
       }
     }
-    // Defensive invariant: total pool in-flight can never exceed the runs
-    // with started-and-not-terminal status in the run window. Mapped
-    // running runs always fit inside that bound, so any excess is ring
-    // carry: drop the oldest carry first until the bound holds.
+    // Defensive invariant: every pool-pressure unit traces to a mapped
+    // running run or to fresh non-terminal ring carry inside the in-flight
+    // horizon. The clamp bound covers both, so it only ever fires on a
+    // counting bug: runs older than the 60-min rate window keep their
+    // pressure through their carry (long runs steer allocation for the full
+    // documented horizon), and only excess above observed-running PLUS
+    // carry drops, oldest carry first.
     let clampedInFlightDropped = 0;
-    {
+    const ringCarryKept = (() => {
       const windowActive = runs.filter(r => r.status === 'running').length;
+      const bound = windowActive + ringCarry.length;
       let total = Object.values(inFlightByPool).reduce((s, n) => s + n, 0);
-      if (total > windowActive && ringCarry.length > 0) {
-        ringCarry.sort((a, b) => a.at - b.at);
-        for (const c of ringCarry) {
-          if (total <= windowActive) break;
-          inFlightByPool[c.pool] = (inFlightByPool[c.pool] ?? 1) - 1;
-          total -= 1;
-          clampedInFlightDropped += 1;
-        }
+      if (total <= bound || ringCarry.length === 0) return ringCarry;
+      const ordered = [...ringCarry].sort((a, b) => a.at - b.at);
+      const drop = new Set();
+      for (const c of ordered) {
+        if (total <= bound) break;
+        inFlightByPool[c.pool] = (inFlightByPool[c.pool] ?? 1) - 1;
+        total -= 1;
+        clampedInFlightDropped += 1;
+        drop.add(c);
       }
+      return ringCarry.filter(c => !drop.has(c));
+    })();
+    // Decided-account pressure: fresh unfinished ring entries per accountId,
+    // with the same runId dedupe as the pool loop above. A hook-enforced run
+    // carries no model while it runs (modelDecision lands on terminal
+    // events), so the mapped counts miss it -- without this its only trace
+    // is the queue the tick clears each merge, and the per-account cap
+    // resets every tick. Only surviving (non-clamped) carry counts.
+    const ringDecidedByAccount = {};
+    for (const c of ringCarryKept) {
+      ringDecidedByAccount[c.accountId] = (ringDecidedByAccount[c.accountId] ?? 0) + 1;
+    }
+    // Per-account in-flight the caps check: mapped running runs plus decided
+    // (ring-carry) pressure on the same accountId. Read by the live view,
+    // the tick's own cap check, and the capacity report.
+    const capInFlightByAccount = { ...inFlightByAccount };
+    for (const [id, n] of Object.entries(ringDecidedByAccount)) {
+      capInFlightByAccount[id] = (capInFlightByAccount[id] ?? 0) + n;
     }
     // Water-filling order, rebuilt per run: need band first, then largest
     // (targetShare - pooled in-flight). Decisions made earlier in THIS tick
@@ -1086,7 +1144,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           health: view?.health ?? 'unknown',
           meter: view?.meter ?? null,
           quality: view?.quality ?? 'unknown',
-          inFlight: inFlightByAccount[a.accountId] ?? 0,
+          inFlight: capInFlightByAccount[a.accountId] ?? 0,
           resetAtMs: view?.resetAtMs ?? null,
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
@@ -1128,7 +1186,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // this tick count toward the cap: it bounds single-tick bursts, not
         // just previously observed executions.
         if (!view.reactive && view.remainingPct == null) continue;
-        if (view.reactive && (inFlightByAccount[sel.accountId] ?? 0) + (tickAcctPending[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
+        if (view.reactive && (capInFlightByAccount[sel.accountId] ?? 0) + (tickAcctPending[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
         const d = decide({
           runId: run.runId,
           agentId: run.agentId,
@@ -1152,14 +1210,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           decision = d;
           // Water-filling state: the next candidate run sees this decision
           // as in-flight (pool pressure) and toward the account cap (burst
-          // bound), even though nothing has executed yet -- but never
-          // double-counted: a run already observed running is in the base
-          // pressure, and a terminal run will never execute.
-          if (run.status === 'running' && !countedRunning.has(run.runId)) {
-            tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
-            const pool = poolOfKey(d.accountId);
-            tickPoolPending[pool] = (tickPoolPending[pool] ?? 0) + 1;
-            countedRunning.add(run.runId);
+          // bound), even though nothing has executed yet. A run already
+          // observed running is in the base pressure under its MAPPED
+          // bucket: when the decision sends it elsewhere, MOVE that unit
+          // (decrement mapped, increment decided, per dimension) instead of
+          // adding a second one. Skipping the increment outright would eat
+          // the decided bucket's pressure -- no spread, no burst bound --
+          // for every candidate whose model already maps to an account.
+          if (run.status === 'running') {
+            const mapped = runMapped.get(run.runId);
+            const decidedPool = poolOfKey(d.accountId);
+            if (!mapped) {
+              tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
+              tickPoolPending[decidedPool] = (tickPoolPending[decidedPool] ?? 0) + 1;
+              countedRunning.add(run.runId);
+            } else {
+              if (mapped.pool !== decidedPool) {
+                tickPoolPending[mapped.pool] = (tickPoolPending[mapped.pool] ?? 0) - 1;
+                tickPoolPending[decidedPool] = (tickPoolPending[decidedPool] ?? 0) + 1;
+              }
+              if (mapped.accountId !== d.accountId) {
+                tickAcctPending[mapped.accountId] = (tickAcctPending[mapped.accountId] ?? 0) - 1;
+                tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
+              }
+            }
           }
           if (d.trial === true) {
             const fam = inferFamily(canonicalModelName(d.model));
@@ -1169,7 +1243,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
       }
       if (decision) {
-        const wouldModel = `${decision.model}(${decision.effort ?? 'default'})`;
+        // 1M claude runs render decorated so the CLI takes the 1M window;
+        // the terminal modelDecision echoes the same string, keeping
+        // modelMatch exact.
+        const wouldModel = decoratedModelFor(decision, run.adapterType ?? null)
+          ?? `${decision.model}(${decision.effort ?? 'default'})`;
         const actual = await resolveActualModel(companyId, run, modelCaches);
         const actualModel = actual.model ?? 'unknown';
         ring.push({
@@ -1259,8 +1337,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // the tick's pool pressure AND consumed trial budgets into it so the
     // hook and event-time path water-fill against fresh counts until the
     // next tick republishes. (Per-tick state: the next tick recomputes
-    // from scratch, and tickPoolPending only holds runs not already
-    // counted, so nothing double-counts.)
+    // from scratch. tickPoolPending holds fresh decisions plus pressure
+    // moved off mapped buckets onto decided ones (negative entries), so
+    // each observed run still counts exactly once in the merged total.)
     {
       const live = liveViews.get(companyId);
       if (live) {
@@ -1304,12 +1383,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       unscored,
       trialFamilies,
       trialTransitions,
-      inFlightByAccount,
+      inFlightByAccount: capInFlightByAccount,
       inFlightByPool,
       // Ring-carry accounting: entries dropped as stale (older than the
       // in-flight horizon with no terminal event) and by the defensive
-      // clamp (total pool in-flight can never exceed observed running
-      // runs in the window; oldest carry drops first).
+      // clamp backstop (bound = observed running runs in the window PLUS
+      // non-terminal carry inside the horizon; oldest carry drops first).
       staleInFlightDropped,
       clampedInFlightDropped,
       reactiveAccounts: accountViews.filter(v => v.reactive).length,
@@ -1364,11 +1443,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * Entries older than the 2h queue horizon are ignored; the tick clears
    * both queues after every merge, so anything older means the tick died
    * (and the memory paths self-disable on stale views anyway).
+   * `excludeRunId` drops one run's own entries: the host publishes
+   * agent.run.started at claim BEFORE the model hook resolves, so the hook
+   * must not count the run's own event-time shadow entry against itself in
+   * caps, budgets, or ordering.
    */
-  function queuedDecisions(companyId) {
+  function queuedDecisions(companyId, excludeRunId = null) {
     const byId = new Map();
     for (const q of [...(pendingEnforced.get(companyId) ?? []), ...(pendingShadow.get(companyId) ?? [])]) {
       if (!q?.runId || byId.has(q.runId)) continue;
+      if (excludeRunId != null && q.runId === excludeRunId) continue;
       if (q.at != null && clock() - q.at > 2 * 3600 * 1000) continue;
       byId.set(q.runId, q);
     }
@@ -1384,12 +1468,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * per-account cap is checked separately against per-account counts
    * (see the hook and event-time loops).
    */
-  function allocationOrderFromLive(live, companyId) {
+  function allocationOrderFromLive(live, companyId, excludeRunId = null) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
       [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
     const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
     const poolPending = {};
-    for (const q of queuedDecisions(companyId)) {
+    for (const q of queuedDecisions(companyId, excludeRunId)) {
       if (!q?.accountId) continue;
       const p = poolOf(q.accountId);
       poolPending[p] = (poolPending[p] ?? 0) + 1;
@@ -1413,9 +1497,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * or event-time, not yet merged) consume from a per-call copy, so a
    * burst within one tick cannot mint unbounded trial arms.
    */
-  function effectiveTrialBudget(live, companyId) {
+  function effectiveTrialBudget(live, companyId, excludeRunId = null) {
     const use = new Map();
-    for (const q of queuedDecisions(companyId)) {
+    for (const q of queuedDecisions(companyId, excludeRunId)) {
       if (q?.trial !== true || !q?.family) continue;
       use.set(q.family, (use.get(q.family) ?? 0) + 1);
     }
@@ -1427,9 +1511,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   /** Queued decisions per accountId, deduped by runId: the per-account side of the reactive cap. */
-  function pendingByAccount(companyId) {
+  function pendingByAccount(companyId, excludeRunId = null) {
     const out = new Map();
-    for (const q of queuedDecisions(companyId)) {
+    for (const q of queuedDecisions(companyId, excludeRunId)) {
       if (!q?.accountId) continue;
       out.set(q.accountId, (out.get(q.accountId) ?? 0) + 1);
     }
@@ -1484,6 +1568,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       });
       if (d.kind !== 'decide') continue;
       const queue = pendingShadow.get(companyId) ?? [];
+      const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
       queue.push({
         runId: String(run.runId ?? 'unknown'),
         agentId: String(run.agentId ?? 'unknown'),
@@ -1491,7 +1576,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         actualModelSource: null,
         actualModelError: null,
         actualPending: true,
-        wouldModel: `${d.model}(${d.effort ?? 'default'})`,
+        wouldModel: decoratedModelFor(d, emitAdapter) ?? `${d.model}(${d.effort ?? 'default'})`,
         modelMatch: null,
         account: d.accountId,
         accountId: d.accountId,
@@ -1767,11 +1852,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // decisions per account, both deduped) -- the pooled value on the
       // ordered views drives ordering only. Trial budgets are consumed
       // from a per-call copy, so bursts within one tick stay bounded.
-      const order = allocationOrderFromLive(live, params.companyId);
+      // Own-run exclusion: the host fires agent.run.started at claim before
+      // this hook resolves, so a queued shadow entry for THIS runId must not
+      // count against it in ordering, caps, or budgets.
+      const selfId = params?.runId != null ? String(params.runId) : null;
+      const order = allocationOrderFromLive(live, params.companyId, selfId);
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
-      const acctPending = pendingByAccount(params.companyId);
+      const acctPending = pendingByAccount(params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
-      const budget = effectiveTrialBudget(live, params.companyId);
+      const budget = effectiveTrialBudget(live, params.companyId, selfId);
       for (const view of order) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;
@@ -1796,6 +1885,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           trialAdapters: live.trialAdapters ?? {},
         });
         if (d.kind === 'decide') {
+          // The enforced entry REPLACES any event-time shadow entry for this
+          // runId (host order: started queued one before the hook ran), so
+          // the run counts exactly once until the tick merges the queues.
+          const shadowQueue = pendingShadow.get(params.companyId) ?? [];
+          const keptShadow = shadowQueue.filter(q => q.runId !== selfId);
+          if (keptShadow.length !== shadowQueue.length) pendingShadow.set(params.companyId, keptShadow);
+          const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
+          const decorated = decoratedModelFor(d, emitAdapter);
           const queue = pendingEnforced.get(params.companyId) ?? [];
           queue.push({
             runId: String(params.runId ?? 'unknown'),
@@ -1804,7 +1901,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             actualModelSource: null,
             actualModelError: null,
             actualPending: true,
-            wouldModel: `${d.model}(${d.effort ?? 'default'})`,
+            wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
             modelMatch: null,
             account: d.accountId,
             accountId: d.accountId,
@@ -1819,7 +1916,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           return {
             kind: 'decide',
             decisionId: d.decisionId,
-            model: d.model,
+            model: decorated ?? d.model,
             effort: d.effort,
             env: d.env,
             source: d.source,

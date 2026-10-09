@@ -58,10 +58,20 @@ export const MODEL_AA_OVERRIDES = Object.freeze({
 /** Model ids that can never carry an agent run: media, test, and private ids. */
 export const NON_CHAT_MODEL_RE = /(image|video|private|^test([_-]|$))/i;
 
-/** Strip a `provider/` alias prefix to the canonical bare model id. */
+/**
+ * Strip a `provider/` alias prefix to the canonical bare model id. Also
+ * strips the emission decorations the plugin (and host balancer) add for
+ * 1M-context claude runs: a trailing `[1m]` context suffix and a trailing
+ * `(effort)` paren suffix, so decorated actuals (`claude-haiku-5-5(max)[1m]`
+ * or the CLI-stripped `claude-haiku-5-5(max)`) still map to the arm that
+ * serves the bare id. No served id or AA slug carries parens or brackets,
+ * so the strip only ever turns a miss into a hit.
+ */
 export function canonicalModelName(model) {
   if (typeof model !== 'string') return null;
-  const bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
+  let bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
+  if (bare.endsWith('[1m]')) bare = bare.slice(0, -4);
+  if (bare.endsWith(')') && bare.includes('(')) bare = bare.slice(0, bare.lastIndexOf('('));
   return bare.length > 0 ? bare : null;
 }
 

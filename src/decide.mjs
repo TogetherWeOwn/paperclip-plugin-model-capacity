@@ -142,6 +142,9 @@ export function decide({
       model: arm.model,
       effort: arm.effort,
       trial: arm.trial === true,
+      // AA context window of the chosen arm (null when unknown): the plugin
+      // renders `<model>(<effort>)[1m]` for 1M claude runs off this.
+      contextWindow: arm.contextWindow ?? null,
       env,
       source: 'model-capacity',
       calibration: weak ? 'weak' : 'ok',
