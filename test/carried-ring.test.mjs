@@ -84,7 +84,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  let plugin = createModelCapacityPlugin({ clock: () => now });
+  let plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   const wire = async () => {
     await plugin.setup(io);
     await plugin.onConfigChanged(config, { companyId: 'acme' });
@@ -100,7 +100,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
     },
     // Simulates a worker restart: fresh memory, same persisted store.
     restart: async () => {
-      plugin = createModelCapacityPlugin({ clock: () => now });
+      plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
       await wire();
     },
     tick: () => jobs.get('shadow-tick')({}),

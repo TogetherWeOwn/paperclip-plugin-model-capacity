@@ -65,7 +65,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
   });
   const jobs1 = new Map();
   const handlers1 = new Map();
-  let plugin = createModelCapacityPlugin({ clock: () => TICK });
+  let plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
   await plugin.setup(io(jobs1, handlers1));
   await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
   store.set(skey(AA_STATE_KEY), {
@@ -90,7 +90,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
   // Gen2 (restart): gate the ledger-v1 read, fire a start while pending.
   const jobs2 = new Map();
   const handlers2 = new Map();
-  plugin = createModelCapacityPlugin({ clock: () => TICK });
+  plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
   await plugin.setup(io(jobs2, handlers2));
   await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
   gateLoad = true;

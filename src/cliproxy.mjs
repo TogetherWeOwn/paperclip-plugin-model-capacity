@@ -28,8 +28,31 @@
  * blocked in code and covered by the allowlist test.
  */
 
-export const DEFAULT_BASE_URL = 'https://router.infextion.net';
+import { LANE_BASE_URLS } from './lane-host.mjs';
+
+export const DEFAULT_BASE_URL = LANE_BASE_URLS[0];
 export const DEFAULT_ACCOUNTS_PATH = '/telemetry/cliproxy/live/accounts.json';
+
+/**
+ * True when `baseUrl` is the public placeholder (an RFC 2606 `.invalid`
+ * host): the build did not pin a real lane host, so no read can succeed.
+ */
+export function isPlaceholderLaneHost(baseUrl = DEFAULT_BASE_URL) {
+  try {
+    return new URL(baseUrl).hostname.endsWith('.invalid');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Throw when the build did not pin a lane host. Called before the lane key
+ * is resolved, so an unpinned build never reads the secret, regardless of
+ * DNS: "cannot leak" is a code guarantee, not a resolver property.
+ */
+export function assertLaneHostPinned(baseUrl = DEFAULT_BASE_URL) {
+  if (isPlaceholderLaneHost(baseUrl)) throw new Error('cliproxy-lane-host-unpinned');
+}
 
 /**
  * Lane feed path allowlist: the ONLY `cliproxy.accountsPath` the config may

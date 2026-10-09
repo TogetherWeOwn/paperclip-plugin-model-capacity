@@ -77,7 +77,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error: (...a) => { errors.push(a); } },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup(fake);
   store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
   await plugin.onConfigChanged({}, { companyId: 'acme' });
