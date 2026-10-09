@@ -48,18 +48,21 @@ export function paretoFilter(entries, opts = {}) {
   const gateByArm = opts.gateByArm instanceof Map ? opts.gateByArm
     : (opts.gateByArm && typeof opts.gateByArm === 'object' ? opts.gateByArm : null);
   const gateOf = armId => gateByArm?.get?.(armId) ?? gateByArm?.[armId] ?? null;
-  // Persisted holds: challenger -> incumbent it was held against last tick.
-  const held = new Map();
+  // Persisted holds: one entry per (challenger, incumbent) pair held last
+  // tick -- a SET, not a challenger-keyed map, because one challenger can sit
+  // within noise of several incumbents at once and a map keeps only the last.
+  // NUL-joined: arm ids never contain NUL, so distinct pairs stay distinct.
+  const held = new Set();
   for (const w of opts.heldPairs ?? []) {
     if (w && typeof w.challenger === 'string' && typeof w.incumbent === 'string') {
-      held.set(w.challenger, w.incumbent);
+      held.add(`${w.challenger}${w.incumbent}`);
     }
   }
   const noisyBlocks = [];
   const dominatesForDrop = (o, m) => {
     if (!strictlyDominates(o, m)) return false;
     const newcomer = incumbents && !incumbents.has(o.armId);
-    const heldAgainst = incumbents && held.get(o.armId) === m.armId;
+    const heldAgainst = incumbents && held.has(`${o.armId}${m.armId}`);
     if (incumbents && gateByArm && incumbents.has(m.armId) && (newcomer || heldAgainst)) {
       const n = gateOf(o.armId);
       const r = gateOf(m.armId);

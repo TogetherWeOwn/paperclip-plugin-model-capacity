@@ -278,6 +278,38 @@ test('rung gate: the hold persists across ticks until the bar clears', () => {
   assert.deepEqual(t4.withinNoise, []);
 });
 
+test('rung gate: one newcomer held against TWO incumbents keeps both', () => {
+  // n strictly dominates i1 and i2 but sits within TB4 noise of each. A
+  // challenger-keyed hold keeps only the last pair and drops i1 on tick 2;
+  // the pair set must hold both across ticks on identical inputs.
+  // i1 and i2 dominate each other on neither axis (else strict dominance,
+  // not the gate, decides between them); n dominates both on both axes.
+  const entries = () => ([
+    { armId: 'n', Q: 1.5, C: 4, coverage: 1 },
+    { armId: 'i1', Q: 1.0, C: 6, coverage: 1 },
+    { armId: 'i2', Q: 0.8, C: 5, coverage: 1 },
+  ]);
+  const prev = () => ([{ armId: 'i1', rung: 0 }, { armId: 'i2', rung: 1 }]);
+  const gate = new Map([
+    ['i1', { score: 64.85, se: se(61.74, 67.96) }],
+    ['i2', { score: 64.2, se: se(61.1, 67.3) }],
+    ['n', { score: 66.0, se: se(62.9, 69.1) }],
+  ]);
+  const t1 = buildLadder(entries(), prev(), gate);
+  assert.deepEqual(t1.rungs.map(r => r.armId), ['n', 'i2', 'i1']);
+  assert.deepEqual(t1.dominated, []);
+  assert.deepEqual(t1.withinNoise, [
+    { challenger: 'n', incumbent: 'i1' },
+    { challenger: 'n', incumbent: 'i2' },
+  ]);
+  const t2 = buildLadder(entries(), t1.rungs, gate, t1.withinNoise);
+  assert.deepEqual(t2.rungs.map(r => r.armId), ['n', 'i2', 'i1']);
+  assert.deepEqual(t2.dominated, []);
+  const t3 = buildLadder(entries(), t2.rungs, gate, t2.withinNoise);
+  assert.deepEqual(t3.rungs.map(r => r.armId), ['n', 'i2', 'i1']);
+  assert.deepEqual(t3.dominated, []);
+});
+
 test('rung gate: a 25-point gap knocks out; missing SE keeps today behavior', () => {
   const gate = new Map([
     ['i', { score: 41.82, se: se(38.59, 45.05) }],
