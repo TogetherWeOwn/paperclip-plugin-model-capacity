@@ -95,8 +95,10 @@ function typicalPrompt(stats) {
 /**
  * Measured P(prompt > T), stepwise-linear over the feed's fractionOver
  * points. Below the smallest measured threshold every request is over
- * (1.0, conservative); above the largest, none is (0.0). Null when the feed
- * carries no usable points.
+ * (1.0, conservative). Null when the threshold sits ABOVE the largest knot
+ * or the feed carries no usable points: that ground is unmeasured, and the
+ * caller must estimate from quantiles (below) or fall back -- never assume
+ * zero over the cliff.
  */
 export function overFractionAt(stats, threshold) {
   const frac = stats?.fractionOver;
@@ -111,7 +113,7 @@ export function overFractionAt(stats, threshold) {
   // ground outside the observed range assumes an extreme.
   if (threshold < points[0][0]) return 1.0;
   const last = points[points.length - 1];
-  if (threshold > last[0]) return 0.0;
+  if (threshold > last[0]) return null; // uncovered: unmeasured, not zero
   for (let i = 0; i < points.length - 1; i++) {
     const [t0, f0] = points[i];
     const [t1, f1] = points[i + 1];
@@ -121,6 +123,56 @@ export function overFractionAt(stats, threshold) {
     }
   }
   return last[1];
+}
+
+/**
+ * Sorted fractionOver knots, or null when the feed carries none.
+ * Exported for the quantile estimator below.
+ */
+export function fractionKnots(stats) {
+  const frac = stats?.fractionOver;
+  if (!frac || typeof frac !== 'object') return null;
+  const points = Object.entries(frac)
+    .map(([k, v]) => [Number(k), Number(v)])
+    .filter(([t, f]) => Number.isFinite(t) && Number.isFinite(f));
+  if (points.length === 0) return null;
+  return points.sort((a, b) => a[0] - b[0]);
+}
+
+/**
+ * Quantile estimate of P(prompt > T) for thresholds the knots do not cover.
+ * 0 only when even p99 sits under the cliff; at least 0.9 when p10 already
+ * clears it; linear between p10 and p99 otherwise. Null when the stats row
+ * carries no quantiles at all. share scales the quantiles down for
+ * countsCached=false tiers (cached tokens do not count: compare the raw
+ * threshold against uncached quantiles).
+ */
+export function quantileOverShare(stats, threshold, share = 0) {
+  const s = Math.min(1, Math.max(0, num(share) ?? 0));
+  const q10 = promptQuantile(stats, 'p10');
+  const q99 = promptQuantile(stats, 'p99');
+  if (q10 == null || q99 == null) return null;
+  const u10 = q10 * (1 - s);
+  const u99 = q99 * (1 - s);
+  if (u99 < threshold) return 0;
+  if (u10 > threshold) return 0.9;
+  if (!(u99 > u10)) return u99 >= threshold ? 0.9 : 0;
+  return Math.min(1, Math.max(0, (u99 - threshold) / (u99 - u10)));
+}
+
+/**
+ * P(prompt > T): knots first (compared at the EFFECTIVE threshold, since
+ * knots measure full prompts), quantile estimate for uncovered ground
+ * (compared at the RAW threshold against uncached quantiles), null when
+ * nothing is measured. share is the cache-read share for
+ * countsCached=false tiers (0 otherwise).
+ */
+export function overShareAt(stats, tEff, tRaw = tEff, share = 0) {
+  const knots = fractionKnots(stats);
+  if (knots && tEff <= knots[knots.length - 1][0]) {
+    return overFractionAt(stats, tEff);
+  }
+  return quantileOverShare(stats, tRaw, share);
 }
 
 /**
@@ -185,12 +237,18 @@ function effectiveThreshold(tier, stats) {
 }
 
 /**
- * E[multiplier] core over resolved rows [{ over, blend, appliesTo }].
+ * E[multiplier] core over resolved rows
+ * [{ over, tRaw, share, blend, appliesTo }]: over is the effective threshold
+ * (scaled up when cached tokens do not count), tRaw the feed threshold, and
+ * share the cache-read share for countsCached=false tiers (0 otherwise).
  * whole_request bands: P(T_i <= prompt < T_{i+1}) pays that band's blend;
  * below the first threshold pays 1.0. A band with no computable blend pays
  * the max named multiplier (never the cheap assumption). excess_only rows
  * in a mixed list price their whole band at blend (conservative); a pure
  * excess_only list uses the p50/p90 excess-share approximation below.
+ * Any row whose over-share is UNKNOWN (no knots cover it, no quantiles to
+ * estimate from) voids the whole expectation -- null, so the caller falls
+ * back to the baseline or the tier max. Missing data never prices at 1.0.
  */
 function expectFromRows(rows, stats) {
   const valid = (rows ?? []).filter(r => r?.over != null);
@@ -199,13 +257,14 @@ function expectFromRows(rows, stats) {
   // No computable blend anywhere: no expectation (the caller falls back to
   // the fleet baseline, never 1.0).
   if (blends.length === 0) return null;
-  const overAt = (t) => overFractionAt(stats, t) ?? 0;
+  const overs = valid.map(r => overShareAt(stats, r.over, r.tRaw ?? r.over, r.share ?? 0));
+  if (overs.some(o => o == null)) return null;
   if (valid.some(r => (r.appliesTo ?? 'whole_request') === 'whole_request')) {
     const priceOf = (r) => r.blend ?? Math.max(...blends, 1);
-    let exp = 1 - overAt(valid[0].over); // under the first cliff: 1.0x
+    let exp = 1 - overs[0]; // under the first cliff: 1.0x
     for (let i = 0; i < valid.length; i++) {
-      const overHi = i + 1 < valid.length ? overAt(valid[i + 1].over) : 0;
-      exp += Math.max(0, overAt(valid[i].over) - overHi) * priceOf(valid[i]);
+      const overHi = i + 1 < valid.length ? overs[i + 1] : 0;
+      exp += Math.max(0, overs[i] - overHi) * priceOf(valid[i]);
     }
     return exp;
   }
@@ -216,9 +275,10 @@ function expectFromRows(rows, stats) {
   const p90 = promptQuantile(stats, 'p90') ?? p50 ?? 0;
   if (blends.length === 0 || !(p50 > 0)) return null;
   let premium = 0;
-  for (const r of valid) {
+  for (let i = 0; i < valid.length; i++) {
+    const r = valid[i];
     if (r.blend == null) continue;
-    premium += Math.min(1, overAt(r.over) * (Math.max(0, p90 - r.over) / p50)) * (r.blend - 1);
+    premium += Math.min(1, overs[i] * (Math.max(0, p90 - r.over) / p50)) * (r.blend - 1);
   }
   return Math.min(Math.max(...blends), 1 + Math.max(0, premium));
 }
@@ -234,6 +294,10 @@ export function expectedMultiplier(tiers, stats, priceBook, blendOf = null) {
   const sorted = [...list].sort((a, b) => a.overPromptTokens - b.overPromptTokens);
   return expectFromRows(sorted.map(t => ({
     over: effectiveThreshold(t, stats),
+    tRaw: num(t?.overPromptTokens),
+    share: t?.countsCached === false
+      ? Math.min(1, Math.max(0, num(stats?.cacheReadShare) ?? 0))
+      : 0,
     blend: (blendOf ?? ((x) => blendedMultiplier(x, stats, priceBook)))(t),
     appliesTo: t?.appliesTo ?? 'whole_request',
   })), stats);
@@ -280,7 +344,13 @@ export function armTierCost({ model, costBase, pricingTiers, modelStats, baselin
   const blendOf = (t) => blendedMultiplier(t, stats, t?.pricesPerMTok ?? entry?.base ?? null);
   let exp = expectedMultiplier(tiers, stats, null, blendOf);
   if (exp == null) {
-    exp = baseline ?? maxTierMultiplier(tiers, stats, entry?.base) ?? 1;
+    // Unmeasured but tiered: the fleet baseline, clamped into this tier's
+    // own [1, max] range. The baseline is other models' median -- applying
+    // it raw can price a model above its worst case and knock it off every
+    // ladder on a cost it cannot incur.
+    const maxMult = maxTierMultiplier(tiers, null, entry?.base);
+    const worst = maxMult ?? baseline ?? 1;
+    exp = baseline == null ? worst : Math.min(Math.max(baseline, 1), worst);
   }
   const tierSource = entry?.status === 'verified' ? 'verified' : 'unverified';
   const firstT = [...tiers].sort((a, b) => (a?.overPromptTokens ?? 0) - (b?.overPromptTokens ?? 0))[0];
@@ -314,16 +384,20 @@ export function tierContextCap(tiers, stats) {
 }
 
 /**
- * Per-family caps from per-arm tier matches: the most constraining
- * (min maxTokens) cap wins per family. { [family]: { maxTokens,
- * autoCompactTokens } }. Arms without a feasible cap contribute nothing.
+ * Per-model caps from per-arm tier matches, keyed by tierModelKey(model):
+ * the most constraining (min maxTokens) cap wins per model. Caps MUST stay
+ * per model -- families group unrelated models (every gemini/gemma id maps
+ * to 'gemini', both gpt-6-luna ids to 'luna'), so a family-keyed cap leaks
+ * one model's compact window onto untiered siblings. Arms without a
+ * feasible cap contribute nothing.
  */
-export function tierCapsByFamily(armCaps) {
+export function tierCapsByModel(armCaps) {
   const out = {};
-  for (const { family, cap } of armCaps ?? []) {
-    if (!family || !cap || !(cap.maxTokens > 0)) continue;
-    const cur = out[family];
-    if (!cur || cap.maxTokens < cur.maxTokens) out[family] = { ...cap };
+  for (const { model, cap } of armCaps ?? []) {
+    const key = tierModelKey(model);
+    if (!key || !cap || !(cap.maxTokens > 0)) continue;
+    const cur = out[key];
+    if (!cur || cap.maxTokens < cur.maxTokens) out[key] = { ...cap };
   }
   return out;
 }

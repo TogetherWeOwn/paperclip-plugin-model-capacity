@@ -42,7 +42,7 @@ import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
 import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
 import {
-  armTierCost, armTierCap, tierCapsByFamily, fleetBaselineForModels,
+  armTierCost, armTierCap, tierCapsByModel, tierModelKey, fleetBaselineForModels,
 } from './tiers.mjs';
 import {
   scheduleError, stepController, stepRateController, appendUtilReading,
@@ -451,15 +451,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
-    // Feasibility-gated compact windows per family (most constraining
-    // cap wins); decide() prefers these over the static legacy keys.
-    const tierCaps = tierCapsByFamily(arms.map(a => ({
-      family: a.family,
+    // Feasibility-gated compact windows per MODEL (most constraining cap
+    // wins per model key). Family-keyed caps leak one model's window onto
+    // untiered same-family siblings, so each rung arm carries its own cap
+    // and decide() reads it off the chosen arm.
+    const tierCaps = tierCapsByModel(arms.map(a => ({
+      model: a.model,
       cap: armTierCap({
         model: a.model,
         pricingTiers: tierFeed?.pricingTiers, modelStats: tierFeed?.modelStats,
       }),
     })));
+    for (const key of Object.keys(ladders)) {
+      for (const r of ladders[key].rungs) {
+        r.cap = tierCaps[tierModelKey(r.model)] ?? null;
+      }
+    }
     return { ladders, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline };
   }
 
@@ -733,9 +740,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers },
     });
-    // Tier-derived compact windows ride the caps the hook and event-time
-    // paths read (live view below) as well as this tick's own decisions.
-    const effectiveCaps = { ...config.contextCaps, byFamily: tierCaps };
+    // Tier-derived compact windows ride each rung arm (arm.cap, keyed by
+    // model) into the hook and event-time paths via the live view below as
+    // well as this tick's own decisions. No family-keyed merge: one model's
+    // window must never scope onto its siblings. tierCaps (by model) still
+    // rides the /capacity body below for visibility.
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
@@ -825,6 +834,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         arms: (ladders[key]?.rungs ?? []).map(r => ({
           armId: r.armId, model: r.model, effort: r.effort, family: r.family,
           rung: r.rung, trial: r.trial,
+          cap: r.cap ?? null,
           costBase: r.costBase ?? null,
           costMultiplier: r.costMultiplier ?? 1,
           costEffective: r.costEffective ?? r.costBase ?? null,
@@ -1197,7 +1207,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           reservePct: 0.05,
           accountId: sel.accountId,
           roleBands,
-          contextCaps: effectiveCaps,
+          contextCaps: config.contextCaps,
           adapterType: run.adapterType ?? null,
           trialBudget: freshTrialBudget(),
           trialAdapters: config.trials.adapters,
@@ -1309,7 +1319,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
         doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
       },
-      contextCaps: effectiveCaps,
+      contextCaps: config.contextCaps,
       trialBudget: liveTrialBudget,
       trialAdapters: config.trials.adapters,
       maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,

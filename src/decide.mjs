@@ -26,13 +26,12 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
   /** Auto-compact watermark key (operator-overridable, null omits it). */
   autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
   /**
-   * Tier-derived per-family windows (built per tick by the plugin from the
-   * live pricingTiers/modelStats feed, NOT operator config): { [family]:
-   * { maxTokens, autoCompactTokens } }. Present entries override the static
-   * sol/luna keys above for their family; absent families keep the legacy
-   * behavior. Null/{} disables the override entirely.
+   * Tier-derived compact windows ride the chosen ARM (arm.cap, keyed by
+   * model by the plugin from the live pricingTiers/modelStats feed), never
+   * a family map: families group unrelated models, so a family-keyed window
+   * leaks one model's cliff onto untiered siblings. Arms without a cap keep
+   * the legacy sol/luna behavior below.
    */
-  byFamily: null,
   /** Haiku hit the 32k output cap live; raise it to 64k on haiku arms. */
   haikuMaxOutputTokens: 64000,
 });
@@ -74,7 +73,9 @@ function sanitizeId(part) {
  * Decide one run on one account.
  *
  * ladderRungs: [{ rung, arms: [{ armId, model, effort, family,
- *   contextWindow, Q, C, trial }] }] (already provider-filtered).
+ *   contextWindow, Q, C, trial, cap }] }] (already provider-filtered).
+ *   cap is the arm's tier-derived compact window ({ maxTokens,
+ *   autoCompactTokens }) or null; it overrides the legacy sol/luna caps.
  * burnPerRunPct: armId -> expected weekly % consumed by one run (E_a[m]);
  *   missing entries mean uncalibrated: the arm is skipped when headroom is
  *   known, allowed (flagged weak) when headroom is unknown.
@@ -136,14 +137,16 @@ export function decide({
     fitting.sort((a, b) => (b.Q - a.Q) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     const env = {};
-    // Tier-derived compact window (byFamily, from measured price cliffs via
-    // tiers.mjs) wins over the static legacy keys when present: the feed is
-    // fresher than the default. Legacy keys stay as the no-tier fallback.
-    const famCap = contextCaps.byFamily?.[arm.family];
-    if (famCap && famCap.maxTokens > 0) {
-      env[MAX_CONTEXT_ENV_KEY] = String(Math.floor(famCap.maxTokens));
-      if (contextCaps.autoCompactEnvKey && famCap.autoCompactTokens > 0) {
-        env[contextCaps.autoCompactEnvKey] = String(Math.floor(famCap.autoCompactTokens));
+    // Tier-derived compact window rides the chosen arm (arm.cap, set per
+    // model by the plugin from measured price cliffs via tiers.mjs) and wins
+    // over the static legacy keys when present: the feed is fresher than the
+    // default. Arms without a cap -- no tier, or an infeasible cliff -- keep
+    // the legacy sol/luna behavior.
+    const cap = arm.cap;
+    if (cap && cap.maxTokens > 0) {
+      env[MAX_CONTEXT_ENV_KEY] = String(Math.floor(cap.maxTokens));
+      if (contextCaps.autoCompactEnvKey && cap.autoCompactTokens > 0) {
+        env[contextCaps.autoCompactEnvKey] = String(Math.floor(cap.autoCompactTokens));
       }
     } else if (arm.family === 'sol' || arm.family === 'luna') {
       env[MAX_CONTEXT_ENV_KEY] = String(contextCaps.solLunaMaxTokens);

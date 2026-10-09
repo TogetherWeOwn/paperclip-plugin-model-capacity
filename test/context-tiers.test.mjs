@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { decide, DEFAULT_CONTEXT_CAPS, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY } from '../src/decide.mjs';
 import {
-  tierModelKey, matchPricingTier, overFractionAt, blendedMultiplier,
-  expectedMultiplier, armTierCost, armTierCap, tierCapsByFamily,
+  tierModelKey, matchPricingTier, overFractionAt, overShareAt,
+  quantileOverShare, blendedMultiplier,
+  expectedMultiplier, armTierCost, armTierCap, tierCapsByModel,
   fleetBaselineForModels, median,
 } from '../src/tiers.mjs';
 import { parseLaneBody } from '../src/cliproxy.mjs';
@@ -56,14 +57,35 @@ test('tier regexes match normalized ids; invalid regexes never match', () => {
   assert.equal(matchPricingTier('gpt-6-luna', tiers), null);
 });
 
-test('over-fraction hits measured knots exactly, interpolates, clamps extremes', () => {
+test('over-fraction hits measured knots exactly, interpolates, unknowns stay null', () => {
   const stats = { fractionOver: { '100000': 0.98, '200000': 0.4 } };
   assert.equal(overFractionAt(stats, 100000), 0.98);
   assert.equal(overFractionAt(stats, 200000), 0.4);
   closeTo(overFractionAt(stats, 150000), 0.69);
   assert.equal(overFractionAt(stats, 1000), 1.0);
-  assert.equal(overFractionAt(stats, 999999), 0.0);
+  // Above the largest knot is UNMEASURED ground, not zero: null so the
+  // caller estimates from quantiles or falls back (never P(over) = 0).
+  assert.equal(overFractionAt(stats, 999999), null);
   assert.equal(overFractionAt({}, 100000), null);
+});
+
+test('quantile estimator covers ground the knots do not', () => {
+  const stats = haikuStats({ fractionOver: undefined });
+  // p10 124k already clears the 100k cliff: at least 0.9 over.
+  assert.equal(quantileOverShare(stats, 100000), 0.9);
+  // Even p99 500k sits under a 600k cliff: nothing over.
+  assert.equal(quantileOverShare(stats, 600000), 0);
+  // Between p10 and p99: linear (500k-300k)/(500k-124k).
+  closeTo(quantileOverShare(stats, 300000), 200000 / 376000);
+  // No quantiles at all: unknown, not zero.
+  assert.equal(quantileOverShare({ fractionOver: { '1': 0.5 } }, 100000), null);
+  // countsCached=false compares the raw threshold against UNSCALED-down
+  // quantiles: share 0.7 leaves u10 37.2k / u99 150k against T 100k.
+  closeTo(quantileOverShare(stats, 100000, 0.7), (150000 - 100000) / (150000 - 37200));
+  // overShareAt prefers knots when they cover, quantiles past the last knot.
+  const knotty = haikuStats();
+  assert.equal(overShareAt(knotty, 100000), 0.98);
+  assert.equal(overShareAt(stats, 100000), 0.9);
 });
 
 test('whole_request E blends cost shares, then weights by over-probability', () => {
@@ -190,32 +212,63 @@ test('feasibility gate: Haiku infeasible (no cap), Sol feasible (240k/220k)', ()
   );
   // No stats, no tier, or p10 exactly at the gate: no cap.
   assert.equal(armTierCap({ model: 'm', pricingTiers: [], modelStats: null }), null);
-  assert.equal(tierCapsByFamily([{ family: 'sol', cap: null }]).sol, undefined);
+  // Caps are keyed per MODEL (never per family): an untiered sibling shares
+  // the family but gets no entry; duplicates keep the tighter window.
+  assert.deepEqual(tierCapsByModel([{ model: 'gemini-3-flash', cap: null }]), {});
   assert.deepEqual(
-    tierCapsByFamily([
-      { family: 'sol', cap: { maxTokens: 240000, autoCompactTokens: 220000 } },
-      { family: 'sol', cap: { maxTokens: 200000, autoCompactTokens: 180000 } },
-    ]).sol,
-    { maxTokens: 200000, autoCompactTokens: 180000 },
+    tierCapsByModel([
+      { model: 'GPT-6.1-Sol', cap: { maxTokens: 240000, autoCompactTokens: 220000 } },
+      { model: 'gpt-6.1-sol', cap: { maxTokens: 200000, autoCompactTokens: 180000 } },
+    ]),
+    { 'gpt-6.1-sol': { maxTokens: 200000, autoCompactTokens: 180000 } },
   );
 });
 
-test('decide prefers tier windows over legacy keys, keeps legacy fallback', () => {
-  const rungs = [{
-    rung: 0,
-    arms: [{ armId: 'a', model: 'gpt-6.1-sol', effort: 'max', family: 'sol', contextWindow: 272000, Q: 1, C: 1, trial: false }],
-  }];
+test('decide prefers the arm tier cap over legacy keys, keeps legacy fallback', () => {
+  const arm = (model, family, cap) => ({
+    armId: model, model, effort: 'max', family,
+    contextWindow: 1000000, Q: 1, C: 1, trial: false, cap,
+  });
+  const rungs = (a) => [{ rung: 0, arms: [a] }];
+  const solo = { maxTokens: 240000, autoCompactTokens: 220000 };
   const tiered = decide({
-    runId: 'r', agentId: 'a', ladderRungs: rungs, accountId: 'codex:1',
-    contextCaps: { ...DEFAULT_CONTEXT_CAPS, byFamily: { sol: { maxTokens: 240000, autoCompactTokens: 220000 } } },
+    runId: 'r', agentId: 'a',
+    ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', solo)),
+    accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
   assert.equal(tiered.env[MAX_CONTEXT_ENV_KEY], '240000');
   assert.equal(tiered.env[AUTO_COMPACT_ENV_KEY], '220000');
   const legacy = decide({
-    runId: 'r', agentId: 'a', ladderRungs: rungs, accountId: 'codex:1',
-    contextCaps: DEFAULT_CONTEXT_CAPS,
+    runId: 'r', agentId: 'a',
+    ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', null)),
+    accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
   assert.equal(legacy.env[MAX_CONTEXT_ENV_KEY], '260000');
+});
+
+test('one tiered model never caps its untiered same-family sibling', () => {
+  // Review probe: a feasible 200k Gemini Pro tier capped Gemini Flash at
+  // 168k/148k through the family map. Per-model caps scope it to Pro.
+  const proCap = { maxTokens: 168000, autoCompactTokens: 148000 };
+  const rungs = (model, cap) => [{
+    rung: 0,
+    arms: [{
+      armId: model, model, effort: 'max', family: 'gemini',
+      contextWindow: 1000000, Q: 1, C: 1, trial: false, cap,
+    }],
+  }];
+  const pro = decide({
+    runId: 'r', agentId: 'a', ladderRungs: rungs('gemini-3-pro', proCap),
+    accountId: 'x:1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
+  assert.equal(pro.env[MAX_CONTEXT_ENV_KEY], '168000');
+  assert.equal(pro.env[AUTO_COMPACT_ENV_KEY], '148000');
+  const flash = decide({
+    runId: 'r', agentId: 'a', ladderRungs: rungs('gemini-3-flash', null),
+    accountId: 'x:1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
+  assert.equal(flash.env[MAX_CONTEXT_ENV_KEY], undefined);
+  assert.equal(flash.env[AUTO_COMPACT_ENV_KEY], undefined);
 });
 
 test('median helper', () => {
@@ -378,6 +431,59 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
   closeTo(tiered.capacity.contextTiers.baselineMultiplier, 3.01);
   assert.deepEqual(
     tiered.capacity.contextTiers.caps,
-    { luna: { maxTokens: 468000, autoCompactTokens: 448000 } },
+    { 'pricey-luna': { maxTokens: 468000, autoCompactTokens: 448000 } },
   );
+  // The rung carries its own per-model cap into decide()/hook paths.
+  assert.deepEqual(
+    pricey.cap,
+    { maxTokens: 468000, autoCompactTokens: 448000 },
+  );
+});
+
+test('uncovered thresholds never price at the cheap tier (review probe)', () => {
+  // Haiku fixture: p10 124k against a 100k 5x cliff, so >=90% of requests
+  // are over. All four once returned costMultiplier 1.
+  const priced = (stats) => armTierCost({
+    model: 'claude-haiku-5-5', costBase: 2.0,
+    pricingTiers: [haikuEntry()], modelStats: { models: { 'claude-haiku-5-5': stats } },
+    baseline: null,
+  }).costMultiplier;
+  // fractionOver absent, empty, or with its only knot below T: the p10 rule
+  // estimates 0.9 over -> E = 1 + 0.9 x 4 = 4.6.
+  closeTo(priced(haikuStats({ fractionOver: undefined })), 4.6);
+  closeTo(priced(haikuStats({ fractionOver: {} })), 4.6);
+  closeTo(priced(haikuStats({ fractionOver: { '50000': 1.0 } })), 4.6);
+  // countsCached=false with the knot at T: effective 333k sits past the
+  // 100k knot, so uncached quantiles (u10 37.2k, u99 150k) interpolate.
+  const uncached = armTierCost({
+    model: 'claude-haiku-5-5', costBase: 2.0,
+    pricingTiers: [haikuEntry({ tiers: [haikuTier({ countsCached: false })] })],
+    modelStats: { models: { 'claude-haiku-5-5': haikuStats() } },
+    baseline: null,
+  }).costMultiplier;
+  closeTo(uncached, 1 + ((150000 - 100000) / (150000 - 37200)) * 4);
+  // No knots AND no quantiles: unknown -> the tier's own max, never 1.0.
+  closeTo(
+    priced({ requests: 7, cacheReadShare: 0, meanOutputTokens: 100 }),
+    5.0,
+  );
+});
+
+test('fleet baseline clamps into the unmeasured tier own range', () => {
+  // Measured Haiku (E 4.92) sets the baseline; unmeasured Sonnet's only tier
+  // is 1.5x, so raw 4.92 would price it at 2x its worst case.
+  const sonnetTier = haikuTier({
+    overPromptTokens: 200000,
+    multiplier: { input: 1.5, output: 1.5, cacheRead: 1.5, cacheWrite: 1.5 },
+  });
+  const tiers = [haikuEntry(), { ...haikuEntry(), match: ['sonnet'], tiers: [sonnetTier] }];
+  const measured = { models: { 'claude-haiku-5-5': haikuStats() } };
+  const baseline = fleetBaselineForModels(['claude-haiku-5-5'], tiers, measured);
+  closeTo(baseline, 4.92);
+  const cost = armTierCost({
+    model: 'claude-sonnet-5-5', costBase: 3.0,
+    pricingTiers: tiers, modelStats: measured, baseline,
+  });
+  closeTo(cost.costMultiplier, 1.5);
+  closeTo(cost.costEffective, 4.5);
 });
