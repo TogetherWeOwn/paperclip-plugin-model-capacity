@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 # Model Capacity plugin (v0.2.16, all-providers)
+=======
+# Model Capacity plugin (v0.2.15, all-providers)
+>>>>>>> 3ef3f76 (feat(model-capacity): demand-aware per-agent caps from current demand)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -224,11 +228,16 @@ anchor-less records are marked `unverified` and excluded (never
 deleted). The clamp backstop is retired (`clampedInFlightDropped` always
 0): single-counting is structural now.
 
-`GET /caps` spreads the concurrency target over agents with queued/ready
-work (assigned `todo` + `in_progress` issues, grouped by assignee):
-floor 1 per active agent, largest-remainder weighting by queued count,
-never above `maxTotal` (75). Weak calibration (no target) returns
-`agents: []`.
+`GET /caps` splits the concurrency target across agents in proportion to
+CURRENT demand (ledger `running` + assigned `todo`/`in_progress` issues),
+never historical share. Below target every agent covers its full demand
+(idle agents keep `running + 1` headroom); at/above target the split is
+proportional by demand share, floored at `running`, trimming over-pace
+burners with the most in-flight first. No cap lands below `running`.
+Each entry reports `demand`, `running`, `allocated`, and `reason`
+(`full-demand` | `headroom` | `proportional` | `floor-running` |
+`trimmed-over-pace` | `capped-ceiling`). Weak calibration (no target)
+returns `agents: []`.
 
 ## Configuration
 

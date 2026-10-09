@@ -132,6 +132,95 @@ export function distributeWeightedCaps(target, demands, maxTotal = 75) {
   return active.map((a, i) => ({ agentId: a.agentId, maxConcurrentRuns: 1 + extras[i] }));
 }
 
+/**
+ * Demand-aware per-agent caps. Demand is current, never historical:
+ * demand = running + queued. Below the fleet target there is no throttle
+ * pressure, so every agent covers its full demand (idlers keep running+1
+ * headroom) -- a cap below running would throttle work that already exists
+ * while the fleet idles. At or above target the fleet sheds: the target
+ * splits by demand share (largest remainder), floored at running, then
+ * over-pace burners with the most in-flight trim back to running while the
+ * sum exceeds the target. Floors can hold the sum above target; that is
+ * reported as-is (caps cannot kill running runs).
+ *
+ * agents: [{ agentId, running, queued, overPace }].
+ * Returns [{ agentId, demand, running, queued, allocated, maxConcurrentRuns,
+ * reason }] with reason in full-demand | headroom | proportional |
+ * floor-running | trimmed-over-pace | capped-ceiling. maxConcurrentRuns
+ * mirrors allocated for the existing /caps consumer.
+ */
+export function allocateDemandCaps(target, agents, maxTotal = 75) {
+  const list = (agents ?? [])
+    .filter(a => a && typeof a.agentId === 'string' && a.agentId.length > 0)
+    .map(a => ({
+      agentId: a.agentId,
+      running: Math.max(0, Math.floor(a.running ?? 0)),
+      queued: Math.max(0, Math.floor(a.queued ?? 0)),
+      overPace: a.overPace === true,
+    }))
+    .filter(a => a.running + a.queued > 0)
+    .sort((x, y) => ((y.running + y.queued) - (x.running + x.queued)) || (x.agentId < y.agentId ? -1 : 1));
+  if (list.length === 0 || target == null) return [];
+  const ceiling = Math.max(1, Math.floor(maxTotal));
+  const T = Math.max(0, Math.round(target));
+  const totalRunning = list.reduce((s, a) => s + a.running, 0);
+  const out = list.map(a => ({ ...a, demand: a.running + a.queued, allocated: 0, reason: 'proportional' }));
+  // The ceiling never undercuts running: a cap below running is fiction.
+  const applyCeiling = (e, computed, reason) => {
+    if (computed <= ceiling) { e.allocated = computed; e.reason = reason; }
+    else if (ceiling <= e.running) { e.allocated = e.running; e.reason = 'floor-running'; }
+    else { e.allocated = ceiling; e.reason = 'capped-ceiling'; }
+  };
+  if (T <= 0) {
+    // Explicit shed: hold running, start nothing.
+    for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
+  } else if (totalRunning < T) {
+    for (const e of out) {
+      const want = Math.max(e.demand, e.running + 1);
+      applyCeiling(e, want, e.demand >= e.running + 1 ? 'full-demand' : 'headroom');
+    }
+  } else {
+    const totalDemand = out.reduce((s, e) => s + e.demand, 0);
+    const shares = totalDemand > 0 ? largestRemainder(T, out.map(e => e.demand)) : out.map(() => 0);
+    out.forEach((e, i) => {
+      if (shares[i] >= e.running) applyCeiling(e, shares[i], 'proportional');
+      else { e.allocated = e.running; e.reason = 'floor-running'; }
+    });
+    const trimOrder = out
+      .filter(e => e.overPace && e.allocated > e.running)
+      .sort((a, b) => (b.running - a.running) || (b.demand - a.demand) || (a.agentId < b.agentId ? -1 : 1));
+    const sum = () => out.reduce((s, e) => s + e.allocated, 0);
+    for (const e of trimOrder) {
+      if (sum() <= T) break;
+      e.allocated = e.running;
+      e.reason = 'trimmed-over-pace';
+    }
+  }
+  return out.map(e => ({
+    agentId: e.agentId, demand: e.demand, running: e.running, queued: e.queued,
+    allocated: e.allocated, maxConcurrentRuns: e.allocated, reason: e.reason,
+  }));
+}
+
+/** Integer split of total by weights, largest remainder, index-stable. */
+function largestRemainder(total, weights) {
+  const wTotal = weights.reduce((s, w) => s + w, 0);
+  if (wTotal <= 0) return weights.map(() => 0);
+  const raw = weights.map(w => (total * w) / wTotal);
+  const base = raw.map(Math.floor);
+  let left = total - base.reduce((s, b) => s + b, 0);
+  const extra = new Array(weights.length).fill(0);
+  const order = raw
+    .map((r, i) => ({ i, rest: r - base[i], w: weights[i] }))
+    .sort((a, b) => (b.rest - a.rest) || (b.w - a.w) || (a.i - b.i));
+  for (const o of order) {
+    if (left <= 0) break;
+    extra[o.i] += 1;
+    left -= 1;
+  }
+  return base.map((b, i) => b + extra[i]);
+}
+
 /** Spread an integer slot target across agents with queued/ready work. */
 export function distributeCaps(target, agentIds) {
   const ids = [...new Set(agentIds ?? [])].sort();

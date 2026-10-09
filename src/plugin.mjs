@@ -63,7 +63,7 @@ import {
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, createBreakerStore,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
 import { orderAccountsForRun } from './select.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
@@ -1710,6 +1710,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
     await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);
+    // Demand-aware caps input: per-agent in-flight counts plus whether the
+    // agent burns on an over-pace (guard-active) account. Running = ledger
+    // records with status 'running' (started, no terminal); unverified
+    // records never proved alive since startup and stay excluded. Burn side
+    // (actualAccount) outranks the decision guess for the over-pace check.
+    const overPaceAccounts = new Set(
+      accountViews.filter(v => v?.guardActive === true).map(v => v.accountId));
+    const agentRunning = {};
+    for (const r of ledger.values()) {
+      if (r?.status !== 'running' || r?.unverified === true) continue;
+      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
+      const entry = agentRunning[r.agentId] ?? (agentRunning[r.agentId] = { running: 0, overPace: false });
+      entry.running += 1;
+      const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
+      if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
+    }
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
@@ -1731,6 +1747,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         thinker: config.roles.excludeFamilies.thinker,
         other: config.roles.excludeFamilies.other,
       },
+      // Per-agent running + over-pace burn flags for the demand-aware /caps
+      // allocator below. Bounded by the live agent count.
+      agentRunning,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -2177,9 +2196,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           ctx.logger.error('model-capacity: caps issues read failed', { companyId, error: error?.message ?? String(error) });
           return { status: 200, body: { atMs, calibration, target, agents: [], capsError: 'issues-unavailable' } };
         }
-        const agents = distributeWeightedCaps(
+        // Demand-aware caps: C* splits across agents in proportion to
+        // CURRENT demand (running + queued), never historical share. Below
+        // the target every agent covers its full demand; at/above it the
+        // allocator sheds over-pace burners first. No cap lands below an
+        // agent's running count -- throttling existing runs while the fleet
+        // idles is the failure this replaces.
+        const runningByAgent = cap.agentRunning ?? {};
+        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
+        const agents = allocateDemandCaps(
           target,
-          [...counts].map(([agentId, queued]) => ({ agentId, queued })),
+          [...agentIds].map(agentId => ({
+            agentId,
+            running: runningByAgent[agentId]?.running ?? 0,
+            queued: counts.get(agentId) ?? 0,
+            overPace: runningByAgent[agentId]?.overPace === true,
+          })),
           cap.maxTotal ?? 75,
         );
         return { status: 200, body: { atMs, calibration, target, agents } };
