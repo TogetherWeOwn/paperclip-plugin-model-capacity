@@ -126,3 +126,21 @@ test('weighted spread: never exceeds maxTotal; shed target zeroes actives', () =
   assert.deepEqual(distributeWeightedCaps(9, []), []);
   assert.deepEqual(distributeWeightedCaps(null, [{ agentId: 'a', queued: 1 }]), []);
 });
+
+test('unhealthy accounts contribute zero slots with reason excluded', () => {
+  // Dead quota is not sustainable concurrency: an unavailable account with a
+  // measured E still allocates nothing, and the target equals the healthy
+  // accounts only. Fails pre-fix (healthy key ignored, dead quota in target).
+  const out = computeConcurrencyTarget({
+    accounts: [
+      { accountId: 'a', remainingPct: 0.5, hoursToReset: 72, burnPerRunPct: 0.001, measuredBurnPerRunPct: 0.001, guardActive: false, healthy: true },
+      { accountId: 'b', remainingPct: 0.5, hoursToReset: 72, burnPerRunPct: 0.001, measuredBurnPerRunPct: 0.001, guardActive: false, healthy: false },
+    ],
+    meanRunDurationHours: 0.186, maxTotal: 75,
+  });
+  const a = out.perAccount.find(x => x.accountId === 'a');
+  const b = out.perAccount.find(x => x.accountId === 'b');
+  assert.deepEqual([b.slots, b.runsPerHour, b.capped, b.reason], [0, 0, true, 'excluded']);
+  assert.equal(out.target, a.slots);
+  assert.ok(out.target > 0);
+});

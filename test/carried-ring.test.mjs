@@ -43,17 +43,21 @@ const ringEntry = (runId, at) => ({
   trial: false, family: 'kimi', reason: 'seed', at,
 });
 
-function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), ringSeed = null, runsSeed = null }) {
+function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), ringSeed = null, runsSeed = null, failOnSet = [] }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
   const skey = k => JSON.stringify(k);
   let now = TICK;
+  let failKeys = failOnSet;
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
-      set: async (k, v) => { store.set(skey(k), v); },
+      set: async (k, v) => {
+        if (failKeys.some(s => skey(k).includes(s))) throw new Error('injected-persist-failure');
+        store.set(skey(k), v);
+      },
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
@@ -66,6 +70,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
   const plugin = createModelCapacityPlugin({ clock: () => now });
   return {
     setNow: (ms) => { now = ms; },
+    setFailOnSet: (l) => { failKeys = l; },
     setup: async () => {
       await plugin.setup(io);
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aa, duplicateSlugs: [] });
@@ -143,4 +148,32 @@ test('entries decided live by this worker are trusted, not reconciled away', asy
   const capacity = await d.api('capacity');
   assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 1 });
   assert.equal(capacity.body.reconciledRingDropped, 0);
+});
+
+test('a tick that dies before persisting reconciles again next tick', async () => {
+  // The reconcile flag sets only after a successful persist: a throw
+  // mid-tick (here at the ring write) leaves the carried ring uncleaned on
+  // disk, so the next tick reconciles again instead of trusting memory.
+  // Pre-fix the flag sets before the throw and the ghosts inflate tick two.
+  const d = drive({
+    laneAccounts: [kimiLane('k1')],
+    ringSeed: [
+      ringEntry('ghost-recent', TICK - 30 * 60000),
+      ringEntry('ghost-mid', TICK - 70 * 60000),
+      ringEntry('ghost-ancient', TICK - 3 * 3600000),
+      ringEntry('run-live', TICK - 30 * 60000),
+    ],
+    runsSeed: [
+      { runId: 'run-live', agentId: 'agent-9', status: 'running', at: TICK - 30 * 60000 },
+    ],
+    failOnSet: ['shadow-ring-v1'],
+  });
+  await d.setup();
+  await assert.rejects(d.tick());
+  d.setFailOnSet([]);
+  await d.tick();
+  const capacity = await d.api('capacity');
+  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 1 });
+  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 1 });
+  assert.equal(capacity.body.reconciledRingDropped, 3);
 });

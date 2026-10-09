@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.8, all-providers)
+# Model Capacity plugin (v0.2.9, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -66,6 +66,12 @@ fully feed-driven: vanished accounts get no decisions and drop out of the
 report and target, brand-new providers/models are eligible on the next
 tick with zero config, and non-healthy accounts freeze their pointer and
 report action `excluded` instead of a misleading hold.
+
+**v0.2.9 = EXCLUDED QUOTA + PERSIST-GATED RECONCILE.** Unhealthy accounts
+contribute zero quota to the concurrency target (their measured burn still
+calibrates, but dead quota is not sustainable concurrency), and the
+reconcile-once flag sets only after a successful persist, so a tick that
+dies mid-write reconciles again on the next tick instead of trusting memory.
 
 ## How it decides (per account, per run)
 

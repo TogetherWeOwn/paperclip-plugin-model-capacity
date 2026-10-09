@@ -5,7 +5,8 @@
  * fraction per hour divided by the measured weekly fraction one run
  * consumes (E_a, calibrated from lane usage deltas over runs that ran on
  * the account), times mean run duration D. Guard-capped accounts contribute
- * zero (their load is shed, not grown); the total is capped by a
+ * zero (their load is shed, not grown), as do unhealthy accounts (dead
+ * quota is not sustainable concurrency); the total is capped by a
  * configured hard ceiling.
  *
  * Calibration discipline: E_a comes from measurement, never from the
@@ -24,7 +25,8 @@ export const DEFAULT_CONCURRENCY = Object.freeze({
 /**
  * accounts: [{ accountId, remainingPct (0-1), hoursToReset,
  *   burnPerRunPct (anchor fallback), measuredBurnPerRunPct (E, nullable),
- *   guardActive }]
+ *   guardActive, healthy (false excludes the account with reason
+ *   'excluded'; absent counts as healthy) }]
  */
 export function computeConcurrencyTarget({ accounts, meanRunDurationHours, demandFactor = 1, maxTotal = 75 } = {}) {
   const D = meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours;
@@ -37,6 +39,15 @@ export function computeConcurrencyTarget({ accounts, meanRunDurationHours, deman
     if (a.guardActive) {
       return {
         accountId: a.accountId, slots: 0, runsPerHour: 0, capped: true, reason: '5h-guard', calibrated: false,
+        measuredBurnPerRunPct: a.measuredBurnPerRunPct > 0 ? a.measuredBurnPerRunPct : null,
+        burnPerRunPct: null, runsInWindow: a.runsInWindow ?? null,
+      };
+    }
+    // Unhealthy accounts allocate nothing, so their quota is not
+    // sustainable concurrency: zero slots, same shape as the guard branch.
+    if (a.healthy === false) {
+      return {
+        accountId: a.accountId, slots: 0, runsPerHour: 0, capped: true, reason: 'excluded', calibrated: false,
         measuredBurnPerRunPct: a.measuredBurnPerRunPct > 0 ? a.measuredBurnPerRunPct : null,
         burnPerRunPct: null, runsInWindow: a.runsInWindow ?? null,
       };

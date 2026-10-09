@@ -213,3 +213,36 @@ test('healthy -> unavailable -> healthy freezes, excludes, and resumes', async (
   const out = await d.hook('run-back', { adapterType: 'claude-code' });
   assert.equal(out.kind, 'decide');
 });
+
+test('an unavailable account with readings contributes zero quota to the target', async () => {
+  // The live regression: claude-lane-2 flipped to unavailable, got no
+  // decisions, yet its measured quota stayed inside the target (target 32.3
+  // with 27.6 sustainable). Post-fix the dead account reads slots 0 with
+  // reason excluded and the target equals the healthy accounts only.
+  const d = drive({
+    lanes: [
+      lane('alpha', 'a1', { models: ['claude-haiku-5-5'], used: 0.30 }),
+      lane('beta', 'b1', { models: ['kimi-k3-256k'], used: 0.30 }),
+    ],
+  });
+  await d.setup();
+  await d.tick();
+  // Eleven minutes later both burned a point and each served a run; beta is
+  // now unavailable. Both calibrate, but only alpha allocates.
+  d.setNow(TICK + 11 * 60000);
+  d.setLanes([
+    lane('alpha', 'a1', { models: ['claude-haiku-5-5'], used: 0.31 }),
+    lane('beta', 'b1', { models: ['kimi-k3-256k'], used: 0.31, health: 'unavailable' }),
+  ]);
+  await d.fire(started('run-a', TICK + 10 * 60000, 'claude-haiku-5-5'));
+  await d.fire(started('run-b', TICK + 10 * 60000, 'kimi-k3-256k'));
+  await d.tick();
+  const capacity = await d.api('capacity');
+  const a = capacity.body.perAccount.find(x => x.accountId === 'alpha:a1');
+  const b = capacity.body.perAccount.find(x => x.accountId === 'beta:b1');
+  assert.ok(a.slots > 0);
+  assert.deepEqual([b.slots, b.reason], [0, 'excluded']);
+  assert.equal(capacity.body.target, a.slots);
+  const bAction = capacity.body.accounts.find(x => x.accountId === 'beta:b1');
+  assert.equal(bAction.action, 'excluded');
+});

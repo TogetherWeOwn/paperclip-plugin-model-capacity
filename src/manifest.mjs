@@ -1,6 +1,6 @@
 /**
  * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
- * reactive-account eligibility, event-time shadow). v0.2.8 = SHADOW BY
+ * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
  * DEFAULT: the default export holds NO `run.model.resolve` capability and no
  * modelRouting; it observes and records only. The enforce-capable variant
  * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
@@ -16,7 +16,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.8';
+export const PLUGIN_VERSION = '0.2.9';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

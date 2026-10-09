@@ -957,6 +957,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           measuredBurnPerRunPct: measuredE,
           runsInWindow: runsInSpan(a.accountId, rateWindowMs),
           guardActive: a.guardActive,
+          healthy: a.health === 'healthy',
         };
       }),
       meanRunDurationHours: config.concurrency.meanRunDurationHours,
@@ -978,10 +979,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // carried state: without it dead runs inflate pools until they age out,
     // and the clamp bound (which includes the carry) cannot catch them.
     // Entries decided live by THIS worker are trusted -- the worker just
-    // saw those runs start -- so reconciliation runs exactly once.
+    // saw those runs start -- so reconciliation runs once per company per
+    // successful tick (the flag sets after the persist below).
     let reconciledRingDropped = 0;
     if (!reconciledCompanies.has(companyId)) {
-      reconciledCompanies.add(companyId);
       const verifiable = new Set(runs.filter(r => !isTerminalStatus(r.status)).map(r => r.runId));
       reconciledRingDropped = ring.prune(e => !verifiable.has(e.runId));
     }
@@ -1447,6 +1448,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       },
     });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
+    // Reconciliation counts as done only when the tick persists: a throw
+    // before this point leaves the carried ring uncleaned on disk, so the
+    // next tick must reconcile again instead of trusting memory.
+    reconciledCompanies.add(companyId);
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,
       calibration: concurrency.calibration, observed, runs: runs.length, runsSource: 'events',

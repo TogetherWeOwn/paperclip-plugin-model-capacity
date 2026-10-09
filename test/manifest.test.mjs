@@ -5,8 +5,8 @@ import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MO
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.8');
-  assert.equal(PLUGIN_VERSION, '0.2.8');
+  assert.equal(manifest.version, '0.2.9');
+  assert.equal(PLUGIN_VERSION, '0.2.9');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -69,7 +69,7 @@ test('shadow entrypoints use no build step', () => {
   assert.equal(manifest.entrypoints.worker, './src/worker.mjs');
 });
 
-test('v0.2.8 schema declares trials and modelAaOverrides', () => {
+test('v0.2.9 schema declares trials and modelAaOverrides', () => {
   const props = manifest.instanceConfigSchema.properties;
   assert.equal(props.trials.properties.maxInFlightPerAccount.default, 2);
   assert.equal(props.trials.properties.maxInFlightPerFamily.default, 2);
