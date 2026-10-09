@@ -342,6 +342,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const ledgerReady = new Set(); // companyIds whose memory ledger absorbed persisted state
   const breakerStores = new Map(); // companyId -> breaker store (memory truth; tick persists)
   const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
+  const breakerLoads = new Map(); // companyId -> in-flight first-load promise (single-flight)
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
@@ -893,9 +894,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // failed records. A throw here aborts the tick before any persist, same
     // as the ledger direct load.
     if (!breakerReady.has(companyId)) {
-      breakerReady.add(companyId);
-      breakerStores.set(companyId,
-        breakerStoreFromJSON(await ctx.state.get(scopeKey(companyId, BREAKER_KEY))));
+      // Single-flight first load (mirrors ledgerLoads): overlapping first
+      // ticks share one read, and ready is marked ONLY after it succeeds --
+      // a failed read aborts this tick with ready unset, so the next tick
+      // retries the load instead of persisting an empty store over the saved
+      // open/half-open breakers.
+      let pending = breakerLoads.get(companyId);
+      if (!pending) {
+        pending = (async () => breakerStoreFromJSON(await ctx.state.get(scopeKey(companyId, BREAKER_KEY))))();
+        breakerLoads.set(companyId, pending);
+      }
+      try {
+        breakerStores.set(companyId, await pending);
+        breakerReady.add(companyId);
+      } finally {
+        if (breakerLoads.get(companyId) === pending) breakerLoads.delete(companyId);
+      }
     }
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
@@ -1637,7 +1651,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       throw new Error('model-capacity: refusing ledger persist without a successful load');
     }
     await ctx.state.set(scopeKey(companyId, LEDGER_KEY), ledgerToJSON(ledger));
-    await ctx.state.set(scopeKey(companyId, BREAKER_KEY), breakerStoreToJSON(breakers, { nowMs, cfg: breakersCfg }));
+    // Gated on a successful load (see above): persisting without one would
+    // wipe saved open/half-open breakers with an empty store.
+    if (breakerReady.has(companyId)) {
+      await ctx.state.set(scopeKey(companyId, BREAKER_KEY), breakerStoreToJSON(breakers, { nowMs, cfg: breakersCfg }));
+    }
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
     await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
@@ -2146,6 +2164,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
       const budget = effectiveTrialBudget(live, params.companyId, selfId);
+      // Breaker state live at call time (not the tick-frozen view): a probe
+      // occupied after the tick published must exclude the arm here, or N
+      // enforced runs would pile onto one half-open probe slot.
+      const bstore = breakerStores.get(params.companyId) ?? createBreakerStore();
+      const bcfg = lastConfig.get(params.companyId)?.breakers ?? DEFAULT_BREAKERS;
+      const bnow = clock();
       for (const view of order) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;
@@ -2154,7 +2178,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           runId: params.runId,
           agentId: params.agentId,
           role,
-          ladderRungs: view.ladderRungs,
+          ladderRungs: filterBreakerRungs(view.ladderRungs, bstore, view.accountId, bnow, bcfg),
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -2176,13 +2200,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // counts exactly once, and it survives a load in flight.
           // Memory-only here; the next tick persists it.
           // Half-open probe: only enforced runs route real traffic, so only
-          // the hook occupies the probe slot (shadow picks never do). First
-          // caller wins; a racing second run may slip through and both
-          // terminals resolve the same way.
-          if (d.armId != null && params?.runId != null) {
-            startProbe(breakerStores.get(params.companyId) ?? createBreakerStore(),
-              d.accountId, d.armId, params.runId, clock(),
-              lastConfig.get(params.companyId)?.breakers ?? DEFAULT_BREAKERS);
+          // the hook occupies the probe slot (shadow picks never do). The
+          // pre-filter above already excluded occupied slots, and everything
+          // from the filter through this claim is synchronous, so the claim
+          // cannot lose -- but if it ever does, skip to the next account
+          // rather than piling a second enforced run onto one probe.
+          // Slipped runs cannot occur: with the slot claimed, every later
+          // hook filters the arm out until its terminal resolves.
+          if (d.armId != null && params?.runId != null
+            && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
+            && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
+            continue;
           }
           const hookLedger = await getOrLoadLedger(params.companyId);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;

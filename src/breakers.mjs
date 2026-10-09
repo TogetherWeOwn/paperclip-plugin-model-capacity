@@ -255,7 +255,11 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
   // so a re-processed stale failure can never wipe newer ones or trip.
   const ref = Math.max(Number.isFinite(nowMs) ? nowMs : atMs, atMs);
   const cutoff = ref - (cfg?.windowMin ?? DEFAULT_BREAKERS.windowMin) * 60 * 1000;
-  e.fails = [...e.fails.filter(f => f >= cutoff), atMs].slice(-10);
+  // Filter AFTER appending: a stale failure is dropped, never counted, so the
+  // trip is order-independent (recent-then-ancient and ancient-then-recent
+  // agree). The ref uses the later of now and the failure, so a re-processed
+  // stale failure can neither trip nor wipe newer ones.
+  e.fails = [...e.fails, atMs].filter(f => f >= cutoff).slice(-10);
   const trip = cfg?.tripCount ?? DEFAULT_BREAKERS.tripCount;
   if (e.fails.length >= trip) {
     e.state = 'open';
@@ -270,8 +274,10 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
 
 /**
  * Occupy the half-open probe slot with an enforced run. Only the first caller
- * wins; a racing second run slips through but both terminals resolve the same
- * way. Returns true when this runId holds the slot.
+ * wins; later callers get false and must route elsewhere (the hook live-filters
+ * occupied slots and skips to the next account when the claim loses, so two
+ * enforced runs never pile onto one probe). Returns true when this runId
+ * holds the slot.
  */
 export function startProbe(store, accountId, armId, runId, nowMs, cfg = DEFAULT_BREAKERS) {
   if (runId == null) return false;
