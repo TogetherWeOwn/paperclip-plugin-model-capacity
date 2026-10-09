@@ -80,6 +80,36 @@ test('empty and null targets allocate nothing', () => {
   assert.deepEqual(allocateDemandCaps(10, [{ agentId: '', running: 1, queued: 1 }]), []);
 });
 
+test('below-target queue spike sheds proportionally within maxTotal', () => {
+  // Review PoC: 5 x {running:1, queued:20} at target 35, maxTotal 75 had
+  // allocated [21 x 5] = 105, overshooting the fleet ceiling.
+  const spike = Array.from({ length: 5 }, (_, i) => ({ agentId: `a${i}`, running: 1, queued: 20, overPace: false }));
+  const agents = allocateDemandCaps(35, spike, 75);
+  const sum = agents.reduce((s, a) => s + a.allocated, 0);
+  assert.ok(sum <= 75, `fleet sum ${sum} exceeds maxTotal`);
+  for (const a of agents) {
+    assert.ok(a.allocated >= a.running, a.agentId);
+    assert.equal(a.maxConcurrentRuns, a.allocated);
+    assert.ok(REASONS.has(a.reason), a.reason);
+  }
+  // Equal demands split the target evenly.
+  assert.deepEqual(agents.map(a => a.allocated), [7, 7, 7, 7, 7]);
+});
+
+test("a '__proto__' agentId counts in caps without polluting Object.prototype", () => {
+  const agents = allocateDemandCaps(35, [
+    { agentId: '__proto__', running: 2, queued: 3, overPace: false },
+    { agentId: 'devops', running: 1, queued: 0, overPace: false },
+  ]);
+  const byId = new Map(agents.map(a => [a.agentId, a]));
+  assert.equal(byId.get('__proto__').running, 2);
+  assert.equal(byId.get('__proto__').demand, 5);
+  assert.equal(byId.get('__proto__').allocated, 5);
+  assert.equal(byId.get('devops').allocated, 2);
+  assert.equal({}.running, undefined);
+  assert.equal(Object.prototype.running, undefined);
+});
+
 // --- /caps handler wiring: running comes from the ledger, queued from issues.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
@@ -173,4 +203,27 @@ test('/caps exposes demand, running, allocated, reason with ledger running count
       assert.ok(a.allocated >= a.demand, `${a.agentId}: throttled below demand under target`);
     }
   }
+});
+
+test("tick accumulator isolates a '__proto__' agentId end to end", async () => {
+  const d = drive({ nowMs: TICK, config: { enforce: true }, issueLists: { todo: [], in_progress: [] } });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 10 * 60000);
+  await d.fire(runEvent('proto-run-1', TICK + 10 * 60000, '__proto__'));
+  await d.fire(runEvent('devops-run-1', TICK + 10 * 60000, 'devops'));
+  d.setNow(TICK + 30 * 60000);
+  d.setLane(0.328);
+  await d.tick();
+  const caps = await d.api('caps');
+  assert.equal(caps.status, 200);
+  const byId = new Map(caps.body.agents.map(a => [a.agentId, a]));
+  // The hostile id is counted as its own agent, not folded into the
+  // prototype: both agents report their own running counts.
+  assert.equal(byId.get('__proto__').running, 1);
+  assert.equal(byId.get('devops').running, 1);
+  for (const a of caps.body.agents) assert.ok(a.allocated >= a.running, a.agentId);
+  // No worker-wide pollution from the accumulator write path.
+  assert.equal({}.running, undefined);
+  assert.equal(Object.prototype.running, undefined);
 });

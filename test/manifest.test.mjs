@@ -79,3 +79,9 @@ test('v0.2.13 schema declares trials and modelAaOverrides', () => {
   assert.deepEqual(props.modelAaOverrides.default, {});
   assert.deepEqual(buildManifest({ modelResolve: false }).instanceConfigSchema.properties.trials, props.trials);
 });
+
+test('package.json version tracks PLUGIN_VERSION (no release drift)', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
+  assert.equal(pkg.version, PLUGIN_VERSION);
+});

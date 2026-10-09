@@ -137,11 +137,14 @@ export function distributeWeightedCaps(target, demands, maxTotal = 75) {
  * demand = running + queued. Below the fleet target there is no throttle
  * pressure, so every agent covers its full demand (idlers keep running+1
  * headroom) -- a cap below running would throttle work that already exists
- * while the fleet idles. At or above target the fleet sheds: the target
+ * while the fleet idles -- but only while the want-sum fits the fleet
+ * ceiling: a queue spike that would overshoot maxTotal sheds
+ * proportionally instead. At or above target the fleet sheds: the target
  * splits by demand share (largest remainder), floored at running, then
  * over-pace burners with the most in-flight trim back to running while the
- * sum exceeds the target. Floors can hold the sum above target; that is
- * reported as-is (caps cannot kill running runs).
+ * sum exceeds the split. Floors are absolute (caps cannot kill running
+ * runs), so the sum can exceed the split or ceiling only by running; that
+ * is reported as-is, never hidden.
  *
  * agents: [{ agentId, running, queued, overPace }].
  * Returns [{ agentId, demand, running, queued, allocated, maxConcurrentRuns,
@@ -171,17 +174,18 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
     else if (ceiling <= e.running) { e.allocated = e.running; e.reason = 'floor-running'; }
     else { e.allocated = ceiling; e.reason = 'capped-ceiling'; }
   };
-  if (T <= 0) {
-    // Explicit shed: hold running, start nothing.
-    for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
-  } else if (totalRunning < T) {
-    for (const e of out) {
-      const want = Math.max(e.demand, e.running + 1);
-      applyCeiling(e, want, e.demand >= e.running + 1 ? 'full-demand' : 'headroom');
-    }
-  } else {
+  // Proportional shed shared by the at/above-target branch and the
+  // below-target queue-spike fallback: split S by demand share (largest
+  // remainder), floored at running, then over-pace burners with the most
+  // in-flight trim back to running while the sum exceeds S. S clamps to
+  // the ceiling here (unconditional fleet bound, like the predecessor;
+  // production C* arrives pre-clamped anyway); the per-agent ceiling in
+  // applyCeiling stays as backstop. Running floors stay absolute and are
+  // reported as-is: only pre-existing running can hold the sum over.
+  const shedProportionally = (S) => {
+    S = Math.min(S, ceiling);
     const totalDemand = out.reduce((s, e) => s + e.demand, 0);
-    const shares = totalDemand > 0 ? largestRemainder(T, out.map(e => e.demand)) : out.map(() => 0);
+    const shares = totalDemand > 0 ? largestRemainder(S, out.map(e => e.demand)) : out.map(() => 0);
     out.forEach((e, i) => {
       if (shares[i] >= e.running) applyCeiling(e, shares[i], 'proportional');
       else { e.allocated = e.running; e.reason = 'floor-running'; }
@@ -191,10 +195,29 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
       .sort((a, b) => (b.running - a.running) || (b.demand - a.demand) || (a.agentId < b.agentId ? -1 : 1));
     const sum = () => out.reduce((s, e) => s + e.allocated, 0);
     for (const e of trimOrder) {
-      if (sum() <= T) break;
+      if (sum() <= S) break;
       e.allocated = e.running;
       e.reason = 'trimmed-over-pace';
     }
+  };
+  if (T <= 0) {
+    // Explicit shed: hold running, start nothing.
+    for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
+  } else if (totalRunning < T) {
+    const wants = out.map(e => Math.max(e.demand, e.running + 1));
+    // A lone spike can still be capped per-agent under the ceiling (keeps
+    // the capped-ceiling label); a fleet-wide spike sheds proportionally.
+    const cappedWants = wants.map(w => Math.min(w, ceiling));
+    if (cappedWants.reduce((s, w) => s + w, 0) <= ceiling) {
+      out.forEach((e, i) => applyCeiling(e, wants[i], e.demand >= e.running + 1 ? 'full-demand' : 'headroom'));
+    } else {
+      // Fleet-wide queue spike: full demand would overshoot the fleet
+      // ceiling, so split by demand share instead of treating maxTotal
+      // as per-agent. Running floors stay absolute.
+      shedProportionally(T);
+    }
+  } else {
+    shedProportionally(T);
   }
   return out.map(e => ({
     agentId: e.agentId, demand: e.demand, running: e.running, queued: e.queued,

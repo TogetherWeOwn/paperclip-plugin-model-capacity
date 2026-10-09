@@ -221,15 +221,18 @@ export function inflightByAccount(ledger, { nowMs, horizonMs }) {
 
 /** Per-family trial in-flight: fresh trial decisions on non-terminal runs. */
 export function trialInflight(ledger, { nowMs, windowMs = TRIAL_WINDOW_MS }) {
-  const out = {};
+  // Map accumulator: family strings key this count and '__proto__' would
+  // read Object.prototype (an object, so `?? 0` never fires and `+ 1`
+  // string-concatenates). fromEntries keeps the plain-object return shape.
+  const counts = new Map();
   for (const r of (ledger ?? new Map()).values()) {
     if (r?.trial !== true || !r?.family) continue;
     if (isLedgerTerminal(r?.status) || r?.unverified === true) continue;
     const anchor = anchorOf(r);
     if (anchor == null || !(anchor <= nowMs) || nowMs - anchor >= windowMs) continue;
-    out[r.family] = (out[r.family] ?? 0) + 1;
+    counts.set(r.family, (counts.get(r.family) ?? 0) + 1);
   }
-  return out;
+  return Object.fromEntries(counts);
 }
 
 /**

@@ -1571,13 +1571,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // Adapter map for the memory-only paths: fresh cached agent adapter
     // types, so the hook and event-time shadow decide trial arms for
     // agents the tick has already seen without performing I/O.
-    const adapterByAgent = {};
+    // Same '__proto__' discipline as agentRunning below: agentIds key this
+    // map, so accumulate in a Map and snapshot with fromEntries (own data
+    // properties; a direct assignment would hit the prototype setter).
+    const adapterByAgentEntries = new Map();
     for (const [k, v] of agentAdapterCache) {
       const sep = k.indexOf(':');
       if (sep < 0 || k.slice(0, sep) !== companyId) continue;
       if (!v?.adapterType || nowMs - v.atMs > ADAPTER_TTL_MS) continue;
-      adapterByAgent[k.slice(sep + 1)] = { adapterType: v.adapterType, atMs: v.atMs };
+      adapterByAgentEntries.set(k.slice(sep + 1), { adapterType: v.adapterType, atMs: v.atMs });
     }
+    const adapterByAgent = Object.fromEntries(adapterByAgentEntries);
     const liveCensus = inflightByAccount(ledger, { nowMs, horizonMs: staleHorizonMs });
     const livePools = {};
     for (const [id, n] of Object.entries(liveCensus.byAccount)) {
@@ -1717,15 +1721,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // (actualAccount) outranks the decision guess for the over-pace check.
     const overPaceAccounts = new Set(
       accountViews.filter(v => v?.guardActive === true).map(v => v.accountId));
-    const agentRunning = {};
+    // Map accumulator: agentIds are ledger/issue strings, and indexing a
+    // plain object with '__proto__' would write Object.prototype worker-wide
+    // (and read it back as NaN counts). fromEntries below defines own data
+    // properties even for '__proto__', so the snapshot reads back safely.
+    const agentRunningById = new Map();
     for (const r of ledger.values()) {
       if (r?.status !== 'running' || r?.unverified === true) continue;
       if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
-      const entry = agentRunning[r.agentId] ?? (agentRunning[r.agentId] = { running: 0, overPace: false });
+      let entry = agentRunningById.get(r.agentId);
+      if (!entry) { entry = { running: 0, overPace: false }; agentRunningById.set(r.agentId, entry); }
       entry.running += 1;
       const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
+    const agentRunning = Object.fromEntries(agentRunningById);
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
