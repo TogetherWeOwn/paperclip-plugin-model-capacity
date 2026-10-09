@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
+import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
@@ -18,10 +19,14 @@ test('no database grant: no database block, no db capabilities', () => {
 });
 
 test('lane endpoint pinned to the allowlist in schema', () => {
-  assert.deepEqual([...LANE_BASE_URL_ALLOWLIST], ['https://router.infextion.net']);
+  assert.deepEqual([...LANE_BASE_URL_ALLOWLIST], [...LANE_BASE_URLS]);
   assert.deepEqual(
     manifest.instanceConfigSchema.properties.cliproxy.properties.baseUrl.enum,
-    ['https://router.infextion.net'],
+    [...LANE_BASE_URLS],
+  );
+  assert.equal(
+    manifest.instanceConfigSchema.properties.cliproxy.properties.baseUrl.default,
+    LANE_BASE_URLS[0],
   );
 });
 

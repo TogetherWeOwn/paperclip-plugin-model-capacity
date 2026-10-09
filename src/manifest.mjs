@@ -1,5 +1,11 @@
 /**
- * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
+ * Plugin manifest. v0.2.18 = LANE HOST PIN: the lane host is no longer
+ * written in the public source. src/lane-host.mjs holds a non-routable
+ * placeholder and the package build replaces that one file with the real
+ * origin; the manifest enum, the config validator and the config fallback
+ * all read it, so the key still goes to exactly one compile-time origin.
+ *
+ * v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
  * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
  * DEFAULT: the default export holds NO `run.model.resolve` capability and no
  * modelRouting; it observes and records only. The enforce-capable variant
@@ -56,15 +62,17 @@
  * management key stays on the host.
  */
 
-import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
+import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
+import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
 export const PLUGIN_VERSION = '0.2.20';
 
-/** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
-export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
-  'https://router.infextion.net',
-]);
+/**
+ * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
+ * The origin comes from the build-time pin in lane-host.mjs.
+ */
+export const LANE_BASE_URL_ALLOWLIST = Object.freeze([...LANE_BASE_URLS]);
 
 /**
  * Env keys a run.model.resolve decision may set. Minimal by construction:
@@ -101,7 +109,7 @@ const CONFIG_SCHEMA = {
         // Pinned: the lane key must never be sent to any other host. The
         // enum pins it at schema level; validateConfigShape rejects
         // anything else at config-validation time.
-        baseUrl: { type: 'string', enum: [...LANE_BASE_URL_ALLOWLIST], default: 'https://router.infextion.net' },
+        baseUrl: { type: 'string', enum: [...LANE_BASE_URL_ALLOWLIST], default: DEFAULT_BASE_URL },
         // Pinned like baseUrl: the lane key is sent on this request, so
         // the schema pins the feed path and config validation rejects
         // anything else.
