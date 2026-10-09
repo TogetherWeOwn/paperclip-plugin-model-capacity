@@ -25,6 +25,14 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
   solLunaAutoCompactTokens: 240000,
   /** Auto-compact watermark key (operator-overridable, null omits it). */
   autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
+  /**
+   * Tier-derived per-family windows (built per tick by the plugin from the
+   * live pricingTiers/modelStats feed, NOT operator config): { [family]:
+   * { maxTokens, autoCompactTokens } }. Present entries override the static
+   * sol/luna keys above for their family; absent families keep the legacy
+   * behavior. Null/{} disables the override entirely.
+   */
+  byFamily: null,
   /** Haiku hit the 32k output cap live; raise it to 64k on haiku arms. */
   haikuMaxOutputTokens: 64000,
 });
@@ -128,7 +136,16 @@ export function decide({
     fitting.sort((a, b) => (b.Q - a.Q) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     const env = {};
-    if (arm.family === 'sol' || arm.family === 'luna') {
+    // Tier-derived compact window (byFamily, from measured price cliffs via
+    // tiers.mjs) wins over the static legacy keys when present: the feed is
+    // fresher than the default. Legacy keys stay as the no-tier fallback.
+    const famCap = contextCaps.byFamily?.[arm.family];
+    if (famCap && famCap.maxTokens > 0) {
+      env[MAX_CONTEXT_ENV_KEY] = String(Math.floor(famCap.maxTokens));
+      if (contextCaps.autoCompactEnvKey && famCap.autoCompactTokens > 0) {
+        env[contextCaps.autoCompactEnvKey] = String(Math.floor(famCap.autoCompactTokens));
+      }
+    } else if (arm.family === 'sol' || arm.family === 'luna') {
       env[MAX_CONTEXT_ENV_KEY] = String(contextCaps.solLunaMaxTokens);
       if (contextCaps.autoCompactEnvKey) env[contextCaps.autoCompactEnvKey] = String(contextCaps.solLunaAutoCompactTokens);
     }

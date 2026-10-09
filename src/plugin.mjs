@@ -42,6 +42,9 @@ import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
 import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
 import {
+  armTierCost, armTierCap, tierCapsByFamily, fleetBaselineForModels,
+} from './tiers.mjs';
+import {
   scheduleError, stepController, stepRateController, appendUtilReading,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
@@ -296,12 +299,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
-      return { accounts: [], source: 'no-secret', atMs: nowMs };
+      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [] };
     }
     const body = await cliproxyLaneGet(companyId, config);
     const parsed = parseLaneBody(body, nowMs);
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
-    const snapshot = { accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs };
+    const snapshot = {
+      accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs,
+      modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers,
+    };
     cache.set('accounts', snapshot, nowMs);
     return snapshot;
   }
@@ -335,7 +341,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return (trialState?.graduated ?? []).includes(family);
   }
 
-  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null, trialState = null }) {
+  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null }) {
     const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
     const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
     // Dynamic arms from the models the feed reports served, minus ids the
@@ -362,6 +368,27 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         .filter(a => (a?.models ?? []).map(canonicalModelName).includes(u.model))
         .map(a => accountKey(a));
     }
+    // Context-tier costing (see tiers.mjs): C_eff = base x E[multiplier]
+    // per arm, ordered by the EFFECTIVE cost. The fleet baseline (median E
+    // over tiered models with measured stats) prices tiered-but-unmeasured
+    // arms -- never the cheap tier, never dropped.
+    const tierModels = [];
+    {
+      const seen = new Set();
+      for (const a of arms) {
+        if (a?.model && !seen.has(a.model)) {
+          seen.add(a.model);
+          tierModels.push(a.model);
+        }
+      }
+    }
+    const tierBaseline = fleetBaselineForModels(
+      tierModels, tierFeed?.pricingTiers, tierFeed?.modelStats);
+    const tierCostOf = (arm, base) => armTierCost({
+      model: arm.model, costBase: base,
+      pricingTiers: tierFeed?.pricingTiers, modelStats: tierFeed?.modelStats,
+      baseline: tierBaseline,
+    });
     const refRow = byArm.get(config.calibration.referenceArmId)?.row;
     const refCost = typeof refRow?.intelligenceIndexCostPerTask === 'number' ? refRow.intelligenceIndexCostPerTask : null;
     const burnFor = cost => {
@@ -381,16 +408,29 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         priceIn: a.row.price1mInputTokens,
         priceOut: a.row.price1mOutputTokens,
       })));
-      const eligible = served.map(a => ({
-        armId: a.armId,
-        Q: scored.get(a.armId)?.Q ?? null,
-        C: costs.get(a.armId)?.C ?? null,
-        coverage: scored.get(a.armId)?.coverage ?? 0,
-      }));
+      const eligible = served.map(a => {
+        const base = costs.get(a.armId)?.C ?? null;
+        const tier = tierCostOf(a, base);
+        return {
+          armId: a.armId,
+          Q: scored.get(a.armId)?.Q ?? null,
+          // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
+          // below stays on base cost: price cliffs change money, not tokens.
+          C: tier.costEffective ?? base,
+          coverage: scored.get(a.armId)?.coverage ?? 0,
+          costBase: base,
+          costMultiplier: tier.costMultiplier,
+          costEffective: tier.costEffective,
+          tierSource: tier.tierSource,
+          statsRequests: tier.statsRequests,
+        };
+      });
+      const eligibleByArm = new Map(eligible.map(e => [e.armId, e]));
       const { rungs, dominated, dropped } = buildLadder(eligible, previousLadders?.[keyOf(account, i)]?.rungs ?? []);
       ladders[keyOf(account, i)] = {
         rungs: rungs.map(r => {
           const arm = byArm.get(r.armId);
+          const tier = eligibleByArm.get(r.armId);
           return {
             ...r,
             model: arm.model,
@@ -399,6 +439,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             trial: !isProvenFamily(trialState, arm.family),
             contextWindow: arm.row.contextWindowTokens ?? null,
             costEstimated: costs.get(r.armId)?.estimated ?? false,
+            costBase: tier?.costBase ?? null,
+            costMultiplier: tier?.costMultiplier ?? 1,
+            costEffective: tier?.costEffective ?? tier?.costBase ?? null,
+            tierSource: tier?.tierSource ?? 'none',
+            statsRequests: tier?.statsRequests ?? 0,
           };
         }),
         dominated,
@@ -406,7 +451,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
-    return { ladders, skipped, arms: arms.map(a => a.armId), unscored };
+    // Feasibility-gated compact windows per family (most constraining
+    // cap wins); decide() prefers these over the static legacy keys.
+    const tierCaps = tierCapsByFamily(arms.map(a => ({
+      family: a.family,
+      cap: armTierCap({
+        model: a.model,
+        pricingTiers: tierFeed?.pricingTiers, modelStats: tierFeed?.modelStats,
+      }),
+    })));
+    return { ladders, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline };
   }
 
   function accountKey(account) {
@@ -675,7 +729,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, skipped, unscored } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys, trialState });
+    const { ladders, skipped, unscored, tierCaps, tierBaseline } = buildAccountLadders({
+      accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys, trialState,
+      tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers },
+    });
+    // Tier-derived compact windows ride the caps the hook and event-time
+    // paths read (live view below) as well as this tick's own decisions.
+    const effectiveCaps = { ...config.contextCaps, byFamily: tierCaps };
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
@@ -762,6 +822,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const headroomSource = fiveHourUsed != null ? 'five-hour' : (headroomPct != null ? 'weekly-fallback' : null);
       accountViews.push({
         accountId: key,
+        arms: (ladders[key]?.rungs ?? []).map(r => ({
+          armId: r.armId, model: r.model, effort: r.effort, family: r.family,
+          rung: r.rung, trial: r.trial,
+          costBase: r.costBase ?? null,
+          costMultiplier: r.costMultiplier ?? 1,
+          costEffective: r.costEffective ?? r.costBase ?? null,
+          tierSource: r.tierSource ?? 'none',
+          statsRequests: r.statsRequests ?? 0,
+        })),
         provider: account.provider,
         health: account.health,
         meter: account.meter ?? null,
@@ -1128,7 +1197,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           reservePct: 0.05,
           accountId: sel.accountId,
           roleBands,
-          contextCaps: config.contextCaps,
+          contextCaps: effectiveCaps,
           adapterType: run.adapterType ?? null,
           trialBudget: freshTrialBudget(),
           trialAdapters: config.trials.adapters,
@@ -1240,7 +1309,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
         doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
       },
-      contextCaps: config.contextCaps,
+      contextCaps: effectiveCaps,
       trialBudget: liveTrialBudget,
       trialAdapters: config.trials.adapters,
       maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
@@ -1320,6 +1389,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accounts: accountViews,
       skippedArms: skipped,
       unscored,
+      contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
       trialTransitions,
       inFlightByAccount: liveCensus.byAccount,
