@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 
-// Startup/upgrade reconciliation: ring entries carried in persisted state
-// (older versions, missed terminal events, pre-install runs) count only
-// when their run is verifiably non-terminal in the current feed.
-// Unverifiable entries count 0. Entries decided live by this worker are
-// trusted. Fails on pre-fix code (ghosts inflate the pools).
+// Startup/upgrade reconciliation under the ledger: legacy persisted runs and
+// shadow-ring entries migrate into one record per runId. Restart reconcile
+// only marks anchor-less or horizon-old records `unverified` (excluded from
+// counting) -- it NEVER deletes, so the shadow log survives restarts with
+// enforced flags and terminal history intact. Fresh carried decisions keep
+// counting; horizon-old ones are excluded but retained.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
@@ -36,11 +37,11 @@ const kimiLane = (key) => ({
   observedAt: '2026-10-08T22:59:00Z', quality: 'reactive',
 });
 
-const ringEntry = (runId, at) => ({
+const ringEntry = (runId, at, extra = {}) => ({
   runId, agentId: 'agent-9',
   wouldModel: 'kimi-k3-256k(default)',
   account: 'kimi:k1', accountId: 'kimi:k1', rung: 0,
-  trial: false, family: 'kimi', reason: 'seed', at,
+  trial: false, family: 'kimi', reason: 'seed', at, ...extra,
 });
 
 function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), ringSeed = null, runsSeed = null, failOnSet = [] }) {
@@ -67,16 +68,24 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  let plugin = createModelCapacityPlugin({ clock: () => now });
+  const wire = async () => {
+    await plugin.setup(io);
+    await plugin.onConfigChanged(config, { companyId: 'acme' });
+  };
   return {
     setNow: (ms) => { now = ms; },
     setFailOnSet: (l) => { failKeys = l; },
     setup: async () => {
-      await plugin.setup(io);
+      await wire();
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aa, duplicateSlugs: [] });
       if (ringSeed) store.set(skey(RING_STATE_KEY), ringSeed);
       if (runsSeed) store.set(skey(RUNS_STATE_KEY), runsSeed);
-      await plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    // Simulates a worker restart: fresh memory, same persisted store.
+    restart: async () => {
+      plugin = createModelCapacityPlugin({ clock: () => now });
+      await wire();
     },
     tick: () => jobs.get('shadow-tick')({}),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
@@ -96,12 +105,11 @@ const started = (runId, atMs) => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
-test('carried ghosts verify against the feed or count 0', async () => {
-  // Simulates a worker starting with persisted ring state from an older
-  // version: three ghost entries (fresh, R4-aged, ancient) plus one entry
-  // for a run the persisted feed still shows as running. Pre-fix the two
-  // horizon-fresh ghosts inflate the pools (stale filter keeps them, clamp
-  // bound includes them); post-fix only the verifiable run counts.
+test('carried decisions migrate into one record per runId; horizon-old ones are excluded, never deleted', async () => {
+  // A worker starting with legacy persisted state: three carried decisions
+  // (fresh, R4-aged, ancient) plus a start for the live run. The ancient
+  // anchor is past the 2h horizon, so reconcile marks it unverified and it
+  // stops counting -- but the shadow log keeps all four entries.
   const d = drive({
     laneAccounts: [kimiLane('k1')],
     ringSeed: [
@@ -117,20 +125,27 @@ test('carried ghosts verify against the feed or count 0', async () => {
   await d.setup();
   await d.tick();
   const capacity = await d.api('capacity');
-  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 1 });
-  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 1 });
-  assert.equal(capacity.body.reconciledRingDropped, 3);
-  assert.equal(capacity.body.staleInFlightDropped, 0);
+  // Fresh carried decisions count (each runId exactly once -- the live
+  // run's start and decision merged into one record); the ancient one is
+  // age-excluded but retained.
+  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 3 });
+  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 3 });
+  assert.equal(capacity.body.reconciledUnverified, 1);
+  assert.equal(capacity.body.staleInFlightDropped, 1);
   assert.equal(capacity.body.clampedInFlightDropped, 0);
   const shadow = await d.api('shadow');
   const ids = shadow.body.entries.map(e => e.runId);
-  assert.ok(ids.includes('run-live'));
-  assert.ok(!ids.includes('ghost-recent') && !ids.includes('ghost-mid') && !ids.includes('ghost-ancient'));
-  // Reconciliation runs once: the next tick reports zero and counts hold.
+  assert.equal(shadow.body.entries.length, 4);
+  assert.ok(ids.includes('run-live') && ids.includes('ghost-recent')
+    && ids.includes('ghost-mid') && ids.includes('ghost-ancient'));
+  assert.equal(shadow.body.entries.find(e => e.runId === 'ghost-ancient').unverified, true);
+  // Reconciliation is idempotent: the next tick marks nothing new and the
+  // shadow log still holds every entry.
   await d.tick();
   const again = await d.api('capacity');
-  assert.equal(again.body.reconciledRingDropped, 0);
-  assert.deepEqual(again.body.inFlightByAccount, { 'kimi:k1': 1 });
+  assert.equal(again.body.reconciledUnverified, 0);
+  assert.deepEqual(again.body.inFlightByAccount, { 'kimi:k1': 3 });
+  assert.equal((await d.api('shadow')).body.entries.length, 4);
 });
 
 test('entries decided live by this worker are trusted, not reconciled away', async () => {
@@ -144,36 +159,50 @@ test('entries decided live by this worker are trusted, not reconciled away', asy
   const out = await d.hook('run-a', { adapterType: 'claude-code' });
   assert.equal(out.kind, 'decide');
   await d.fire(started('run-a', TICK + 1000));
+  d.setNow(TICK + 1000);
   await d.tick();
   const capacity = await d.api('capacity');
   assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 1 });
-  assert.equal(capacity.body.reconciledRingDropped, 0);
+  assert.equal(capacity.body.reconciledUnverified, 0);
 });
 
-test('a tick that dies before persisting reconciles again next tick', async () => {
-  // The reconcile flag sets only after a successful persist: a throw
-  // mid-tick (here at the ring write) leaves the carried ring uncleaned on
-  // disk, so the next tick reconciles again instead of trusting memory.
-  // Pre-fix the flag sets before the throw and the ghosts inflate tick two.
+test('a restart retains the shadow log, enforced flags, and in-flight (reconcile never prunes)', async () => {
+  // Finding (1): the old startup reconcile DELETED shadow history (GET
+  // /shadow emptied on restart, the enforced flag was lost, long runs lost
+  // in-flight). Post-fix the shadow log is an append-only view over ledger
+  // records and a restart only re-marks, never removes.
   const d = drive({
     laneAccounts: [kimiLane('k1')],
     ringSeed: [
-      ringEntry('ghost-recent', TICK - 30 * 60000),
+      ringEntry('ghost-recent', TICK - 30 * 60000, { enforced: true }),
       ringEntry('ghost-mid', TICK - 70 * 60000),
       ringEntry('ghost-ancient', TICK - 3 * 3600000),
-      ringEntry('run-live', TICK - 30 * 60000),
+      ringEntry('run-live', TICK - 30 * 60000, { enforced: true }),
     ],
     runsSeed: [
       { runId: 'run-live', agentId: 'agent-9', status: 'running', at: TICK - 30 * 60000 },
     ],
-    failOnSet: ['shadow-ring-v1'],
+    failOnSet: ['ledger-v1'],
   });
   await d.setup();
+  // A tick that dies before persisting leaves nothing usable on disk; the
+  // next worker generation migrates from the legacy keys instead.
   await assert.rejects(d.tick());
   d.setFailOnSet([]);
+  await d.restart();
   await d.tick();
   const capacity = await d.api('capacity');
-  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 1 });
-  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 1 });
-  assert.equal(capacity.body.reconciledRingDropped, 3);
+  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 3 });
+  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 3 });
+  const shadow = await d.api('shadow');
+  assert.equal(shadow.body.entries.length, 4);
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  assert.equal(byId.get('ghost-recent').enforced, true);
+  assert.equal(byId.get('run-live').enforced, true);
+  assert.equal(byId.get('ghost-ancient').unverified, true);
+  // A clean restart with the ledger persisted keeps everything too.
+  await d.restart();
+  await d.tick();
+  assert.deepEqual((await d.api('capacity')).body.inFlightByAccount, { 'kimi:k1': 3 });
+  assert.equal((await d.api('shadow')).body.entries.length, 4);
 });

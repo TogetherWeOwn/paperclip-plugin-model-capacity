@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.9, all-providers)
+# Model Capacity plugin (v0.2.10, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -55,7 +55,8 @@ ignores MAX_CONTEXT_TOKENS for claude-* ids; it is never set for them),
 and run mapping normalizes `[1m]` and effort parens away.
 
 **v0.2.8 = CARRIED-RING RECONCILE + RELATIVE-ONLY DEADBAND + ACCOUNT
-CHURN.** On a worker's first tick per company the carried ring reconciles
+CHURN (reconcile behavior superseded by v0.2.10 below).** On a worker's
+first tick per company the carried ring reconciles
 against the run feed: entries whose runs are not verifiably non-terminal
 count 0 (`reconciledRingDropped`; the persisted ring self-heals), because
 the clamp bound includes the carry and cannot catch dead-run inflation
@@ -72,6 +73,26 @@ contribute zero quota to the concurrency target (their measured burn still
 calibrates, but dead quota is not sustainable concurrency), and the
 reconcile-once flag sets only after a successful persist, so a tick that
 dies mid-write reconciles again on the next tick instead of trusting memory.
+
+**v0.2.10 = ONE LEDGER, NEVER DELETE.** Run accounting is a single pure
+module (`src/ledger.mjs`), one record per runId
+`{runId, agentId, decidedAccount (+enforced), actualAccount, startedAt,
+terminalAt, status}`. In-flight attribution is decided-first (a hook/shadow
+decision always outranks the agent-config model guess, so enforced runs
+count on their lane until a terminal event), else the resolved actual
+account, else unattributed. In-flight = non-terminal and anchored inside
+the stale horizon. Restart reconcile only marks horizon-old or
+anchor-less records `unverified` (excluded, reported as
+`reconciledUnverified`) -- it NEVER deletes, so the shadow log (an
+append-only view over the same records, trimmed by size/age only)
+survives restarts with enforced flags intact. This supersedes the v0.2.8
+`reconciledRingDropped` behavior (retired): carried decisions inside the
+horizon keep counting instead of dropping to 0. The tick, the hook, and
+event-time all read and write through `recordDecision` / `recordStart` /
+`recordTerminal` / `inFlightBy(pool|account)` / `trialInflight(family)`;
+the parallel queues are gone. Hook/event-time pressure since the last tick
+is structural (decisions the frozen live view does not yet reflect), so a
+frozen clock can never double-count.
 
 ## How it decides (per account, per run)
 
@@ -133,13 +154,12 @@ dies mid-write reconciles again on the next tick instead of trusting memory.
    concurrency target). In-flight is pooled at the **provider level**:
    CLIProxy round-robins same-provider lanes onto shared credentials, so
    lane-level spreading is theater and provider pressure is real.
-   In-flight = mapped running runs UNION fresh ring would-decisions for
-   unfinished runs (deduped by runId) PLUS decisions already made this
-   tick -- the order is re-sorted per run, so ten sequential decisions
-   spread in proportion to target shares instead of herding onto one
-   argmax winner. Reactive/trial caps still apply per account in every path
-   (per-account in-flight plus that account's pending decisions); pooled
-   totals order allocation only.
+   In-flight is read fresh from the ledger per run (decided-first
+   attribution, one record per runId) -- the order is re-sorted per run,
+   so ten sequential decisions spread in proportion to target shares
+   instead of herding onto one argmax winner. Reactive/trial caps still
+   apply per account in every path (per-account in-flight plus decisions
+   since the last tick); pooled totals order allocation only.
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
 under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
@@ -155,8 +175,8 @@ published and performs zero I/O, so it always answers inside the host's
 1.5s RPC deadline. Unknown company, `enforce: false`, a human operator
 override (`issueOverrideModel`), and tick staleness over 120s all answer
 `keep`. Only an all-accounts-no-headroom fleet answers `defer`
-(`retryAfterMs` 60000). Every enforced decision lands in the shadow ring
-with `enforced:true` on the next tick.
+(`retryAfterMs` 60000). Every enforced decision is recorded in the ledger
+with `enforced:true` (memory-only; the next tick persists it).
 
 Eligibility: health must read exactly `healthy` (unknown/unavailable/
 exhausted/degraded accounts never qualify), and metered accounts need
@@ -191,16 +211,17 @@ cannot overshoot. Graduated families route as full members on the next tick.
 Shadow records three provenances: tick decisions, `enforced:true` hook
 decisions, and `eventTime:true` decisions recorded memory-only from
 `agent.run.started` when the resolver is absent (live view + cached
-config, zero I/O, stale views over 120s record nothing). The tick merges
-all three, backfills actual models (entries first, then the runs they
-came from), and never re-decides a recorded runId. Terminal runIds
-persist for the full ring horizon, so a run that finished more than 60
-minutes ago still clears its slot after aging out of the rate window;
-ring entries older than max(3 x mean run duration, 2h) with no terminal
-event are stale-dropped (`/capacity` -> `staleInFlightDropped`); the
-clamp backstop bounds total pooled in-flight by observed running runs
-PLUS non-terminal carry inside the horizon (`clampedInFlightDropped`,
-normally zero).
+config, zero I/O, stale views over 120s record nothing). All three write
+straight into the ledger (one record per runId, first decision wins,
+enforced overwrites event-time) and the tick backfills actual models;
+the tick never re-decides a recorded runId. Terminal records persist
+until the shadow TTL trims them, so a run that finished more than 60
+minutes ago still clears its slot after aging out of the rate window.
+Records older than max(3 x mean run duration, 2h) with no terminal event
+report under `/capacity` -> `staleInFlightDropped`; horizon-old or
+anchor-less records are marked `unverified` and excluded (never
+deleted). The clamp backstop is retired (`clampedInFlightDropped` always
+0): single-counting is structural now.
 
 `GET /caps` spreads the concurrency target over agents with queued/ready
 work (assigned `todo` + `in_progress` issues, grouped by assignee):
@@ -235,8 +256,10 @@ the host service does passive-first plus single-account live pull,
 server-side. Readings are cached 45s (`cliproxy.cacheTtlSec`).
 
 Run facts come from `agent.run.*` events only (started, finished,
-failed), buffered in memory and merged with a persisted run ring in
-plugin state -- no database capabilities exist (the host executes plugin
+failed, cancelled), recorded into the per-company ledger in memory and
+persisted each tick under `ledger-v1` (legacy `runs-v1` /
+`shadow-ring-v1` keys are read once for upgrade migration) -- no
+database capabilities exist (the host executes plugin
 SQL unchanged, so a core-table grant's tenant filter would be
 plugin-enforced only; refused scope, removed in v0.2.1). `/capacity`
 says so (`runsSource: 'events'`). Each shadow entry records
@@ -259,7 +282,9 @@ otherwise, never a silent zero.
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
-- `src/shadow.mjs` -- bounded shadow ring
+- `src/shadow.mjs` -- bounded shadow ring (unit-tested legacy helper)
+- `src/ledger.mjs` -- the run ledger: one record per runId, decided-first
+  attribution, mark-but-never-delete reconcile, append-only shadow view
 - `src/plugin.mjs` -- worker wiring; `src/worker.mjs` -- entrypoint
 - `test/` -- `node --test`, no build step: `npm test`
 

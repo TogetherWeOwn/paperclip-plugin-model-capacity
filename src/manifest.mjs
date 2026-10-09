@@ -7,6 +7,10 @@
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
+ * v0.2.10 = LEDGER ACCOUNTING: run accounting lives in one pure module
+ * (src/ledger.mjs), one record per runId; restart reconcile marks but never
+ * deletes; the shadow log is append-only.
+ *
  * v0.1.2: burn telemetry comes from ONE host-published lane endpoint
  * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
  * cannot reach CLIProxy directly (private IPs are blocked) and the
@@ -16,7 +20,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.9';
+export const PLUGIN_VERSION = '0.2.10';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

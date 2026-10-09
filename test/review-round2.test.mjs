@@ -126,6 +126,49 @@ test('R1: enforce-mode per-account cap holds across ticks (decided runs count un
   assert.equal(shadow.body.entries.filter(e => e.enforced === true && e.accountId === 'kimi:k1').length, 2);
 });
 
+test('R1-with-model: enforce cap holds when the agent has a configured model (no backfill reset)', async () => {
+  // Review round 4 finding (2): with an agent-config model mapping to the
+  // agent's usual (here degraded, ineligible) account, the backfill mapped
+  // each enforced run to its usual account and countedRunning skipped the
+  // decided entry -- the per-account cap reset every tick and 6 runs were
+  // decided onto k1 over a cap of 2. Post-fix attribution is decided-first:
+  // the decision always outranks the agent-config guess.
+  const degraded = { ...meteredLane('claude', 'c1', ['claude-haiku-5-5']), health: 'degraded' };
+  const d = drive({
+    config: { enforce: true, trials: { maxInFlightPerFamily: 10 } },
+    laneAccounts: [kimiLane('k1'), degraded],
+    agentGets: {
+      'agent-9': {
+        adapterType: 'claude-code',
+        adapterConfig: { model: 'claude-haiku-5-5' },
+      },
+    },
+  });
+  await d.setup();
+  const kinds = [];
+  for (let round = 0; round < 3; round++) {
+    const t = TICK + round * 30000;
+    d.setNow(t);
+    await d.tick();
+    for (let i = 0; i < 3; i++) {
+      const out = await d.hook(`run-m${round}c${i}`, { adapterType: 'claude-code' });
+      kinds.push(out.kind);
+      if (out.kind === 'decide') await d.fire(runEvent(`run-m${round}c${i}`, t + 1000, { adapterType: 'claude-code' }));
+    }
+  }
+  d.setNow(TICK + 90000);
+  await d.tick();
+  // Same shape as R1: the lane holds 2 across ticks, nothing leaks onto
+  // the agent-config account.
+  assert.deepEqual(kinds.slice(0, 3), ['decide', 'decide', 'defer']);
+  assert.deepEqual(kinds.slice(3), ['defer', 'defer', 'defer', 'defer', 'defer', 'defer']);
+  const capacity = await d.api('capacity');
+  assert.deepEqual(capacity.body.inFlightByPool, { kimi: 2 });
+  assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 2 });
+  const shadow = await d.api('shadow');
+  assert.equal(shadow.body.entries.filter(e => e.enforced === true && e.accountId === 'kimi:k1').length, 2);
+});
+
 test('R2: host event order (started before hook) does not spend the run own slot', async () => {
   // heartbeat.ts publishes agent.run.started at claim, before the model hook
   // resolves. Pre-fix the run's own event-time shadow entry counts against
