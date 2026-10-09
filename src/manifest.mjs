@@ -42,7 +42,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.14';
+export const PLUGIN_VERSION = '0.2.16';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -120,6 +120,15 @@ const CONFIG_SCHEMA = {
       type: 'object', additionalProperties: false,
       properties: {
         thinkerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
+        doerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
+        excludeFamilies: {
+          type: 'object', default: {}, additionalProperties: false,
+          properties: {
+            doer: { type: 'array', default: [], items: { type: 'string' } },
+            thinker: { type: 'array', default: [], items: { type: 'string' } },
+            other: { type: 'array', default: [], items: { type: 'string' } },
+          },
+        },
         thinkerFloorRung: { type: 'integer', minimum: 0, default: 2 },
         thinkerCeilingRung: { type: ['integer', 'null'], minimum: 0, default: null },
         doerFloorRung: { type: 'integer', minimum: 0, default: 0 },
