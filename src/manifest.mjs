@@ -11,6 +11,11 @@
  * (src/ledger.mjs), one record per runId; restart reconcile marks but never
  * deletes; the shadow log is append-only.
  *
+ * v0.2.11 = REVIEW ROUND 5: calibration counts actual burn (enforced picks
+ * only); persist trim sheds dead weight and hard-bounds the ledger blob;
+ * GET /shadow honors the requested limit; single-flight ledger loads; SDK
+ * reads pass companyId positionally (no object-form first attempt).
+ *
  * v0.1.2: burn telemetry comes from ONE host-published lane endpoint
  * (GET {baseUrl}{accountsPath}, X-Api-Key lane key). The plugin worker
  * cannot reach CLIProxy directly (private IPs are blocked) and the
@@ -20,7 +25,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.10';
+export const PLUGIN_VERSION = '0.2.11';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

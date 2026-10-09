@@ -5,9 +5,10 @@ import { createModelCapacityPlugin } from '../src/plugin.mjs';
 // Startup/upgrade reconciliation under the ledger: legacy persisted runs and
 // shadow-ring entries migrate into one record per runId. Restart reconcile
 // only marks anchor-less or horizon-old records `unverified` (excluded from
-// counting) -- it NEVER deletes, so the shadow log survives restarts with
-// enforced flags and terminal history intact. Fresh carried decisions keep
-// counting; horizon-old ones are excluded but retained.
+// counting) -- it NEVER deletes. The per-tick persist trim DOES delete,
+// but only dead weight (old terminal, old unverified, stale-horizon), so the
+// persisted blob stays bounded while live shadow history, enforced flags,
+// and terminal history survive restarts intact.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
@@ -62,8 +63,23 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
-    agents: { get: async (arg) => agentGets[arg?.agentId] ?? null },
-    issues: { get: async () => null, list: async () => [] },
+    agents: {
+      get: async (agentId, companyId) => {
+        if (typeof agentId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return agentGets[agentId] ?? null;
+      },
+    },
+    issues: {
+      get: async (issueId, companyId) => {
+        if (typeof issueId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return null;
+      },
+      list: async () => [],
+    },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
@@ -105,11 +121,12 @@ const started = (runId, atMs) => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
-test('carried decisions migrate into one record per runId; horizon-old ones are excluded, never deleted', async () => {
+test('carried decisions migrate into one record per runId; horizon-old ones are excluded, then trimmed', async () => {
   // A worker starting with legacy persisted state: three carried decisions
   // (fresh, R4-aged, ancient) plus a start for the live run. The ancient
   // anchor is past the 2h horizon, so reconcile marks it unverified and it
-  // stops counting -- but the shadow log keeps all four entries.
+  // stops counting -- and the persist trim sheds it (dead weight), while the
+  // shadow log keeps the three live entries.
   const d = drive({
     laneAccounts: [kimiLane('k1')],
     ringSeed: [
@@ -127,7 +144,7 @@ test('carried decisions migrate into one record per runId; horizon-old ones are 
   const capacity = await d.api('capacity');
   // Fresh carried decisions count (each runId exactly once -- the live
   // run's start and decision merged into one record); the ancient one is
-  // age-excluded but retained.
+  // age-excluded by reconcile, then shed by the persist trim.
   assert.deepEqual(capacity.body.inFlightByPool, { kimi: 3 });
   assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 3 });
   assert.equal(capacity.body.reconciledUnverified, 1);
@@ -135,17 +152,16 @@ test('carried decisions migrate into one record per runId; horizon-old ones are 
   assert.equal(capacity.body.clampedInFlightDropped, 0);
   const shadow = await d.api('shadow');
   const ids = shadow.body.entries.map(e => e.runId);
-  assert.equal(shadow.body.entries.length, 4);
-  assert.ok(ids.includes('run-live') && ids.includes('ghost-recent')
-    && ids.includes('ghost-mid') && ids.includes('ghost-ancient'));
-  assert.equal(shadow.body.entries.find(e => e.runId === 'ghost-ancient').unverified, true);
+  assert.equal(shadow.body.entries.length, 3);
+  assert.ok(ids.includes('run-live') && ids.includes('ghost-recent') && ids.includes('ghost-mid'));
+  assert.ok(!ids.includes('ghost-ancient'), 'stale-horizon record trimmed from the persisted ledger');
   // Reconciliation is idempotent: the next tick marks nothing new and the
-  // shadow log still holds every entry.
+  // shadow log still holds every live entry.
   await d.tick();
   const again = await d.api('capacity');
   assert.equal(again.body.reconciledUnverified, 0);
   assert.deepEqual(again.body.inFlightByAccount, { 'kimi:k1': 3 });
-  assert.equal((await d.api('shadow')).body.entries.length, 4);
+  assert.equal((await d.api('shadow')).body.entries.length, 3);
 });
 
 test('entries decided live by this worker are trusted, not reconciled away', async () => {
@@ -166,11 +182,12 @@ test('entries decided live by this worker are trusted, not reconciled away', asy
   assert.equal(capacity.body.reconciledUnverified, 0);
 });
 
-test('a restart retains the shadow log, enforced flags, and in-flight (reconcile never prunes)', async () => {
+test('a restart retains live shadow history, enforced flags, and in-flight (trim sheds only stale records)', async () => {
   // Finding (1): the old startup reconcile DELETED shadow history (GET
   // /shadow emptied on restart, the enforced flag was lost, long runs lost
   // in-flight). Post-fix the shadow log is an append-only view over ledger
-  // records and a restart only re-marks, never removes.
+  // records and a restart only re-marks, never removes; the persist trim
+  // sheds only dead weight (here: the 3h-ancient carried entry).
   const d = drive({
     laneAccounts: [kimiLane('k1')],
     ringSeed: [
@@ -195,14 +212,14 @@ test('a restart retains the shadow log, enforced flags, and in-flight (reconcile
   assert.deepEqual(capacity.body.inFlightByPool, { kimi: 3 });
   assert.deepEqual(capacity.body.inFlightByAccount, { 'kimi:k1': 3 });
   const shadow = await d.api('shadow');
-  assert.equal(shadow.body.entries.length, 4);
+  assert.equal(shadow.body.entries.length, 3);
   const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
   assert.equal(byId.get('ghost-recent').enforced, true);
   assert.equal(byId.get('run-live').enforced, true);
-  assert.equal(byId.get('ghost-ancient').unverified, true);
-  // A clean restart with the ledger persisted keeps everything too.
+  assert.ok(!byId.has('ghost-ancient'), 'stale-horizon record trimmed, live history retained');
+  // A clean restart with the ledger persisted keeps everything live too.
   await d.restart();
   await d.tick();
   assert.deepEqual((await d.api('capacity')).body.inFlightByAccount, { 'kimi:k1': 3 });
-  assert.equal((await d.api('shadow')).body.entries.length, 4);
+  assert.equal((await d.api('shadow')).body.entries.length, 3);
 });

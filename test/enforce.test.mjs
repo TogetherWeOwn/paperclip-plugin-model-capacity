@@ -42,12 +42,12 @@ const runEvent = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
 // object-form issues/agents reads ({issueId, companyId} / {agentId,
 // companyId}). Positional calls are a host-contract violation, so the fakes
 // throw on them -- any regression back to positional reads fails the suite.
-const strictGet = (idKey, table, fail) => async (arg) => {
-  if (!arg || typeof arg !== 'object' || typeof arg[idKey] !== 'string') {
-    throw new Error(`positional-get:${idKey}`);
+const strictGet = (table, fail) => async (id, companyId) => {
+  if (typeof id !== 'string' || typeof companyId !== 'string') {
+    throw new Error('companyId is required for this operation');
   }
   if (fail) throw new Error(fail);
-  return table[arg[idKey]] ?? null;
+  return table[id] ?? null;
 };
 
 function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGets = {}, agentGets = {}, issueLists = {}, issuesListError = null, failIssueGet = null, failAgentGet = null }) {
@@ -65,9 +65,9 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGe
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => lane }) },
-    agents: { get: strictGet('agentId', agentGets, failAgentGet) },
+    agents: { get: strictGet(agentGets, failAgentGet) },
     issues: {
-      get: strictGet('issueId', issueGets, failIssueGet),
+      get: strictGet(issueGets, failIssueGet),
       list: async ({ status } = {}) => {
         if (issuesListError) throw new Error(issuesListError);
         return issueLists[status] ?? [];

@@ -51,7 +51,7 @@ import { orderAccountsForRun } from './select.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
-  recordTerminal, attributedAccount, isInflight, inflightByAccount,
+  recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount,
   trialInflight, reconcileLedger, startedOnCountWhere,
   terminalRecords, shadowEntries, trimLedger, mergeLedger, migrateLegacy,
   isLedgerTerminal as isTerminalStatus, TRIAL_WINDOW_MS, LEDGER_CAP,
@@ -433,35 +433,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   /**
-   * SDK client reads with positional fallback. The SDK contract is object
-   * params (`{ issueId, companyId }` / `{ agentId, companyId }`); a host
-   * that only honors the older positional form still works via the
-   * fallback. Either way the caller gets the entity or a throw -- never a
-   * silent null from a shape mismatch.
+   * SDK client reads use the declared plugin-context contract, positional:
+   * `PluginIssuesClient.get(issueId, companyId)` /
+   * `PluginAgentsClient.get(agentId, companyId)`
+   * (@paperclipai/plugin-sdk dist/types.d.ts). The wire params object form
+   * (`{ issueId, companyId }`) belongs to the lower-level host-client
+   * layer, NOT ctx: passed to ctx it lands in the id slot, companyId
+   * arrives undefined, and the host logs "companyId is required" on EVERY
+   * lookup (then the call fails). So there is deliberately no object-form
+   * attempt and no retry -- one call, companyId always present.
    */
-  async function compatIssueGet(issueId, companyId) {
-    try {
-      return await ctx.issues.get({ issueId, companyId });
-    } catch (first) {
-      try {
-        return await ctx.issues.get(issueId, companyId);
-      } catch {
-        throw first;
-      }
-    }
-  }
-
-  async function compatAgentGet(agentId, companyId) {
-    try {
-      return await ctx.agents.get({ agentId, companyId });
-    } catch (first) {
-      try {
-        return await ctx.agents.get(agentId, companyId);
-      } catch {
-        throw first;
-      }
-    }
-  }
+  const issueGet = (issueId, companyId) => ctx.issues.get(issueId, companyId);
+  const agentGet = (agentId, companyId) => ctx.agents.get(agentId, companyId);
 
   /**
    * Adapter type for a run whose event did not carry one. Reads the agent
@@ -476,7 +459,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const hit = agentAdapterCache.get(key);
     if (hit && hit.adapterType && clock() - hit.atMs < ADAPTER_TTL_MS) return hit.adapterType;
     try {
-      const agent = await compatAgentGet(agentId, companyId);
+      const agent = await agentGet(agentId, companyId);
       const t = agent?.adapterType ?? agent?.adapter_type ?? null;
       if (typeof t === 'string' && t.length > 0) {
         agentAdapterCache.set(key, { adapterType: t, atMs: clock() });
@@ -521,7 +504,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       try {
         let entry = caches.issues.get(run.issueId);
         if (entry === undefined) {
-          const issue = await compatIssueGet(run.issueId, companyId);
+          const issue = await issueGet(run.issueId, companyId);
           const o = issue?.assigneeAdapterOverrides ?? issue?.assignee_adapter_overrides;
           const m = o?.adapterConfig?.model ?? o?.adapter_config?.model;
           entry = {
@@ -543,7 +526,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       try {
         let entry = caches.agents.get(run.agentId);
         if (entry === undefined) {
-          const agent = await compatAgentGet(run.agentId, companyId);
+          const agent = await agentGet(run.agentId, companyId);
           const found = agent?.adapterConfig?.model ?? agent?.adapter_config?.model;
           entry = {
             model: typeof found === 'string' && found.length > 0 ? found : null,
@@ -601,22 +584,38 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * Pre-tick hook/event-time decisions already in memory merge over the
    * persisted base without dropping it.
    */
+  // Single-flight loads: concurrent ticks (restart, overlapping runs)
+  // share one load promise per company instead of each reading state and
+  // last-writer-wins clobbering the other's in-memory overlay.
+  const ledgerLoads = new Map();
   async function loadLedger(companyId) {
-    let ledger = ledgers.get(companyId);
-    if (ledgerReady.has(companyId)) return ledger ?? createLedger();
-    const persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
-    if (persisted.size > 0) {
-      ledger = mergeLedger(persisted, ledger);
-    } else {
-      const legacy = migrateLegacy({
-        runs: await ctx.state.get(scopeKey(companyId, LEGACY_RUNS_KEY)),
-        ringEntries: await ctx.state.get(scopeKey(companyId, LEGACY_RING_KEY)),
-      });
-      ledger = mergeLedger(legacy, ledger);
+    const ready = ledgers.get(companyId);
+    if (ledgerReady.has(companyId)) return ready ?? createLedger();
+    let pending = ledgerLoads.get(companyId);
+    if (!pending) {
+      pending = (async () => {
+        let ledger = ledgers.get(companyId);
+        const persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
+        if (persisted.size > 0) {
+          ledger = mergeLedger(persisted, ledger);
+        } else {
+          const legacy = migrateLegacy({
+            runs: await ctx.state.get(scopeKey(companyId, LEGACY_RUNS_KEY)),
+            ringEntries: await ctx.state.get(scopeKey(companyId, LEGACY_RING_KEY)),
+          });
+          ledger = mergeLedger(legacy, ledger);
+        }
+        ledgers.set(companyId, ledger);
+        ledgerReady.add(companyId);
+        return ledger;
+      })();
+      ledgerLoads.set(companyId, pending);
+      pending.then(
+        () => { ledgerLoads.delete(companyId); },
+        () => { ledgerLoads.delete(companyId); },
+      );
     }
-    ledgers.set(companyId, ledger);
-    ledgerReady.add(companyId);
-    return ledger;
+    return pending;
   }
 
   async function runShadowTick(companyId, job) {
@@ -847,8 +846,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // unattributed) -- it is E-calibration scope only.
     const keyOfProvider = new Map();
     for (const [k, p] of keyToProvider) if (p && !keyOfProvider.has(p)) keyOfProvider.set(p, k);
-    const calibrationAccountOf = (r) => attributedAccount(r)
-      ?? (r?.provider != null ? keyOfProvider.get(String(r.provider).toLowerCase()) ?? null : null);
+    // E-calibration burns calibrate where the run ACTUALLY burned
+    // (model-mapped actual, provider fallback): a non-enforced shadow pick
+    // is a routing guess, not observed burn. Only the enforced hook
+    // decision outranks reality.
+    const calibrationAccountOf = (r) => calibrationAccount(r, keyOfProvider);
     // Model-mapping census: records with no decided/actual account and no
     // provider fallback (same mapping the calibration span uses below).
     // (In-flight attribution is separate, decided-first.)
@@ -1264,8 +1266,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
-    // idempotent) on the next run. Trim drops old terminal records only.
-    trimLedger(ledger, { nowMs, maxRecords: config.shadowMaxEntries });
+    // idempotent) on the next run. Trim bounds the persisted blob at
+    // maxRecords: old terminal, old unverified, and stale-horizon records
+    // first, then oldest activity -- live pressure always survives.
+    trimLedger(ledger, { nowMs, maxRecords: config.shadowMaxEntries, staleHorizonMs });
     await ctx.state.set(scopeKey(companyId, LEDGER_KEY), ledgerToJSON(ledger));
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
     await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);
@@ -1669,12 +1673,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:
-        // reconcile never prunes it, so a restart never empties it.
+        // reconcile never prunes it, so a restart never empties it. The
+        // requested limit reaches the ledger (default 100, max 500); size
+        // is the full decided count, computed without materializing rows.
         const persisted = await ctx.state.get(scopeKey(companyId, LEDGER_KEY));
         const view = persisted != null ? ledgerFromJSON(persisted) : (ledgers.get(companyId) ?? createLedger());
         const limit = Math.min(Number(input.query?.limit ?? 100) || 100, 500);
-        const all = shadowEntries(view);
-        return { status: 200, body: { entries: all.slice(0, limit), size: all.length } };
+        return { status: 200, body: { entries: shadowEntries(view, { limit }), size: decidedCount(view) } };
       }
       if (input.routeKey === 'ladder') {
         return { status: 200, body: (await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} } };

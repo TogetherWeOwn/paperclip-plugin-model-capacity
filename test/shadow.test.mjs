@@ -79,12 +79,12 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     return { observedAt: new Date(now).toISOString(), accounts: accounts ?? oneClaude(0.3, new Date(now).toISOString()).accounts };
   };
   let lane = resolveLane();
-  const strictGet = (kind, idKey, table, fail) => async (arg) => {
-    if (!arg || typeof arg !== 'object' || typeof arg[idKey] !== 'string') {
-      throw new Error(`positional-${kind}-get`);
+  const strictGet = (kind, table, fail) => async (id, companyId) => {
+    if (typeof id !== 'string' || typeof companyId !== 'string') {
+      throw new Error('companyId is required for this operation');
     }
     if (fail) throw new Error(fail);
-    return table[arg[idKey]] ?? null;
+    return table[id] ?? null;
   };
   const fake = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
@@ -94,8 +94,8 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => lane }) },
-    agents: { get: strictGet('agents', 'agentId', agentGets, failAgentGet) },
-    issues: { get: strictGet('issues', 'issueId', issueGets, failIssueGet) },
+    agents: { get: strictGet('agents', agentGets, failAgentGet) },
+    issues: { get: strictGet('issues', issueGets, failIssueGet) },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },

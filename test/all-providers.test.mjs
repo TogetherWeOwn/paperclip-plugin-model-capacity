@@ -63,8 +63,22 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => lane }) },
-    agents: { get: async (arg) => agentGets[arg?.agentId] ?? null },
-    issues: { get: async (arg) => issueGets[arg?.issueId] ?? null },
+    agents: {
+      get: async (agentId, companyId) => {
+        if (typeof agentId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return agentGets[agentId] ?? null;
+      },
+    },
+    issues: {
+      get: async (issueId, companyId) => {
+        if (typeof issueId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return issueGets[issueId] ?? null;
+      },
+    },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },

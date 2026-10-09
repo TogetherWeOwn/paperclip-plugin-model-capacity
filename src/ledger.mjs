@@ -24,7 +24,9 @@
  * startedAt ?? decidedAt, younger than the horizon. Restart reconciliation
  * only marks unverifiable records `unverified` (excluded from counting);
  * it NEVER deletes -- the shadow log is built from the same records and
- * survives restarts. Trimming drops only old terminal records, by size/age.
+ * survives restarts. Trimming (for the persist bound) drops old terminal,
+ * old unverified, and stale-horizon records first, then oldest activity
+ * past the cap -- live in-flight records are always newest and survive.
  */
 
 export const LEDGER_TERMINAL_STATUSES = new Set(['finished', 'failed', 'cancelled']);
@@ -154,6 +156,23 @@ export function recordTerminal(ledger, event, status, atMs) {
 /** Attribution: the decision outranks any model-guess mapping. */
 export function attributedAccount(r) {
   return r?.decidedAccount ?? r?.actualAccount ?? null;
+}
+
+/**
+ * E-calibration mapping: what account a run's burn calibrates. The actual
+ * (model-mapped) account first, provider fallback when the run named only
+ * a provider -- a non-enforced shadow/event-time pick is a guess about
+ * where the run SHOULD go, not where it burned, so it must not divert
+ * calibration. Only an enforced (hook) decision outranks reality.
+ * providerKeyOf maps lowercase provider -> account key (tick-built).
+ */
+export function calibrationAccount(r, providerKeyOf) {
+  if (r?.enforced === true && r?.decidedAccount != null) return r.decidedAccount;
+  if (r?.actualAccount != null) return r.actualAccount;
+  if (r?.provider != null && providerKeyOf != null) {
+    return providerKeyOf.get(String(r.provider).toLowerCase()) ?? null;
+  }
+  return null;
 }
 
 const anchorOf = (r) => r?.startedAt ?? r?.decidedAt ?? null;
@@ -286,10 +305,19 @@ export function terminalRecords(ledger) {
   return [...(ledger ?? new Map()).values()].filter(r => isLedgerTerminal(r?.status));
 }
 
+/** Number of decided records (the /shadow size without materializing entries). */
+export function decidedCount(ledger) {
+  let n = 0;
+  for (const r of (ledger ?? new Map()).values()) {
+    if (r?.decidedAccount != null) n += 1;
+  }
+  return n;
+}
+
 /**
  * The shadow log: every decided record, newest first. Built from the same
- * records as accounting, never pruned by reconciliation; trim only by
- * size/age (see trimLedger, terminal records only).
+ * records as accounting, never pruned by reconciliation; trimLedger bounds
+ * it by size/age (terminal, unverified, and stale records first).
  */
 export function shadowEntries(ledger, { limit = 100 } = {}) {
   const all = [...(ledger ?? new Map()).values()].filter(r => r?.decidedAccount != null);
@@ -317,21 +345,34 @@ export function shadowEntries(ledger, { limit = 100 } = {}) {
 }
 
 /**
- * Trim for persist: drop terminal records older than the TTL, then oldest
- * terminal first past the cap. Non-terminal records are NEVER trimmed
- * (they are live pressure or proof a run existed).
+ * Trim for persist: drop terminal records older than the TTL, then
+ * unverified and stale-horizon non-terminal records (reconcile already
+ * excludes both from counting, and a late start/terminal event re-creates
+ * the record if the run proves alive again). Past the cap, evict
+ * oldest-activity-first. The persisted blob is therefore HARD-bounded at
+ * maxRecords: in practice only dead weight reaches the cap pass, because
+ * live in-flight records are always the newest activity; if live pressure
+ * alone ever exceeds the cap the oldest of it is shed first (fail-safe
+ * against unbounded persist growth, at the cost of the stalest pressure).
  */
-export function trimLedger(ledger, { nowMs, maxRecords = LEDGER_CAP, terminalTtlMs = LEDGER_TERMINAL_TTL_MS } = {}) {
-  for (const [id, r] of [...(ledger ?? new Map()).entries()]) {
+export function trimLedger(ledger, { nowMs, maxRecords = LEDGER_CAP, terminalTtlMs = LEDGER_TERMINAL_TTL_MS, staleHorizonMs = null } = {}) {
+  const all = [...(ledger ?? new Map()).entries()];
+  for (const [id, r] of all) {
     if (isLedgerTerminal(r?.status) && r?.terminalAt != null && nowMs - r.terminalAt > terminalTtlMs) {
       ledger.delete(id);
     }
   }
+  for (const [id, r] of [...ledger.entries()]) {
+    if (isLedgerTerminal(r?.status)) continue;
+    const anchor = anchorOf(r);
+    const age = anchor != null ? nowMs - anchor : Infinity;
+    if (r?.unverified === true && age > terminalTtlMs) ledger.delete(id);
+    else if (staleHorizonMs != null && (anchor == null || age >= staleHorizonMs)) ledger.delete(id);
+  }
   if (ledger.size > maxRecords) {
-    const terminal = [...ledger.values()]
-      .filter(r => isLedgerTerminal(r?.status))
-      .sort((a, b) => (a.terminalAt ?? 0) - (b.terminalAt ?? 0));
-    for (const r of terminal) {
+    const activityOf = (r) => Math.max(r?.startedAt ?? 0, r?.decidedAt ?? 0, r?.terminalAt ?? 0);
+    const ordered = [...ledger.values()].sort((a, b) => activityOf(a) - activityOf(b));
+    for (const r of ordered) {
       if (ledger.size <= maxRecords) break;
       ledger.delete(r.runId);
     }
@@ -375,8 +416,17 @@ export function mergeLedger(base, overlay) {
  * Upgrade migration: legacy persisted runs feed + shadow-ring entries into
  * one ledger. Ring entries become decisions (decidedAt = entry at);
  * runs-feed entries become starts/terminals; both merge by runId.
+ *
+ * Ring entries for runs already terminal in the feed are excluded by
+ * default: decisions never land on terminal records (the finding-2
+ * precedence), so a legacy ring full of dead runs does not resurface as
+ * live history. Pass includeTerminalDecisions:true to import those as
+ * history-only records instead -- status stays terminal (never counted,
+ * never fresh pressure since decidedAt stays historical), visible in
+ * /shadow only. Entries without a historical `at` are never imported
+ * that way (an undated decision must not look fresh to decidedSince).
  */
-export function migrateLegacy({ runs, ringEntries }) {
+export function migrateLegacy({ runs, ringEntries, includeTerminalDecisions = false }) {
   const ledger = new Map();
   for (const run of runs ?? []) {
     if (run == null || run.runId == null) continue;
@@ -404,6 +454,21 @@ export function migrateLegacy({ runs, ringEntries }) {
     }, e.at ?? Date.now());
     const r = ledger.get(String(e.runId));
     if (r) {
+      if (includeTerminalDecisions === true
+        && isLedgerTerminal(r.status)
+        && r.decidedAccount == null
+        && e.at != null) {
+        r.decidedAccount = e.accountId ?? e.account ?? null;
+        r.decidedAt = e.at;
+        r.enforced = e.enforced === true;
+        if (e.wouldModel != null) r.wouldModel = e.wouldModel;
+        if (e.rung != null) r.rung = e.rung;
+        if (e.trial === true) r.trial = true;
+        if (e.family != null) r.family = e.family;
+        if (e.reason != null) r.reason = e.reason;
+        if (e.eventTime === true) r.eventTime = true;
+        fill(r, 'agentId', e.agentId);
+      }
       if (e.actualModel != null) {
         r.actualModel = e.actualModel;
         r.actualModelSource = e.actualModelSource ?? null;

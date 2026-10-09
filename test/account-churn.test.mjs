@@ -57,8 +57,23 @@ function drive({ config = {}, lanes = [], agentGets = {}, aa = baseAa(), ringSee
         }),
       }),
     },
-    agents: { get: async (arg) => agentGets[arg?.agentId] ?? null },
-    issues: { get: async () => null, list: async () => [] },
+    agents: {
+      get: async (agentId, companyId) => {
+        if (typeof agentId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return agentGets[agentId] ?? null;
+      },
+    },
+    issues: {
+      get: async (issueId, companyId) => {
+        if (typeof issueId !== 'string' || typeof companyId !== 'string') {
+          throw new Error('companyId is required for this operation');
+        }
+        return null;
+      },
+      list: async () => [],
+    },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
