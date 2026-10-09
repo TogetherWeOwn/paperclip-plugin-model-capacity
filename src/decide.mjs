@@ -51,6 +51,12 @@ export const DEFAULT_TRIALS = Object.freeze({
     claude_local: ['*'],
     'claude-code': ['*'],
   }),
+  // Roles that may take trial arms. 'other' exists only when
+  // roles.doerAgentIds is set (absent that config every non-thinker is a
+  // doer, so the default is bit-identical to the old doer-only gate).
+  // Thinkers stay excluded by default: trial traffic is unmeasured by
+  // definition and never belongs on the thinker blend.
+  roles: Object.freeze(['doer', 'other']),
 });
 
 /** True when the adapter type may run trial arms of the family. */
@@ -65,6 +71,39 @@ export function adapterAllowsTrial(trialAdapters, adapterType, family) {
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
+/** Normalize a family-exclusion list: lowercase strings, deduped. */
+export function normalizeExcludedFamilies(list) {
+  const out = [];
+  const seen = new Set();
+  for (const f of Array.isArray(list) ? list : []) {
+    if (typeof f !== 'string') continue;
+    const t = f.toLowerCase();
+    if (t.length === 0 || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Drop excluded families from grouped rungs, keeping rung shells (decide
+ * indexes rungs by number with topRung = length - 1, so groups stay).
+ * Empty exclusions return the input untouched.
+ */
+export function filterRungsByExcludedFamilies(ladderRungs, excludedFamilies) {
+  const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
+  if (excluded.size === 0) return ladderRungs;
+  return (ladderRungs ?? []).map(g => ({
+    ...g,
+    arms: (g?.arms ?? []).filter(a => !excluded.has(String(a?.family ?? '').toLowerCase())),
+  }));
+}
+
+/** True when at least one arm survives in any rung group. */
+export function rungsHaveEligibleArms(ladderRungs) {
+  return (ladderRungs ?? []).some(g => (g?.arms ?? []).length > 0);
+}
+
 function sanitizeId(part) {
   return String(part).replace(/[^a-zA-Z0-9-]+/g, '-').slice(0, 80) || 'x';
 }
@@ -78,12 +117,15 @@ function sanitizeId(part) {
  *   autoCompactTokens }) or null; it overrides the legacy sol/luna caps.
  *   qThinker is the thinker-alpha EEE blend (null when AA-only); thinkers
  *   sort on it, other roles on Q.
+ * excludedFamilies: families skipped for this run's role (role-based
+ *   exclusion from config). Empty by default: identical decisions.
  * burnPerRunPct: armId -> expected weekly % consumed by one run (E_a[m]);
  *   missing entries mean uncalibrated: the arm is skipped when headroom is
  *   known, allowed (flagged weak) when headroom is unknown.
- * Trial arms (trial: true) are exploration traffic: doer role only, the
- * adapter must allow the family, and the family needs a free in-flight
- * slot in trialBudget. Trial picks bypass the burn check (their burn is
+ * Trial arms (trial: true) are exploration traffic: only roles listed in
+ * trialRoles (default doer + other; thinkers never), the adapter must
+ * allow the family, and the family needs a free in-flight slot in
+ * trialBudget. Trial picks bypass the burn check (their burn is
  * unmeasured by definition; the in-flight cap bounds the blast radius)
  * and always report weak calibration.
  */
@@ -105,6 +147,8 @@ export function decide({
   adapterType = null,
   trialBudget = null,
   trialAdapters = null,
+  trialRoles = DEFAULT_TRIALS.roles,
+  excludedFamilies = [],
 } = {}) {
   if (failureClass === 'rate-limit') {
     return { kind: 'defer', retryAfterMs: 20000, reason: 'previous run rate-limited: reroute to next account' };
@@ -115,11 +159,12 @@ export function decide({
   const ceiling = band.ceilingRung == null ? topRung : clamp(band.ceilingRung, floor, topRung);
   const escalation = Math.max(0, retryCount) + (failureClass === 'test-fail' ? 1 : 0);
   const target = clamp((pointer ?? floor) + escalation, floor, ceiling);
+  const excludedFamilySet = new Set(normalizeExcludedFamilies(excludedFamilies));
   const requiredWindow = contextTokens != null ? contextTokens * 2 : 0;
 
   const trialOk = (arm) => {
     if (!arm.trial) return true;
-    if (role !== 'doer') return false;
+    if (!(Array.isArray(trialRoles) ? trialRoles : []).includes(role)) return false;
     if (!adapterAllowsTrial(trialAdapters, adapterType, arm.family)) return false;
     return (trialBudget?.[arm.family] ?? 0) > 0;
   };
@@ -127,6 +172,7 @@ export function decide({
     const entry = ladderRungs.find(r => r.rung === rung);
     const arms = (entry?.arms ?? []).filter(a => (a.contextWindow ?? Number.MAX_SAFE_INTEGER) >= requiredWindow);
     const fitting = arms.filter(a => {
+      if (excludedFamilySet.has(String(a?.family ?? '').toLowerCase())) return false;
       if (!trialOk(a)) return false;
       // Trial picks bypass the burn check: unmeasured by definition.
       if (a.trial) return true;

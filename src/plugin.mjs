@@ -55,7 +55,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS } from './decide.mjs';
+import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms } from './decide.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
@@ -160,8 +160,22 @@ export function validateConfigShape(raw) {
     }
   }
   if (roles) {
-    for (const k of ['thinkerAgentIds']) {
+    for (const k of ['thinkerAgentIds', 'doerAgentIds']) {
       if (k in roles && !Array.isArray(roles[k])) errors.push(`roles.${k} must be an array`);
+    }
+    if ('excludeFamilies' in roles) {
+      const ef = roles.excludeFamilies;
+      if (ef == null || typeof ef !== 'object' || Array.isArray(ef)) {
+        errors.push('roles.excludeFamilies must be an object of role to families');
+      } else {
+        for (const [rk, rv] of Object.entries(ef)) {
+          if (!['doer', 'thinker', 'other'].includes(rk)) {
+            errors.push(`roles.excludeFamilies.${rk} is not a known role`);
+          } else if (!Array.isArray(rv) || rv.some(f => typeof f !== 'string')) {
+            errors.push(`roles.excludeFamilies.${rk} must be an array of strings`);
+          }
+        }
+      }
     }
   }
   if (raw.trials) {
@@ -173,6 +187,9 @@ export function validateConfigShape(raw) {
     }
     if ('adapters' in raw.trials && (raw.trials.adapters == null || typeof raw.trials.adapters !== 'object' || Array.isArray(raw.trials.adapters))) {
       errors.push('trials.adapters must be an object of adapter type to families');
+    }
+    if ('roles' in raw.trials && (!Array.isArray(raw.trials.roles) || raw.trials.roles.some(r => typeof r !== 'string'))) {
+      errors.push('trials.roles must be an array of role names');
     }
   }
   if (raw.modelAaOverrides != null && (typeof raw.modelAaOverrides !== 'object' || Array.isArray(raw.modelAaOverrides))) {
@@ -260,6 +277,12 @@ export function resolveConfig(raw = {}) {
     armMap: Array.isArray(raw.armMap) && raw.armMap.length > 0 ? raw.armMap : DEFAULT_ARM_MAP,
     roles: {
       thinkerAgentIds: raw.roles?.thinkerAgentIds ?? [],
+      doerAgentIds: (Array.isArray(raw.roles?.doerAgentIds) ? raw.roles.doerAgentIds : []).filter(id => typeof id === 'string'),
+      excludeFamilies: {
+        doer: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.doer),
+        thinker: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.thinker),
+        other: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.other),
+      },
       thinkerFloorRung: raw.roles?.thinkerFloorRung ?? 2,
       thinkerCeilingRung: raw.roles?.thinkerCeilingRung ?? null,
       doerFloorRung: raw.roles?.doerFloorRung ?? 0,
@@ -287,14 +310,16 @@ export function resolveConfig(raw = {}) {
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
     // Trial lanes and arms: families without fleet success history route
-    // doer-only through adapters that opt in, capped in flight per account
-    // and per family, until measured success graduates them.
+    // through adapters that opt in for roles that opt in (default doer +
+    // other; thinkers never), capped in flight per account and per family,
+    // until measured success graduates them.
     trials: {
       maxInFlightPerAccount: raw.trials?.maxInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount,
       maxInFlightPerFamily: raw.trials?.maxInFlightPerFamily ?? DEFAULT_TRIALS.maxInFlightPerFamily,
       minRuns: raw.trials?.minRuns ?? DEFAULT_TRIALS.minRuns,
       minSuccessRate: raw.trials?.minSuccessRate ?? DEFAULT_TRIALS.minSuccessRate,
       adapters: raw.trials?.adapters ?? DEFAULT_TRIALS.adapters,
+      roles: (Array.isArray(raw.trials?.roles) ? raw.trials.roles : [...DEFAULT_TRIALS.roles]).filter(r => typeof r === 'string'),
     },
     // Operator extensions to the AA-slug override table (CLIProxy model
     // id -> AA slug or { slug, effort }); merged over the built-in table.
@@ -347,7 +372,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
   // Live view per company, populated by every tick for the memory-only
-  // resolve hook: { atMs, enforce, thinkerAgentIds, roleBands, contextCaps,
+  // resolve hook: { atMs, enforce, thinkerAgentIds, doerAgentIds,
+  //   excludeFamilies, roleBands, contextCaps,
   //   accounts: [{ accountId, pointer, headroomPct, remainingKnown,
   //   ladderRungs, burnPerRunPct }] } in reset order.
   const liveViews = new Map();
@@ -417,8 +443,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return snapshot;
   }
 
+  // doer/thinker/other from the agent lists: thinkers first, then the
+  // engineering cohort when roles.doerAgentIds is set; everyone else is
+  // 'other'. With no doerAgentIds the legacy rule holds (non-thinker = doer).
   function roleOf(config, agentId) {
-    return config.roles.thinkerAgentIds.includes(agentId) ? 'thinker' : 'doer';
+    const roles = config?.roles ?? {};
+    if (Array.isArray(roles.thinkerAgentIds) && roles.thinkerAgentIds.includes(agentId)) return 'thinker';
+    const doers = Array.isArray(roles.doerAgentIds) ? roles.doerAgentIds : [];
+    if (doers.length === 0) return 'doer';
+    return doers.includes(agentId) ? 'doer' : 'other';
+  }
+
+  /** Effective family exclusions for a role (already sanitized by resolveConfig). */
+  function excludedFamiliesForRole(config, role) {
+    const ef = config?.roles?.excludeFamilies ?? {};
+    const list = ef?.[role] ?? [];
+    return Array.isArray(list) ? list : [];
   }
 
   /**
@@ -1430,15 +1470,23 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (!view.reactive && view.remainingPct == null) continue;
         const pressure = freshPressure().byAccount;
         if (view.reactive && (pressure[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
+        // Role-based family exclusions: accounts with no eligible arm for
+        // this role are skipped, never deferred on (decide would only find
+        // empty rungs there).
+        const roleRungs = filterRungsByExcludedFamilies(
+          groupByRung(ladder.rungs), excludedFamiliesForRole(config, role));
+        if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
           agentId: run.agentId,
           role,
-          // Open breakers (and occupied half-open probes) are excluded: the
-          // ladder skips them and decide falls to the next rung or account.
-          // Shadow picks never occupy the probe slot -- only enforced hook
-          // runs route real traffic, so only the hook calls startProbe.
-          ladderRungs: filterBreakerRungs(groupByRung(ladder.rungs), breakers, sel.accountId, nowMs, breakersCfg),
+          // Open breakers (and occupied half-open probes) are excluded on
+          // top of the role filter: the ladder skips them and decide falls
+          // to the next rung or account. Shadow picks never occupy the
+          // probe slot -- only enforced hook runs route real traffic, so
+          // only the hook calls startProbe.
+          ladderRungs: filterBreakerRungs(roleRungs, breakers, sel.accountId, nowMs, breakersCfg),
+          excludedFamilies: excludedFamiliesForRole(config, role),
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -1452,6 +1500,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           adapterType: run.adapterType ?? null,
           trialBudget: freshTrialBudget(),
           trialAdapters: config.trials.adapters,
+          trialRoles: config.trials.roles,
         });
         if (d.kind === 'decide') {
           decision = d;
@@ -1557,6 +1606,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       inFlightByPool: livePools,
       adapterByAgent,
       thinkerAgentIds: config.roles.thinkerAgentIds,
+      doerAgentIds: config.roles.doerAgentIds,
+      excludeFamilies: config.roles.excludeFamilies,
       roleBands: {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
         doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
@@ -1564,6 +1615,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       contextCaps: config.contextCaps,
       trialBudget: liveTrialBudget,
       trialAdapters: config.trials.adapters,
+      trialRoles: config.trials.roles,
       maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
       accounts: ordered.map(a => {
         const view = viewById.get(a.accountId);
@@ -1673,6 +1725,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Arm circuit breakers: open/half-open arms plus closed arms with
       // recent arm-fatal fails. Bounded (500 arms) by construction.
       armBreakers: breakerReport(breakers, nowMs, breakersCfg),
+      // Per-role effective family exclusions (resolved config values).
+      roleExclusions: {
+        doer: config.roles.excludeFamilies.doer,
+        thinker: config.roles.excludeFamilies.thinker,
+        other: config.roles.excludeFamilies.other,
+      },
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -1823,7 +1881,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     if (run?.runId != null) {
       if (ledgers.get(companyId)?.get(String(run.runId))?.decidedAccount != null) return null;
     }
-    const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(run.agentId) ? 'thinker' : 'doer';
+    const role = roleOf(config, run.agentId);
+    const roleExcluded = excludedFamiliesForRole(config, role);
     const order = allocationOrderFromLive(live, companyId);
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
@@ -1837,11 +1896,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (!view || !view.ladderRungs || view.ladderRungs.length === 0) continue;
       if (!view.reactive && !view.remainingKnown) continue;
       if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
+      const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
+      if (!rungsHaveEligibleArms(roleRungs)) continue;
       const d = decide({
         runId: run.runId,
         agentId: run.agentId,
         role,
-        ladderRungs: view.ladderRungs,
+        ladderRungs: roleRungs,
+        excludedFamilies: roleExcluded,
         pointer: view.pointer ?? 0,
         retryCount: 0,
         failureClass: 'none',
@@ -1855,6 +1917,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         adapterType: run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null,
         trialBudget: budget,
         trialAdapters: live.trialAdapters ?? {},
+        trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
       });
       if (d.kind !== 'decide') continue;
       const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
@@ -2146,7 +2209,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         return { kind: 'keep' };
       }
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
-      const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(params.agentId) ? 'thinker' : 'doer';
+      const role = roleOf({ roles: {
+        thinkerAgentIds: live.thinkerAgentIds,
+        doerAgentIds: live.doerAgentIds,
+      } }, params.agentId);
+      const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
       // Same water-filling order as the shadow tick: need band first, then
       // largest (targetShare - pooled in-flight). Metered accounts without
       // headroom never qualify; healthy reactive accounts qualify without
@@ -2174,11 +2241,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;
         if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
+        // Role-based family exclusions use the tick-frozen live view (the
+        // hook performs zero I/O): ineligible accounts are skipped, never
+        // deferred on.
+        const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
+        if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: params.runId,
           agentId: params.agentId,
           role,
-          ladderRungs: filterBreakerRungs(view.ladderRungs, bstore, view.accountId, bnow, bcfg),
+          ladderRungs: filterBreakerRungs(roleRungs, bstore, view.accountId, bnow, bcfg),
+          excludedFamilies: roleExcluded,
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -2192,6 +2265,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
           trialBudget: budget,
           trialAdapters: live.trialAdapters ?? {},
+          trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
         });
         if (d.kind === 'decide') {
           // Straight into the ledger via the shared helper: the enforced

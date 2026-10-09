@@ -285,7 +285,7 @@ test('manifest breakers schema defaults match the code defaults', () => {
   assert.equal(props.breakers.properties.maxCooloffHours.default, 48);
   assert.deepEqual(props.breakers.properties.fatalPatterns.default, DEFAULT_BREAKERS.fatalPatterns);
   assert.deepEqual(props.breakers.properties.vetoPatterns.default, DEFAULT_BREAKERS.vetoPatterns);
-  assert.equal(PLUGIN_VERSION, '0.2.14');
+  assert.equal(PLUGIN_VERSION, '0.2.16');
 });
 
 test('/capacity armBreakers lists tracked arms with effective state', () => {
