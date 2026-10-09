@@ -44,6 +44,8 @@ export const DEFAULT_BREAKERS = {
     'invalid model',
     'unknown model',
     '400+model',
+    'model is unavailable',
+    'no healthy managed',
   ],
   vetoPatterns: [
     'context length',
