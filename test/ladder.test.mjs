@@ -60,6 +60,34 @@ test('stability: non-dominating newcomers do not displace incumbents', () => {
   assert.equal(after.get('b'), before.get('b'));
 });
 
+test('live codex order: stale pins cannot break cost order', () => {
+  // Exact arm set the 0.1.3 shadow served out of order (costs as observed).
+  const live = [
+    ['luna-low', 1, 0.005], ['luna-medium', 2, 0.017], ['luna-high', 3, 0.029],
+    ['luna-xhigh', 4, 0.042], ['luna', 5, 0.068], ['sol-high', 6, 0.319],
+    ['sol', 7, 0.724], ['astra-xhigh', 8, 2.309], ['astra', 9, 3.258],
+  ];
+  const entries = live.map(([armId, Q, C]) => entry(armId, Q, C));
+  // Previous snapshot pinned the broken live positions (stale costs).
+  const previous = ['luna-low', 'sol-high', 'luna-medium', 'sol', 'luna-high', 'luna-xhigh', 'luna', 'astra-xhigh', 'astra']
+    .map((armId, rung) => ({ armId, rung }));
+  const { rungs } = buildLadder(entries, previous);
+  assert.deepEqual(rungs.map(r => r.armId),
+    ['luna-low', 'luna-medium', 'luna-high', 'luna-xhigh', 'luna', 'sol-high', 'sol', 'astra-xhigh', 'astra']);
+  const costs = rungs.map(r => r.C);
+  assert.deepEqual(costs, [...costs].sort((a, b) => a - b));
+  const qs = rungs.map(r => r.Q);
+  assert.deepEqual(qs, [...qs].sort((a, b) => a - b));
+  assert.deepEqual(rungs.map(r => r.rung), rungs.map((_, i) => i));
+});
+
+test('pins hold while cost order is unchanged', () => {
+  const first = buildLadder([entry('a', 40, 0.2), entry('b', 55, 2.0)]);
+  const second = buildLadder([entry('a', 40.5, 0.21), entry('b', 55.2, 2.1)], first.rungs);
+  assert.deepEqual(second.rungs.map(r => r.armId), ['a', 'b']);
+  assert.deepEqual(second.rungs.map(r => r.rung), [0, 1]);
+});
+
 test('stability: a strictly-dominating newcomer displaces', () => {
   const first = buildLadder([entry('old', 45, 0.8)]);
   const second = buildLadder([entry('old', 45, 0.8), entry('new', 50, 0.5)], first.rungs);

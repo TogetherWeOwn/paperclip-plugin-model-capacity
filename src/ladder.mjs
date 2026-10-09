@@ -51,24 +51,46 @@ function strictlyDominates(a, b) {
 /**
  * Stability pinning: keep each surviving incumbent's previous rung unless
  * a newcomer (present in fresh, absent from previous) strictly dominates
- * it. Returns a fresh rung list with pinned positions applied, then
- * renumbered 0..n in cost order so rung indices stay contiguous.
+ * it. A pin is only honored while it keeps rungs ascending in C (hence in
+ * Q -- pareto survivors with lower cost always score higher, so any cost
+ * inversion is a quality inversion too). Cost refreshes move C under
+ * pinned positions; every pin that would invert the order falls back to
+ * the fresh rung, iterating to a fixed point (fresh order is always a
+ * fixed point, so this terminates). Returns rungs renumbered 0..n.
  */
 export function pinRungs(freshRungs, previousRungs) {
   const prevByArm = new Map((previousRungs ?? []).map(r => [r.armId, r]));
   if (prevByArm.size === 0) return freshRungs;
   const freshByArm = new Map(freshRungs.map(r => [r.armId, r]));
   const newcomers = freshRungs.filter(r => !prevByArm.has(r.armId));
-  const adjusted = freshRungs.map(r => {
+  const finalRung = new Map();
+  for (const r of freshRungs) {
     const prev = prevByArm.get(r.armId);
-    if (!prev) return r;
-    const displaced = newcomers.some(n => strictlyDominates(n, r));
-    if (!displaced) return { ...r, rung: Math.min(prev.rung, freshRungs.length - 1) };
-    return r;
-  });
-  // Renumber contiguously by (pinned rung, cost): pinned rungs win ties.
-  const ordered = [...adjusted].sort((a, b) => (a.rung - b.rung) || (a.C - b.C));
-  return ordered.map((r, rung) => ({ ...r, rung }));
+    const displaced = prev ? newcomers.some(n => strictlyDominates(n, r)) : false;
+    finalRung.set(r.armId, (prev && !displaced) ? Math.min(prev.rung, freshRungs.length - 1) : r.rung);
+  }
+  const byFinal = () => [...freshRungs].sort(
+    (a, b) => (finalRung.get(a.armId) - finalRung.get(b.armId)) || (a.C - b.C),
+  );
+  // Yield pinned arms back to fresh until C ascends. Each pass resets at
+  // least one arm and pins are never re-applied, so this terminates in at
+  // most n passes; all-fresh order is C-ascending by construction.
+  for (let pass = 0; pass <= freshRungs.length; pass++) {
+    let lastC = -Infinity;
+    let bad = null;
+    const prefix = [];
+    for (const r of byFinal()) {
+      prefix.push(r);
+      if (r.C < lastC) {
+        bad = prefix.filter(x => finalRung.get(x.armId) !== freshByArm.get(x.armId).rung);
+        break;
+      }
+      lastC = r.C;
+    }
+    if (!bad || bad.length === 0) break;
+    for (const x of bad) finalRung.set(x.armId, freshByArm.get(x.armId).rung);
+  }
+  return byFinal().map((r, rung) => ({ ...r, rung }));
 }
 
 /** Full ladder build for one account: filter, pin against previous, cap. */

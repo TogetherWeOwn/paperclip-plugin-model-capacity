@@ -44,6 +44,40 @@ test('identical arms score zero; empty arms are ineligible, not zero', () => {
   assert.equal(empty.coverage, 0);
 });
 
+test('terminal-bench falls back to V40 when Hard and V21 are null', () => {
+  // Free-tier rows (e.g. claude-opus-5-5) carry only terminalbenchV40.
+  const [lo, hi] = computeComposite([
+    arm('lo', { terminalbenchV40: 0.5 }),
+    arm('hi', { terminalbenchV40: 0.6 }),
+  ]);
+  assert.equal(lo.coverage, 1);
+  assert.equal(hi.coverage, 1);
+  assert.ok(Math.abs(lo.Q - -1) < 1e-9);
+  assert.ok(Math.abs(hi.Q - 1) < 1e-9);
+});
+
+test('hle scores arms: higher is better', () => {
+  const byId = new Map(computeComposite([
+    arm('low', { hle: 10 }),
+    arm('high', { hle: 20 }),
+  ]).map(s => [s.armId, s]));
+  assert.ok(byId.get('high').Q > byId.get('low').Q);
+  assert.equal(byId.get('high').coverage, 1);
+});
+
+test('coverage is against common support, not the full metric list', () => {
+  // Neither arm is measured on tau2/apex/hle/omniscience/lcr; those leave
+  // the denominator instead of dragging both arms under the ladder bar.
+  const [a, b] = computeComposite([
+    arm('a', { intelligenceIndex: 50, scicode: 60 }),
+    arm('b', { intelligenceIndex: 60 }),
+  ]);
+  assert.equal(a.coverage, 1);
+  const expected = DEFAULT_WEIGHTS.intelligenceIndex
+    / (DEFAULT_WEIGHTS.intelligenceIndex + DEFAULT_WEIGHTS.scicode);
+  assert.ok(Math.abs(b.coverage - expected) < 1e-9);
+});
+
 test('composite is deterministic for the same snapshot', () => {
   const arms = [
     arm('m1', { terminalbenchHard: 61, scicode: 55, intelligenceIndex: 43.4 }),

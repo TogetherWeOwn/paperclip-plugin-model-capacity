@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY } from '../src/decide.mjs';
+import { decide, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
 
 const arm = (armId, model, effort, family, Q, contextWindow = 1000000) => ({ armId, model, effort, family, Q, C: 1, contextWindow });
 const ladderRungs = [
@@ -38,7 +38,7 @@ test('sol/luna carry the price-cliff context caps', () => {
   assert.equal(d.env[MAX_CONTEXT_ENV_KEY], '260000');
   assert.equal(d.env[AUTO_COMPACT_ENV_KEY], '240000');
   const haiku = decide({ ...base });
-  assert.deepEqual(haiku.env, {});
+  assert.deepEqual(haiku.env, { [MAX_OUTPUT_ENV_KEY]: '64000' });
 });
 
 test('context window filters; rate-limit reroutes', () => {
@@ -61,4 +61,45 @@ test('decision ids are unique per run but stable per input', () => {
   const b = decide({ ...base, runId: 'run-b' });
   assert.notEqual(a.decisionId, b.decisionId);
   assert.equal(decide({ ...base, runId: 'run-a' }).decisionId, a.decisionId);
+});
+
+const trialArm = (extra = {}) => ({
+  armId: 'kimi-k3-256k', model: 'kimi-k3-256k', effort: 'max', family: 'kimi',
+  trial: true, Q: 50, C: 50, contextWindow: 1000000, ...extra,
+});
+const trialBase = {
+  runId: 'run-t', agentId: 'agent-1', role: 'doer',
+  ladderRungs: [{ rung: 0, arms: [trialArm()] }], pointer: 0,
+  fiveHourHeadroomPct: null, burnPerRunPct: {}, reservePct: 0.05,
+  accountId: 'kimi:1', adapterType: 'claude-code',
+  trialBudget: { kimi: 2 }, trialAdapters: { 'claude-code': ['*'] },
+};
+
+test('trial arms route doer-only through opted-in adapters with budget', () => {
+  const d = decide({ ...trialBase });
+  assert.equal(d.kind, 'decide');
+  assert.equal(d.trial, true);
+  assert.equal(d.model, 'kimi-k3-256k');
+  // Unmeasured by definition: always weak, never blocked on calibration.
+  assert.equal(d.calibration, 'weak');
+});
+
+test('trial arms are excluded for thinkers, unknown adapters, and empty budgets', () => {
+  assert.equal(decide({ ...trialBase, role: 'thinker' }).kind, 'defer');
+  assert.equal(decide({ ...trialBase, adapterType: null }).kind, 'defer');
+  assert.equal(decide({ ...trialBase, adapterType: 'opencode' }).kind, 'defer');
+  assert.equal(decide({ ...trialBase, trialBudget: { kimi: 0 } }).kind, 'defer');
+  assert.equal(decide({ ...trialBase, trialBudget: {} }).kind, 'defer');
+});
+
+test('trial picks bypass the burn check: unmeasured by definition', () => {
+  const d = decide({ ...trialBase, fiveHourHeadroomPct: 0.06 });
+  assert.equal(d.kind, 'decide');
+  assert.equal(d.trial, true);
+});
+
+test('proven arms ignore trial gating entirely', () => {
+  const d = decide({ ...base, adapterType: null, trialBudget: {}, trialAdapters: {} });
+  assert.equal(d.kind, 'decide');
+  assert.equal(d.trial, false);
 });

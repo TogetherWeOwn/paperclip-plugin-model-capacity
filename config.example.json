@@ -1,8 +1,8 @@
 {
   "cliproxy": {
-    "baseUrl": "http://cliproxy:8317",
-    "managementKeySecretRef": null,
-    "staleAfterSec": 300,
+    "baseUrl": "https://router.infextion.net",
+    "accountsPath": "/telemetry/cliproxy/live/accounts.json",
+    "laneKeySecretRef": null,
     "cacheTtlSec": 45
   },
   "aa": {
@@ -18,29 +18,46 @@
     "doerCeilingRung": null
   },
   "weights": {
-    "terminalBench": 0.4,
-    "scicode": 0.2,
-    "tau2": 0.1,
-    "apexAgents": 0.1,
-    "intelligenceIndex": 0.1,
-    "omniscience": 0.05,
-    "lcr": 0.05
+    "terminalBench": 0.36,
+    "scicode": 0.18,
+    "tau2": 0.09,
+    "apexAgents": 0.09,
+    "intelligenceIndex": 0.09,
+    "hle": 0.1,
+    "omniscience": 0.045,
+    "lcr": 0.045
   },
   "pacing": {
     "deadband": 0.02,
     "rungCooldownMs": 600000,
     "guardHighPct": 0.8,
-    "guardRejoinPct": 0.5
+    "guardRejoinPct": 0.5,
+    "rateDeadbandRel": 0.15,
+    "rateWindowMin": 60,
+    "rateMinSpanMin": 10
   },
   "concurrency": {
     "maxTotal": 75,
-    "meanRunDurationHours": 0.3333333333333333
+    "meanRunDurationHours": 0.186
   },
   "contextCaps": {
     "solLunaMaxTokens": 260000,
     "solLunaAutoCompactTokens": 240000,
-    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_TOKENS"
+    "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "haikuMaxOutputTokens": 64000
   },
+  "enforce": false,
+  "trials": {
+    "maxInFlightPerAccount": 2,
+    "maxInFlightPerFamily": 2,
+    "minRuns": 10,
+    "minSuccessRate": 0.8,
+    "adapters": {
+      "claude_local": ["*"],
+      "claude-code": ["*"]
+    }
+  },
+  "modelAaOverrides": {},
   "calibration": {
     "referenceArmId": "claude-haiku-5-5",
     "referenceBurnPerRunPct": 0.0005

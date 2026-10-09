@@ -8,19 +8,24 @@
  *
  * Default weights follow the research design with the SWE-bench proxy
  * folded into terminal-bench and scicode (no curated proxy table is
- * maintained): terminalBench .40, scicode .20, tau2 .10, apexAgents .10,
- * intelligenceIndex .10, omniscience .05 (negated: it is a hallucination
- * penalty term), lcr .05. All weights are operator-configurable.
+ * maintained). v0.1.2 adds hle at .10 with the existing weights scaled
+ * x0.9 so the sum stays 1: terminalBench .36, scicode .18, tau2 .09,
+ * apexAgents .09, intelligenceIndex .09, hle .10, omniscience .045
+ * (negated: it is a hallucination penalty term), lcr .045.
+ * The terminal-bench metric reads Hard, falling back to V40 then V21, so
+ * free-tier rows that only carry V40 still score. All weights are
+ * operator-configurable.
  */
 
 export const DEFAULT_WEIGHTS = Object.freeze({
-  terminalBench: 0.4,
-  scicode: 0.2,
-  tau2: 0.1,
-  apexAgents: 0.1,
-  intelligenceIndex: 0.1,
-  omniscience: 0.05,
-  lcr: 0.05,
+  terminalBench: 0.36,
+  scicode: 0.18,
+  tau2: 0.09,
+  apexAgents: 0.09,
+  intelligenceIndex: 0.09,
+  hle: 0.1,
+  omniscience: 0.045,
+  lcr: 0.045,
 });
 
 /** Metric -> candidate AA row fields, first non-null wins. */
@@ -30,6 +35,7 @@ export const METRIC_SOURCES = Object.freeze({
   tau2: ['tau2', 'tauBanking'],
   apexAgents: ['apexAgents'],
   intelligenceIndex: ['intelligenceIndex'],
+  hle: ['hle'],
   omniscience: ['omniscience'],
   lcr: ['lcr'],
 });
@@ -55,21 +61,29 @@ function meanStd(values) {
 
 /**
  * Score every arm. Returns [{ armId, Q, coverage }] where coverage is the
- * fraction of configured weight present for the arm. Arms with no usable
- * metric at all get Q null (ladder-ineligible, not zero).
+ * fraction of weight present for the arm against the COMMON SUPPORT: the
+ * metrics actually measured on at least one arm in this set. A free-tier
+ * gap that hits every arm (e.g. no apexAgents anywhere) shrinks the
+ * denominator instead of pushing every arm under the ladder's coverage
+ * bar. Arms with no usable metric at all get Q null (ladder-ineligible,
+ * not zero). Call once per account arm set so the support is the
+ * account's own.
  */
 export function computeComposite(arms, weights = DEFAULT_WEIGHTS) {
   const metrics = Object.keys(weights).filter(k => weights[k] > 0 && METRIC_SOURCES[k]);
   const stats = new Map();
+  const supported = [];
   for (const metric of metrics) {
     const values = arms.map(a => metricValue(a.row, metric)).filter(v => v != null);
+    if (values.length === 0) continue;
+    supported.push(metric);
     stats.set(metric, meanStd(values));
   }
-  const totalWeight = metrics.reduce((a, m) => a + weights[m], 0);
+  const supportWeight = supported.reduce((a, m) => a + weights[m], 0);
   return arms.map(arm => {
     let num = 0;
     let present = 0;
-    for (const metric of metrics) {
+    for (const metric of supported) {
       const v = metricValue(arm.row, metric);
       if (v == null) continue;
       const s = stats.get(metric);
@@ -82,6 +96,6 @@ export function computeComposite(arms, weights = DEFAULT_WEIGHTS) {
       present += weights[metric];
     }
     if (present <= 0) return { armId: arm.armId, Q: null, coverage: 0 };
-    return { armId: arm.armId, Q: num / present, coverage: present / totalWeight };
+    return { armId: arm.armId, Q: num / present, coverage: supportWeight > 0 ? present / supportWeight : 0 };
   });
 }

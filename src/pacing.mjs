@@ -1,12 +1,16 @@
 /**
  * Per-account pacing controller (pure transitions; state lives in ctx.state).
  *
- * Each account tracks a rung pointer on its Pareto ladder against a linear
- * burn schedule: used% should reach ~100% exactly at reset. The schedule
- * error e = used - target; behind schedule (quota piling up) climbs a rung
- * or adds parallelism, ahead descends. Deadband plus a rung-move cooldown
- * keep the controller from oscillating; the 5h guard overrides everything
- * because the 5h window binds before the weekly one.
+ * v0.1.3 is RATE-based: the error is e = measuredRate - requiredRate
+ * (weekly fraction per hour), where the measured rate comes from successive
+ * lane readings and the required rate is remaining/hoursToReset. Position
+ * (used vs linear target) is only a tie-break while no measured rate
+ * exists yet. A position-only controller climbs when quota merely *looks*
+ * behind even while the current burn already overshoots what's needed --
+ * the rate form cannot make that mistake. Deadband is ±15% relative, with
+ * no absolute floor (a floor swallows real shortfalls on small-required
+ * accounts); the 5h guard still overrides everything because the
+ * 5h window binds before the weekly one.
  */
 
 export const DEFAULT_PACING = Object.freeze({
@@ -19,7 +23,17 @@ export const DEFAULT_PACING = Object.freeze({
   /** Guard releases when 5h used% drops below this. */
   guardRejoin: 0.5,
   floorRung: 0,
+  /** Rate mode: hold while |measured - required| is within this fraction of required. Relative-only. */
+  rateDeadbandRel: 0.15,
+  /** Utilization history window for the measured rate. */
+  rateWindowMin: 60,
+  /** Minimum history span before a measured rate is trusted (~10-15 min after install). */
+  rateMinSpanMin: 10,
 });
+
+/** Utilization history knobs (module constants; operator knobs in DEFAULT_PACING). */
+export const RATE_HISTORY_KEEP_MS = 90 * 60 * 1000;
+export const RATE_HISTORY_CAP = 120;
 
 /** Linear-target schedule error: +ahead (overspent) / -behind. */
 export function scheduleError({ usedPct, nowMs, periodStartMs, periodEndMs }) {
@@ -72,6 +86,118 @@ export function stepController(state, reading, nowMs, cfg = DEFAULT_PACING, ceil
     return { pointer: pointer - 1, lastMoveAtMs: nowMs, guardActive: false, action: 'descend', reason: `ahead of schedule (+${(e * 100).toFixed(1)}%): descend one rung` };
   }
   return { pointer, lastMoveAtMs: state.lastMoveAtMs ?? nowMs, guardActive: false, action: 'hold-limit', reason: 'at floor/ceiling bound' };
+}
+
+/**
+ * Append a utilization reading to per-account history. Returns a fresh
+ * array: sorted, pruned to the keep window, capped by count. Pure (the
+ * worker persists the result in plugin state).
+ */
+export function appendUtilReading(history, { atMs, usedPct }, nowMs = Date.now()) {
+  const keepFrom = nowMs - RATE_HISTORY_KEEP_MS;
+  const next = [...(history ?? []), { atMs, usedPct }]
+    .filter(p => Number.isFinite(p?.atMs) && Number.isFinite(p?.usedPct) && p.atMs >= keepFrom && p.atMs <= nowMs + 60000)
+    .sort((a, b) => a.atMs - b.atMs);
+  return next.slice(-RATE_HISTORY_CAP);
+}
+
+/**
+ * Measured burn rate over the trailing window: (newest - oldest used in
+ * window) / hours. Returns { ratePerHour, spanMs, points } or null when
+ * fewer than 2 in-window points span the minimum span. Counter resets in
+ * the lane data (provider restarts the week early) show as negative
+ * deltas and are rejected, not trusted.
+ */
+export function measuredRatePerHour(history, nowMs = Date.now(), windowMin = 60, minSpanMin = 20) {
+  const from = nowMs - windowMin * 60000;
+  const pts = (history ?? []).filter(p => p.atMs >= from && p.atMs <= nowMs + 60000);
+  if (pts.length < 2) return null;
+  const first = pts[0];
+  const last = pts[pts.length - 1];
+  const spanMs = last.atMs - first.atMs;
+  if (spanMs < minSpanMin * 60000) return null;
+  const delta = last.usedPct - first.usedPct;
+  if (!(delta >= 0)) return null;
+  return { ratePerHour: delta / (spanMs / 3600000), spanMs, points: pts.length };
+}
+
+/** Required burn rate: remaining weekly fraction per hour to land ~100% at reset. */
+export function requiredRatePerHour({ remainingPct, hoursToReset }) {
+  if (!(remainingPct > 0) || !(hoursToReset > 0)) return 0;
+  return remainingPct / hoursToReset;
+}
+
+/**
+ * Rate-mode controller tick. Same state, actions, guard, and cooldown as
+ * stepController; only the error differs:
+ * - measured known: e = measured - required, deadband ±rateDeadbandRel
+ *   relative, no floor -- so a total stall (|e| = required) and any real
+ *   shortfall on a small-required account read as behind plan;
+ * - measured unknown: e = positionError with the absolute deadband.
+ * Reasons always name the rates so the shadow log shows the controller's
+ * actual inputs.
+ */
+export function stepRateController(state, reading, nowMs, cfg = DEFAULT_PACING, ceiling = Number.POSITIVE_INFINITY) {
+  const c = { ...DEFAULT_PACING, ...cfg };
+  const floor = c.floorRung;
+  const top = Math.max(floor, Math.min(ceiling, Number.isFinite(ceiling) ? ceiling : Number.MAX_SAFE_INTEGER));
+  const pointer = Math.min(Math.max(state.pointer ?? floor, floor), top);
+  const fiveHour = reading.fiveHourUsedPct;
+  const keepStamp = state.lastMoveAtMs ?? nowMs;
+
+  // Basis is tracked through guard episodes too, so a guard that ends
+  // after rates appear still counts as a position -> measured switch.
+  const guardBasis = (reading.measuredRatePerHour != null && Number.isFinite(reading.measuredRatePerHour)) ? 'measured' : 'position';
+  if (fiveHour != null && fiveHour >= c.guardHigh) {
+    return {
+      pointer: floor, lastMoveAtMs: nowMs, guardActive: true, rateBasis: guardBasis, action: 'floor-guard',
+      reason: `5h at ${Math.round(fiveHour * 100)}% >= guard ${Math.round(c.guardHigh * 100)}%: floor rung, shed load`,
+    };
+  }
+  if (state.guardActive) {
+    if (fiveHour != null && fiveHour >= c.guardRejoin) {
+      return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: true, rateBasis: guardBasis, action: 'hold-guard', reason: '5h guard still active' };
+    }
+    return { pointer: floor, lastMoveAtMs: keepStamp, guardActive: false, rateBasis: guardBasis, action: 'rejoin', reason: '5h recovered: rejoin at floor' };
+  }
+
+  const measured = reading.measuredRatePerHour;
+  const required = reading.requiredRatePerHour ?? 0;
+  const measuredKnown = measured != null && Number.isFinite(measured);
+  // Persisted basis ('measured' | 'position' | undefined on pre-0.2.1
+  // state): when the basis switches from the position fallback to a real
+  // measured rate, the cooldown resets so the correction a stale fallback
+  // move made necessary is not delayed by that very move.
+  const rateBasis = measuredKnown ? 'measured' : 'position';
+  const basisSwitched = state.rateBasis === 'position' && rateBasis === 'measured';
+  let e;
+  let band;
+  let basis;
+  if (measuredKnown) {
+    e = measured - required;
+    // Relative-only: no absolute floor. A floor at 0.5%/h swallowed whole
+    // required rates (live: measured 0 vs required 0.49%/h read "inside
+    // deadband"); any real shortfall must read as deficit.
+    band = c.rateDeadbandRel * Math.max(required, 0);
+    basis = `rate ${(measured * 100).toFixed(2)}%/h vs required ${(required * 100).toFixed(2)}%/h`;
+  } else {
+    e = reading.positionError ?? 0;
+    band = c.deadband;
+    basis = `no measured rate yet: position ${(e * 100).toFixed(1)}%`;
+  }
+  if (Math.abs(e) <= band) {
+    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold', reason: `${basis}: inside deadband` };
+  }
+  if (!basisSwitched && nowMs - (state.lastMoveAtMs ?? 0) < c.cooldownMs) {
+    return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold-cooldown', reason: `${basis}: rung move inside cooldown` };
+  }
+  if (e < 0 && pointer < top) {
+    return { pointer: pointer + 1, lastMoveAtMs: nowMs, guardActive: false, rateBasis, action: 'climb', reason: `${basis}: burning too slowly, climb one rung` };
+  }
+  if (e > 0 && pointer > floor) {
+    return { pointer: pointer - 1, lastMoveAtMs: nowMs, guardActive: false, rateBasis, action: 'descend', reason: `${basis}: burning too fast, descend one rung` };
+  }
+  return { pointer, lastMoveAtMs: keepStamp, guardActive: false, rateBasis, action: 'hold-limit', reason: `${basis}: at floor/ceiling bound` };
 }
 
 /** Serve runs from accounts ordered earliest reset first, largest remainder first. */
