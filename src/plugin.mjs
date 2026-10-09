@@ -592,6 +592,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // below) are merged in, never overwritten. Every writer goes through
   // getOrLoadLedger -- nothing else calls ledgers.set.
   const ledgerLoads = new Map();
+  // Companies whose ledger-v1 load succeeded since worker start. The tick
+  // persists ledger-v1 ONLY for these: persisting after a failed load would
+  // overwrite the saved ledger with the (often empty) memory overlay.
+  // ledgerReady short-circuits repeat loads; loadedOk gates the persist.
+  const loadedOk = new Set();
   function ensureLedger(companyId) {
     let ledger = ledgers.get(companyId);
     if (!ledger) {
@@ -619,6 +624,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
         ledgers.set(companyId, ledger);
         ledgerReady.add(companyId);
+        loadedOk.add(companyId);
         return ledger;
       })();
       ledgerLoads.set(companyId, pending);
@@ -629,8 +635,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     return pending;
   }
-  // The one entry point for run recording. A state outage must never block
-  // run starts: a failed load falls back to the memory ledger and logs.
+  // The entry point for MEMORY-ONLY run recording (run events, event-time
+  // and hook decisions). A state outage must never block run starts: a failed
+  // load falls back to the memory ledger and logs. Deliberately NOT used by
+  // the tick: the tick calls loadLedger directly so a failed load aborts
+  // before any persist (see the loadedOk guard at the ledger persist).
   async function getOrLoadLedger(companyId) {
     if (ledgerReady.has(companyId)) return ledgers.get(companyId) ?? ensureLedger(companyId);
     try {
@@ -784,7 +793,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // account's quota inside the measured span (model-mapped, never the
     // decision); in-flight pressure attributes decided-first (see below).
     const rateWindowMs = config.pacing.rateWindowMin * 60000;
-    const ledger = await getOrLoadLedger(companyId);
+    // Direct load: a throw here aborts the tick before any persist, so a
+    // failed post-restart read can never wipe the saved ledger. The next
+    // tick retries the load (rejected loads are not cached).
+    const ledger = await loadLedger(companyId);
     const modelCaches = { agents: new Map(), issues: new Map() };
     const accountOfModel = (model) => (model != null && model !== 'unknown'
       ? accountForRun({ model }, snapshot.accounts)
@@ -1293,6 +1305,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // maxRecords: old terminal, old unverified, and stale-horizon records
     // first, then oldest activity -- live pressure always survives.
     trimLedger(ledger, { nowMs, maxRecords: config.shadowMaxEntries, staleHorizonMs });
+    if (!loadedOk.has(companyId)) {
+      throw new Error('model-capacity: refusing ledger persist without a successful load');
+    }
     await ctx.state.set(scopeKey(companyId, LEDGER_KEY), ledgerToJSON(ledger));
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
     await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);

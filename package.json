@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "Shadow-by-default model-capacity routing: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.2.2 routes all providers. The default manifest holds no run.model.resolve capability; the enforce-capable variant is opt-in and its enforce flag defaults false.",
   "license": "MIT",
   "type": "module",
