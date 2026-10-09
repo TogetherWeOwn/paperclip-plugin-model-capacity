@@ -146,10 +146,13 @@ export function eeeKeyToArm(key) {
 /** Alias form for joining derived keys to arm models across sources: the TB
  * harness emits dotted ids (opus-5.5) while the AA mirror emits dashed,
  * prefixed ids (claude-opus-5-5) for the same model. Lowercase, dots->dashes,
- * leading claude- stripped. Distinct models stay distinct (opus-5 vs
- * opus-5-5); same-model spellings merge. */
+ * leading claude- stripped, trailing -contributor stripped (the Muse effort
+ * decoration: the real arm model is muse-spark-1.3-contributor while the
+ * benchmark key is muse-spark-1.3(xhigh) -- cf slugCandidates/dynamicEffort
+ * in arms.mjs). Distinct models stay distinct (opus-5 vs opus-5-5);
+ * same-model spellings merge. */
 function aliasBare(bare) {
-  return String(bare ?? '').toLowerCase().replace(/\./g, '-').replace(/^claude-/, '');
+  return String(bare ?? '').toLowerCase().replace(/\./g, '-').replace(/^claude-/, '').replace(/-contributor$/, '');
 }
 
 /** Split a derived scores key into { bare, keyEffort } (keyEffort null when

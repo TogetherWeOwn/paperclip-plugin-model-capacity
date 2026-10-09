@@ -53,7 +53,7 @@ test('fixture -> exact Q_eee ordering: opus > sonnet > sol > glm > luna', () => 
   assert.ok(q.get('glm-5.3(max)') > q.get('gpt-6-luna(max)'));
   // Same-effort comparison: xhigh arms against each other score and order.
   const xArms = [
-    { armId: 'muse-spark-1.3(xhigh)', model: 'muse-spark-1.3', effort: 'xhigh' },
+    { armId: 'muse-spark-1-3-xhigh', model: 'muse-spark-1.3-contributor', effort: 'xhigh' },
     { armId: 'fable-5.1(xhigh)', model: 'fable-5.1', effort: 'xhigh' },
   ];
   const xFix = {
@@ -61,7 +61,23 @@ test('fixture -> exact Q_eee ordering: opus > sonnet > sol > glm > luna', () => 
     'fable-5.1(xhigh)': { benchmarks: { tb4: tb4(57.88, 54.52, 61.24, '2026-09-01') } },
   };
   const xOut = computeEeeComposite(xArms, xFix, { nowMs: NOW });
-  assert.ok(xOut.get('fable-5.1(xhigh)').Qeee > xOut.get('muse-spark-1.3(xhigh)').Qeee);
+  assert.ok(xOut.get('fable-5.1(xhigh)').Qeee > xOut.get('muse-spark-1-3-xhigh').Qeee);
+});
+
+test('real Muse arm joins its benchmark row (review probe)', () => {
+  // The classic arm table model is muse-spark-1.3-contributor (effort xhigh)
+  // while the artifact key is muse-spark-1.3(xhigh): the join must strip the
+  // -contributor effort decoration, or Muse scores null and its trial-family
+  // prior in /capacity stays null forever.
+  const out = computeEeeComposite(
+    [{ armId: 'muse-spark-1-3-xhigh', model: 'muse-spark-1.3-contributor', effort: 'xhigh' }],
+    { 'muse-spark-1.3(xhigh)': FIXTURE['muse-spark-1.3(xhigh)'] },
+    { nowMs: NOW },
+  );
+  const muse = out.get('muse-spark-1-3-xhigh');
+  assert.notEqual(muse.Qeee, null);
+  assert.ok(muse.detail.tb4);
+  assert.equal(muse.detail.tb4.score, 14.55);
 });
 
 test('fixture Q_eee values are exact and deterministic', () => {
@@ -123,6 +139,20 @@ test('blend alphas: 0.25 doers, 0.10 thinkers', () => {
   assert.equal(DEFAULT_EEE_BLEND_DOER, 0.25);
   assert.equal(DEFAULT_EEE_BLEND_THINKER, 0.1);
   assert.equal(blendQ(1.0, -1.0, 0.25), 0.5);
+});
+
+test('thinkers sort on qThinker, doers on Q (review probe)', async () => {
+  const { decide } = await import('../src/decide.mjs');
+  const arm = (armId, Q, qThinker) => ({
+    armId, model: armId, effort: 'max', family: 'x', contextWindow: null,
+    Q, C: 1, trial: false, ...(qThinker === undefined ? {} : { qThinker }),
+  });
+  // A ranks first on Q, B on the thinker blend; C has no thinker blend and
+  // ranks thinkers on its Q fallback.
+  const rungs = [{ rung: 0, arms: [arm('a', 1.0, 0.0), arm('b', 0.9, 2.0), arm('c', 0.5)] }];
+  const base = { runId: 'r', agentId: 'ag', ladderRungs: rungs, accountId: 'x:1' };
+  assert.equal(decide({ ...base, role: 'doer' }).model, 'a');
+  assert.equal(decide({ ...base, role: 'thinker' }).model, 'b');
 });
 
 test('stale artifact -> unusable (AA-only bit-equality path)', () => {
@@ -217,6 +247,37 @@ test('rung gate: within-noise newcomer does not knock out the incumbent', () => 
   assert.deepEqual(withinNoise, [{ challenger: 'n', incumbent: 'i' }]);
 });
 
+test('rung gate: the hold persists across ticks until the bar clears', () => {
+  const gate = new Map([
+    ['i', { score: 64.85, se: se(61.74, 67.96) }],
+    ['n', { score: 66.0, se: se(62.9, 69.1) }],
+  ]);
+  // Tick 1: newcomer held within noise, pair reported...
+  const t1 = buildLadder(gateEntries(), gatePrev(), gate);
+  assert.deepEqual(t1.rungs.map(r => r.armId), ['n', 'i']);
+  assert.deepEqual(t1.withinNoise, [{ challenger: 'n', incumbent: 'i' }]);
+  // Tick 2 with identical inputs, feeding tick 1's rungs AND its held pairs
+  // back (as the plugin does from the persisted ladder): the old incumbent
+  // must survive again, not drop as a same-tick incumbent.
+  const t2 = buildLadder(gateEntries(), t1.rungs, gate, t1.withinNoise);
+  assert.deepEqual(t2.rungs.map(r => r.armId), ['n', 'i']);
+  assert.deepEqual(t2.dominated, []);
+  assert.deepEqual(t2.withinNoise, [{ challenger: 'n', incumbent: 'i' }]);
+  // ...and a third identical tick holds too (no slow one-tick-per-rung leak).
+  const t3 = buildLadder(gateEntries(), t2.rungs, gate, t2.withinNoise);
+  assert.deepEqual(t3.rungs.map(r => r.armId), ['n', 'i']);
+  assert.deepEqual(t3.dominated, []);
+  // When the gap clears the bar, the same held pair displaces at once.
+  const cleared = new Map([
+    ['i', { score: 41.82, se: se(38.59, 45.05) }],
+    ['n', { score: 66.36, se: se(63.64, 69.08) }],
+  ]);
+  const t4 = buildLadder(gateEntries(), t1.rungs, cleared, t1.withinNoise);
+  assert.deepEqual(t4.rungs.map(r => r.armId), ['n']);
+  assert.deepEqual(t4.dominated, ['i']);
+  assert.deepEqual(t4.withinNoise, []);
+});
+
 test('rung gate: a 25-point gap knocks out; missing SE keeps today behavior', () => {
   const gate = new Map([
     ['i', { score: 41.82, se: se(38.59, 45.05) }],
@@ -257,4 +318,23 @@ test('config: eee defaults resolve, nested and flat keys accepted', async () => 
   assert.equal(d.weights.tb4, 0.35);
   assert.equal(resolveConfig({ eeeBlendDoer: 0.5 }).eee.blendDoer, 0.5);
   assert.equal(resolveConfig({ eee: { weights: { tb4: 0.5 } } }).eee.weights.tb4, 0.5);
+});
+
+test('config: flat eee keys merge OVER nested, junk weights rejected', async () => {
+  const { resolveConfig, validateConfigShape } = await import('../src/plugin.mjs');
+  // Review probe: nested tb4 survives AND flat bfcl applies (was dropped).
+  const merged = resolveConfig({ eee: { weights: { tb4: 0.5 } }, eeeWeights: { bfcl: 0.3 } }).eee.weights;
+  assert.equal(merged.tb4, 0.5);
+  assert.equal(merged.bfcl, 0.3);
+  assert.equal(merged.sweVerified, 0.1);
+  // Flat scalars win over nested, per the manifest text.
+  assert.equal(resolveConfig({ eee: { blendDoer: 0.9 }, eeeBlendDoer: 0.5 }).eee.blendDoer, 0.5);
+  assert.equal(resolveConfig({ eee: { maxAgeDays: 30 }, eeeMaxAgeDays: 3 }).eee.maxAgeDays, 3);
+  // A string weight is a shape error AND resolves to the default (never 0,
+  // never the string in the composite).
+  const bad = { eeeWeights: { tb4: 'high' } };
+  assert.ok(validateConfigShape(bad).some(e => e.includes('eeeWeights.tb4')));
+  assert.equal(resolveConfig(bad).eee.weights.tb4, 0.35);
+  assert.ok(validateConfigShape({ eee: { weights: { tb4: -1 } } }).some(e => e.includes('eee.weights.tb4')));
+  assert.deepEqual(validateConfigShape({ eeeWeights: { bfcl: 0.3 } }), []);
 });

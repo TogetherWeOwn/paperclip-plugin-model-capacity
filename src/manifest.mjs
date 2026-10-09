@@ -158,7 +158,7 @@ const CONFIG_SCHEMA = {
     eeeBlendDoer: { type: 'number', minimum: 0, maximum: 1, default: 0.25 },
     eeeBlendThinker: { type: 'number', minimum: 0, maximum: 1, default: 0.1 },
     eeeWeights: {
-      type: 'object', additionalProperties: true,
+      type: 'object', additionalProperties: { type: 'number', minimum: 0 },
       description: 'Flat overrides for EEE composite weights (merged over eee.weights).',
     },
     eeeMaxAgeDays: { type: 'number', minimum: 1, default: 7 },

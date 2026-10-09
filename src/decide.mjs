@@ -73,9 +73,11 @@ function sanitizeId(part) {
  * Decide one run on one account.
  *
  * ladderRungs: [{ rung, arms: [{ armId, model, effort, family,
- *   contextWindow, Q, C, trial, cap }] }] (already provider-filtered).
+ *   contextWindow, Q, C, trial, cap, qThinker }] }] (already provider-filtered).
  *   cap is the arm's tier-derived compact window ({ maxTokens,
  *   autoCompactTokens }) or null; it overrides the legacy sol/luna caps.
+ *   qThinker is the thinker-alpha EEE blend (null when AA-only); thinkers
+ *   sort on it, other roles on Q.
  * burnPerRunPct: armId -> expected weekly % consumed by one run (E_a[m]);
  *   missing entries mean uncalibrated: the arm is skipped when headroom is
  *   known, allowed (flagged weak) when headroom is unknown.
@@ -134,7 +136,11 @@ export function decide({
       return burn <= fiveHourHeadroomPct - reservePct;
     });
     if (fitting.length === 0) continue;
-    fitting.sort((a, b) => (b.Q - a.Q) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
+    // Thinkers rank on their own EEE blend (qThinker, alpha 0.10); every
+    // other role ranks on the ladder Q (doer blend). Arms without a thinker
+    // blend (AA-only, or ladders built before it existed) fall back to Q.
+    const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
+    fitting.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     const env = {};
     // Tier-derived compact window rides the chosen arm (arm.cap, set per

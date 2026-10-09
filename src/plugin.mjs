@@ -138,6 +138,12 @@ export function validateConfigShape(raw) {
   for (const [k, v] of Object.entries(weights ?? {})) {
     if (typeof v !== 'number' || !(v >= 0)) errors.push(`weights.${k} must be a non-negative number`);
   }
+  for (const [k, v] of Object.entries(raw.eee?.weights ?? {})) {
+    if (typeof v !== 'number' || !(v >= 0)) errors.push(`eee.weights.${k} must be a non-negative number`);
+  }
+  for (const [k, v] of Object.entries(raw.eeeWeights ?? {})) {
+    if (typeof v !== 'number' || !(v >= 0)) errors.push(`eeeWeights.${k} must be a non-negative number`);
+  }
   if (pacing && (pacing.guardHighPct <= pacing.guardRejoinPct)) errors.push('pacing.guardHighPct must exceed pacing.guardRejoinPct');
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   for (const b of armMap ?? []) {
@@ -167,6 +173,22 @@ export function validateConfigShape(raw) {
   }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
   return errors;
+}
+
+/**
+ * Scrub merged EEE weights: a non-numeric/negative override falls back to
+ * the research default for known metrics (a string weight must neither zero
+ * the metric nor drop it) and is dropped for unknown keys.
+ */
+function sanitizeEeeWeights(weights) {
+  const out = { ...weights };
+  for (const [k, v] of Object.entries(out)) {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+      if (k in DEFAULT_EEE_WEIGHTS) out[k] = DEFAULT_EEE_WEIGHTS[k];
+      else delete out[k];
+    }
+  }
+  return out;
 }
 
 export function resolveConfig(raw = {}) {
@@ -227,14 +249,16 @@ export function resolveConfig(raw = {}) {
     modelAaOverrides: raw.modelAaOverrides ?? {},
     // EEE benchmark prior (Phase 2): secondary quality signal blended beside
     // AA. Every default keeps today's AA-only behavior when the artifact is
-    // absent or stale (> eeeMaxAgeDays): bit-for-bit identical output.
+    // absent or stale (> eeeMaxAgeDays): bit-for-bit identical output. Flat
+    // keys merge OVER their nested versions, as the manifest documents; a
+    // non-numeric weight never survives (the default holds that metric).
     eee: {
-      blendDoer: raw.eee?.blendDoer ?? raw.eeeBlendDoer ?? DEFAULT_EEE_BLEND_DOER,
-      blendThinker: raw.eee?.blendThinker ?? raw.eeeBlendThinker ?? DEFAULT_EEE_BLEND_THINKER,
-      weights: { ...DEFAULT_EEE_WEIGHTS, ...(raw.eee?.weights ?? raw.eeeWeights ?? {}) },
-      maxAgeDays: raw.eee?.maxAgeDays ?? raw.eeeMaxAgeDays ?? DEFAULT_EEE_MAX_AGE_DAYS,
-      firstPartyDiscount: raw.eee?.firstPartyDiscount ?? raw.eeeFirstPartyDiscount ?? DEFAULT_EEE_FIRST_PARTY_DISCOUNT,
-      decayHalfLifeDays: raw.eee?.decayHalfLifeDays ?? raw.eeeDecayHalfLifeDays ?? DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
+      blendDoer: raw.eeeBlendDoer ?? raw.eee?.blendDoer ?? DEFAULT_EEE_BLEND_DOER,
+      blendThinker: raw.eeeBlendThinker ?? raw.eee?.blendThinker ?? DEFAULT_EEE_BLEND_THINKER,
+      weights: sanitizeEeeWeights({ ...DEFAULT_EEE_WEIGHTS, ...(raw.eee?.weights ?? {}), ...(raw.eeeWeights ?? {}) }),
+      maxAgeDays: raw.eeeMaxAgeDays ?? raw.eee?.maxAgeDays ?? DEFAULT_EEE_MAX_AGE_DAYS,
+      firstPartyDiscount: raw.eeeFirstPartyDiscount ?? raw.eee?.firstPartyDiscount ?? DEFAULT_EEE_FIRST_PARTY_DISCOUNT,
+      decayHalfLifeDays: raw.eeeDecayHalfLifeDays ?? raw.eee?.decayHalfLifeDays ?? DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
     },
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
@@ -431,9 +455,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const scored = new Map(computeComposite(served, config.weights).map(s => [s.armId, s]));
       // EEE blend: null Q_eee (no informing rows) keeps Q_aa untouched, so
       // unmeasured arms (e.g. haiku-5-5) are neither helped nor harmed. The
-      // doer alpha applies on the ladder path (role bands pick rungs later);
-      // thinker blending is identical except for its smaller alpha -- both
-      // are exposed per arm below so /ladder shows each side.
+      // ladder Pareto-orders on the DOER blend; the thinker blend rides
+      // qThinker per arm so decide() sorts thinkers on their own alpha.
       const eeeScored = eeeLive
         ? computeEeeComposite(served, eeeLive, {
           weights: config.eee.weights, nowMs: tickNow,
@@ -455,7 +478,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         const tier = tierCostOf(a, base);
         const qAa = scored.get(a.armId)?.Q ?? null;
         const qEee = eeeScored?.get(a.armId)?.Qeee ?? null;
-        eeeByArm.set(a.armId, { qAa, qEee, qBlended: blendQ(qAa, qEee, alphaDoer), eeePrior: eeeScored?.get(a.armId) ?? null });
+        eeeByArm.set(a.armId, {
+          qAa, qEee,
+          qBlended: blendQ(qAa, qEee, alphaDoer),
+          qThinker: blendQ(qAa, qEee, alphaThinker),
+          eeePrior: eeeScored?.get(a.armId) ?? null,
+        });
         return {
           armId: a.armId,
           Q: blendQ(qAa, qEee, alphaDoer),
@@ -477,7 +505,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const gateByArm = eeeScored
         ? new Map([...eeeScored].map(([armId, e]) => [armId, eeeGateDatum(e)]))
         : null;
-      const { rungs, dominated, dropped, withinNoise } = buildLadder(eligible, previousLadders?.[keyOf(account, i)]?.rungs ?? [], gateByArm);
+      // The CI rung gate holds across ticks: last tick's withinNoise pairs
+      // ride back in as heldPairs, so a held challenger stays gated against
+      // its incumbent until the 95% bar clears (see ladder.mjs).
+      const prev = previousLadders?.[keyOf(account, i)] ?? {};
+      const { rungs, dominated, dropped, withinNoise } = buildLadder(
+        eligible, prev.rungs ?? [], gateByArm, prev.withinNoise ?? []);
       ladders[keyOf(account, i)] = {
         rungs: rungs.map(r => {
           const arm = byArm.get(r.armId);
@@ -501,6 +534,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             qAa: eq.qAa ?? null,
             qEee: eq.qEee ?? null,
             qBlended: eq.qBlended ?? r.Q,
+            qThinker: eq.qThinker ?? null,
             eeePrior: eq.eeePrior?.Qeee ?? null,
           };
         }),
