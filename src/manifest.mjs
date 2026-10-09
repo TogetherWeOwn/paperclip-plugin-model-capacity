@@ -13,7 +13,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.2';
+export const PLUGIN_VERSION = '0.2.3';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

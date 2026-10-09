@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.2, all-providers)
+# Model Capacity plugin (v0.2.3, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -78,6 +78,19 @@ mapping uses resolved actual models.
    model-family hints). Until any `E` is measured the result is
    `calibration: weak` with no target and no caps. Guard-capped accounts
    contribute zero; a 75 hard ceiling binds the total.
+8. **Allocation (water-filling, v0.2.3)**: each decision goes to the
+   largest `(targetShare_a - inFlight_a)` inside the need band
+   (metered-behind, then reactive, then metered-ahead/over-burning).
+   `targetShare_a = requiredRate_a / E_a` (same term as the C*
+   concurrency target). In-flight is pooled at the **provider level**:
+   CLIProxy round-robins same-provider lanes onto shared credentials, so
+   lane-level spreading is theater and provider pressure is real.
+   In-flight = mapped running runs UNION fresh ring would-decisions for
+   unfinished runs (deduped by runId) PLUS decisions already made this
+   tick -- the order is re-sorted per run, so ten sequential decisions
+   spread in proportion to target shares instead of herding onto one
+   argmax winner. Reactive/trial caps still apply (per account, now also
+   counting this tick's pending decisions as a single-tick burst bound).
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
 under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`

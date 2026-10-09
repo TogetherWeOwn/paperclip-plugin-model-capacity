@@ -232,3 +232,28 @@ test('measured fleet success graduates a trial family', async () => {
   );
   assert.equal(capacity.body.trialTransitions, 2);
 });
+
+test('water-filling spreads ten decisions across three equal metered accounts', async () => {
+  // Herding regression test end to end: three metered lanes with identical
+  // quota signals and identical (proven) arms. The old static argmax order
+  // put all ten decisions on one lane; per-run re-sorting with tick-pending
+  // in-flight must spread them 4/3/3.
+  const mk = (provider, key) => rawAcct({
+    lane: `${provider}-1`, provider, key,
+    weekly: 0.3, reset: '2026-10-15T22:59:00Z', fiveHour: 0.1,
+    models: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'],
+  });
+  const fires = [];
+  for (let i = 0; i < 10; i++) fires.push(started(`run-wf-${i}`, TICK - 60000));
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [mk('p1', 'a1'), mk('p2', 'a2'), mk('p3', 'a3')],
+    steps: [{ now: TICK, fire: fires }],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(shadow.body.entries.length, 10);
+  const counts = {};
+  for (const e of shadow.body.entries) counts[e.accountId] = (counts[e.accountId] ?? 0) + 1;
+  assert.deepEqual(Object.values(counts).sort(), [3, 3, 4]);
+  for (const a of capacity.body.accounts) assert.ok(a.targetShare > 0, `${a.accountId} carries a target share`);
+});

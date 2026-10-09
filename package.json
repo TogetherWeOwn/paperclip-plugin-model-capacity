@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Enforce-capable model-capacity routing: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.2.2 routes all providers; v0.2.1 enforces run models only when the enforce flag is true (default false).",
   "license": "MIT",
   "type": "module",

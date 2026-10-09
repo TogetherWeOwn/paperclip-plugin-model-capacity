@@ -696,6 +696,47 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (run.status === 'running') inFlightByAccount[key] = (inFlightByAccount[key] ?? 0) + 1;
     }
 
+    // Allocation targets and provider pools. CLIProxy round-robins lanes
+    // of the same provider onto shared credentials, so lane-level in-flight
+    // spreading is theater: pressure is real only at the provider bucket.
+    // Each account's target share is requiredRate / E (runs/hour it can
+    // sustain; proportions match the per-account C* concurrency targets).
+    // E prefers measured burn-per-run, then the ladder-average burn, then
+    // the calibration reference anchor.
+    const keyToProvider = new Map(stateKeys.map((k, i) =>
+      [k, String(snapshot.accounts[i]?.provider ?? String(k).split(':')[0]).toLowerCase()]));
+    const poolOfKey = (key) => keyToProvider.get(key) ?? String(key).split(':')[0].toLowerCase();
+    {
+      const refAnchor = config.calibration?.referenceBurnPerRunPct ?? 0.0005;
+      const runsInSpan = (key, spanMs) => (runsByAccount.get(key) ?? []).filter(r => nowMs - r.at <= spanMs).length;
+      for (let i = 0; i < snapshot.accounts.length; i++) {
+        const key = stateKeys[i];
+        const view = accountViews[i];
+        if (!view) continue;
+        view.pool = poolOfKey(key);
+        let E = null;
+        const spanMs = view.rateSpanMs ?? null;
+        if (spanMs != null && spanMs > 0 && view.weeklyUsedPct != null) {
+          const hist = rateHistories[key] ?? [];
+          const inSpan = hist.filter(p => nowMs - p.atMs <= spanMs);
+          if (inSpan.length >= 2) {
+            const delta = inSpan[inSpan.length - 1].usedPct - inSpan[0].usedPct;
+            const n = runsInSpan(key, spanMs);
+            if (delta > 0 && n > 0) E = delta / n;
+          }
+        }
+        if (E == null) {
+          const vals = Object.values(ladders[key]?.burnPerRunPct ?? {}).filter(v => v != null);
+          if (vals.length > 0) E = vals.reduce((s, v) => s + v, 0) / vals.length;
+        }
+        if (E == null || !(E > 0)) E = refAnchor;
+        view.effectiveBurnPerRunPct = E;
+        view.targetShare = view.requiredRatePerHour != null && view.requiredRatePerHour > 0
+          ? view.requiredRatePerHour / E
+          : null;
+      }
+    }
+
     // Trial promotion: terminal runs with a resolved model feed per-family
     // finished/failed counters (each run counted once, via seenTerminal).
     // A non-proven family graduates at trials.minRuns runs with
@@ -814,33 +855,65 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         trialBudget[fam] = Math.max(0, config.trials.maxInFlightPerFamily - (trialInFlight[fam] ?? 0));
       }
     }
-    // Deficit order: hungriest qualified account first, reactive behind
-    // metered-behind-plan, over-burning last, unhealthy and metered-unknown
-    // never. Same order the hook uses.
-    const selectionOrder = orderAccountsForRun(
+    // Pooled in-flight: mapped running runs UNION fresh ring
+    // would-decisions for unfinished runs, deduped by runId. Either source
+    // alone undercounts (ring-only runs older than the rate window; runs
+    // the tick loop has not decided yet are added per-run below).
+    const inFlightByPool = {};
+    {
+      const finishedIds = new Set(runs.filter(r => r.status === 'finished' || r.status === 'failed').map(r => r.runId));
+      const countedRunning = new Set();
+      for (const [key, list] of runsByAccount) {
+        for (const r of list) {
+          if (r.status !== 'running') continue;
+          const p = poolOfKey(key);
+          inFlightByPool[p] = (inFlightByPool[p] ?? 0) + 1;
+          countedRunning.add(r.runId);
+        }
+      }
+      for (const e of ring.list(500)) {
+        if (!e?.runId || !e?.accountId) continue;
+        if (countedRunning.has(e.runId) || finishedIds.has(e.runId)) continue;
+        if (nowMs - e.at > 2 * 3600 * 1000) continue;
+        const p = poolOfKey(e.accountId);
+        inFlightByPool[p] = (inFlightByPool[p] ?? 0) + 1;
+        countedRunning.add(e.runId);
+      }
+    }
+    // Water-filling order, rebuilt per run: need band first, then largest
+    // (targetShare - pooled in-flight). Decisions made earlier in THIS tick
+    // count as in-flight, so sequential decisions spread across accounts
+    // instead of herding onto one static argmax winner. Same order the hook
+    // and the event-time path use (via the live view below).
+    const tickPoolPending = {};
+    const tickAcctPending = {};
+    const allocationOrder = () => orderAccountsForRun(
       accountViews.map(v => ({
         accountId: v.accountId,
         resetAtMs: v.resetAtMs,
         headroomPct: v.headroomPct,
         measuredRatePerHour: v.measuredRatePerHour,
         requiredRatePerHour: v.requiredRatePerHour,
+        targetShare: v.targetShare ?? null,
         health: v.health,
         meter: v.meter,
         quality: v.quality,
-        inFlight: inFlightByAccount[v.accountId] ?? 0,
+        inFlight: (inFlightByPool[v.pool] ?? 0) + (tickPoolPending[v.pool] ?? 0),
       })),
       { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel },
     );
-    const selectionById = new Map(selectionOrder.map(s => [s.accountId, s]));
 
     // Publish the live view the memory-only resolve hook reads. No I/O
     // happens in the hook, so everything it needs is frozen here: effective
     // headroom (5h, else the weekly fallback for feed-model accounts),
-    // health/meter/reactive for the eligibility filter, in-flight counts
-    // for the reactive cap, and the trial budgets + adapters for trial arms.
+    // health/meter/reactive for the eligibility filter, provider + target
+    // share + pooled in-flight for water-filling allocation, per-account
+    // in-flight for the reactive cap, and the trial budgets + adapters for
+    // trial arms.
     liveViews.set(companyId, {
       atMs: nowMs,
       enforce: config.enforce === true,
+      inFlightByPool,
       thinkerAgentIds: config.roles.thinkerAgentIds,
       roleBands: {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
@@ -855,10 +928,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         const ladder = ladders[a.accountId];
         return {
           accountId: a.accountId,
+          provider: view?.pool ?? poolOfKey(a.accountId),
+          pool: view?.pool ?? poolOfKey(a.accountId),
           pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
           headroomPct: view?.headroomPct ?? null,
           headroomSource: view?.headroomSource ?? null,
           remainingKnown: view?.remainingPct != null,
+          targetShare: view?.targetShare ?? null,
           reactive: view?.reactive === true,
           health: view?.health ?? 'unknown',
           meter: view?.meter ?? null,
@@ -890,16 +966,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     for (const run of candidates) {
       const role = roleOf(config, run.agentId);
       let decision = null;
-      for (const sel of selectionOrder) {
+      // Fresh order per run: earlier decisions in this tick already narrow
+      // the winner's shortfall, so the next run spreads elsewhere.
+      for (const sel of allocationOrder()) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
         if (!view || !ladder) continue;
         // Reactive accounts qualify without a remaining fraction; metered
         // accounts need one. Reactive lanes are capped in flight per account
         // (default 2): no vendor meter means no burn signal, so the count of
-        // running runs is the only backpressure.
+        // running runs is the only backpressure. Decisions already made
+        // this tick count toward the cap: it bounds single-tick bursts, not
+        // just previously observed executions.
         if (!view.reactive && view.remainingPct == null) continue;
-        if (view.reactive && (inFlightByAccount[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
+        if (view.reactive && (inFlightByAccount[sel.accountId] ?? 0) + (tickAcctPending[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
         const d = decide({
           runId: run.runId,
           agentId: run.agentId,
@@ -921,6 +1001,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         });
         if (d.kind === 'decide') {
           decision = d;
+          // Water-filling state: the next candidate run sees this decision
+          // as in-flight (pool pressure) and toward the account cap (burst
+          // bound), even though nothing has executed yet.
+          tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
+          const pool = poolOfKey(d.accountId);
+          tickPoolPending[pool] = (tickPoolPending[pool] ?? 0) + 1;
           break;
         }
       }
@@ -1006,6 +1092,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (!t.family || !runningIds.has(t.runId)) continue;
       trialInFlight[t.family] = (trialInFlight[t.family] ?? 0) + 1;
     }
+    // The live view published above predates this tick's decisions; fold
+    // the tick's pool pressure into it so the hook and event-time path
+    // water-fill against fresh counts until the next tick republishes.
+    // (Per-tick state: the next tick recomputes from scratch, no double
+    // counting.)
+    {
+      const live = liveViews.get(companyId);
+      if (live) {
+        const merged = { ...(live.inFlightByPool ?? {}) };
+        for (const [pool, n] of Object.entries(tickPoolPending)) merged[pool] = (merged[pool] ?? 0) + n;
+        live.inFlightByPool = merged;
+      }
+    }
     const trialFamilies = {};
     {
       const fams = new Set([...Object.keys(trialState.counters ?? {}), ...Object.keys(trialBudget)]);
@@ -1036,6 +1135,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       trialFamilies,
       trialTransitions,
       inFlightByAccount,
+      inFlightByPool,
       reactiveAccounts: accountViews.filter(v => v.reactive).length,
       runsObserved: runs.length,
       runsCandidates: candidates.length,
@@ -1080,13 +1180,42 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * beats no decision for a minute). Runs whose events carry adapterType
    * get full trial eligibility here AND in the tick loop.
    */
+  /**
+   * Water-filling order over the frozen live view (hook + event-time path).
+   * In-flight is the pooled pressure the last tick published plus every
+   * queued hook/event decision since (same-provider lanes share one
+   * bucket). Spreads objects so per-call counts never mutate the view.
+   */
+  function allocationOrderFromLive(live, companyId) {
+    const providerOf = new Map((live.accounts ?? []).map(a =>
+      [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
+    const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
+    const poolPending = {};
+    for (const q of [...(pendingEnforced.get(companyId) ?? []), ...(pendingShadow.get(companyId) ?? [])]) {
+      if (!q?.accountId) continue;
+      const p = poolOf(q.accountId);
+      poolPending[p] = (poolPending[p] ?? 0) + 1;
+    }
+    return orderAccountsForRun(
+      (live.accounts ?? []).map(a => {
+        const p = poolOf(a.accountId);
+        return {
+          ...a,
+          targetShare: a.targetShare ?? null,
+          inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
+        };
+      }),
+      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 },
+    );
+  }
+
   function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
     if (!live || !config) return null;
     if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return null;
     const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(run.agentId) ? 'thinker' : 'doer';
-    const order = orderAccountsForRun(live.accounts, { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 });
+    const order = allocationOrderFromLive(live, companyId);
     for (const view of order) {
       if (!view || !view.ladderRungs || view.ladderRungs.length === 0) continue;
       if (!view.reactive && !view.remainingKnown) continue;
@@ -1377,12 +1506,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
       const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(params.agentId) ? 'thinker' : 'doer';
-      // Same deficit order as the shadow tick: hungriest qualified first,
-      // reactive behind metered-behind-plan, over-burning last. Metered
-      // accounts without headroom never qualify; healthy reactive accounts
-      // qualify without headroom (no vendor meter exists), capped in flight
-      // per account.
-      const order = orderAccountsForRun(live.accounts, { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 });
+      // Same water-filling order as the shadow tick: need band first, then
+      // largest (targetShare - pooled in-flight). Metered accounts without
+      // headroom never qualify; healthy reactive accounts qualify without
+      // headroom (no vendor meter exists), capped in flight per account.
+      const order = allocationOrderFromLive(live, params.companyId);
       for (const view of order) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;

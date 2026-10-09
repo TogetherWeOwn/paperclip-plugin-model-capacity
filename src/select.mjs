@@ -13,19 +13,26 @@
  * because a meter that should exist but doesn't means the reading, not
  * the quota, is broken).
  *
- * Ranking: the hungriest metered account first --
+ * Ranking is water-filling inside need bands. Bands come first (they encode
+ * proven need): metered-behind-plan (band 0), then reactive (band 1: no
+ * required rate, so it cannot prove need, but use-it-or-lose-it with
+ * unknown size still beats burning quota against the plan), then
+ * metered-ahead-of-plan and over-burning (band 2, last). Inside a band the
+ * hungriest SHORTFALL wins --
+ *
+ *   shortfall = targetShare - inFlight,  targetShare = requiredRate / E
+ *
+ * (same term as the per-account C* concurrency target; proportions match
+ * because every share scales by the same mean run duration). Each decision
+ * lands on the largest shortfall, so sequential decisions spread across
+ * accounts in proportion to their target shares instead of herding onto one
+ * argmax winner. Unknown targets count as 0, so unknown-rate accounts
+ * spread idle-first. Remaining ties break by deficit --
  *
  *   deficit = (requiredRate - measuredRate) / requiredRate
  *
- * (positive = behind schedule; negative = ahead). Unknown measured rates
- * score deficit 0: behind hungry accounts, ahead of over-served ones.
- * Earliest reset breaks ties; accountId breaks those. Reactive accounts
- * rank AFTER every metered account that is behind plan (they have no
- * required rate, so they cannot prove need) but BEFORE any metered
- * account that is ahead of plan (burning quota with no signal beats
- * burning quota against the plan): use-it-or-lose-it with unknown size.
- * Over-burning metered accounts sort last, so they get no new marginal
- * runs unless nothing else qualifies.
+ * (positive = behind schedule; negative = ahead; unknown rates score 0) --
+ * then earliest reset, then accountId.
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
@@ -47,13 +54,33 @@ export function isOverBurning(view, rateDeadbandRel = 0.15) {
 }
 
 /**
+ * Water-filling shortfall: target share minus in-flight runs. The target
+ * share is requiredRate / E (runs/hour the account can sustain; proportions
+ * match the per-account C* concurrency targets, which scale every share by
+ * the same mean run duration). Null/unknown targets count as 0, so
+ * unknown-rate and reactive accounts spread idle-first.
+ */
+export function shortfallOf(view) {
+  const t = view?.targetShare;
+  const target = (t != null && t > 0) ? t : 0;
+  return target - (view?.inFlight ?? 0);
+}
+
+/**
  * Order account views for one run.
  * views: [{ accountId, resetAtMs, headroomPct (0-1 or null),
  *   measuredRatePerHour (nullable), requiredRatePerHour (nullable),
+ *   targetShare (nullable runs/hour; requiredRate / E),
  *   health ('healthy' to qualify), meter/quality (reactive detection),
- *   inFlight (running runs, tie-break inside the reactive band) }]
+ *   inFlight (running runs mapped to the account's pool PLUS decisions
+ *   already made this tick -- callers re-sort per run with fresh counts) }]
  * Unhealthy accounts and metered accounts without headroom are dropped;
  * healthy reactive accounts qualify without headroom.
+ *
+ * Sort: need band, then water-filling shortfall (largest first), then
+ * deficit, then earliest reset, then accountId. Re-sorting with updated
+ * in-flight after every decision is what spreads load: a static order
+ * re-used across runs herds every decision onto the same winner.
  */
 export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel = 0.15 } = {}) {
   const qualified = (views ?? []).filter(v => {
@@ -73,8 +100,8 @@ export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel 
   const bandCmp = (a, b) => bandOf(a) - bandOf(b);
   return [...qualified].sort((a, b) =>
     bandCmp(a, b) ||
+    (shortfallOf(b) - shortfallOf(a)) ||
     (deficitOf(b) - deficitOf(a)) ||
-    ((a.inFlight ?? 0) - (b.inFlight ?? 0)) ||
     ((a.resetAtMs ?? Number.MAX_SAFE_INTEGER) - (b.resetAtMs ?? Number.MAX_SAFE_INTEGER)) ||
     (a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0),
   );

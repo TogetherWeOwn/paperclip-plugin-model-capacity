@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { deficitOf, isOverBurning, orderAccountsForRun } from '../src/select.mjs';
+import { deficitOf, isOverBurning, orderAccountsForRun, shortfallOf } from '../src/select.mjs';
 
 const view = (accountId, partial = {}) => ({
   accountId, resetAtMs: null, headroomPct: 0.9, health: 'healthy',
@@ -90,4 +90,56 @@ test('in-flight breaks ties inside the reactive band', () => {
     view('idle', { headroomPct: null, meter: 'reactive', inFlight: 0 }),
   ]).map(v => v.accountId);
   assert.deepEqual(order, ['idle', 'busy']);
+});
+
+test('shortfall is target share minus in-flight; unknown targets count as zero', () => {
+  assert.equal(shortfallOf(view('a', { targetShare: 5, inFlight: 2 })), 3);
+  assert.equal(shortfallOf(view('b', { inFlight: 0 })), 0);
+  assert.equal(shortfallOf(view('c', { targetShare: null, inFlight: 1 })), -1);
+});
+
+test('water-filling beats deficit inside a band: larger shortfall wins', () => {
+  // Both behind plan; b is hungrier (deficit 0.9 vs 0.5) but a has the
+  // larger headroom to target (shortfall 5 vs 1). Allocation fills the
+  // target first; deficit decides only true ties.
+  const order = orderAccountsForRun([
+    view('a', { headroomPct: 0.9, measuredRatePerHour: 0.005, requiredRatePerHour: 0.01, targetShare: 5, inFlight: 0 }),
+    view('b', { headroomPct: 0.9, measuredRatePerHour: 0.001, requiredRatePerHour: 0.01, targetShare: 1, inFlight: 0 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['a', 'b']);
+});
+
+test('in-flight pressure flips the shortfall order: the fuller account waits', () => {
+  const order = orderAccountsForRun([
+    view('a', { headroomPct: 0.9, targetShare: 5, inFlight: 5 }),
+    view('b', { headroomPct: 0.9, targetShare: 2, inFlight: 0 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['b', 'a']);
+});
+
+test('bands still dominate shortfall: reactive beats a fat ahead-of-plan target', () => {
+  const order = orderAccountsForRun([
+    view('ahead', { headroomPct: 0.9, measuredRatePerHour: 0.011, requiredRatePerHour: 0.01, targetShare: 9, inFlight: 0 }),
+    view('reactive', { headroomPct: null, meter: 'reactive', inFlight: 0 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['reactive', 'ahead']);
+});
+
+test('ten sequential decisions spread in proportion to target shares, not 10/0/0', () => {
+  // The herding regression test: re-sort per decision with the winner's
+  // in-flight incremented, exactly as the tick loop does. Targets 5/3/2
+  // over 10 picks must come out 5/3/2.
+  const mk = (accountId, targetShare, inFlight) =>
+    view(accountId, { headroomPct: 0.9, targetShare, inFlight });
+  const state = { a: 0, b: 0, c: 0 };
+  const targets = { a: 5, b: 3, c: 2 };
+  for (let i = 0; i < 10; i++) {
+    const [winner] = orderAccountsForRun([
+      mk('a', targets.a, state.a),
+      mk('b', targets.b, state.b),
+      mk('c', targets.c, state.c),
+    ]);
+    state[winner.accountId] += 1;
+  }
+  assert.deepEqual(state, { a: 5, b: 3, c: 2 });
 });
