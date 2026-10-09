@@ -61,9 +61,9 @@ import {
   sanitizeBreakers, classifyArmError, breakerState,
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
-  breakerStoreToJSON, createBreakerStore,
+  breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
 import {
@@ -270,6 +270,27 @@ export function validateConfigShape(raw) {
       else if (Array.isArray(b[k]) && b[k].some(s => typeof s !== 'string')) errors.push(`breakers.${k} must be an array of strings`);
     }
   }
+  if (raw.caps != null) {
+    if (typeof raw.caps !== 'object' || Array.isArray(raw.caps)) {
+      errors.push('caps must be an object');
+    } else if ('reservedFloors' in raw.caps) {
+      const rf = raw.caps.reservedFloors;
+      if (rf == null || typeof rf !== 'object' || Array.isArray(rf)) {
+        errors.push('caps.reservedFloors must be an object of agent id to floor');
+      } else {
+        for (const [agentId, spec] of Object.entries(rf)) {
+          if (spec == null || typeof spec !== 'object' || Array.isArray(spec)) {
+            errors.push(`caps.reservedFloors.${agentId} must be an object of base, perQueued and max`);
+          } else {
+            if (!Number.isInteger(spec.base) || spec.base < 0) errors.push(`caps.reservedFloors.${agentId}.base must be an integer >= 0`);
+            if (!Number.isInteger(spec.perQueued) || spec.perQueued < 1) errors.push(`caps.reservedFloors.${agentId}.perQueued must be an integer >= 1`);
+            if (!Number.isInteger(spec.max) || spec.max < 0) errors.push(`caps.reservedFloors.${agentId}.max must be an integer >= 0`);
+            else if (Number.isInteger(spec.base) && spec.max < spec.base) errors.push(`caps.reservedFloors.${agentId}.max must be >= base`);
+          }
+        }
+      }
+    }
+  }
   return errors;
 }
 
@@ -414,7 +435,33 @@ export function resolveConfig(raw = {}) {
     // (2 arm-fatal failures in 30 min -> 6h cool-off, doubling to 48h) with a
     // half-open single-probe recovery. Nested only; sanitizeBreakers coerces.
     breakers: sanitizeBreakers(raw.breakers),
+    // Reserved per-agent floors: `{ [agentId]: { base, perQueued, max } }`,
+    // empty by default (no behaviour change until set). Invalid entries are
+    // dropped here (the validator reports them); fromEntries defines own
+    // data properties, so a '__proto__' agent id stays a key, never the
+    // prototype.
+    caps: {
+      reservedFloors: sanitizeReservedFloors(raw.caps?.reservedFloors),
+    },
   };
+}
+
+/**
+ * Keep only well-formed floor specs: base integer >= 0, perQueued integer
+ * >= 1, max integer >= base. Anything else reads as unconfigured.
+ */
+function sanitizeReservedFloors(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const kept = [];
+  for (const [agentId, spec] of Object.entries(raw)) {
+    if (typeof agentId !== 'string' || agentId.length === 0) continue;
+    if (spec == null || typeof spec !== 'object' || Array.isArray(spec)) continue;
+    if (!Number.isInteger(spec.base) || spec.base < 0) continue;
+    if (!Number.isInteger(spec.perQueued) || spec.perQueued < 1) continue;
+    if (!Number.isInteger(spec.max) || spec.max < spec.base) continue;
+    kept.push([agentId, { base: spec.base, perQueued: spec.perQueued, max: spec.max }]);
+  }
+  return Object.fromEntries(kept);
 }
 
 // Weekly window length for schedule-error math (the lane reports `used`
@@ -2617,7 +2664,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
-        return { status: 200, body: { atMs, calibration, target, agents } };
+        // Reserved floors run LAST, after the allocator and the hold, so
+        // smoothing never takes a floored cap below its floor. Memory-only
+        // breaker read: while every tracked arm is breaker-open (cooling)
+        // floors suspend and floored caps hold at running.
+        const resolved = lastConfig.get(companyId);
+        const reservedFloors = resolved?.caps?.reservedFloors ?? {};
+        let floorsSuspended = false;
+        let floorSummary = {};
+        if (Object.keys(reservedFloors).length > 0) {
+          try {
+            const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+            floorsSuspended = breakerSuspendsFloors(bstore, nowMs, resolved?.breakers ?? DEFAULT_BREAKERS);
+          } catch (error) {
+            ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
+          }
+          const floored = applyReservedFloors(agents, {
+            reservedFloors,
+            ceiling: cap.maxTotal ?? 75,
+            blockedAgentIds: floorsSuspended ? Object.keys(reservedFloors) : [],
+          });
+          agents = floored.entries;
+          floorSummary = floored.floors;
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },

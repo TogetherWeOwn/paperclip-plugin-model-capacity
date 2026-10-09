@@ -217,6 +217,26 @@ export function breakerAllows(store, accountId, armId, nowMs, cfg = DEFAULT_BREA
   return true;
 }
 
+/**
+ * Reserved-floor guard: true while every tracked arm reads breaker-open
+ * (cooling). Extra floor slots are safe while ANY arm can serve -- placement
+ * already avoids cooled arms, so they land on healthy ones -- and only a
+ * fleet-wide cooling suspends floors, holding floored caps at running so
+ * failed runs on cooled models cannot rise. Half-open arms serve (the probe
+ * slot), an empty store tracks nothing, and a disabled breaker never
+ * suspends.
+ */
+export function breakerSuspendsFloors(store, nowMs, cfg = DEFAULT_BREAKERS) {
+  if (cfg?.enabled === false) return false;
+  const arms = store?.arms ?? {};
+  const keys = Object.keys(arms);
+  if (keys.length === 0) return false;
+  return keys.every(k => {
+    const e = arms[k];
+    return breakerState(store, e?.accountId, e?.armId, nowMs, cfg) === 'open';
+  });
+}
+
 /** RunId currently occupying the half-open probe slot, if any. */
 export function breakerProbeRunId(store, accountId, armId, nowMs, cfg = DEFAULT_BREAKERS) {
   if (breakerState(store, accountId, armId, nowMs, cfg) !== 'half-open') return null;

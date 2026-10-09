@@ -17,6 +17,13 @@
  * 0 restores pure water-filling); /capacity reports per-family run
  * outcomes. No capability, egress, secret or env-key change.
  *
+ * v0.2.20 = RESERVED PER-AGENT FLOORS: `caps.reservedFloors` holds queued
+ * agents at `min(demand, clamp(base + floor(queued / perQueued), base,
+ * max))`, applied after the allocator and the hold with reason
+ * `reserved-floor`; floors win the fleet ceiling and suspend while every
+ * tracked arm is breaker-open. Empty by default. No capability, egress,
+ * secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -52,7 +59,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.19';
+export const PLUGIN_VERSION = '0.2.20';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -306,6 +313,24 @@ const CONFIG_SCHEMA = {
       properties: {
         qualityWeight: { type: 'number', minimum: 0, default: 1 },
         allowanceWeight: { type: 'number', minimum: 0, default: 0.35 },
+      },
+    },
+    caps: {
+      type: 'object', additionalProperties: false,
+      description: 'Reserved per-agent floors for /caps: empty by default (no behaviour change until set).',
+      properties: {
+        reservedFloors: {
+          type: 'object', default: {},
+          description: 'Agent id to floor: min(demand, clamp(base + floor(queued / perQueued), base, max)). Applied after the allocator and the hold; suspends while every tracked arm is breaker-open.',
+          additionalProperties: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              base: { type: 'integer', minimum: 0, default: 4 },
+              perQueued: { type: 'integer', minimum: 1, default: 20 },
+              max: { type: 'integer', minimum: 0, default: 8 },
+            },
+          },
+        },
       },
     },
     shadow: {

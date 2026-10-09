@@ -329,6 +329,98 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
   }));
 }
 
+/**
+ * Reserved per-agent floor: `min(demand, clamp(base + floor(queued /
+ * perQueued), base, max))` with demand = running + queued. Config-only and
+ * empty by default; the operator sets entries under `caps.reservedFloors`.
+ * Returns null for a missing or invalid spec (the validator reports those;
+ * the allocator ignores them), so an unset floor never moves a cap.
+ */
+export function computeReservedFloor(running, queued, spec) {
+  const r = Math.max(0, Math.floor(running ?? 0));
+  const q = Math.max(0, Math.floor(queued ?? 0));
+  const base = spec?.base;
+  const perQueued = spec?.perQueued;
+  const max = spec?.max;
+  if (!Number.isInteger(base) || base < 0) return null;
+  if (!Number.isInteger(perQueued) || perQueued < 1) return null;
+  if (!Number.isInteger(max) || max < base) return null;
+  const clamped = Math.min(Math.max(base + Math.floor(q / perQueued), base), max);
+  return Math.min(r + q, clamped);
+}
+
+/**
+ * Apply reserved floors LAST: after allocateDemandCaps and after the
+ * holdCaps hysteresis, so smoothing never takes a cap below a floor.
+ *
+ * entries: allocateDemandCaps()/holdCaps output. reservedFloors:
+ * `{ [agentId]: { base, perQueued, max } }` (already sanitized; invalid
+ * entries are ignored). blockedAgentIds: agents whose floor is suspended
+ * while every arm they can use is breaker-open -- their cap holds where the
+ * allocator put it (never below running), and the floor stays visible for
+ * audit. Returns `{ entries, applied, floors }` where `applied` lists the
+ * lifted agents and `floors` maps each configured agent to
+ * `{ floor, applied, blocked }`.
+ *
+ * Floors win the ceiling: when floors push the sum over it, non-floored
+ * agents give back NEW slots only (largest first, one slot at a time),
+ * never below their running count. Floored agents are never cut; when even
+ * running plus floors hold the total over the ceiling it reports as-is,
+ * like running does today.
+ */
+export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75, blockedAgentIds = [] } = {}) {
+  const list = (entries ?? []).map(e => ({ ...e }));
+  const specs = new Map(Object.entries(reservedFloors ?? {}));
+  const blocked = new Set(blockedAgentIds ?? []);
+  const cap = Math.max(1, Math.floor(ceiling ?? 75));
+  const applied = [];
+  // Map accumulator, same '__proto__' discipline as the allocator above:
+  // agentIds are host strings, and indexing a plain object with
+  // '__proto__' would hit the prototype setter. fromEntries at the end
+  // defines own data properties, so the snapshot reads back safely.
+  const floorMap = new Map();
+  for (const e of list) {
+    if (typeof e.agentId !== 'string' || e.agentId.length === 0) continue;
+    if (!specs.has(e.agentId)) continue;
+    const floor = computeReservedFloor(e.running, e.queued, specs.get(e.agentId));
+    if (floor == null) continue;
+    const summary = { floor, applied: false, blocked: false };
+    floorMap.set(e.agentId, summary);
+    if (blocked.has(e.agentId)) {
+      e.floor = floor;
+      e.floorBlocked = true;
+      summary.blocked = true;
+      continue;
+    }
+    e.floor = floor;
+    if (floor > e.allocated) {
+      e.allocated = floor;
+      e.maxConcurrentRuns = floor;
+      e.reason = 'reserved-floor';
+      applied.push(e.agentId);
+      summary.applied = true;
+    }
+  }
+  // Fleet bound: floors win, so only non-floored agents give back, and only
+  // the slots above their running count (a cap under running is fiction).
+  const sum = () => list.reduce((s, e) => s + e.allocated, 0);
+  const lifted = new Set(applied);
+  let guard = list.length * 400;
+  while (sum() > cap && guard-- > 0) {
+    let best = -1;
+    let bestNew = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (lifted.has(list[i].agentId)) continue;
+      const fresh = list[i].allocated - Math.max(0, Math.floor(list[i].running ?? 0));
+      if (fresh > bestNew) { best = i; bestNew = fresh; }
+    }
+    if (best < 0) break;
+    list[best].allocated -= 1;
+    list[best].maxConcurrentRuns = list[best].allocated;
+  }
+  return { entries: list, applied, floors: Object.fromEntries(floorMap) };
+}
+
 /** Integer split of total by weights, largest remainder, index-stable. */
 function largestRemainder(total, weights) {
   const wTotal = weights.reduce((s, w) => s + w, 0);
