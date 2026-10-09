@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.5, all-providers)
+# Model Capacity plugin (v0.2.6, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -33,6 +33,14 @@ measured success graduates them; reactive accounts (vendor publishes no
 meter) are eligible while healthy. Shadow decisions are recorded event-time
 from `agent.run.started` when the resolver is absent, and run->account
 mapping uses resolved actual models.
+
+**v0.2.6 = RUN-ACCOUNTING FIXES.** Trial budgets are consumed in all three
+decision paths (tick, hook, event-time); the per-account reactive/trial
+cap counts per-account in-flight plus per-account pending in every path
+while provider-pool totals order allocation only; terminal runIds are
+retained for the full ring horizon; `agent.run.cancelled` is subscribed
+and terminal; terminal `payload.modelDecision.model` is authoritative for
+attribution and graduation.
 
 ## How it decides (per account, per run)
 
@@ -98,8 +106,9 @@ mapping uses resolved actual models.
    unfinished runs (deduped by runId) PLUS decisions already made this
    tick -- the order is re-sorted per run, so ten sequential decisions
    spread in proportion to target shares instead of herding onto one
-   argmax winner. Reactive/trial caps still apply (per account, now also
-   counting this tick's pending decisions as a single-tick burst bound).
+   argmax winner. Reactive/trial caps still apply per account in every path
+   (per-account in-flight plus that account's pending decisions); pooled
+   totals order allocation only.
 
 Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
 under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
@@ -125,7 +134,8 @@ unknown-headroom case) and stays excluded: it is NOT granted the weekly
 fallback. A REACTIVE account is different: the vendor publishes no meter
 at all (`meter`/`quality` reads `reactive`, no weekly numbers exist), so
 there is no meter to be broken -- a healthy reactive account qualifies
-WITHOUT headroom, is capped in flight per account (`trials.
+WITHOUT headroom, is capped in flight per account (plus that account's
+pending decisions: `trials.
 maxInFlightPerAccount`, default 2), and ranks after metered-behind-plan
 but before metered-ahead-of-plan (use-it-or-lose-it with unknown size).
 Over-burning metered accounts sort last. Zero-cost models are fine as
@@ -134,16 +144,28 @@ doer trial arms; the AA `costPerTask` decides their rung, not their price.
 Trial graduation is measured, not assumed: terminal runs with resolved
 models feed per-family finished/failed counters (`/capacity` ->
 `trialFamilies`), and a family graduates at `trials.minRuns` runs
-(default 10) with `trials.minSuccessRate` success (default 0.8). The
-agent-config source is a pinned model, not an observed execution, hence
-the bar. Graduated families route as full members on the next tick.
+(default 10) with `trials.minSuccessRate` success (default 0.8). The run
+model is authoritative in this order: terminal
+`payload.modelDecision.model` (the applied decision), then resolved
+actuals, then agent config -- the agent-config source is a pinned model,
+not an observed execution, hence the bar. Cancelled runs are terminal
+for slot accounting but feed neither counter. Trial budgets
+(`trials.maxInFlightPerFamily`, default 2) are consumed in all three
+decision paths (tick, hook, event-time), so a burst inside one tick
+cannot overshoot. Graduated families route as full members on the next tick.
 
 Shadow records three provenances: tick decisions, `enforced:true` hook
 decisions, and `eventTime:true` decisions recorded memory-only from
 `agent.run.started` when the resolver is absent (live view + cached
 config, zero I/O, stale views over 120s record nothing). The tick merges
 all three, backfills actual models (entries first, then the runs they
-came from), and never re-decides a recorded runId.
+came from), and never re-decides a recorded runId. Terminal runIds
+persist for the full ring horizon, so a run that finished more than 60
+minutes ago still clears its slot after aging out of the rate window;
+ring entries older than max(3 x mean run duration, 2h) with no terminal
+event are stale-dropped (`/capacity` -> `staleInFlightDropped`), and
+total pooled in-flight is clamped to observed running runs
+(`clampedInFlightDropped`).
 
 `GET /caps` spreads the concurrency target over agents with queued/ready
 work (assigned `todo` + `in_progress` issues, grouped by assignee):

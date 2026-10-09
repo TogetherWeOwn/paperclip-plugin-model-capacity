@@ -67,6 +67,15 @@ const RUNEVT_KEY = 'run-events-v1';
  */
 const RUNS_KEY = 'runs-v1';
 const RUNS_CAP = 500;
+// Terminal runIds retained for the full in-flight horizon (the merged runs
+// above only cover the 60-min rate window, but ring entries count longer --
+// without this, runs that finished 60-120 min ago count as in flight).
+const TERMINAL_KEY = 'terminal-runs-v1';
+const TERMINAL_CAP = 5000;
+
+/** Run statuses that free their in-flight slot. Cancelled included: the host emits it, so we honor it. */
+const TERMINAL_STATUSES = new Set(['finished', 'failed', 'cancelled']);
+const isTerminalStatus = (s) => TERMINAL_STATUSES.has(s);
 
 const scopeKey = (companyId, stateKey) => ({ scopeKind: 'company', scopeId: companyId, namespace: NS, stateKey });
 
@@ -560,6 +569,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * deduped by run id. On a duplicate id the FIRST record keeps its place
    * while null fields (model, provider, agentId, issueId, status) are
    * backfilled from the later duplicate instead of dropping it.
+   *
+   * Two overrides break the first-wins rule, both terminal-driven: any
+   * terminal status (finished/failed/cancelled) wins over non-terminal,
+   * and a terminal `run-decision` model (payload.modelDecision: what the
+   * run actually used) overwrites earlier guesses such as the agent-config
+   * backfill. Without the model override, enforced runs are credited to
+   * the agent's configured model and trial families can never graduate.
    */
   function mergeRuns(buffered, stored, nowMs, windowMs) {
     const byId = new Map();
@@ -573,11 +589,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       for (const k of ['model', 'modelSource', 'provider', 'agentId', 'issueId', 'adapterType']) {
         if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
       }
+      if (r.model != null && r.model !== 'unknown' && r.modelSource === 'run-decision' && prev.modelSource !== 'run-decision') {
+        prev.model = r.model;
+        prev.modelSource = r.modelSource;
+      }
       // Terminal status wins (a finished event after a started one), but
       // `at` stays the START time: calibration counts runs started in span.
       if ((prev.status == null) && r.status != null) prev.status = r.status;
-      if ((r.status === 'finished' || r.status === 'failed') &&
-        prev.status !== 'finished' && prev.status !== 'failed') prev.status = r.status;
+      if (isTerminalStatus(r.status) && !isTerminalStatus(prev.status)) prev.status = r.status;
     }
     return [...byId.values()].sort((a, b) => b.at - a.at);
   }
@@ -586,6 +605,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const nowMs = clock();
     const raw = await ctx.config.get(companyId);
     const config = resolveConfig(raw);
+    // In-flight horizon: a run with no terminal event stops counting after
+    // max(3 x mean run duration, 2h). The 2h floor keeps the horizon at the
+    // ring's memory even when the duration calibrates short; terminal runIds
+    // below are retained for the same horizon so finished runs the 60-min
+    // rate window already evicted stay recognized.
+    const meanHours = Number(config.concurrency?.meanRunDurationHours);
+    const staleHorizonMs = Math.max(
+      3 * (Number.isFinite(meanHours) && meanHours > 0 ? meanHours : 0.186) * 3600 * 1000,
+      2 * 3600 * 1000,
+    );
     const snapshot = await readAccounts(companyId, config, nowMs);
     const aaSnapshot = await ctx.state.get(scopeKey(companyId, AA_KEY));
     const pacingState = (await ctx.state.get(scopeKey(companyId, PACING_KEY))) ?? {};
@@ -753,6 +782,24 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       runsByAccount.get(key).push(run);
       if (run.status === 'running') inFlightByAccount[key] = (inFlightByAccount[key] ?? 0) + 1;
     }
+    // Terminal runIds outlive the 60-min rate window: without this memory,
+    // a run that finished 60+ min ago drops out of `runs`, its ring entry
+    // (kept up to the in-flight horizon) counts as in flight, and pools
+    // inflate with ghosts. Retained for the in-flight horizon, capped.
+    let terminalSeen = (await ctx.state.get(scopeKey(companyId, TERMINAL_KEY))) ?? {};
+    if (terminalSeen == null || typeof terminalSeen !== 'object' || Array.isArray(terminalSeen)) terminalSeen = {};
+    for (const r of runs) {
+      if (isTerminalStatus(r.status) && terminalSeen[r.runId] == null) terminalSeen[r.runId] = nowMs;
+    }
+    for (const [id, at] of Object.entries(terminalSeen)) {
+      if (!Number.isFinite(at) || nowMs - at > staleHorizonMs) delete terminalSeen[id];
+    }
+    {
+      const ids = Object.keys(terminalSeen).sort((a, b) => terminalSeen[a] - terminalSeen[b]);
+      if (ids.length > TERMINAL_CAP) for (const id of ids.slice(0, ids.length - TERMINAL_CAP)) delete terminalSeen[id];
+    }
+    await ctx.state.set(scopeKey(companyId, TERMINAL_KEY), terminalSeen);
+    const terminalIds = new Set(Object.keys(terminalSeen));
 
     // Allocation targets and provider pools. CLIProxy round-robins lanes
     // of the same provider onto shared credentials, so lane-level in-flight
@@ -917,10 +964,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // would-decisions for unfinished runs, deduped by runId. Either source
     // alone undercounts (ring-only runs older than the rate window; runs
     // the tick loop has not decided yet are added per-run below).
+    // Pooled in-flight: mapped running runs UNION fresh ring
+    // would-decisions for unfinished runs, deduped by runId. Terminal ids
+    // come from the runs window PLUS the retained terminal memory (runs
+    // the 60-min window already evicted still veto their ring entries).
+    // Ring entries older than the in-flight horizon with no terminal event
+    // are stale: dropped and counted, never pressure.
     const inFlightByPool = {};
+    const ringCarry = [];
+    let staleInFlightDropped = 0;
+    const countedRunning = new Set();
     {
-      const finishedIds = new Set(runs.filter(r => r.status === 'finished' || r.status === 'failed').map(r => r.runId));
-      const countedRunning = new Set();
+      const finishedIds = new Set(runs.filter(r => isTerminalStatus(r.status)).map(r => r.runId));
+      for (const id of terminalIds) finishedIds.add(id);
       for (const [key, list] of runsByAccount) {
         for (const r of list) {
           if (r.status !== 'running') continue;
@@ -932,10 +988,32 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       for (const e of ring.list(500)) {
         if (!e?.runId || !e?.accountId) continue;
         if (countedRunning.has(e.runId) || finishedIds.has(e.runId)) continue;
-        if (nowMs - e.at > 2 * 3600 * 1000) continue;
+        if (nowMs - e.at > staleHorizonMs) {
+          staleInFlightDropped += 1;
+          continue;
+        }
         const p = poolOfKey(e.accountId);
         inFlightByPool[p] = (inFlightByPool[p] ?? 0) + 1;
         countedRunning.add(e.runId);
+        ringCarry.push({ pool: p, at: e.at });
+      }
+    }
+    // Defensive invariant: total pool in-flight can never exceed the runs
+    // with started-and-not-terminal status in the run window. Mapped
+    // running runs always fit inside that bound, so any excess is ring
+    // carry: drop the oldest carry first until the bound holds.
+    let clampedInFlightDropped = 0;
+    {
+      const windowActive = runs.filter(r => r.status === 'running').length;
+      let total = Object.values(inFlightByPool).reduce((s, n) => s + n, 0);
+      if (total > windowActive && ringCarry.length > 0) {
+        ringCarry.sort((a, b) => a.at - b.at);
+        for (const c of ringCarry) {
+          if (total <= windowActive) break;
+          inFlightByPool[c.pool] = (inFlightByPool[c.pool] ?? 1) - 1;
+          total -= 1;
+          clampedInFlightDropped += 1;
+        }
       }
     }
     // Water-filling order, rebuilt per run: need band first, then largest
@@ -1027,10 +1105,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     };
     let observed = 0;
     let shadowSkippedNoDecision = 0;
-    // Trial slots occupied by decisions made THIS tick: the pre-loop ring
-    // scan cannot see them, but the report (and the next tick's budget)
-    // should. Budgets used for gating stay pre-loop; only the reported
-    // in-flight moves.
+    // Trial budget consumed within the tick: the pre-loop ring scan cannot
+    // see decisions made below, so a mutable copy gates each candidate --
+    // otherwise one tick mints unbounded trial arms against a budget of 2.
+    // decidedTrials still feeds the reported (not gating) in-flight, and
+    // the next tick recomputes budgets from the ring it just persisted.
+    const tickBudget = { ...trialBudget };
     const decidedTrials = [];
     for (const run of candidates) {
       const role = roleOf(config, run.agentId);
@@ -1065,17 +1145,26 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           roleBands,
           contextCaps: config.contextCaps,
           adapterType: run.adapterType ?? null,
-          trialBudget,
+          trialBudget: tickBudget,
           trialAdapters: config.trials.adapters,
         });
         if (d.kind === 'decide') {
           decision = d;
           // Water-filling state: the next candidate run sees this decision
           // as in-flight (pool pressure) and toward the account cap (burst
-          // bound), even though nothing has executed yet.
-          tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
-          const pool = poolOfKey(d.accountId);
-          tickPoolPending[pool] = (tickPoolPending[pool] ?? 0) + 1;
+          // bound), even though nothing has executed yet -- but never
+          // double-counted: a run already observed running is in the base
+          // pressure, and a terminal run will never execute.
+          if (run.status === 'running' && !countedRunning.has(run.runId)) {
+            tickAcctPending[d.accountId] = (tickAcctPending[d.accountId] ?? 0) + 1;
+            const pool = poolOfKey(d.accountId);
+            tickPoolPending[pool] = (tickPoolPending[pool] ?? 0) + 1;
+            countedRunning.add(run.runId);
+          }
+          if (d.trial === true) {
+            const fam = inferFamily(canonicalModelName(d.model));
+            if (fam) tickBudget[fam] = Math.max(0, (tickBudget[fam] ?? 0) - 1);
+          }
           break;
         }
       }
@@ -1128,17 +1217,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // Ring actual backfill: event-time and hook entries record with
     // actualPending:true (no I/O on those paths). Resolve from the merged
     // runs (which carry issueId/agentId) -- fresh entries only, 20 per tick.
+    // A terminal run-decision (payload.modelDecision) also corrects entries
+    // that already resolved to a guess (e.g. agent-config): the decision is
+    // authoritative, so attribution, match stats, and graduation follow it.
     let ringBackfilled = 0;
     {
       const entries = ring.toJSON();
       for (const e of entries) {
         if (ringBackfilled >= 20) break;
-        if (e?.actualPending !== true) continue;
-        if (nowMs - e.at > 2 * 3600 * 1000) {
+        if (e?.actualPending === true && nowMs - e.at > 2 * 3600 * 1000) {
           e.actualPending = false;
           continue;
         }
         const run = runById.get(e.runId);
+        const runDecision = run?.model != null && run.model !== 'unknown' && run?.modelSource === 'run-decision';
+        if (e?.actualPending !== true && !(runDecision && e.actualModelSource !== 'run-decision')) continue;
         if (!run) continue;
         const actual = await resolveActualModel(companyId, run, modelCaches);
         if (actual.model != null) {
@@ -1156,22 +1249,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // Trial family report: counters plus graduation status plus live
     // in-flight, so /api/capacity shows what would need to happen for each
     // trial family to graduate. This tick's own trial decisions count as
-    // in-flight (their runs are fresh); gating budgets stay pre-loop.
+    // in-flight (their runs are fresh); gating budgets were consumed
+    // per decision in the loop above (tickBudget).
     for (const t of decidedTrials) {
       if (!t.family || !runningIds.has(t.runId)) continue;
       trialInFlight[t.family] = (trialInFlight[t.family] ?? 0) + 1;
     }
     // The live view published above predates this tick's decisions; fold
-    // the tick's pool pressure into it so the hook and event-time path
-    // water-fill against fresh counts until the next tick republishes.
-    // (Per-tick state: the next tick recomputes from scratch, no double
-    // counting.)
+    // the tick's pool pressure AND consumed trial budgets into it so the
+    // hook and event-time path water-fill against fresh counts until the
+    // next tick republishes. (Per-tick state: the next tick recomputes
+    // from scratch, and tickPoolPending only holds runs not already
+    // counted, so nothing double-counts.)
     {
       const live = liveViews.get(companyId);
       if (live) {
         const merged = { ...(live.inFlightByPool ?? {}) };
         for (const [pool, n] of Object.entries(tickPoolPending)) merged[pool] = (merged[pool] ?? 0) + n;
         live.inFlightByPool = merged;
+        const budgets = { ...(live.trialBudget ?? {}) };
+        for (const t of decidedTrials) {
+          if (!t.family) continue;
+          budgets[t.family] = Math.max(0, (budgets[t.family] ?? 0) - 1);
+        }
+        live.trialBudget = budgets;
       }
     }
     const trialFamilies = {};
@@ -1205,6 +1306,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       trialTransitions,
       inFlightByAccount,
       inFlightByPool,
+      // Ring-carry accounting: entries dropped as stale (older than the
+      // in-flight horizon with no terminal event) and by the defensive
+      // clamp (total pool in-flight can never exceed observed running
+      // runs in the window; oldest carry drops first).
+      staleInFlightDropped,
+      clampedInFlightDropped,
       reactiveAccounts: accountViews.filter(v => v.reactive).length,
       runsObserved: runs.length,
       runsCandidates: candidates.length,
@@ -1251,17 +1358,38 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * here AND in the tick loop.
    */
   /**
+   * Queued hook/event decisions not yet merged into the ring, deduped by
+   * runId (a hook-decided run that started gets BOTH a pendingEnforced and
+   * a pendingShadow entry -- counting both double-counts the run).
+   * Entries older than the 2h queue horizon are ignored; the tick clears
+   * both queues after every merge, so anything older means the tick died
+   * (and the memory paths self-disable on stale views anyway).
+   */
+  function queuedDecisions(companyId) {
+    const byId = new Map();
+    for (const q of [...(pendingEnforced.get(companyId) ?? []), ...(pendingShadow.get(companyId) ?? [])]) {
+      if (!q?.runId || byId.has(q.runId)) continue;
+      if (q.at != null && clock() - q.at > 2 * 3600 * 1000) continue;
+      byId.set(q.runId, q);
+    }
+    return [...byId.values()];
+  }
+
+  /**
    * Water-filling order over the frozen live view (hook + event-time path).
    * In-flight is the pooled pressure the last tick published plus every
-   * queued hook/event decision since (same-provider lanes share one
-   * bucket). Spreads objects so per-call counts never mutate the view.
+   * queued hook/event decision since, deduped by runId (same-provider
+   * lanes share one bucket). Spreads objects so per-call counts never
+   * mutate the view. The pooled value drives ORDERING only; the reactive
+   * per-account cap is checked separately against per-account counts
+   * (see the hook and event-time loops).
    */
   function allocationOrderFromLive(live, companyId) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
       [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
     const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
     const poolPending = {};
-    for (const q of [...(pendingEnforced.get(companyId) ?? []), ...(pendingShadow.get(companyId) ?? [])]) {
+    for (const q of queuedDecisions(companyId)) {
       if (!q?.accountId) continue;
       const p = poolOf(q.accountId);
       poolPending[p] = (poolPending[p] ?? 0) + 1;
@@ -1279,17 +1407,62 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     );
   }
 
+  /**
+   * Trial budget minus queued trial decisions per family, deduped by runId.
+   * The tick publishes budgets from the ring; decisions made since (hook
+   * or event-time, not yet merged) consume from a per-call copy, so a
+   * burst within one tick cannot mint unbounded trial arms.
+   */
+  function effectiveTrialBudget(live, companyId) {
+    const use = new Map();
+    for (const q of queuedDecisions(companyId)) {
+      if (q?.trial !== true || !q?.family) continue;
+      use.set(q.family, (use.get(q.family) ?? 0) + 1);
+    }
+    const out = {};
+    for (const [fam, b] of Object.entries(live?.trialBudget ?? {})) {
+      out[fam] = Math.max(0, b - (use.get(fam) ?? 0));
+    }
+    return out;
+  }
+
+  /** Queued decisions per accountId, deduped by runId: the per-account side of the reactive cap. */
+  function pendingByAccount(companyId) {
+    const out = new Map();
+    for (const q of queuedDecisions(companyId)) {
+      if (!q?.accountId) continue;
+      out.set(q.accountId, (out.get(q.accountId) ?? 0) + 1);
+    }
+    return out;
+  }
+
   function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
     if (!live || !config) return null;
     if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return null;
+    // Already covered: the hook (or an earlier event) queued a decision
+    // for this runId, and the tick merges the queue into the ring. Recording
+    // again would double-count the run in pool pressure and trial use.
+    if (run?.runId != null) {
+      for (const q of queuedDecisions(companyId)) {
+        if (q.runId === String(run.runId)) return null;
+      }
+    }
     const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(run.agentId) ? 'thinker' : 'doer';
     const order = allocationOrderFromLive(live, companyId);
+    // Per-account cap inputs: the live view's per-account in-flight plus
+    // queued decisions per account. The pooled inFlight on the ordered
+    // views drives ordering only -- comparing the pool total against the
+    // per-account cap starves multi-lane providers.
+    const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
+    const acctPending = pendingByAccount(companyId);
+    const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
+    const budget = effectiveTrialBudget(live, companyId);
     for (const view of order) {
       if (!view || !view.ladderRungs || view.ladderRungs.length === 0) continue;
       if (!view.reactive && !view.remainingKnown) continue;
-      if (view.reactive && (view.inFlight ?? 0) >= (live.maxTrialInFlightPerAccount ?? 2)) continue;
+      if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
       const d = decide({
         runId: run.runId,
         agentId: run.agentId,
@@ -1306,7 +1479,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         roleBands: live.roleBands,
         contextCaps: live.contextCaps,
         adapterType: run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null,
-        trialBudget: live.trialBudget ?? {},
+        trialBudget: budget,
         trialAdapters: live.trialAdapters ?? {},
       });
       if (d.kind !== 'decide') continue;
@@ -1409,21 +1582,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
       });
       // Run facts come from agent.run.* events only (started, finished,
-      // failed): the sole run feed since the db grant was removed. Events
-      // WITHOUT a companyId are ignored outright -- fanning a company-less
-      // event out to every configured company would misattribute runs.
+      // failed, cancelled): the sole run feed since the db grant was
+      // removed. Events WITHOUT a companyId are ignored outright --
+      // fanning a company-less event out to every configured company would
+      // misattribute runs.
       const onRunEvent = (status) => async event => {
         const companyId = event?.companyId;
         if (typeof companyId !== 'string' || companyId.length === 0) return;
         if (!configured.has(companyId)) return;
         // Tolerant extraction: accept every known placement and never drop
-        // an event for a missing id.
+        // an event for a missing id. The terminal modelDecision (what the
+        // run actually used) outranks every other model placement and is
+        // tagged source run-decision, so mergeRuns treats it as
+        // authoritative over earlier guesses.
         const p = event?.payload && typeof event.payload === 'object' ? event.payload : {};
         const run = p.run && typeof p.run === 'object' ? p.run : {};
+        const md = p.modelDecision && typeof p.modelDecision === 'object' ? p.modelDecision : {};
+        const mdSnake = p.model_decision && typeof p.model_decision === 'object' ? p.model_decision : {};
+        const decidedModel = md.model ?? mdSnake.model ?? null;
+        const hasDecision = typeof decidedModel === 'string' && decidedModel.length > 0;
         const entry = {
           runId: String(event?.entityId ?? p.runId ?? run.id ?? p.id ?? 'unknown'),
           agentId: String(p.agentId ?? run.agentId ?? event?.actorId ?? 'unknown'),
-          model: p.model ?? run.model ?? null,
+          model: hasDecision ? decidedModel : (p.model ?? run.model ?? null),
+          modelSource: hasDecision ? 'run-decision' : null,
           provider: typeof (p.provider ?? run.provider) === 'string' ? String(p.provider ?? run.provider).toLowerCase() : null,
           issueId: p.issueId ?? run.issueId ?? p.issue_id ?? null,
           adapterType: p.adapterType ?? run.adapterType ?? null,
@@ -1451,6 +1633,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       };
       ctx.events.on('agent.run.started', onRunEvent('running'));
       ctx.events.on('agent.run.finished', onRunEvent('finished'));
+      ctx.events.on('agent.run.cancelled', onRunEvent('cancelled'));
       ctx.events.on('agent.run.failed', onRunEvent('failed'));
     },
 
@@ -1579,12 +1762,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Same water-filling order as the shadow tick: need band first, then
       // largest (targetShare - pooled in-flight). Metered accounts without
       // headroom never qualify; healthy reactive accounts qualify without
-      // headroom (no vendor meter exists), capped in flight per account.
+      // headroom (no vendor meter exists). The reactive cap compares
+      // PER-ACCOUNT in-flight (live per-account counts plus queued
+      // decisions per account, both deduped) -- the pooled value on the
+      // ordered views drives ordering only. Trial budgets are consumed
+      // from a per-call copy, so bursts within one tick stay bounded.
       const order = allocationOrderFromLive(live, params.companyId);
+      const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
+      const acctPending = pendingByAccount(params.companyId);
+      const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
+      const budget = effectiveTrialBudget(live, params.companyId);
       for (const view of order) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;
-        if (view.reactive && (view.inFlight ?? 0) >= (live.maxTrialInFlightPerAccount ?? 2)) continue;
+        if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
         const d = decide({
           runId: params.runId,
           agentId: params.agentId,
@@ -1601,7 +1792,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           roleBands: live.roleBands,
           contextCaps: live.contextCaps,
           adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
-          trialBudget: live.trialBudget ?? {},
+          trialBudget: budget,
           trialAdapters: live.trialAdapters ?? {},
         });
         if (d.kind === 'decide') {

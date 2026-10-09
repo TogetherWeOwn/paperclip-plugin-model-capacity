@@ -295,3 +295,89 @@ test('unresolvable agent adapter keeps trial arms gated (stable deferral)', asyn
   assert.equal(shadow.body.entries.length, 0);
   assert.ok(capacity.body.shadow.skippedNoDecision >= 1);
 });
+
+test('finding 4: finished runs older than the rate window do not haunt pool in-flight', async () => {
+  // The live ghost: inFlightByPool { kimi: 1 } with nothing running. The run
+  // finished 69 min ago, so the 60-min window evicted it while its ring
+  // entry (2h horizon) still counted. Terminal-id memory fixes it -- and
+  // the defensive invariant (total pooled <= observed running, here 0) holds.
+  const at = TICK - 70 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct()],
+    steps: [
+      { now: at, fire: [started('run-old', at, { adapterType: 'claude-code' })] },
+      { now: at + 60000, fire: [{ ...started('run-old', at + 60000), type: 'agent.run.finished' }] },
+      { now: TICK },
+    ],
+  });
+  const { capacity } = await run();
+  assert.deepEqual(capacity.body.inFlightByPool, {});
+  assert.equal(capacity.body.staleInFlightDropped, 0);
+  assert.equal(capacity.body.clampedInFlightDropped, 0);
+});
+
+test('finding 4b: ring entries older than the horizon with no terminal event are stale-dropped and counted', async () => {
+  // Decided 150 min ago, never heard from again: older than max(3 x mean
+  // run duration, 2h), so it stops counting and shows up in the counter.
+  const at = TICK - 150 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct()],
+    steps: [
+      { now: at, fire: [started('run-stale', at, { adapterType: 'claude-code' })] },
+      { now: TICK },
+    ],
+  });
+  const { capacity } = await run();
+  assert.deepEqual(capacity.body.inFlightByPool, {});
+  assert.equal(capacity.body.staleInFlightDropped, 1);
+});
+
+test('finding 5: cancelled runs free their slot (agent.run.cancelled subscribed)', async () => {
+  // Started 40 min ago, cancelled 39 min ago: pre-fix the event had no
+  // subscriber (and no terminal status), so the run held its slot for an
+  // hour. Post-fix it counts as terminal everywhere except the
+  // finished/failed graduation counters.
+  const at = TICK - 40 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct()],
+    steps: [
+      { now: at, fire: [started('run-c', at, { adapterType: 'claude-code' })] },
+      { now: at + 60000, fire: [{ ...started('run-c', at + 60000), type: 'agent.run.cancelled' }] },
+      { now: TICK },
+    ],
+  });
+  const { capacity } = await run();
+  assert.deepEqual(capacity.body.inFlightByPool, {});
+  assert.equal(capacity.body.trialFamilies.kimi.finished, 0);
+});
+
+test('finding 6: terminal modelDecision attributes the run to the decided model', async () => {
+  // The hook/tick decided kimi, but the agent record names no model, so the
+  // old trail credited agent-config (null here). The finished event's
+  // payload.modelDecision is authoritative: kimi earns the finished run
+  // (graduation signal) and the ring actual is corrected with match true.
+  const at = TICK - 60000;
+  const fin = {
+    ...started('run-m', at + 30000),
+    type: 'agent.run.finished',
+    payload: { run: { agentId: 'agent-9' }, modelDecision: { model: 'kimi-k3-256k' } },
+  };
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct()],
+    agentGets: { 'agent-9': { adapterType: 'claude-code' } },
+    steps: [
+      { now: at + 30000, fire: [started('run-m', at)] },
+      { now: TICK, fire: [fin] },
+    ],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(capacity.body.trialFamilies.kimi.finished, 1);
+  const entry = shadow.body.entries.find(e => e.runId === 'run-m');
+  assert.equal(entry.actualModel, 'kimi-k3-256k');
+  assert.equal(entry.actualModelSource, 'run-decision');
+  assert.equal(entry.modelMatch, true);
+});
