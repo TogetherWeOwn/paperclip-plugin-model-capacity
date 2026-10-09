@@ -46,6 +46,15 @@ export function isPlaceholderLaneHost(baseUrl = DEFAULT_BASE_URL) {
 }
 
 /**
+ * Throw when the build did not pin a lane host. Called before the lane key
+ * is resolved, so an unpinned build never reads the secret, regardless of
+ * DNS: "cannot leak" is a code guarantee, not a resolver property.
+ */
+export function assertLaneHostPinned(baseUrl = DEFAULT_BASE_URL) {
+  if (isPlaceholderLaneHost(baseUrl)) throw new Error('cliproxy-lane-host-unpinned');
+}
+
+/**
  * Lane feed path allowlist: the ONLY `cliproxy.accountsPath` the config may
  * name. The lane key rides on this request, so a configurable path without
  * a pin would let config redirect the key to an attacker-chosen endpoint

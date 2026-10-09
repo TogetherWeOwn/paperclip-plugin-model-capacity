@@ -275,9 +275,12 @@ compile-time on purpose: config can name only a listed origin, so a
 config write cannot redirect the key.
 
 The public file ships a non-routable placeholder
-(`https://lane-host.invalid`; RFC 2606 `.invalid` never resolves), so an
-unpinned build cannot leak the key: lane reads fail like a network error
-and `onHealth` reports `degraded` ("Lane host not pinned"). To deploy,
+(`https://lane-host.invalid`; RFC 2606 `.invalid` never resolves). An
+unpinned build cannot leak the key: the lane read throws
+`cliproxy-lane-host-unpinned` before the lane secret is resolved, so no
+request is made, and `onHealth` reports `degraded` ("Lane host not
+pinned"). `config.example.json` leaves `cliproxy.baseUrl` unset so the
+same file validates against any pin. To deploy,
 replace that one file at package-build time with your real origin, for
 example:
 
@@ -314,6 +317,7 @@ otherwise, never a silent zero.
 - `src/manifest.mjs` -- shadow-default manifest, opt-in `enforceManifest`, `buildManifest` variant flag
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/lane-host.mjs` -- build-time lane host pin (public placeholder; replaced at package build)
+- `scripts/check-public-pin.mjs` -- CI-only: fails if the committed pin is not the placeholder (not shipped; an overlaid build fails it by design)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
 - `src/shadow.mjs` -- bounded shadow ring (unit-tested legacy helper)

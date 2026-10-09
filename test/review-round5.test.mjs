@@ -94,7 +94,7 @@ test('(3) /shadow honors the requested limit; size is the full decided count', a
     events: { on() {} },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => nowMs });
+  const plugin = createModelCapacityPlugin({ clock: () => nowMs, requirePinnedLaneHost: false });
   await plugin.setup(fake);
   await plugin.onConfigChanged({}, { companyId: 'acme' });
   store.set(skey(LEDGER_STATE_KEY), ledgerToJSON(ledger));
@@ -143,7 +143,7 @@ test('(4) concurrent first ticks share one ledger load', async () => {
     events: { on() {} },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => nowMs });
+  const plugin = createModelCapacityPlugin({ clock: () => nowMs, requirePinnedLaneHost: false });
   await plugin.setup(fake);
   store.set(skey(AA_STATE_KEY), {
     fetchedAt: new Date(nowMs).toISOString(),

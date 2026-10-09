@@ -206,7 +206,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
     setLane: (used) => { lane = laneBody(used, new Date(now).toISOString()); },
