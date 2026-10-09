@@ -9,6 +9,7 @@ import {
   usedRatio,
   parseLaneAccount,
   parseLaneBody,
+  isReactiveAccount,
   resetAtMsOf,
   CliproxyCache,
 } from '../src/cliproxy.mjs';
@@ -138,4 +139,30 @@ test('cache honors TTL', () => {
   c.set('k', { v: 1 }, NOW);
   assert.deepEqual(c.get('k', NOW + 44000), { v: 1 });
   assert.equal(c.get('k', NOW + 46000), null);
+});
+
+test('lane accounts carry models, meter, and pool; reactive detection', () => {
+  const a = parseLaneAccount({
+    lane: 'k', provider: 'kimi', accountKey: 'k1', health: 'healthy',
+    meter: 'reactive', pool: null, models: ['kimi-k3-256k'],
+    weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
+    observedAt: '2026-10-08T22:59:00Z', quality: 'reactive',
+  });
+  assert.deepEqual(a.models, ['kimi-k3-256k']);
+  assert.equal(a.meter, 'reactive');
+  assert.equal(isReactiveAccount(a), true);
+  // Quality-reactive counts too; feeds that predate the meter field (null)
+  // count as metered; metered accounts never count.
+  assert.equal(isReactiveAccount({ meter: null, quality: 'reactive' }), true);
+  assert.equal(isReactiveAccount({ meter: null, quality: 'live' }), false);
+  assert.equal(isReactiveAccount({ meter: 'metered', quality: 'live' }), false);
+  assert.equal(isReactiveAccount(null), false);
+  // Feeds that predate `models` carry null (classic provider binding applies).
+  const legacy = parseLaneAccount({
+    lane: 'c', provider: 'codex', accountKey: 'k9', health: 'healthy',
+    weekly: { used: 0.3, resetsAt: null }, fiveHour: { used: 0.1, resetsAt: null },
+    observedAt: '2026-10-08T22:59:00Z', quality: 'live',
+  });
+  assert.equal(legacy.models, null);
+  assert.equal(legacy.meter, null);
 });

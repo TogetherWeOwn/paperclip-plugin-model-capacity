@@ -99,17 +99,41 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
   };
   const weekly = window(entry?.weekly);
   const fiveHour = window(entry?.fiveHour);
+  // Served model ids (CLIProxy ids this account routes): the ONLY
+  // provider->models source. A new account or model added to CLIProxy is
+  // picked up with zero code changes; accounts that predate the field
+  // carry models: null.
+  const rawModels = Array.isArray(entry?.models)
+    ? entry.models.filter(m => typeof m === 'string' && m.length > 0)
+    : null;
   return {
     accountId: `${entry?.provider ?? 'unknown'}:${entry?.accountKey ?? entry?.lane ?? 'x'}`,
     lane: entry?.lane ?? null,
     provider: entry?.provider ?? null,
+    pool: entry?.pool ?? null,
     health: entry?.health ?? 'unknown',
     quality: entry?.quality ?? 'unknown',
+    // Vendor-meter kind: 'reactive' = the vendor publishes no meter (the
+    // account is usable but unpaced); anything else with usage numbers is
+    // metered. Null on feeds that predate the field (treated as metered).
+    meter: entry?.meter ?? null,
+    models: rawModels,
     weekly: { ...weekly, resetsAtMs: msOrNull(weekly.resetsAt) },
     fiveHour: { ...fiveHour, resetsAtMs: msOrNull(fiveHour.resetsAt) },
     signalsAtMs: msOrNull(entry?.observedAt) ?? nowMs,
     nowMs,
   };
+}
+
+/**
+ * True when the account publishes no vendor meter: the vendor exposes no
+ * usage numbers (quality/meter 'reactive'), so the account is usable but
+ * unpaced. Distinct from a metered account with missing numbers (a broken
+ * reading -- never eligible). Feeds that predate the meter field report
+ * null, which counts as metered.
+ */
+export function isReactiveAccount(account) {
+  return account?.meter === 'reactive' || account?.quality === 'reactive';
 }
 
 /** Parse the whole lane body; null when the shape is unknown. */

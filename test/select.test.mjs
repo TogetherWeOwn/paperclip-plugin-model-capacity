@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { deficitOf, isOverBurning, orderAccountsForRun } from '../src/select.mjs';
 
 const view = (accountId, partial = {}) => ({
-  accountId, resetAtMs: null, headroomPct: 0.9,
+  accountId, resetAtMs: null, headroomPct: 0.9, health: 'healthy',
   measuredRatePerHour: null, requiredRatePerHour: null, ...partial,
 });
 
@@ -50,4 +50,44 @@ test('over-burning is the only pool when nothing else qualifies', () => {
   assert.deepEqual(order, ['hot']);
   assert.equal(isOverBurning(view('x', { measuredRatePerHour: 0.022, requiredRatePerHour: 0.017 })), true);
   assert.equal(isOverBurning(view('x', { measuredRatePerHour: null, requiredRatePerHour: 0.017 })), false);
+});
+
+test('health gate: exhausted/unhealthy accounts never qualify, even with headroom', () => {
+  // Live bug this fixes: opencode-go-lane-3 read exhausted yet stayed
+  // selectable. Health must read exactly healthy.
+  const order = orderAccountsForRun([
+    view('dead', { health: 'exhausted', headroomPct: 0.9, measuredRatePerHour: null, requiredRatePerHour: 0.01 }),
+    view('sick', { health: 'unknown', headroomPct: 0.9, measuredRatePerHour: null, requiredRatePerHour: 0.01 }),
+    view('ok', { headroomPct: 0.9, measuredRatePerHour: null, requiredRatePerHour: 0.01 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['ok']);
+});
+
+test('reactive accounts qualify without headroom; metered unknowns do not', () => {
+  const order = orderAccountsForRun([
+    view('metered-unknown', { headroomPct: null, measuredRatePerHour: null, requiredRatePerHour: 0.05 }),
+    view('reactive', { headroomPct: null, meter: 'reactive', measuredRatePerHour: null, requiredRatePerHour: null }),
+  ]).map(v => v.accountId);
+  // CISO distinction: a meter that should exist but doesn't means the
+  // reading is broken (never eligible); a vendor with no meter at all is
+  // usable unpaced while healthy.
+  assert.deepEqual(order, ['reactive']);
+});
+
+test('reactive ranks after metered-behind, before metered-ahead and over-burning', () => {
+  const order = orderAccountsForRun([
+    view('ahead', { headroomPct: 0.9, measuredRatePerHour: 0.011, requiredRatePerHour: 0.01 }),
+    view('reactive', { headroomPct: null, meter: 'reactive' }),
+    view('hot', { headroomPct: 0.9, measuredRatePerHour: 0.03, requiredRatePerHour: 0.017 }),
+    view('behind', { headroomPct: 0.9, measuredRatePerHour: 0.002, requiredRatePerHour: 0.017 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['behind', 'reactive', 'ahead', 'hot']);
+});
+
+test('in-flight breaks ties inside the reactive band', () => {
+  const order = orderAccountsForRun([
+    view('busy', { headroomPct: null, meter: 'reactive', inFlight: 3 }),
+    view('idle', { headroomPct: null, meter: 'reactive', inFlight: 0 }),
+  ]).map(v => v.accountId);
+  assert.deepEqual(order, ['idle', 'busy']);
 });

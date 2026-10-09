@@ -1,0 +1,234 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { validateConfigShape, createModelCapacityPlugin } from '../src/plugin.mjs';
+
+const TICK = Date.parse('2026-10-08T23:00:00Z');
+const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
+const AA_STATE_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
+
+// AA snapshot: classic claude rows plus the dynamic rows the feed models
+// below normalize to (kimi-k3-256k via override, gemini-2-5-flash direct).
+const aaRows = () => ([
+  { slug: 'claude-opus-5-5', intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+  { slug: 'claude-sonnet-5-5-high', intelligenceIndex: 58, intelligenceIndexCostPerTask: 18, price1mInputTokens: 3, price1mOutputTokens: 15 },
+  { slug: 'claude-haiku-5-5-xhigh', intelligenceIndex: 53, intelligenceIndexCostPerTask: 8, price1mInputTokens: 1, price1mOutputTokens: 5 },
+  { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  { slug: 'kimi-k3', intelligenceIndex: 55, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
+]);
+
+const rawAcct = (o) => ({
+  lane: o.lane, provider: o.provider, accountKey: o.key,
+  health: o.health ?? 'healthy', meter: o.meter ?? null, pool: o.pool ?? null,
+  models: o.models ?? null,
+  weekly: { used: o.weekly ?? null, resetsAt: o.reset ?? null },
+  fiveHour: { used: o.fiveHour ?? null, resetsAt: o.reset5 ?? null },
+  observedAt: o.observedAt ?? '2026-10-08T22:59:00Z', quality: o.quality ?? 'live',
+});
+
+const kimiAcct = (over = {}) => rawAcct({
+  lane: 'kimi-1', provider: 'kimi', key: 'k1', meter: 'reactive', quality: 'reactive',
+  models: ['kimi-k3-256k'], ...over,
+});
+
+const claudeAcct = (over = {}) => rawAcct({
+  lane: 'claude-1', provider: 'claude', key: 'a1',
+  weekly: 0.3, reset: '2026-10-15T22:59:00Z', fiveHour: 0.1,
+  models: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], ...over,
+});
+
+const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
+  type, companyId: 'acme', entityId: runId,
+  payload: { run: { agentId: 'agent-9', ...extra } },
+  occurredAt: new Date(atMs).toISOString(),
+});
+
+function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {} }) {
+  const store = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  const skey = k => JSON.stringify(k);
+  let now = nowMs;
+  let tickNo = 0;
+  const resolveLane = () => {
+    const accounts = typeof laneAccounts === 'function' ? laneAccounts(tickNo, now) : laneAccounts;
+    return { observedAt: new Date(now).toISOString(), accounts: accounts ?? [] };
+  };
+  let lane = resolveLane();
+  const fake = {
+    config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
+    state: {
+      get: async k => store.get(skey(k)) ?? null,
+      set: async (k, v) => { store.set(skey(k), v); },
+    },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    agents: { get: async (arg) => agentGets[arg?.agentId] ?? null },
+    issues: { get: async (arg) => issueGets[arg?.issueId] ?? null },
+    jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+    events: { on: (n, fn) => { handlers.set(n, fn); } },
+    logger: { info() {}, error() {} },
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now });
+  return {
+    run: async () => {
+      await plugin.setup(fake);
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+      for (const s of steps ?? [{ now: nowMs }]) {
+        now = s.now;
+        lane = s.lane !== undefined ? s.lane : resolveLane();
+        tickNo += 1;
+        for (const e of s.fire ?? []) await handlers.get(e.type)(e);
+        await jobs.get('shadow-tick')({});
+      }
+      return {
+        shadow: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+        capacity: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' }),
+      };
+    },
+  };
+}
+
+test('trials config validates: minima and adapter shape', () => {
+  assert.deepEqual(validateConfigShape({ trials: { maxInFlightPerAccount: 2, minSuccessRate: 0.8 } }), []);
+  assert.ok(validateConfigShape({ trials: { maxInFlightPerAccount: 0 } }).length > 0);
+  assert.ok(validateConfigShape({ trials: { minSuccessRate: 2 } }).length > 0);
+  assert.ok(validateConfigShape({ trials: { adapters: ['claude-code'] } }).length > 0);
+  assert.ok(validateConfigShape({ modelAaOverrides: ['x'] }).length > 0);
+  assert.deepEqual(validateConfigShape({ modelAaOverrides: { 'my-model': 'my-slug' } }), []);
+});
+
+test('healthy reactive lane routes a capped trial decision', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct()],
+    steps: [{ now: TICK, fire: [started('run-k', TICK - 60000, { adapterType: 'claude-code' })] }],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(shadow.body.entries.length, 1);
+  const [entry] = shadow.body.entries;
+  assert.deepEqual(
+    [entry.accountId, entry.trial, entry.family, entry.wouldModel],
+    ['kimi:k1', true, 'kimi', 'kimi-k3-256k(max)'],
+  );
+  assert.equal(capacity.body.reactiveAccounts, 1);
+  assert.equal(capacity.body.trialFamilies.kimi.inFlight, 1);
+  assert.equal(capacity.body.trialFamilies.kimi.proven, false);
+});
+
+test('exhausted reactive lane gets nothing: health gates eligibility', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct({ health: 'exhausted' })],
+    steps: [{ now: TICK, fire: [started('run-k', TICK - 60000, { adapterType: 'claude-code' })] }],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(shadow.body.entries.length, 0);
+  assert.equal(capacity.body.shadow.skippedNoDecision, 1);
+});
+
+test('run maps to its account from the resolved actual model', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [claudeAcct(), kimiAcct()],
+    issueGets: { 'iss-k': { assigneeAdapterOverrides: { adapterConfig: { model: 'kimi-k3-256k' } } } },
+    steps: [{
+      now: TICK,
+      fire: [
+        started('run-mapped', TICK - 60000, { issueId: 'iss-k' }),
+        started('run-unmapped', TICK - 30000, {}),
+      ],
+    }],
+  });
+  const { shadow, capacity } = await run();
+  // The mapped run resolved through its issue override; the bare run names
+  // no model anywhere and stays honestly unmapped.
+  assert.equal(capacity.body.unmappedRuns, 1);
+  assert.equal(capacity.body.runsObserved, 2);
+  assert.equal(shadow.body.entries.length, 2);
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  assert.deepEqual(
+    [byId.get('run-mapped').actualModel, byId.get('run-mapped').actualModelSource],
+    ['kimi-k3-256k', 'issue-override'],
+  );
+});
+
+test('pool headroom falls back to weekly when 5h is missing; legacy feeds stay null', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [
+      rawAcct({
+        lane: 'ag-pool', provider: 'antigravity', key: 'pool1', pool: 'partner',
+        models: ['gemini-2-5-flash'], weekly: 0.75, reset: '2026-10-15T22:59:00Z',
+      }),
+      rawAcct({
+        lane: 'legacy', provider: 'codex', key: 'old', weekly: 0.5, reset: '2026-10-15T22:59:00Z',
+      }),
+    ],
+  });
+  const { capacity } = await run();
+  const byId = new Map(capacity.body.accounts.map(a => [a.accountId, a]));
+  assert.deepEqual(
+    [byId.get('antigravity:pool1').headroomPct, byId.get('antigravity:pool1').headroomSource],
+    [0.25, 'weekly-fallback'],
+  );
+  // No models list on a metered feed with no 5h: the CISO
+  // unknown-headroom rule, still excluded, still null.
+  assert.deepEqual(
+    [byId.get('codex:old').headroomPct, byId.get('codex:old').headroomSource],
+    [null, null],
+  );
+});
+
+test('models with no AA match are listed unscored with their servers, never invented', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [kimiAcct({ models: ['kimi-k3-256k', 'zzz-new-9'] })],
+  });
+  const { capacity } = await run();
+  const hit = capacity.body.unscored.find(u => u.model === 'zzz-new-9');
+  assert.deepEqual([hit.reason, hit.servedBy], ['no-aa-match', ['kimi:k1']]);
+});
+
+test('event-time shadow covers runs that start between ticks', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [claudeAcct()],
+    steps: [
+      { now: TICK },
+      { now: TICK + 60000, fire: [started('run-e', TICK + 30000, { model: 'claude-haiku-5-5', provider: 'claude' })] },
+    ],
+  });
+  const { shadow } = await run();
+  // The started event fired after tick 1 published its live view, so the
+  // memory-only path recorded the decision before tick 2 merged it.
+  assert.equal(shadow.body.entries.length, 1);
+  assert.equal(shadow.body.entries[0].eventTime, true);
+  assert.equal(shadow.body.entries[0].runId, 'run-e');
+});
+
+test('measured fleet success graduates a trial family', async () => {
+  const at = TICK - 5 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    config: { trials: { minRuns: 2, minSuccessRate: 0.5 } },
+    laneAccounts: [kimiAcct()],
+    issueGets: { 'iss-k': { assigneeAdapterOverrides: { adapterConfig: { model: 'kimi-k3-256k' } } } },
+    steps: [{
+      now: TICK,
+      fire: [
+        started('run-g1', at, { issueId: 'iss-k', adapterType: 'claude-code' }),
+        { ...started('run-g1', at + 60000, { issueId: 'iss-k' }), type: 'agent.run.finished' },
+        started('run-g2', at, { issueId: 'iss-k', adapterType: 'claude-code' }),
+        { ...started('run-g2', at + 60000, { issueId: 'iss-k' }), type: 'agent.run.finished' },
+      ],
+    }],
+  });
+  const { capacity } = await run();
+  assert.deepEqual(
+    [capacity.body.trialFamilies.kimi.finished, capacity.body.trialFamilies.kimi.proven],
+    [2, true],
+  );
+  assert.equal(capacity.body.trialTransitions, 2);
+});

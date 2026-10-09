@@ -2,13 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_ARM_MAP,
+  MODEL_AA_OVERRIDES,
+  PROVEN_FAMILIES,
   parseEffortSuffix,
   effortAllowed,
-  providerServes,
   resolveArms,
-  armsForProvider,
+  canonicalModelName,
+  inferFamily,
   familyOfModelName,
-  providerForModelName,
+  slugCandidates,
+  dynamicEffort,
+  buildDynamicBindings,
+  resolveDynamicArms,
+  armsForAccount,
 } from '../src/arms.mjs';
 
 const rows = (slugs) => slugs.map(slug => ({ slug }));
@@ -35,16 +41,115 @@ test('muse contributor rows are capped at xhigh', () => {
   assert.equal(effortAllowed('sol', 'max'), true);
 });
 
-test('ladders are per account: families never cross providers', () => {
-  assert.equal(providerServes('claude', 'sol'), false);
-  assert.equal(providerServes('codex', 'haiku'), false);
-  assert.equal(providerServes('codex', 'sol'), true);
-  const { arms } = resolveArms(rows(DEFAULT_ARM_MAP.map(m => m.aaSlug)));
-  const claudeArms = armsForProvider(arms, 'claude');
-  assert.ok(claudeArms.length > 0);
-  assert.ok(claudeArms.every(a => ['opus', 'sonnet', 'haiku'].includes(a.family)));
-  const codexArms = armsForProvider(arms, 'codex');
-  assert.ok(codexArms.every(a => ['sol', 'luna', 'astra'].includes(a.family)));
+test('canonical names strip provider prefixes; non-strings stay null', () => {
+  assert.equal(canonicalModelName('antigravity/gemini-3-flash'), 'gemini-3-flash');
+  assert.equal(canonicalModelName('gemini-3-flash'), 'gemini-3-flash');
+  assert.equal(canonicalModelName(null), null);
+  assert.equal(canonicalModelName(''), null);
+});
+
+test('family inference: proven families, trial generations, first-segment fallback', () => {
+  assert.equal(inferFamily('claude-opus-5-5'), 'opus');
+  assert.equal(inferFamily('claude-sonnet-4-6'), 'claude-4-6');
+  assert.equal(inferFamily('claude-opus-4-6-thinking'), 'claude-4-6');
+  assert.equal(inferFamily('claude-haiku-5-5'), 'haiku');
+  assert.equal(inferFamily('gpt-6.1-sol'), 'sol');
+  assert.equal(inferFamily('gpt-6-luna'), 'luna');
+  assert.equal(inferFamily('gpt-6-astra'), 'astra');
+  assert.equal(inferFamily('gpt-oss-120b-medium'), 'oss');
+  assert.equal(inferFamily('gemini-2-5-flash'), 'gemini');
+  assert.equal(inferFamily('kimi-k3-256k'), 'kimi');
+  assert.equal(inferFamily('grok-4-20-0309-reasoning'), 'grok');
+  assert.equal(inferFamily('muse-spark-1.3-contributor'), 'muse');
+  assert.equal(inferFamily('deepseek-v4-1'), 'deepseek');
+  // Novel ids get their own first-segment family: never merged into an
+  // unrelated trial budget or success history.
+  assert.equal(inferFamily('something-entirely-new'), 'something');
+  assert.equal(inferFamily(null), null);
+  assert.ok(PROVEN_FAMILIES.includes('opus'));
+  assert.ok(!PROVEN_FAMILIES.includes('claude-4-6'));
+  assert.ok(!PROVEN_FAMILIES.includes('gemini'));
+});
+
+test('run model strings map to family; shadow labels and prefixed ids work', () => {
+  assert.equal(familyOfModelName('claude-opus-5-5'), 'opus');
+  assert.equal(familyOfModelName('gpt-6-luna(high)'), 'luna');
+  assert.equal(familyOfModelName('antigravity/gemini-3-flash'), 'gemini');
+  assert.equal(familyOfModelName('muse-spark-1.3-contributor(xhigh)'), 'muse');
+  assert.equal(familyOfModelName('grok-4-1-fast'), 'grok');
+  assert.equal(familyOfModelName('something-entirely-new'), 'something');
+  assert.equal(familyOfModelName(null), null);
+});
+
+test('slug candidates: dots to dashes, suffix strips, contributor to xhigh', () => {
+  assert.deepEqual(slugCandidates('gpt-6.1-sol'), ['gpt-6.1-sol', 'gpt-6-1-sol']);
+  assert.deepEqual(slugCandidates('zen-free'), ['zen-free', 'zen']);
+  assert.deepEqual(slugCandidates('muse-spark-1.3-contributor'),
+    ['muse-spark-1.3-contributor', 'muse-spark-1-3-contributor', 'muse-spark-1-3-xhigh']);
+  assert.deepEqual(slugCandidates('grok-4-20-0309'), ['grok-4-20-0309']);
+  assert.equal(dynamicEffort('muse-spark-1.3-contributor'), 'xhigh');
+  assert.equal(dynamicEffort('gemini-2-5-flash'), 'max');
+});
+
+test('override table holds only verified mismatches', () => {
+  assert.equal(MODEL_AA_OVERRIDES['gpt-oss-120b-medium'], 'gpt-oss-120b');
+  assert.equal(MODEL_AA_OVERRIDES['kimi-k3-256k'], 'kimi-k3');
+  assert.equal(MODEL_AA_OVERRIDES['claude-opus-4-6-thinking'], 'claude-opus-4-6');
+});
+
+test('dynamic bindings: covered models skipped, overrides bypass candidates, non-chat unscored', () => {
+  const { bindings, unscored } = buildDynamicBindings(
+    ['claude-opus-5-5', 'antigravity/gpt-oss-120b-medium', 'test-private-eval', 'gemini-2-5-flash'],
+    { coveredModels: ['claude-opus-5-5'] },
+  );
+  assert.ok(!bindings.some(b => b.model === 'claude-opus-5-5'));
+  assert.ok(!unscored.some(u => u.model === 'claude-opus-5-5'));
+  const oss = bindings.find(b => b.model === 'gpt-oss-120b-medium');
+  assert.deepEqual([oss.aaSlug, oss.family, oss.dynamic], ['gpt-oss-120b', 'oss', true]);
+  const gemini = bindings.find(b => b.model === 'gemini-2-5-flash');
+  assert.deepEqual(gemini.slugCandidates, ['gemini-2-5-flash']);
+  assert.deepEqual(unscored, [{ model: 'test-private-eval', reason: 'non-chat-model', tried: [] }]);
+});
+
+test('operator modelAaOverrides extend the built-in table', () => {
+  const { bindings } = buildDynamicBindings(['my-model-1'], {
+    overrides: { 'my-model-1': 'my-aa-slug' },
+  });
+  assert.equal(bindings[0].aaSlug, 'my-aa-slug');
+});
+
+test('dynamic arms join AA rows; misses are unscored, never invented', () => {
+  const aaRows = rows(['gemini-2-5-flash', 'gpt-6-1-sol']);
+  const { bindings } = buildDynamicBindings(['gemini-2-5-flash', 'no-such-model-9'], {});
+  const { arms, unscored } = resolveDynamicArms(aaRows, bindings);
+  assert.equal(arms.length, 1);
+  assert.deepEqual([arms[0].armId, arms[0].family, arms[0].effort], ['gemini-2-5-flash', 'gemini', 'max']);
+  assert.equal(unscored.length, 1);
+  assert.deepEqual([unscored[0].model, unscored[0].reason], ['no-such-model-9', 'no-aa-match']);
+});
+
+test('ambiguous AA slugs never bind a dynamic arm', () => {
+  const { bindings } = buildDynamicBindings(['dup-model'], {});
+  const { arms, unscored } = resolveDynamicArms(
+    [{ slug: 'dup-model' }, { slug: 'dup-model' }], bindings);
+  assert.equal(arms.length, 0);
+  assert.equal(unscored[0].reason, 'no-aa-match');
+});
+
+test('ladders are per account: models membership, no provider list', () => {
+  const arms = [
+    { armId: 'a', model: 'm-a', family: 'sol', providers: ['codex'] },
+    { armId: 'b', model: 'm-b', family: 'gemini', providers: null, dynamic: true },
+  ];
+  // Feed with models lists: membership decides, classic binding included.
+  const acct = { provider: 'antigravity', models: ['m-a', 'm-b'] };
+  assert.deepEqual(armsForAccount(arms, acct).map(a => a.armId), ['a', 'b']);
+  // A model the feed stops serving leaves every ladder automatically.
+  assert.deepEqual(armsForAccount(arms, { provider: 'antigravity', models: ['m-b'] }).map(a => a.armId), ['b']);
+  // Classic arms still match by provider on feeds that predate `models`;
+  // dynamic arms require a list (never served anywhere = never eligible).
+  const legacy = { provider: 'codex' };
+  assert.deepEqual(armsForAccount(arms, legacy).map(a => a.armId), ['a']);
 });
 
 test('luna and astra families resolve to gpt-6-luna / gpt-6-astra ids', () => {
@@ -72,20 +177,6 @@ test('muse base slug is skipped: Contributor has no max effort', () => {
   ]);
   assert.deepEqual(arms.map(a => a.armId), ['muse-spark-1-3-xhigh']);
   assert.deepEqual(skipped, [{ aaSlug: 'muse-spark-1-3', reason: 'effort-inexpressible' }]);
-});
-
-test('run model strings map to family and provider; unknown stays null', () => {
-  assert.equal(familyOfModelName('claude-opus-5-5'), 'opus');
-  assert.equal(providerForModelName('claude-opus-5-5'), 'claude');
-  assert.equal(familyOfModelName('gpt-6-luna(high)'), 'luna');
-  assert.equal(providerForModelName('gpt-6-luna(high)'), 'codex');
-  assert.equal(familyOfModelName('muse-spark-1.3-contributor(xhigh)'), 'muse');
-  assert.equal(providerForModelName('muse-spark-1.3-contributor(xhigh)'), 'meta');
-  // grok is a known hint but no lane provider serves it: family yes, provider null.
-  assert.equal(familyOfModelName('grok-4-1-fast'), 'grok');
-  assert.equal(providerForModelName('grok-4-1-fast'), null);
-  assert.equal(familyOfModelName('something-entirely-new'), null);
-  assert.equal(providerForModelName(null), null);
 });
 
 test('ambiguous and absent slugs are reported, not silently dropped', () => {

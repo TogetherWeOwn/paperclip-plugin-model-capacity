@@ -1,6 +1,16 @@
 /**
  * Model-capacity plugin worker wiring (I/O at the edges; math in modules).
  *
+ * v0.2.2 = ALL-PROVIDERS. Arms are data-driven (the feed's `models` lists
+ * are the only coverage source; AA slugs resolve via normalization plus a
+ * small override table; no-AA-match models are reported `unscored`, never
+ * invented). Families without fleet success route as capped trials
+ * (doer-only, adapter-gated) until measured success graduates them.
+ * Reactive accounts (vendor publishes no meter) are eligible while healthy
+ * and rank between metered-behind-plan and metered-ahead-of-plan. Shadow
+ * decisions are recorded event-time from agent.run.started when the
+ * resolver is absent, and run->account mapping uses resolved actual models.
+ *
  * v0.2.1 = ENFORCE-CAPABLE. The worker refreshes AA data daily, reads
  * CLIProxy burn from the host-published lane endpoint (one GET, short
  * in-memory cache), steps per-account pacing pointers, and records what it
@@ -19,10 +29,14 @@ import {
   buildLaneRequest,
   assertLaneRequest,
   parseLaneBody,
+  isReactiveAccount,
   CliproxyCache,
 } from './cliproxy.mjs';
 import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows } from './aa.mjs';
-import { DEFAULT_ARM_MAP, resolveArms, armsForProvider, providerForModelName } from './arms.mjs';
+import {
+  DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
+  canonicalModelName, inferFamily, familyOfModelName, PROVEN_FAMILIES,
+} from './arms.mjs';
 import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
 import { fillCosts } from './cost.mjs';
 import { buildLadder } from './ladder.mjs';
@@ -30,7 +44,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS } from './decide.mjs';
+import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS } from './decide.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from './concurrency.mjs';
 import { orderAccountsForRun } from './select.mjs';
 import { createShadowRing, SHADOW_CAPACITY } from './shadow.mjs';
@@ -38,6 +52,7 @@ import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
+const TRIAL_KEY = 'trial-families-v1';
 const PACING_KEY = 'pacing-v1';
 const RING_KEY = 'shadow-ring-v1';
 const CAPACITY_KEY = 'capacity-v1';
@@ -88,6 +103,20 @@ export function validateConfigShape(raw) {
       if (k in roles && !Array.isArray(roles[k])) errors.push(`roles.${k} must be an array`);
     }
   }
+  if (raw.trials) {
+    for (const k of ['maxInFlightPerAccount', 'maxInFlightPerFamily', 'minRuns']) {
+      if (k in raw.trials && !(raw.trials[k] >= 1)) errors.push(`trials.${k} must be >= 1`);
+    }
+    if ('minSuccessRate' in raw.trials && (typeof raw.trials.minSuccessRate !== 'number' || raw.trials.minSuccessRate < 0 || raw.trials.minSuccessRate > 1)) {
+      errors.push('trials.minSuccessRate must be a number in [0, 1]');
+    }
+    if ('adapters' in raw.trials && (raw.trials.adapters == null || typeof raw.trials.adapters !== 'object' || Array.isArray(raw.trials.adapters))) {
+      errors.push('trials.adapters must be an object of adapter type to families');
+    }
+  }
+  if (raw.modelAaOverrides != null && (typeof raw.modelAaOverrides !== 'object' || Array.isArray(raw.modelAaOverrides))) {
+    errors.push('modelAaOverrides must be an object of CLIProxy model id to AA slug');
+  }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
   return errors;
 }
@@ -134,6 +163,19 @@ export function resolveConfig(raw = {}) {
     // Kill switch for run.model.resolve enforcement. False (default): the
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
+    // Trial lanes and arms: families without fleet success history route
+    // doer-only through adapters that opt in, capped in flight per account
+    // and per family, until measured success graduates them.
+    trials: {
+      maxInFlightPerAccount: raw.trials?.maxInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount,
+      maxInFlightPerFamily: raw.trials?.maxInFlightPerFamily ?? DEFAULT_TRIALS.maxInFlightPerFamily,
+      minRuns: raw.trials?.minRuns ?? DEFAULT_TRIALS.minRuns,
+      minSuccessRate: raw.trials?.minSuccessRate ?? DEFAULT_TRIALS.minSuccessRate,
+      adapters: raw.trials?.adapters ?? DEFAULT_TRIALS.adapters,
+    },
+    // Operator extensions to the AA-slug override table (CLIProxy model
+    // id -> AA slug or { slug, effort }); merged over the built-in table.
+    modelAaOverrides: raw.modelAaOverrides ?? {},
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
     // for an account (research example value; flagged calibration: weak).
@@ -167,6 +209,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // Enforced hook decisions queued in memory, merged into the shadow ring
   // (flagged enforced:true) on the next tick. companyId -> [records].
   const pendingEnforced = new Map();
+  // Event-time shadow decisions, recorded memory-only from agent.run.started
+  // when the resolver is absent (hook not registered or enforce off): the
+  // tick merges them into the ring, backfills actuals, and never re-decides
+  // the same run. companyId -> [records].
+  const pendingShadow = new Map();
+  // Last resolved config per company, for the memory-only event-time path
+  // (the event handler performs zero I/O, so it reads this, not ctx.config).
+  const lastConfig = new Map();
   const enforceCompanies = new Set(); // companyIds with enforce: true
 
   const cacheFor = (companyId, ttlSec) => {
@@ -214,10 +264,58 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return config.roles.thinkerAgentIds.includes(agentId) ? 'thinker' : 'doer';
   }
 
-  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null }) {
+  /**
+   * Trial state: per-family fleet success counters plus the graduated set.
+   * { counters: { family: { finished, failed } }, graduated: [family],
+   *   seenTerminal: [runId] }. A family graduates when finished+failed
+   * reaches trials.minRuns with finished/total >= trials.minSuccessRate.
+   * Families in PROVEN_FAMILIES start proven (months of fleet history);
+   * every other family earns it through these counters.
+   */
+  function emptyTrialState() {
+    return { counters: {}, graduated: [], seenTerminal: [] };
+  }
+
+  function trialFamilyStats(trialState, family) {
+    const c = trialState?.counters?.[family] ?? { finished: 0, failed: 0 };
+    const finished = Number(c.finished) || 0;
+    const failed = Number(c.failed) || 0;
+    const total = finished + failed;
+    return { finished, failed, total, successRate: total > 0 ? finished / total : null };
+  }
+
+  function isProvenFamily(trialState, family) {
+    if (PROVEN_FAMILIES.includes(family)) return true;
+    return (trialState?.graduated ?? []).includes(family);
+  }
+
+  function buildAccountLadders({ accounts, aaSnapshot, config, previousLadders, stateKeys = null, trialState = null }) {
     const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
-    const { arms, skipped } = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
+    const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
+    // Dynamic arms from the models the feed reports served, minus ids the
+    // classic table already binds. No provider list involved: the feed is
+    // the only coverage source.
+    const servedModels = new Set();
+    for (const account of accounts ?? []) {
+      for (const m of account?.models ?? []) {
+        const canon = canonicalModelName(m);
+        if (canon) servedModels.add(canon);
+      }
+    }
+    const classicModels = new Set(classic.arms.map(a => a.model));
+    const { bindings } = buildDynamicBindings([...servedModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides });
+    const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings);
+    const arms = [...classic.arms, ...dynamic.arms];
+    const skipped = [...classic.skipped, ...dynamic.unscored.map(u => ({ model: u.model, reason: u.reason }))];
     const byArm = new Map(arms.map(a => [a.armId, a]));
+    // Unscored models (no AA match, non-chat ids): unrankable, listed for
+    // the capacity report with the accounts that serve them.
+    const unscored = [...dynamic.unscored];
+    for (const u of unscored) {
+      u.servedBy = (accounts ?? [])
+        .filter(a => (a?.models ?? []).map(canonicalModelName).includes(u.model))
+        .map(a => accountKey(a));
+    }
     const refRow = byArm.get(config.calibration.referenceArmId)?.row;
     const refCost = typeof refRow?.intelligenceIndexCostPerTask === 'number' ? refRow.intelligenceIndexCostPerTask : null;
     const burnFor = cost => {
@@ -229,7 +327,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const account = accounts[i];
       // Per-account scoring: quality support and cost profile are the
       // account's own arm set, so one provider's gaps never punish another.
-      const served = armsForProvider(arms, account.provider);
+      const served = armsForAccount(arms, account);
       const scored = new Map(computeComposite(served, config.weights).map(s => [s.armId, s]));
       const costs = fillCosts(served.map(a => ({
         armId: a.armId,
@@ -252,6 +350,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             model: arm.model,
             effort: arm.effort,
             family: arm.family,
+            trial: !isProvenFamily(trialState, arm.family),
             contextWindow: arm.row.contextWindowTokens ?? null,
             costEstimated: costs.get(r.armId)?.estimated ?? false,
           };
@@ -261,7 +360,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
-    return { ladders, skipped, arms: arms.map(a => a.armId) };
+    return { ladders, skipped, arms: arms.map(a => a.armId), unscored };
   }
 
   function accountKey(account) {
@@ -334,7 +433,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * carry codes, not exception strings.
    */
   async function resolveActualModel(companyId, run, caches) {
-    if (run.model) return { model: run.model, source: 'run-event', error: null };
+    // Backfilled runs carry modelSource from the tick's resolved-actual
+    // backfill; only a model the event itself carried counts as run-event.
+    if (run.model) return { model: run.model, source: run.modelSource ?? 'run-event', error: null };
     const notes = [];
     if (run.issueId) {
       try {
@@ -383,18 +484,33 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   /**
-   * Map a run to an account key: direct provider match first, model-family
-   * hint second. Null when neither resolves (counted, never misattributed).
+   * Map a run to an account key. Most specific first: an exact served-model
+   * match (disambiguates pools sharing one provider, e.g. an Antigravity
+   * partner model vs a Gemini one), then a direct provider match, then a
+   * model-family hint to the first account serving that family. Null when
+   * nothing resolves (counted, never misattributed). Runs name no model or
+   * provider until the actual-model trail resolves, so callers backfill
+   * resolved actuals onto run records before mapping -- see the tick.
    */
   function accountForRun(run, accounts) {
+    const canon = canonicalModelName(run?.model);
+    if (canon) {
+      for (const a of accounts ?? []) {
+        if ((a?.models ?? []).map(canonicalModelName).includes(canon)) return accountKey(a);
+      }
+    }
     const byProvider = new Map();
-    for (const a of accounts) {
+    for (const a of accounts ?? []) {
       const p = (a.provider ?? '').toLowerCase();
       if (p && !byProvider.has(p)) byProvider.set(p, accountKey(a));
     }
-    if (run.provider && byProvider.has(run.provider)) return byProvider.get(run.provider);
-    const hinted = providerForModelName(run.model);
-    if (hinted && byProvider.has(hinted)) return byProvider.get(hinted);
+    if (run?.provider && byProvider.has(run.provider)) return byProvider.get(run.provider);
+    const family = familyOfModelName(run?.model);
+    if (family) {
+      for (const a of accounts ?? []) {
+        if ((a?.models ?? []).some(m => inferFamily(canonicalModelName(m)) === family)) return accountKey(a);
+      }
+    }
     return null;
   }
 
@@ -413,7 +529,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         byId.set(r.runId, { ...r });
         continue;
       }
-      for (const k of ['model', 'provider', 'agentId', 'issueId']) {
+      for (const k of ['model', 'modelSource', 'provider', 'agentId', 'issueId']) {
         if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
       }
       // Terminal status wins (a finished event after a started one), but
@@ -433,10 +549,14 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const aaSnapshot = await ctx.state.get(scopeKey(companyId, AA_KEY));
     const pacingState = (await ctx.state.get(scopeKey(companyId, PACING_KEY))) ?? {};
     const prevLadders = (await ctx.state.get(scopeKey(companyId, LADDER_KEY)))?.ladders ?? {};
+    // Trial family counters drive which families route as trials; the fresh
+    // resolved config feeds the memory-only event-time path (see setup).
+    const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
+    lastConfig.set(companyId, config);
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, skipped } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys });
+    const { ladders, skipped, unscored } = buildAccountLadders({ accounts: snapshot.accounts, aaSnapshot, config, previousLadders: prevLadders, stateKeys, trialState });
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
@@ -493,11 +613,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
       nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive, rateBasis: step.rateBasis ?? null };
+      // Effective headroom: the 5h meter when present, else the weekly
+      // remaining as a fallback pool guard -- but ONLY for accounts whose
+      // feed entry carries a `models` list (the auto-discovery feed). A
+      // feed that predates `models` keeps headroom null (CISO
+      // unknown-headroom rule: a meter that should exist but doesn't means
+      // the reading is broken, never "plenty of quota"). Reactive accounts
+      // (vendor publishes no meter at all) carry no headroom signal; their
+      // eligibility comes from health alone (see select.mjs).
+      const reactive = isReactiveAccount(account);
+      const headroomPct = fiveHourUsed != null
+        ? Math.max(0, 1 - fiveHourUsed)
+        : (weeklyUsed != null && Array.isArray(account.models) ? Math.max(0, 1 - weeklyUsed) : null);
+      const headroomSource = fiveHourUsed != null ? 'five-hour' : (headroomPct != null ? 'weekly-fallback' : null);
       accountViews.push({
         accountId: key,
         provider: account.provider,
+        health: account.health,
+        meter: account.meter ?? null,
+        quality: account.quality,
+        reactive,
         weeklyUsedPct: weeklyUsed,
         fiveHourUsedPct: fiveHourUsed,
+        headroomPct,
+        headroomSource,
         resetAtMs,
         remainingPct: remaining,
         hoursToReset,
@@ -523,8 +662,28 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const persisted = (await ctx.state.get(scopeKey(companyId, RUNS_KEY))) ?? [];
     const runs = mergeRuns(buffered, persisted, nowMs, rateWindowMs);
     recentRuns.set(companyId, buffered.filter(r => nowMs - r.at < 15 * 60 * 1000).slice(-200));
+    const modelCaches = { agents: new Map(), issues: new Map() };
+    // Resolved-actual backfill: live run.started events name no model or
+    // provider, so unmapped runs stay unmapped until the actual model
+    // resolves (issue override, then agent config). Backfill up to 20
+    // unresolved runs per tick, newest first; the mapping below then sees
+    // the resolved models. Persisted AFTER the backfill so progress sticks.
+    let backfilledActuals = 0;
+    for (const run of runs) {
+      if (backfilledActuals >= 20) break;
+      if (run.model != null && run.model !== 'unknown') continue;
+      if (!run.agentId && !run.issueId) continue;
+      const actual = await resolveActualModel(companyId, run, modelCaches);
+      if (actual.model != null) {
+        run.model = actual.model;
+        run.modelSource = actual.source;
+        backfilledActuals += 1;
+      }
+    }
     await ctx.state.set(scopeKey(companyId, RUNS_KEY), runs.slice(0, RUNS_CAP));
+    const runById = new Map(runs.map(r => [r.runId, r]));
     const runsByAccount = new Map();
+    const inFlightByAccount = {};
     let unmappedRuns = 0;
     for (const run of runs) {
       const key = accountForRun(run, snapshot.accounts);
@@ -534,7 +693,41 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       if (!runsByAccount.has(key)) runsByAccount.set(key, []);
       runsByAccount.get(key).push(run);
+      if (run.status === 'running') inFlightByAccount[key] = (inFlightByAccount[key] ?? 0) + 1;
     }
+
+    // Trial promotion: terminal runs with a resolved model feed per-family
+    // finished/failed counters (each run counted once, via seenTerminal).
+    // A non-proven family graduates at trials.minRuns runs with
+    // trials.minSuccessRate success; its arms stop routing as trials on the
+    // NEXT tick (ladders above were built with the pre-tick set).
+    // Caveat: the 'agent-config' source is the agent's pinned model, not an
+    // observed execution -- a noisy promotion signal, hence the 10-run /
+    // 80% bar before a family sheds its in-flight cap.
+    const seenTerminal = new Set(trialState.seenTerminal ?? []);
+    let trialTransitions = 0;
+    for (const run of runs) {
+      if (run.status !== 'finished' && run.status !== 'failed') continue;
+      if (seenTerminal.has(run.runId)) continue;
+      const canon = canonicalModelName(run.model);
+      if (!canon) continue;
+      const family = inferFamily(canon);
+      if (!family) continue;
+      const c = trialState.counters[family] ?? { finished: 0, failed: 0 };
+      if (run.status === 'finished') c.finished += 1; else c.failed += 1;
+      trialState.counters[family] = c;
+      seenTerminal.add(run.runId);
+      trialTransitions += 1;
+    }
+    trialState.seenTerminal = [...seenTerminal].slice(-2000);
+    const graduated = new Set(trialState.graduated ?? []);
+    for (const [family, c] of Object.entries(trialState.counters)) {
+      const total = (c.finished ?? 0) + (c.failed ?? 0);
+      if (total >= config.trials.minRuns && (c.finished ?? 0) / total >= config.trials.minSuccessRate) {
+        graduated.add(family);
+      }
+    }
+    trialState.graduated = [...graduated];
 
     // E_a calibration: weekly-used delta over the measured span divided by
     // runs that started on the account inside that span.
@@ -573,37 +766,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       maxTotal: config.concurrency.maxTotal,
     });
 
-    // Publish the live view the memory-only resolve hook reads. No I/O
-    // happens in the hook, so everything it needs is frozen here.
+    // Shadow ring first: trial in-flight budgets are measured from trial
+    // entries whose runs are still running, and the live view publishes the
+    // resulting budgets for the memory-only hook.
     const viewById = new Map(accountViews.map(v => [v.accountId, v]));
-    liveViews.set(companyId, {
-      atMs: nowMs,
-      enforce: config.enforce === true,
-      thinkerAgentIds: config.roles.thinkerAgentIds,
-      roleBands: {
-        thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
-        doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
-      },
-      contextCaps: config.contextCaps,
-      accounts: ordered.map(a => {
-        const view = viewById.get(a.accountId);
-        const ladder = ladders[a.accountId];
-        return {
-          accountId: a.accountId,
-          pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
-          headroomPct: view?.fiveHourUsedPct != null ? Math.max(0, 1 - view.fiveHourUsedPct) : null,
-          remainingKnown: view?.remainingPct != null,
-          resetAtMs: view?.resetAtMs ?? null,
-          measuredRatePerHour: view?.measuredRatePerHour ?? null,
-          requiredRatePerHour: view?.requiredRatePerHour ?? null,
-          ladderRungs: groupByRung(ladder?.rungs ?? []),
-          burnPerRunPct: ladder?.burnPerRunPct ?? {},
-        };
-      }),
-      rateDeadbandRel: config.pacing.rateDeadbandRel,
-    });
-
-    // Shadow decisions for recently started runs (db + event feed).
     const ring = createShadowRing(config.shadowMaxEntries);
     ring.load(await ctx.state.get(scopeKey(companyId, RING_KEY)));
     const recorded = new Set(ring.list(500).map(e => e.runId));
@@ -616,32 +782,124 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
     }
     pendingEnforced.set(companyId, []);
+    // Event-time shadow decisions (recorded from agent.run.started when the
+    // resolver was absent) merge next; the loop below skips their runIds.
+    let mergedEventTime = 0;
+    for (const pending of pendingShadow.get(companyId) ?? []) {
+      if (!recorded.has(pending.runId)) {
+        ring.push(pending);
+        recorded.add(pending.runId);
+        mergedEventTime += 1;
+      }
+    }
+    pendingShadow.set(companyId, []);
+    // Per-family trial in-flight: trial ring entries (fresh, <= 2h) whose
+    // runs have no terminal status yet. Budgets go to decide, the hook, and
+    // the capacity report.
+    const runningIds = new Set(runs.filter(r => r.status === 'running').map(r => r.runId));
+    const trialInFlight = {};
+    for (const e of ring.list(500)) {
+      if (e?.trial !== true || !e?.family) continue;
+      if (!runningIds.has(e.runId)) continue;
+      if (nowMs - e.at > 2 * 3600 * 1000) continue;
+      trialInFlight[e.family] = (trialInFlight[e.family] ?? 0) + 1;
+    }
+    const trialBudget = {};
+    {
+      const fams = new Set(Object.keys(trialInFlight));
+      for (const ladder of Object.values(ladders ?? {})) {
+        for (const r of ladder?.rungs ?? []) if (r?.trial && r?.family) fams.add(r.family);
+      }
+      for (const fam of fams) {
+        trialBudget[fam] = Math.max(0, config.trials.maxInFlightPerFamily - (trialInFlight[fam] ?? 0));
+      }
+    }
+    // Deficit order: hungriest qualified account first, reactive behind
+    // metered-behind-plan, over-burning last, unhealthy and metered-unknown
+    // never. Same order the hook uses.
+    const selectionOrder = orderAccountsForRun(
+      accountViews.map(v => ({
+        accountId: v.accountId,
+        resetAtMs: v.resetAtMs,
+        headroomPct: v.headroomPct,
+        measuredRatePerHour: v.measuredRatePerHour,
+        requiredRatePerHour: v.requiredRatePerHour,
+        health: v.health,
+        meter: v.meter,
+        quality: v.quality,
+        inFlight: inFlightByAccount[v.accountId] ?? 0,
+      })),
+      { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel },
+    );
+    const selectionById = new Map(selectionOrder.map(s => [s.accountId, s]));
+
+    // Publish the live view the memory-only resolve hook reads. No I/O
+    // happens in the hook, so everything it needs is frozen here: effective
+    // headroom (5h, else the weekly fallback for feed-model accounts),
+    // health/meter/reactive for the eligibility filter, in-flight counts
+    // for the reactive cap, and the trial budgets + adapters for trial arms.
+    liveViews.set(companyId, {
+      atMs: nowMs,
+      enforce: config.enforce === true,
+      thinkerAgentIds: config.roles.thinkerAgentIds,
+      roleBands: {
+        thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
+        doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
+      },
+      contextCaps: config.contextCaps,
+      trialBudget,
+      trialAdapters: config.trials.adapters,
+      maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
+      accounts: ordered.map(a => {
+        const view = viewById.get(a.accountId);
+        const ladder = ladders[a.accountId];
+        return {
+          accountId: a.accountId,
+          pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
+          headroomPct: view?.headroomPct ?? null,
+          headroomSource: view?.headroomSource ?? null,
+          remainingKnown: view?.remainingPct != null,
+          reactive: view?.reactive === true,
+          health: view?.health ?? 'unknown',
+          meter: view?.meter ?? null,
+          quality: view?.quality ?? 'unknown',
+          inFlight: inFlightByAccount[a.accountId] ?? 0,
+          resetAtMs: view?.resetAtMs ?? null,
+          measuredRatePerHour: view?.measuredRatePerHour ?? null,
+          requiredRatePerHour: view?.requiredRatePerHour ?? null,
+          ladderRungs: groupByRung(ladder?.rungs ?? []),
+          burnPerRunPct: ladder?.burnPerRunPct ?? {},
+        };
+      }),
+      rateDeadbandRel: config.pacing.rateDeadbandRel,
+    });
+
+    // Shadow decisions for recently started runs (event feed only).
     const candidates = runs.filter(r => nowMs - r.at < 15 * 60 * 1000 && !recorded.has(r.runId)).slice(0, 100);
     const roleBands = {
       thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
       doer: { floorRung: config.roles.doerFloorRung, ceilingRung: config.roles.doerCeilingRung },
     };
-    // Deficit order: hungriest qualified account first, over-burning
-    // last, unknown headroom never. Same order the hook uses.
-    const selectionOrder = orderAccountsForRun(
-      accountViews.map(v => ({
-        accountId: v.accountId,
-        resetAtMs: v.resetAtMs,
-        headroomPct: v.fiveHourUsedPct != null ? Math.max(0, 1 - v.fiveHourUsedPct) : null,
-        measuredRatePerHour: v.measuredRatePerHour,
-        requiredRatePerHour: v.requiredRatePerHour,
-      })),
-      { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel },
-    );
     let observed = 0;
-    const modelCaches = { agents: new Map(), issues: new Map() };
+    let shadowSkippedNoDecision = 0;
+    // Trial slots occupied by decisions made THIS tick: the pre-loop ring
+    // scan cannot see them, but the report (and the next tick's budget)
+    // should. Budgets used for gating stay pre-loop; only the reported
+    // in-flight moves.
+    const decidedTrials = [];
     for (const run of candidates) {
       const role = roleOf(config, run.agentId);
       let decision = null;
       for (const sel of selectionOrder) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
-        if (!view || !ladder || view.remainingPct == null) continue;
+        if (!view || !ladder) continue;
+        // Reactive accounts qualify without a remaining fraction; metered
+        // accounts need one. Reactive lanes are capped in flight per account
+        // (default 2): no vendor meter means no burn signal, so the count of
+        // running runs is the only backpressure.
+        if (!view.reactive && view.remainingPct == null) continue;
+        if (view.reactive && (inFlightByAccount[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
         const d = decide({
           runId: run.runId,
           agentId: run.agentId,
@@ -657,6 +915,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           accountId: sel.accountId,
           roleBands,
           contextCaps: config.contextCaps,
+          adapterType: run.adapterType ?? null,
+          trialBudget,
+          trialAdapters: config.trials.adapters,
         });
         if (d.kind === 'decide') {
           decision = d;
@@ -675,6 +936,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // Why the actual model is unknown (codes only, never upstream
           // text); null when the actual model resolved.
           actualModelError: actual.error,
+          // False here: the tick resolves actuals synchronously, so nothing
+          // is pending. Event-time and hook entries set true until a tick
+          // backfills them (see below).
+          actualPending: false,
           wouldModel,
           // Did shadow agree with reality? Null while the actual model is
           // still unknown; true/false once known.
@@ -682,10 +947,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           account: decision.accountId,
           accountId: decision.accountId,
           rung: decision.rung,
+          trial: decision.trial === true,
+          family: inferFamily(canonicalModelName(decision.model)),
           reason: decision.reason,
           at: nowMs,
         });
         observed += 1;
+        if (decision.trial === true) {
+          decidedTrials.push({ family: inferFamily(canonicalModelName(decision.model)), runId: run.runId });
+        }
+      } else {
+        shadowSkippedNoDecision += 1;
       }
     }
 
@@ -698,10 +970,60 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     };
     runEventStats.set(companyId, { seen: 0, lastAtMs: mergedEvt.lastAtMs, lastRunId: mergedEvt.lastRunId });
 
+    // Ring actual backfill: event-time and hook entries record with
+    // actualPending:true (no I/O on those paths). Resolve from the merged
+    // runs (which carry issueId/agentId) -- fresh entries only, 20 per tick.
+    let ringBackfilled = 0;
+    {
+      const entries = ring.toJSON();
+      for (const e of entries) {
+        if (ringBackfilled >= 20) break;
+        if (e?.actualPending !== true) continue;
+        if (nowMs - e.at > 2 * 3600 * 1000) {
+          e.actualPending = false;
+          continue;
+        }
+        const run = runById.get(e.runId);
+        if (!run) continue;
+        const actual = await resolveActualModel(companyId, run, modelCaches);
+        if (actual.model != null) {
+          e.actualModel = actual.model;
+          e.actualModelSource = actual.source;
+          e.actualModelError = null;
+          e.actualPending = false;
+          e.modelMatch = actual.model === String(e.wouldModel).split('(')[0] || actual.model === e.wouldModel;
+          ringBackfilled += 1;
+        }
+      }
+      ring.load(entries);
+    }
+
+    // Trial family report: counters plus graduation status plus live
+    // in-flight, so /api/capacity shows what would need to happen for each
+    // trial family to graduate. This tick's own trial decisions count as
+    // in-flight (their runs are fresh); gating budgets stay pre-loop.
+    for (const t of decidedTrials) {
+      if (!t.family || !runningIds.has(t.runId)) continue;
+      trialInFlight[t.family] = (trialInFlight[t.family] ?? 0) + 1;
+    }
+    const trialFamilies = {};
+    {
+      const fams = new Set([...Object.keys(trialState.counters ?? {}), ...Object.keys(trialBudget)]);
+      for (const fam of fams) {
+        const st = trialFamilyStats(trialState, fam);
+        trialFamilies[fam] = {
+          ...st,
+          proven: isProvenFamily(trialState, fam),
+          inFlight: trialInFlight[fam] ?? 0,
+          budget: trialBudget[fam] ?? 0,
+        };
+      }
+    }
     await ctx.state.set(scopeKey(companyId, PACING_KEY), nextPacing);
     await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
     await ctx.state.set(scopeKey(companyId, RING_KEY), ring.toJSON());
     await ctx.state.set(scopeKey(companyId, RUNEVT_KEY), mergedEvt);
+    await ctx.state.set(scopeKey(companyId, TRIAL_KEY), trialState);
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
@@ -710,12 +1032,23 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       perAccount: concurrency.perAccount,
       accounts: accountViews,
       skippedArms: skipped,
+      unscored,
+      trialFamilies,
+      trialTransitions,
+      inFlightByAccount,
+      reactiveAccounts: accountViews.filter(v => v.reactive).length,
       runsObserved: runs.length,
       runsCandidates: candidates.length,
       runsSource: 'events',
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
+      shadow: {
+        decided: observed,
+        mergedEventTime,
+        backfilledActuals: backfilledActuals + ringBackfilled,
+        skippedNoDecision: shadowSkippedNoDecision,
+      },
     });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
     ctx.logger.info('model-capacity: shadow tick', {
@@ -732,6 +1065,75 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       byRung.get(r.rung).arms.push(r);
     }
     return [...byRung.values()].sort((a, b) => a.rung - b.rung);
+  }
+
+  /**
+   * Memory-only shadow decision from a run.started event. Inputs are the
+   * live view frozen by the last tick plus the cached resolved config --
+   * zero I/O, so this never blocks the event loop. Stale views (>120s, the
+   * same bound as the hook) record nothing: a tick is overdue and its own
+   * loop will cover the run. The tick merges the record into the ring and
+   * backfills the actual model; its own loop then skips the runId.
+   *
+   * Trial arms need an opted-in adapter type, which events often omit --
+   * adapter-less events decide proven arms only (a proven-arm decision now
+   * beats no decision for a minute). Runs whose events carry adapterType
+   * get full trial eligibility here AND in the tick loop.
+   */
+  function recordEventTimeShadow(companyId, run) {
+    const live = liveViews.get(companyId);
+    const config = lastConfig.get(companyId);
+    if (!live || !config) return null;
+    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return null;
+    const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(run.agentId) ? 'thinker' : 'doer';
+    const order = orderAccountsForRun(live.accounts, { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 });
+    for (const view of order) {
+      if (!view || !view.ladderRungs || view.ladderRungs.length === 0) continue;
+      if (!view.reactive && !view.remainingKnown) continue;
+      if (view.reactive && (view.inFlight ?? 0) >= (live.maxTrialInFlightPerAccount ?? 2)) continue;
+      const d = decide({
+        runId: run.runId,
+        agentId: run.agentId,
+        role,
+        ladderRungs: view.ladderRungs,
+        pointer: view.pointer ?? 0,
+        retryCount: 0,
+        failureClass: 'none',
+        contextTokens: null,
+        fiveHourHeadroomPct: view.headroomPct ?? null,
+        burnPerRunPct: view.burnPerRunPct ?? {},
+        reservePct: 0.05,
+        accountId: view.accountId,
+        roleBands: live.roleBands,
+        contextCaps: live.contextCaps,
+        adapterType: run.adapterType ?? null,
+        trialBudget: live.trialBudget ?? {},
+        trialAdapters: live.trialAdapters ?? {},
+      });
+      if (d.kind !== 'decide') continue;
+      const queue = pendingShadow.get(companyId) ?? [];
+      queue.push({
+        runId: String(run.runId ?? 'unknown'),
+        agentId: String(run.agentId ?? 'unknown'),
+        actualModel: 'unknown',
+        actualModelSource: null,
+        actualModelError: null,
+        actualPending: true,
+        wouldModel: `${d.model}(${d.effort ?? 'default'})`,
+        modelMatch: null,
+        account: d.accountId,
+        accountId: d.accountId,
+        rung: d.rung,
+        trial: d.trial === true,
+        family: inferFamily(canonicalModelName(d.model)),
+        eventTime: true,
+        reason: d.reason,
+        at: clock(),
+      });
+      pendingShadow.set(companyId, queue.slice(-200));
+      return d;
+    }
+    return null;
   }
 
   async function runAaRefresh(companyId) {
@@ -825,6 +1227,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           model: p.model ?? run.model ?? null,
           provider: typeof (p.provider ?? run.provider) === 'string' ? String(p.provider ?? run.provider).toLowerCase() : null,
           issueId: p.issueId ?? run.issueId ?? p.issue_id ?? null,
+          adapterType: p.adapterType ?? run.adapterType ?? null,
           status,
           at: Date.parse(event?.occurredAt ?? '') || clock(),
         };
@@ -836,6 +1239,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         st.lastAtMs = entry.at;
         st.lastRunId = entry.runId;
         runEventStats.set(companyId, st);
+        // Event-time shadow decision (memory-only; see
+        // recordEventTimeShadow): covers runs that start when the resolver
+        // is absent, so the ring has no minute-long blind spot.
+        if (status === 'running') {
+          try {
+            recordEventTimeShadow(companyId, entry);
+          } catch (error) {
+            ctx.logger.error('model-capacity: event-time shadow failed', { companyId, error: error?.message ?? String(error) });
+          }
+        }
       };
       ctx.events.on('agent.run.started', onRunEvent('running'));
       ctx.events.on('agent.run.finished', onRunEvent('finished'));
@@ -851,6 +1264,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         throw new Error('invalid-config');
       }
       configured.add(companyId);
+      // Cache the resolved config immediately so the event-time shadow path
+      // works before the first tick lands (the tick refreshes it every run).
+      lastConfig.set(companyId, resolveConfig(raw));
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
     },
@@ -962,11 +1378,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
       const role = Array.isArray(live.thinkerAgentIds) && live.thinkerAgentIds.includes(params.agentId) ? 'thinker' : 'doer';
       // Same deficit order as the shadow tick: hungriest qualified first,
-      // over-burning last. Unknown headroom (null weekly or 5h) never
-      // qualifies -- without a 5h signal the hook cannot verify headroom.
+      // reactive behind metered-behind-plan, over-burning last. Metered
+      // accounts without headroom never qualify; healthy reactive accounts
+      // qualify without headroom (no vendor meter exists), capped in flight
+      // per account.
       const order = orderAccountsForRun(live.accounts, { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15 });
       for (const view of order) {
-        if (!view.remainingKnown || view.ladderRungs.length === 0) continue;
+        if (!view || view.ladderRungs.length === 0) continue;
+        if (!view.reactive && !view.remainingKnown) continue;
+        if (view.reactive && (view.inFlight ?? 0) >= (live.maxTrialInFlightPerAccount ?? 2)) continue;
         const d = decide({
           runId: params.runId,
           agentId: params.agentId,
@@ -982,6 +1402,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           accountId: view.accountId,
           roleBands: live.roleBands,
           contextCaps: live.contextCaps,
+          adapterType: params.adapterType ?? null,
+          trialBudget: live.trialBudget ?? {},
+          trialAdapters: live.trialAdapters ?? {},
         });
         if (d.kind === 'decide') {
           const queue = pendingEnforced.get(params.companyId) ?? [];
@@ -990,11 +1413,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             agentId: String(params.agentId ?? 'unknown'),
             actualModel: 'unknown',
             actualModelSource: null,
+            actualModelError: null,
+            actualPending: true,
             wouldModel: `${d.model}(${d.effort ?? 'default'})`,
             modelMatch: null,
             account: d.accountId,
             accountId: d.accountId,
             rung: d.rung,
+            trial: d.trial === true,
+            family: inferFamily(canonicalModelName(d.model)),
             reason: d.reason,
             at: clock(),
             enforced: true,

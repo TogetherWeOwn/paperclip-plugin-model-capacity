@@ -1,5 +1,6 @@
 /**
- * Plugin manifest. v0.2.1 = ENFORCE-CAPABLE: holds `run.model.resolve` with
+ * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
+ * reactive-account eligibility, event-time shadow). v0.2.1 = ENFORCE-CAPABLE: holds `run.model.resolve` with
  * a minimal modelRouting envKeys list, gated at runtime by the `enforce`
  * config flag (default false: the hook answers `keep` until the operator
  * flips it). `buildManifest({ modelResolve: false })` still builds the
@@ -12,7 +13,7 @@
  */
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.1';
+export const PLUGIN_VERSION = '0.2.2';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -139,6 +140,26 @@ const CONFIG_SCHEMA = {
     enforce: {
       type: 'boolean', default: false,
       description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
+    },
+    trials: {
+      type: 'object', additionalProperties: false,
+      description: 'Trial lanes for model families without fleet success history (doer-only, adapter-gated, in-flight-capped until measured success graduates them).',
+      properties: {
+        maxInFlightPerAccount: { type: 'integer', minimum: 1, default: 2 },
+        maxInFlightPerFamily: { type: 'integer', minimum: 1, default: 2 },
+        minRuns: { type: 'integer', minimum: 1, default: 10 },
+        minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
+        adapters: {
+          type: 'object', default: { claude_local: ['*'], 'claude-code': ['*'] },
+          description: 'Adapter type to trial-eligible families ("*" means any family). Unlisted adapters get no trial arms.',
+          additionalProperties: { anyOf: [{ const: '*' }, { type: 'array', items: { type: 'string' } }] },
+        },
+      },
+    },
+    modelAaOverrides: {
+      type: 'object', default: {},
+      description: 'Operator extensions to the AA-slug override table: CLIProxy model id to AA slug (or { slug, effort }). Merged over the built-in table.',
+      additionalProperties: { anyOf: [{ type: 'string' }, { type: 'object' }] },
     },
     calibration: {
       type: 'object', additionalProperties: false,

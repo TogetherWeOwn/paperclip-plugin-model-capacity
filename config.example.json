@@ -48,6 +48,17 @@
     "haikuMaxOutputTokens": 64000
   },
   "enforce": false,
+  "trials": {
+    "maxInFlightPerAccount": 2,
+    "maxInFlightPerFamily": 2,
+    "minRuns": 10,
+    "minSuccessRate": 0.8,
+    "adapters": {
+      "claude_local": ["*"],
+      "claude-code": ["*"]
+    }
+  },
+  "modelAaOverrides": {},
   "calibration": {
     "referenceArmId": "claude-haiku-5-5",
     "referenceBurnPerRunPct": 0.0005
