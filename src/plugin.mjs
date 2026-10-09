@@ -596,26 +596,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return counts;
   }
 
-  // Queued demand per role for the role-weighted target. With no queued work
-  // (or issues unreadable) the roles that exist weigh equally: the target
-  // then counts any capacity some role can use, instead of collapsing to 0
-  // on an empty queue or hollowing out on a read failure.
+  // Queued demand per role, for the target's demand bound. With no queued
+  // work (or issues unreadable) every role reads zero and the bound is not
+  // applied: the target then counts any capacity some role can use, instead
+  // of collapsing to 0 on an empty queue or hollowing out on a read failure.
   async function roleDemandFor(companyId, config, nowMs) {
-    const roles = config?.roles ?? {};
-    const prior = {
-      doer: 1,
-      thinker: Array.isArray(roles.thinkerAgentIds) && roles.thinkerAgentIds.length > 0 ? 1 : 0,
-      other: Array.isArray(roles.doerAgentIds) && roles.doerAgentIds.length > 0 ? 1 : 0,
-    };
+    const zero = { doer: 0, thinker: 0, other: 0 };
     try {
       const counts = await queuedByAgent(companyId, nowMs);
-      const byRole = { doer: 0, thinker: 0, other: 0 };
+      const byRole = { ...zero };
       for (const [agentId, n] of counts) byRole[roleOf(config, agentId)] += n;
       const total = byRole.doer + byRole.thinker + byRole.other;
-      return total > 0 ? { byRole, source: 'issues' } : { byRole: prior, source: 'idle-prior' };
+      return total > 0 ? { byRole, source: 'issues' } : { byRole: zero, source: 'idle' };
     } catch (error) {
       ctx.logger.error('model-capacity: role demand read failed', { companyId, error: error?.message ?? String(error) });
-      return { byRole: prior, source: 'unavailable' };
+      return { byRole: zero, source: 'unavailable' };
     }
   }
 
@@ -1435,7 +1430,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         if (reads >= OUTCOME_READS_PER_TICK) break;
         // First seen late (restart, tick gap): the issue may already carry
         // the run's own status move. Leave the baseline unset -- the run
-        // scores unknown unless it created a work product.
+        // scores unknown.
         if (r.startedAt == null || nowMs - r.startedAt > OUTCOME_BASELINE_MAX_AGE_MS) {
           r.baselineSkipped = true;
           continue;
@@ -1460,9 +1455,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           if (r.evalTries >= OUTCOME_MAX_TRIES) r.progress = 'unknown';
           continue;
         }
-        const res = classifyOutcome({ runId: r.runId, baselineStatus: r.issueStatus0 ?? null, after: snap });
+        const res = classifyOutcome({ baselineStatus: r.issueStatus0 ?? null, after: snap });
         r.progress = res.outcome;
-        r.handoffOwed = res.signals.handoffOwed;
         r.progressAt = nowMs;
       }
     }
@@ -1684,6 +1678,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const prevT = Object.hasOwn(smoothState, 'target') ? smoothState.target : null;
       nextSmoothTarget = smoothValue(prevT, rawTarget, nowMs, targetSmoothOpts);
       concurrency.target = Math.min(nextSmoothTarget.value, config.concurrency.maxTotal);
+      // Demand bound (current queues, applied after smoothing so a surge is
+      // not lagged): never serve more concurrency than the queued work can
+      // fill. Zero means no account serves the queued roles; that is left to
+      // the decision path, not shed here.
+      if (concurrency.demandBound != null && concurrency.demandBound > 0) {
+        concurrency.target = Math.min(concurrency.target, concurrency.demandBound);
+      }
     }
     concurrency.targetRaw = rawTarget;
 
@@ -2097,16 +2098,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Unsmoothed usable target, and the quota-only sum with no role
       // filtering (what the target used to read), so the gap stays visible.
       targetRaw: concurrency.targetRaw ?? concurrency.target,
+      // Most runs the queued work could fill at once (null when idle).
+      demandBound: concurrency.demandBound ?? null,
       targetUnweighted: concurrency.slotsTotal ?? null,
       maxTotal: config.concurrency.maxTotal,
       calibration: concurrency.calibration,
-      // Did finished runs do their job (issue status moved / work product
-      // created by the run), per resolved model family, last 24h.
+      // Did finished runs do their job (issue moved to a disposition), per
+      // resolved model family, last 24h.
       familyOutcomes: familyOutcomes(terminalRecords(ledger), {
         nowMs,
         familyOf: outcomeFamilyOf,
       }),
-      // Per-role usable capacity and the queued demand that weights it.
+      // Per-role usable capacity and the queued demand that bounds it.
       roles: concurrency.roles ?? null,
       demandSource: demand.source,
       medianMeasuredBurnPct: concurrency.medianMeasuredBurnPct ?? null,

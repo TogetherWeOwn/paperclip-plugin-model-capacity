@@ -13,9 +13,9 @@
  *
  *  2. Measured outcomes, per (family, role) (`roles.outcomeGate`): the
  *     share of the family's recent finished runs that made progress on their
- *     issue (a status move to a disposition, or a work product the run
- *     created; see outcomes.mjs). Below the bar, and clearly worse than the
- *     best family measured for the same role, the family is ineligible for
+ *     issue (a status move to a disposition; see outcomes.mjs). Below the
+ *     bar, and clearly worse than the best family measured for the same
+ *     role, the family is ineligible for
  *     that role. Recovery is by evidence aging: a gated family gets no new
  *     runs, its old ones leave the window (the ledger keeps 24h), it drops
  *     under `minRuns` and is eligible again; if it still does not do the

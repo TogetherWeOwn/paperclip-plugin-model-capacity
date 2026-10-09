@@ -4,17 +4,18 @@
  * ended in 2-3 minutes with no tool calls and no source work.
  *
  * What the plugin can see with the capabilities it already holds
- * (`issues.read`): the issue's status when the run was first observed, the
- * issue after the run ended, and the work products the issue lists (each
- * carries `createdByRunId`). A run PROGRESSED when its issue moved to a
- * disposition (done / in_review / blocked / cancelled) or the run created a
- * work product (a PR, a document). A comment-only
- * disposition is invisible without `issue.comments.read`, which this plugin
- * does not hold, so such a run reads `noChange` -- the metric undercounts
- * absolute progress but compares families on equal terms. When the platform
- * itself flags the run as a successful run that still owes a handoff
- * (`successfulRunHandoff` naming this run), that is counted separately as
- * `handoffOwed`.
+ * (`issues.read`): the issue's status when the run was first observed and
+ * the issue's status after the run ended. A run PROGRESSED when its issue
+ * moved to a disposition (done / in_review / blocked / cancelled).
+ *
+ * Deliberately status-only. The host's plugin `issues.get` returns the plain
+ * issue row (`issues.getById`); the work products and the successful-run
+ * handoff are attached only by the HTTP `GET /issues/:id` route and no SDK
+ * client exposes them, so a work-product or handoff branch here could never
+ * fire against the real host. A run that opens a PR or posts a disposition
+ * comment but leaves the issue in its status reads `noChange`: the metric
+ * undercounts absolute progress but compares families on equal terms, which
+ * is all the gate needs (it also requires the family to trail the best one).
  *
  * Outcomes: 'progressed' | 'noChange' | 'unknown' (issue unreadable or no
  * baseline to compare). Pure functions; the tick owns the issue reads.
@@ -45,31 +46,21 @@ export const DISPOSITION_STATUSES = new Set(['done', 'in_review', 'blocked', 'ca
 /** Snapshot of the issue fields the outcome needs; null when unreadable. */
 export function issueSnapshot(issue) {
   if (issue == null || typeof issue !== 'object') return null;
-  const handoff = issue.successfulRunHandoff;
-  return {
-    status: asString(issue.status),
-    workProductRunIds: (Array.isArray(issue.workProducts) ? issue.workProducts : [])
-      .map(w => asString(w?.createdByRunId)).filter(Boolean),
-    handoffOwedRunId: handoff != null && (handoff.required === true || handoff.state === 'required')
-      ? asString(handoff.sourceRunId)
-      : null,
-  };
+  return { status: asString(issue.status) };
 }
 
 /**
  * Classify one finished run. baselineStatus: the issue status recorded while
  * the run was in flight (null when never observed).
- * Returns { outcome, signals: { statusChanged, workProduct, handoffOwed } }.
+ * Returns { outcome, signals: { statusChanged } }.
  */
-export function classifyOutcome({ runId, baselineStatus = null, after }) {
-  if (after == null) return { outcome: 'unknown', signals: { statusChanged: false, workProduct: false, handoffOwed: false } };
-  const workProduct = after.workProductRunIds.includes(runId);
+export function classifyOutcome({ baselineStatus = null, after }) {
+  if (after == null) return { outcome: 'unknown', signals: { statusChanged: false } };
   const statusChanged = baselineStatus != null && after.status != null
     && after.status !== baselineStatus && DISPOSITION_STATUSES.has(after.status);
-  const handoffOwed = after.handoffOwedRunId === runId;
-  const signals = { statusChanged, workProduct, handoffOwed };
-  if (workProduct || statusChanged) return { outcome: 'progressed', signals };
-  // No baseline and no work product: nothing to compare against.
+  const signals = { statusChanged };
+  if (statusChanged) return { outcome: 'progressed', signals };
+  // No baseline: nothing to compare against.
   if (baselineStatus == null) return { outcome: 'unknown', signals };
   return { outcome: 'noChange', signals };
 }
@@ -91,7 +82,7 @@ export function familyOutcomes(records, { nowMs, windowMs = 24 * 3600 * 1000, fa
     if (!e) {
       e = {
         runs: 0, finished: 0, failed: 0, cancelled: 0,
-        progressed: 0, noChange: 0, unknown: 0, handoffOwed: 0,
+        progressed: 0, noChange: 0, unknown: 0,
         finishRate: null, progressRate: null,
       };
       out.set(fam, e);
@@ -102,7 +93,6 @@ export function familyOutcomes(records, { nowMs, windowMs = 24 * 3600 * 1000, fa
       if (r.progress === 'progressed') e.progressed += 1;
       else if (r.progress === 'noChange') e.noChange += 1;
       else e.unknown += 1;
-      if (r.handoffOwed === true) e.handoffOwed += 1;
     } else if (r.status === 'failed') e.failed += 1;
     else e.cancelled += 1;
   }

@@ -6,52 +6,56 @@ import { createModelCapacityPlugin } from '../src/plugin.mjs';
 // "finished" read 98-100% for Muse and Claude alike. The
 // report now says whether the run moved its issue.
 
-test('issueSnapshot keeps only what the outcome reads', () => {
-  assert.equal(issueSnapshot(null), null);
-  assert.deepEqual(issueSnapshot({ status: 'in_progress' }), { status: 'in_progress', workProductRunIds: [], handoffOwedRunId: null });
-  const snap = issueSnapshot({
-    status: 'in_review',
-    workProducts: [{ createdByRunId: 'r1' }, { createdByRunId: null }, {}],
-    successfulRunHandoff: { state: 'required', required: true, sourceRunId: 'r2' },
-  });
-  assert.deepEqual(snap, { status: 'in_review', workProductRunIds: ['r1'], handoffOwedRunId: 'r2' });
-  // A resolved handoff owes nothing.
-  assert.equal(issueSnapshot({ successfulRunHandoff: { state: 'resolved', required: false, sourceRunId: 'r2' } }).handoffOwedRunId, null);
+// The host's plugin `issues.get` returns the plain issue row plus labels
+// (`issues.getById`); `workProducts` and `successfulRunHandoff` are attached
+// only by the HTTP GET /issues/:id route. This is that row, as the plugin
+// receives it.
+const hostRow = (status) => ({
+  id: 'i1', companyId: 'c1', identifier: 'ABC-1', title: 't', status, priority: 'high',
+  assigneeAgentId: 'a1', checkoutRunId: 'r', createdAt: new Date(0), updatedAt: new Date(0),
+  labelIds: [], labels: [],
 });
 
-const after = (status, extra = {}) => issueSnapshot({ status, ...extra });
+test('issueSnapshot keeps only the status, and reads it from the host row shape', () => {
+  assert.equal(issueSnapshot(null), null);
+  assert.deepEqual(issueSnapshot({ status: 'in_progress' }), { status: 'in_progress' });
+  assert.deepEqual(issueSnapshot(hostRow('in_review')), { status: 'in_review' });
+  assert.deepEqual(issueSnapshot({}), { status: null });
+  // Fields only the HTTP route carries are not read: no claim rides on them.
+  const snap = issueSnapshot({
+    status: 'in_progress',
+    workProducts: [{ createdByRunId: 'r' }],
+    successfulRunHandoff: { state: 'required', required: true, sourceRunId: 'r' },
+  });
+  assert.deepEqual(snap, { status: 'in_progress' });
+});
+
+const after = (status) => issueSnapshot(hostRow(status));
 
 test('a move onto a disposition is progress', () => {
   for (const status of ['done', 'in_review', 'blocked', 'cancelled']) {
-    assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: after(status) }).outcome, 'progressed', status);
+    assert.equal(classifyOutcome({ baselineStatus: 'in_progress', after: after(status) }).outcome, 'progressed', status);
   }
 });
 
 test('checkout is not progress: a move into in_progress, or no move, reads noChange', () => {
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'todo', after: after('in_progress') }).outcome, 'noChange');
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: after('in_progress') }).outcome, 'noChange');
+  assert.equal(classifyOutcome({ baselineStatus: 'todo', after: after('in_progress') }).outcome, 'noChange');
+  assert.equal(classifyOutcome({ baselineStatus: 'in_progress', after: after('in_progress') }).outcome, 'noChange');
 });
 
-test('a work product created by THIS run is progress, another run\'s is not', () => {
-  const mine = after('in_progress', { workProducts: [{ createdByRunId: 'r' }] });
-  const theirs = after('in_progress', { workProducts: [{ createdByRunId: 'other' }] });
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: mine }).outcome, 'progressed');
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: theirs }).outcome, 'noChange');
-  // Without a baseline a work product still proves progress.
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: null, after: mine }).outcome, 'progressed');
+test('host-shaped issues with no work product fields still classify (contract)', () => {
+  // The run opened a PR and left the issue in_progress: invisible to the
+  // plugin, so it reads noChange -- for every family alike.
+  const res = classifyOutcome({ baselineStatus: 'in_progress', after: after('in_progress') });
+  assert.deepEqual(res, { outcome: 'noChange', signals: { statusChanged: false } });
+  assert.deepEqual(classifyOutcome({ baselineStatus: 'todo', after: after('done') }),
+    { outcome: 'progressed', signals: { statusChanged: true } });
 });
 
-test('no baseline and no work product is unknown, never a guessed noChange', () => {
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: null, after: after('in_progress') }).outcome, 'unknown');
-  assert.equal(classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: null }).outcome, 'unknown');
-});
-
-test('the platform handoff flag is carried as a signal for this run only', () => {
-  const owed = after('in_progress', { successfulRunHandoff: { state: 'required', required: true, sourceRunId: 'r' } });
-  const res = classifyOutcome({ runId: 'r', baselineStatus: 'in_progress', after: owed });
-  assert.equal(res.outcome, 'noChange');
-  assert.equal(res.signals.handoffOwed, true);
-  assert.equal(classifyOutcome({ runId: 'someone-else', baselineStatus: 'in_progress', after: owed }).signals.handoffOwed, false);
+test('no baseline is unknown, never a guessed noChange', () => {
+  assert.equal(classifyOutcome({ baselineStatus: null, after: after('in_progress') }).outcome, 'unknown');
+  assert.equal(classifyOutcome({ baselineStatus: null, after: after('done') }).outcome, 'unknown');
+  assert.equal(classifyOutcome({ baselineStatus: 'in_progress', after: null }).outcome, 'unknown');
 });
 
 const NOW = 1_750_000_000_000;
@@ -64,7 +68,7 @@ test('familyOutcomes: Muse and Claude finish alike but only one moves issues', (
     ...Array.from({ length: 10 }, (_, i) => rec(`c${i}`, 'finished', { family: 'opus', progress: i < 8 ? 'progressed' : 'noChange' })),
     rec('mf', 'failed', { family: 'muse' }),
     rec('cx', 'cancelled', { family: 'opus' }),
-    rec('mu', 'finished', { family: 'muse', progress: 'unknown', handoffOwed: true }),
+    rec('mu', 'finished', { family: 'muse', progress: 'unknown' }),
   ];
   const out = familyOutcomes(records, { nowMs: NOW, familyOf });
   assert.equal(out.muse.finished, 11);
@@ -72,7 +76,7 @@ test('familyOutcomes: Muse and Claude finish alike but only one moves issues', (
   assert.ok(Math.abs(out.muse.finishRate - 11 / 12) < 1e-9);
   assert.ok(Math.abs(out.muse.progressRate - 0.1) < 1e-9, 'progressed over progressed + noChange; unknown excluded');
   assert.equal(out.muse.unknown, 1);
-  assert.equal(out.muse.handoffOwed, 1);
+  assert.equal('handoffOwed' in out.muse, false);
   assert.equal(out.opus.finishRate, 1, 'cancelled runs say nothing about the model');
   assert.ok(Math.abs(out.opus.progressRate - 0.8) < 1e-9);
   assert.equal(out.opus.cancelled, 1);
@@ -161,7 +165,7 @@ const evt = (type, runId, at, issueId) => ({
 test('the tick baselines a running issue and scores the finished run against it', async () => {
   // Issue A moves in_progress -> in_review after the run; issue B stays put.
   const status = { 'iss-a': 'in_progress', 'iss-b': 'in_progress' };
-  const d = drive((id) => ({ id, status: status[id], workProducts: [] }));
+  const d = drive((id) => ({ id, status: status[id], }));
   await d.setup();
   await d.at(TICK, [evt('agent.run.started', 'run-a', TICK, 'iss-a'), evt('agent.run.started', 'run-b', TICK, 'iss-b')]);
   status['iss-a'] = 'in_review';
@@ -191,7 +195,7 @@ test('an issue that cannot be read is retried then closed as unknown, never stuc
 });
 
 test('runs past the evaluation window are closed unknown without a read', async () => {
-  const d = drive((id) => ({ id, status: 'in_review', workProducts: [] }));
+  const d = drive((id) => ({ id, status: 'in_review', }));
   await d.setup();
   await d.at(TICK, [evt('agent.run.finished', 'run-late', TICK, 'iss-late')]);
   const before = d.reads.length;
@@ -204,7 +208,7 @@ test('runs past the evaluation window are closed unknown without a read', async 
 test('a baseline first read late is not trusted: the run scores unknown, not noChange', async () => {
   // The first tick sees the run 10 minutes in; by then the agent may already
   // have moved the issue, so the status read would not be a baseline.
-  const d = drive((id) => ({ id, status: 'in_review', workProducts: [] }));
+  const d = drive((id) => ({ id, status: 'in_review', }));
   await d.setup();
   await d.at(TICK + 10 * MIN, [evt('agent.run.started', 'run-late', TICK, 'iss-late')]);
   await d.at(TICK + 11 * MIN, [evt('agent.run.finished', 'run-late', TICK + 11 * MIN, 'iss-late')]);
@@ -219,7 +223,7 @@ test('baseline read failures do not spend the evaluation attempts', async () => 
   const status = { 'iss-t': 'in_progress' };
   const d = drive((id) => {
     if (failing) throw new Error('transient');
-    return { id, status: status[id], workProducts: [] };
+    return { id, status: status[id], };
   });
   await d.setup();
   await d.at(TICK, [evt('agent.run.started', 'run-t', TICK, 'iss-t')]);
@@ -236,5 +240,5 @@ test('baseline read failures do not spend the evaluation attempts', async () => 
   const rec = ledger.find(r => r.runId === 'run-t');
   assert.equal(rec.baselineTries, 3);
   assert.equal(rec.evalTries ?? 0, 0);
-  assert.equal(rec.progress, 'unknown', 'no baseline and no work product: unknown, but classified');
+  assert.equal(rec.progress, 'unknown', 'no baseline: unknown, but classified');
 });

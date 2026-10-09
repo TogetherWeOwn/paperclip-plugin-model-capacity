@@ -44,10 +44,18 @@ export function medianPositive(values) {
  *     -- roleLadderAccess() per role: family exclusions, the role's
  *     floor..ceiling rung window and trial-role gating already applied.
  *     Absent entries (or an absent map) count the account for every role.
- *   roleDemand: { doer, thinker, other } queued work per role. The target
- *     is the sum over roles of (role's demand share) x (slots of accounts
- *     eligible for the role), so an account only the idle role can use adds
- *     nothing. All-zero demand weighs any eligible role equally.
+ *   roleDemand: { doer, thinker, other } queued issues per role. It does NOT
+ *     weight the target: the target is the sum of the slots of every account
+ *     some role can use, which does not move with the queue (a share
+ *     weighting discounted role-exclusive capacity by the OTHER roles'
+ *     queues, so two disjoint pools both under deep queues read half
+ *     of what they sustain). Demand instead yields `demandBound`: the most
+ *     runs that could be in flight at once if each role runs only as many as
+ *     it has queued issues (a bipartite max flow, exact by min cut over role
+ *     subsets). The plugin applies it AFTER smoothing, so a queue surge lifts
+ *     the served target at once instead of rising on the EWMA half-life.
+ *     Null when demand is absent or all zero (idle or unreadable queue:
+ *     count any capacity some role can use).
  *   trialSlotCap: a trial-only account sustains at most this many runs in
  *     flight (the trial cap), whatever its quota says.
  * Uncalibrated (anchor) burn estimates never dominate: an anchor-fallback
@@ -133,12 +141,7 @@ export function computeConcurrencyTarget({
   for (const row of perAccount) {
     const eligibleRoles = ROLES.filter(r => accessOf(row.accountId, r).eligible);
     row.eligibleRoles = eligibleRoles;
-    let weight = 0;
-    if (row.slots > 0 && eligibleRoles.length > 0) {
-      weight = demandTotal > 0
-        ? eligibleRoles.reduce((s, r) => s + demand[r], 0) / demandTotal
-        : 1;
-    }
+    const weight = row.slots > 0 && eligibleRoles.length > 0 ? 1 : 0;
     // Trial-only: every eligible role can only reach trial arms.
     row.trialOnly = eligibleRoles.length > 0 && eligibleRoles.every(r => accessOf(row.accountId, r).trialOnly);
     let usable = row.slots * weight;
@@ -155,13 +158,37 @@ export function computeConcurrencyTarget({
   const slotsTotal = perAccount.reduce((sum, a) => sum + a.slots, 0) * demandFactor;
   const raw = perAccount.reduce((sum, a) => sum + a.usableSlots, 0) * demandFactor;
   const target = Math.min(raw, maxTotal);
+  const demandBound = demandTotal > 0 ? roleDemandBound(perAccount, demand, demandFactor) : null;
   return {
-    target, raw, slotsTotal, maxTotal, demandFactor, meanRunDurationHours: D,
+    target, raw, slotsTotal, demandBound, maxTotal, demandFactor, meanRunDurationHours: D,
     medianMeasuredBurnPct: medianMeasured,
     roles: Object.fromEntries(ROLES.map(r => [r, { demand: demand[r], slots: roleSlots[r].slots, accounts: roleSlots[r].accounts }])),
     calibration: measuredCount === perAccount.filter(a => !a.capped).length ? 'measured' : 'partial',
     perAccount,
   };
+}
+
+/**
+ * Most runs that can be in flight at once when role r runs at most demand[r]
+ * and account a funds at most a.usableSlots x factor, an account serving only
+ * its eligible roles. A transportation problem; by max-flow/min-cut it equals
+ * the minimum over role subsets R of
+ *   sum(demand[r], r in R) + sum(capacity of accounts with a role outside R).
+ * Three roles make that eight subsets. Accounts with no eligible role add
+ * nothing.
+ */
+export function roleDemandBound(rows, demand, factor = 1) {
+  let best = Infinity;
+  for (let mask = 0; mask < (1 << ROLES.length); mask++) {
+    let cut = 0;
+    ROLES.forEach((r, i) => { if (mask & (1 << i)) cut += demand[r]; });
+    for (const row of rows) {
+      if (!(row.usableSlots > 0)) continue;
+      if ((row.eligibleRoles ?? []).some(r => !(mask & (1 << ROLES.indexOf(r))))) cut += row.usableSlots * factor;
+    }
+    if (cut < best) best = cut;
+  }
+  return best;
 }
 
 /**

@@ -143,39 +143,67 @@ test('#4 the eight Meta lanes calibrate as one pool with the full per-run burn',
   assert.ok(group.runs >= 13);
 });
 
+const queue = (agent, n) => Array.from({ length: n }, (_, i) => issue(`${agent}-${i}`, agent));
+
 test('#1 capacity no role can use adds nothing; the report keeps the quota-only sum', async () => {
   const d = drive({
     config: ROLES_CONFIG,
-    queued: { todo: [issue('i1', 'eng'), issue('i2', 'eng'), issue('i3', 'planner')], in_progress: [] },
+    queued: { todo: [...queue('eng', 30), ...queue('planner', 30)], in_progress: [] },
   });
   const cap = await runScenario(d);
   assert.equal(cap.demandSource, 'issues');
-  assert.deepEqual([cap.roles.doer.demand, cap.roles.thinker.demand], [2, 1]);
+  assert.deepEqual([cap.roles.doer.demand, cap.roles.thinker.demand], [30, 30]);
   const ag = cap.perAccount.find(a => a.accountId.startsWith('antigravity:'));
   // Doers exclude oss; oss is a trial arm thinkers never take. Only 'other'
   // agents may run trials there, and none has queued work.
   assert.deepEqual(ag.eligibleRoles, ['other']);
   assert.equal(ag.trialOnly, true);
-  assert.equal(ag.usableSlots, 0);
+  assert.ok(ag.usableSlots <= 2 + 1e-9, 'a trial-only lane never counts past the trial cap');
   // Thinkers exclude Meta: only the Claude lane serves them.
   const meta = cap.perAccount.find(a => a.accountId === 'meta:meta-lane-1');
   assert.ok(meta.eligibleRoles.includes('doer'));
   assert.ok(!meta.eligibleRoles.includes('thinker'));
   assert.ok(cap.roles.thinker.accounts === 1 && cap.roles.doer.accounts >= META_LANES);
-  assert.ok(cap.targetUnweighted > cap.targetRaw, `${cap.targetUnweighted} !> ${cap.targetRaw}`);
-  assert.ok(cap.target > 0 && cap.target <= cap.targetUnweighted);
+  assert.ok(cap.targetUnweighted >= cap.targetRaw, `${cap.targetUnweighted} < ${cap.targetRaw}`);
+  // Deep queues on both roles: the served target is every slot a queued role
+  // can use, and the lane only 'other' agents could use (nobody queued) is
+  // out of the bound.
+  const usable = cap.perAccount.filter(r => r.eligibleRoles.some(x => x !== 'other')).reduce((sum, r) => sum + r.usableSlots, 0);
+  assert.ok(Math.abs(cap.demandBound - usable) < 1e-9, `bound ${cap.demandBound} vs ${usable}`);
+  assert.ok(cap.target > 0 && cap.target <= cap.demandBound + 1e-9);
 });
 
-test('#1 with only thinker work queued, Meta capacity drops out of the target', async () => {
-  const doerWork = drive({ config: ROLES_CONFIG, queued: { todo: [issue('i1', 'eng')], in_progress: [] } });
-  const thinkerWork = drive({ config: ROLES_CONFIG, queued: { todo: [issue('i1', 'planner')], in_progress: [] } });
+test('#1 with only thinker work queued, Meta capacity drops out of the served target', async () => {
+  const doerWork = drive({ config: ROLES_CONFIG, queued: { todo: queue('eng', 40), in_progress: [] } });
+  const thinkerWork = drive({ config: ROLES_CONFIG, queued: { todo: queue('planner', 40), in_progress: [] } });
   const [a, b] = [await runScenario(doerWork), await runScenario(thinkerWork)];
-  assert.ok(b.targetRaw < a.targetRaw, `thinker-only ${b.targetRaw} should be below doer-only ${a.targetRaw}`);
+  // The capacity series does not move with the queue; the bound does.
+  assert.ok(Math.abs(a.targetRaw - b.targetRaw) < 1e-9, 'queue composition does not move the capacity target');
+  assert.ok(b.demandBound < a.demandBound, `thinker-only ${b.demandBound} should be below doer-only ${a.demandBound}`);
   const claude = b.perAccount.find(r => r.accountId === 'claude:claude-lane-1');
-  assert.ok(Math.abs(b.targetRaw - claude.slots) < 1e-9, 'only the Claude lane counts for thinkers');
+  assert.ok(Math.abs(b.demandBound - claude.slots) < 1e-9, 'only the Claude lane counts for thinkers');
+  assert.ok(b.target <= b.demandBound + 1e-9);
 });
 
-test('#1 an unreadable queue falls back to equal role weights, never a hollow target', async () => {
+test('#1 a queue surge lifts the served target at once, not on the EWMA half-life', async () => {
+  // Thin queue: the served target is bounded by the few queued issues.
+  const queued = { todo: queue('eng', 2), in_progress: [] };
+  const d = drive({ config: ROLES_CONFIG, queued });
+  const thin = await runScenario(d);
+  assert.ok(thin.demandBound <= 2 + 1e-9, `thin bound ${thin.demandBound}`);
+  assert.ok(thin.target <= 2 + 1e-9);
+  // 60 more issues arrive. The capacity series is unchanged, so the
+  // smoothed value does not lag: the served target jumps to the new bound.
+  queued.todo = queue('eng', 60);
+  await d.step({ at: T0 + 25 * MIN, step: 2 });
+  const surge = await d.capacity();
+  assert.ok(surge.demandBound > thin.demandBound + 1, `bound ${surge.demandBound}`);
+  assert.ok(Math.abs(surge.target - Math.min(surge.demandBound, surge.smoothing.target ?? surge.targetRaw)) < 1.0 || surge.target > thin.target + 1,
+    `served ${surge.target} should follow the queue, was ${thin.target}`);
+  assert.ok(surge.target > 2 + 1, `served target ${surge.target} must not stay at the thin-queue level`);
+});
+
+test('#1 an unreadable queue counts any capacity some role can use, never a hollow target', async () => {
   const d = drive({ config: ROLES_CONFIG, issuesList: () => { throw new Error('boom'); } });
   const cap = await runScenario(d);
   assert.equal(cap.demandSource, 'unavailable');

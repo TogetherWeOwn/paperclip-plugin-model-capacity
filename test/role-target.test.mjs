@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { decide, roleRungWindow, roleLadderAccess } from '../src/decide.mjs';
-import { computeConcurrencyTarget } from '../src/concurrency.mjs';
+import { computeConcurrencyTarget, roleDemandBound } from '../src/concurrency.mjs';
 
 // Per-role target: the target counts only capacity the roles can use.
 // Live evidence (12:37Z): target ~20 of which ~9 slots came from a lane that
@@ -104,20 +104,71 @@ test('ineligible capacity adds nothing: only accounts a role can use count for i
   assert.ok(out.slotsTotal > out.raw, 'raw quota capacity stays visible next to the usable target');
 });
 
-test('each role weighs its slots by that role queued demand', () => {
+test('the capacity target ignores the queue; the demand bound follows it', () => {
   const accounts = [acct('claude'), acct('meta')];
   const roleAccess = { claude: access(yes, yes), meta: access(yes, no) };
   const slot = 0.93;
-  const doerOnly = computeConcurrencyTarget({ accounts, roleAccess, roleDemand: { doer: 5, thinker: 0, other: 0 } });
-  assert.ok(Math.abs(doerOnly.target - 2 * slot) < 1e-9);
-  const thinkerOnly = computeConcurrencyTarget({ accounts, roleAccess, roleDemand: { doer: 0, thinker: 5, other: 0 } });
-  assert.ok(Math.abs(thinkerOnly.target - slot) < 1e-9, 'Meta is invisible to thinkers');
-  // 3 doer : 1 thinker queued -> meta counts 3/4 of its slots.
-  const mixed = computeConcurrencyTarget({ accounts, roleAccess, roleDemand: { doer: 3, thinker: 1, other: 0 } });
-  assert.ok(Math.abs(mixed.target - (slot + 0.75 * slot)) < 1e-9);
-  // No queued work anywhere: any eligible account counts fully.
-  const idle = computeConcurrencyTarget({ accounts, roleAccess, roleDemand: { doer: 0, thinker: 0, other: 0 } });
-  assert.ok(Math.abs(idle.target - 2 * slot) < 1e-9);
+  const run = (roleDemand) => computeConcurrencyTarget({ accounts, roleAccess, roleDemand });
+  const doerOnly = run({ doer: 5, thinker: 0, other: 0 });
+  const thinkerOnly = run({ doer: 0, thinker: 5, other: 0 });
+  const mixed = run({ doer: 3, thinker: 1, other: 0 });
+  const idle = run({ doer: 0, thinker: 0, other: 0 });
+  for (const out of [doerOnly, thinkerOnly, mixed, idle]) {
+    assert.ok(Math.abs(out.target - 2 * slot) < 1e-9, 'every account some role can use counts, whatever the queue');
+  }
+  // Deep queues: both bounds are what the roles can reach. Thinkers cannot
+  // use Meta; doers can use both.
+  const deep = (d, t) => run({ doer: d, thinker: t, other: 0 }).demandBound;
+  assert.ok(Math.abs(deep(50, 0) - 2 * slot) < 1e-9);
+  assert.ok(Math.abs(deep(0, 50) - slot) < 1e-9, 'Meta is invisible to thinkers');
+  assert.ok(Math.abs(deep(50, 50) - 2 * slot) < 1e-9);
+  // 3 doers : 1 thinker queued is short of the 1.86 slots: bounded by the queue.
+  assert.ok(Math.abs(mixed.demandBound - Math.min(4, 2 * slot)) < 1e-9);
+  assert.equal(idle.demandBound, null, 'no queued work: the bound is not applied');
+  assert.equal(computeConcurrencyTarget({ accounts, roleAccess }).demandBound, null, 'absent demand: not applied');
+});
+
+// Paperclip Review: two role-exclusive pools under deep queues both run
+// full, so the target must read the sum, not the other role's queue share.
+test('role-exclusive pools under deep queues are not discounted by the other role queue', () => {
+  // 9.3 slots each: a doer-only and a thinker-only pool.
+  const accounts = [acct('d1', { hoursToReset: 10 }), acct('t1', { hoursToReset: 10 })];
+  const roleAccess = { d1: access(yes, no), t1: access(no, yes) };
+  const run = (doer, thinker) => computeConcurrencyTarget({ accounts, roleAccess, roleDemand: { doer, thinker, other: 0 } });
+  for (const [d, t] of [[50, 50], [90, 10], [10, 90], [30, 30]]) {
+    const out = run(d, t);
+    assert.ok(Math.abs(out.target - 18.6) < 1e-9, `${d}/${t} target ${out.target}`);
+    assert.ok(Math.abs(out.demandBound - 18.6) < 1e-9, `${d}/${t} bound ${out.demandBound}`);
+  }
+  // A role with nothing queued cannot fill its pool; a thin queue fills part.
+  assert.ok(Math.abs(run(100, 0).demandBound - 9.3) < 1e-9);
+  assert.ok(Math.abs(run(100, 1).demandBound - 10.3) < 1e-9);
+  assert.ok(Math.abs(run(100, 1).target - 18.6) < 1e-9, 'the capacity target itself does not follow the queue');
+  // The idle / unreadable prior counts every account some role can use.
+  const shared = [acct('s1', { hoursToReset: 10 }), acct('d1', { hoursToReset: 10 })];
+  const idle = computeConcurrencyTarget({
+    accounts: shared,
+    roleAccess: { s1: access(yes, yes), d1: access(yes, no, yes) },
+    roleDemand: { doer: 0, thinker: 0, other: 0 },
+  });
+  assert.ok(Math.abs(idle.target - 18.6) < 1e-9, `idle ${idle.target}`);
+  assert.equal(idle.demandBound, null);
+});
+
+test('roleDemandBound: a shared pool fills the other roles after exclusive demand', () => {
+  const row = (slots, eligibleRoles) => ({ usableSlots: slots, eligibleRoles });
+  const rows = [row(9, ['doer']), row(9, ['doer', 'thinker'])];
+  // Doers can take the shared pool too; thinkers only the shared one.
+  assert.equal(roleDemandBound(rows, { doer: 5, thinker: 5, other: 0 }), 10);
+  // Thinkers take 5 of the shared pool; doers fill their own 9 plus the other 4.
+  assert.equal(roleDemandBound(rows, { doer: 100, thinker: 5, other: 0 }), 18);
+  assert.equal(roleDemandBound(rows, { doer: 3, thinker: 100, other: 0 }), 12);
+  assert.equal(roleDemandBound(rows, { doer: 100, thinker: 100, other: 0 }), 18);
+  assert.equal(roleDemandBound(rows, { doer: 0, thinker: 100, other: 0 }), 9, 'thinkers reach only the shared pool');
+  assert.equal(roleDemandBound(rows, { doer: 0, thinker: 0, other: 0 }), 0);
+  // An account no role can use adds nothing; the demand factor scales capacity.
+  assert.equal(roleDemandBound([row(9, [])], { doer: 5, thinker: 5, other: 5 }), 0);
+  assert.equal(roleDemandBound(rows, { doer: 100, thinker: 100, other: 0 }, 0.5), 9);
 });
 
 test('no role access map keeps the legacy sum', () => {

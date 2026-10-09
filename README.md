@@ -52,14 +52,23 @@ install ran live:
    floor..ceiling
    rung window and trial-role gating, it has a reachable arm
    (`roleLadderAccess`, checked against `decide()` in the tests). The target
-   is the sum over roles of (the role's share of queued demand) x (slots of
-   the accounts that role can use), so a lane no role can use, or one only
-   the idle role can use, adds nothing. A trial-only account is clipped to the
-   trial in-flight cap. An uncalibrated (anchor) burn estimate is floored at
-   the median measured per-run burn, so a guessed-cheap anchor cannot mint
-   more slots than a measured peer. `/capacity` shows `target` (usable),
-   `targetRaw` (before smoothing), `targetUnweighted` (quota only, the old
-   sum), per-role `roles`, and per-account `eligibleRoles` / `usableSlots`.
+   is the sum of the slots of every account some role can use, so a lane no
+   role can use adds nothing; it does not move with the queue (an earlier
+   share-of-queue weighting discounted a role-exclusive pool by the OTHER
+   roles' queues, so two disjoint pools both under deep queues read half of
+   what they sustain). A trial-only account is clipped to the trial in-flight
+   cap. An uncalibrated (anchor) burn estimate is floored at the median
+   measured per-run burn, so a guessed-cheap anchor cannot mint more slots
+   than a measured peer. Queued work bounds the SERVED target instead:
+   `demandBound` is the most runs the queued issues could fill at once (each
+   role runs at most as many as it has queued, an account serves only its
+   eligible roles; a max flow, exact by min cut over the three roles). It is
+   applied after smoothing, so a queue surge lifts the served target at once
+   rather than on the EWMA half-life. With no queued work, or an unreadable
+   queue, it is null and any capacity some role can use counts. `/capacity`
+   shows `target` (served), `targetRaw` (capacity, before smoothing),
+   `demandBound`, `targetUnweighted` (quota only, the old sum), per-role
+   `roles`, and per-account `eligibleRoles` / `usableSlots`.
 2. *Pooled providers calibrate and place as one pool.* CLIProxy round-robins
    a provider's credentials but a run maps to one lane, so per-lane E was one
    lane's delta over every pool run (about pool-width too low) and the
@@ -323,9 +332,10 @@ population: with fewer than 8 scored arms the minimum is not applied
 **2. `roles.outcomeGate`** (per family and role, from the run ledger).
 Evidence is the family's most recent `lastRuns` finished runs inside
 `windowHours` whose outcome was judged: it *progressed* if the issue moved
-to a disposition (done / in_review / blocked / cancelled) or the run created
-a work product, else *noChange*. Failed runs belong to the arm breaker,
-cancelled runs say nothing about the model, unreadable outcomes are not
+to a disposition (done / in_review / blocked / cancelled), else *noChange*.
+The signal is status-only: the host hands plugins the plain issue row, so a
+PR or comment that leaves the issue's status alone is not seen. Failed runs
+belong to the arm breaker, cancelled runs say nothing about the model, unreadable outcomes are not
 misses. A family is gated for a role when it has at least `minRuns` judged
 runs, its progress rate is below `minProgressRate`, AND below
 `relativeToBest` of the best-measured family's rate for the same role. The
