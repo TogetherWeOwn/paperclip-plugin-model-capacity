@@ -217,6 +217,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  // Agent adapter types, resolved from the agent record when run events
+  // omit adapterType (trial arms are adapter-gated). companyId:agentId ->
+  // { adapterType, atMs }, 10-min TTL, 500-entry cap. Failures and empty
+  // reads are never cached: the next tick retries, and the trial gate
+  // keeps deferring with its stable reason meanwhile.
+  const agentAdapterCache = new Map();
+  const ADAPTER_TTL_MS = 10 * 60 * 1000;
   const enforceCompanies = new Set(); // companyIds with enforce: true
 
   const cacheFor = (companyId, ttlSec) => {
@@ -418,6 +425,40 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   /**
+   * Adapter type for a run whose event did not carry one. Reads the agent
+   * record (agents.read, already declared) with a 10-min per-agent cache.
+   * Null when the agent is unknown or the read fails: trial arms stay
+   * gated and decide keeps deferring with its stable reason -- the lookup
+   * failing must never invent eligibility.
+   */
+  async function agentAdapterType(companyId, agentId) {
+    if (!agentId || agentId === 'unknown') return null;
+    const key = `${companyId}:${agentId}`;
+    const hit = agentAdapterCache.get(key);
+    if (hit && hit.adapterType && clock() - hit.atMs < ADAPTER_TTL_MS) return hit.adapterType;
+    try {
+      const agent = await compatAgentGet(agentId, companyId);
+      const t = agent?.adapterType ?? agent?.adapter_type ?? null;
+      if (typeof t === 'string' && t.length > 0) {
+        agentAdapterCache.set(key, { adapterType: t, atMs: clock() });
+        if (agentAdapterCache.size > 500) agentAdapterCache.delete(agentAdapterCache.keys().next().value);
+        return t;
+      }
+    } catch (error) {
+      ctx.logger.error('model-capacity: agent adapter read failed', { companyId, error: error?.message ?? String(error) });
+    }
+    return null;
+  }
+
+  /** Fresh cached adapter type from a frozen live view (memory-only paths). */
+  function liveAdapterFor(live, agentId) {
+    const entry = live?.adapterByAgent?.[agentId];
+    if (!entry || typeof entry.adapterType !== 'string') return null;
+    if (clock() - entry.atMs > ADAPTER_TTL_MS) return null;
+    return entry.adapterType;
+  }
+
+  /**
    * The actual model a run used. The run.started event carries one when the
    * emitter knew it; otherwise the issue's assignee adapter override
    * (preferred -- it is what the run was told to use), then the agent's
@@ -529,7 +570,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         byId.set(r.runId, { ...r });
         continue;
       }
-      for (const k of ['model', 'modelSource', 'provider', 'agentId', 'issueId']) {
+      for (const k of ['model', 'modelSource', 'provider', 'agentId', 'issueId', 'adapterType']) {
         if ((prev[k] == null || prev[k] === 'unknown') && r[k] != null && r[k] !== 'unknown') prev[k] = r[k];
       }
       // Terminal status wins (a finished event after a started one), but
@@ -678,6 +719,23 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         run.model = actual.model;
         run.modelSource = actual.source;
         backfilledActuals += 1;
+      }
+    }
+    // Adapter gate backfill: trial arms need adapterType and run events
+    // usually omit it. Resolve once per agent from the agent record
+    // (10-min TTL cache) and stamp it onto the runs, so this tick's
+    // decisions, the ring entries, and the live adapter map reuse it.
+    // Runs whose agents do not resolve keep deferring as before.
+    {
+      const byAgent = new Map();
+      for (const run of runs) {
+        if (run.adapterType || !run.agentId || run.agentId === 'unknown') continue;
+        if (!byAgent.has(run.agentId)) byAgent.set(run.agentId, []);
+        byAgent.get(run.agentId).push(run);
+      }
+      for (const [agentId, list] of byAgent) {
+        const t = await agentAdapterType(companyId, agentId);
+        if (t) for (const r of list) r.adapterType = t;
       }
     }
     await ctx.state.set(scopeKey(companyId, RUNS_KEY), runs.slice(0, RUNS_CAP));
@@ -910,10 +968,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // share + pooled in-flight for water-filling allocation, per-account
     // in-flight for the reactive cap, and the trial budgets + adapters for
     // trial arms.
+    // Adapter map for the memory-only paths: fresh cached agent adapter
+    // types, so the hook and event-time shadow decide trial arms for
+    // agents the tick has already seen without performing I/O.
+    const adapterByAgent = {};
+    for (const [k, v] of agentAdapterCache) {
+      const sep = k.indexOf(':');
+      if (sep < 0 || k.slice(0, sep) !== companyId) continue;
+      if (!v?.adapterType || nowMs - v.atMs > ADAPTER_TTL_MS) continue;
+      adapterByAgent[k.slice(sep + 1)] = { adapterType: v.adapterType, atMs: v.atMs };
+    }
     liveViews.set(companyId, {
       atMs: nowMs,
       enforce: config.enforce === true,
       inFlightByPool,
+      adapterByAgent,
       thinkerAgentIds: config.roles.thinkerAgentIds,
       roleBands: {
         thinker: { floorRung: config.roles.thinkerFloorRung, ceilingRung: config.roles.thinkerCeilingRung },
@@ -1176,9 +1245,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * backfills the actual model; its own loop then skips the runId.
    *
    * Trial arms need an opted-in adapter type, which events often omit --
-   * adapter-less events decide proven arms only (a proven-arm decision now
-   * beats no decision for a minute). Runs whose events carry adapterType
-   * get full trial eligibility here AND in the tick loop.
+   * adapter-less events fall back to the live adapter map (agent types the
+   * tick resolved from agent records, 10-min TTL), then to proven arms
+   * only. Runs whose events carry adapterType get full trial eligibility
+   * here AND in the tick loop.
    */
   /**
    * Water-filling order over the frozen live view (hook + event-time path).
@@ -1235,7 +1305,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         accountId: view.accountId,
         roleBands: live.roleBands,
         contextCaps: live.contextCaps,
-        adapterType: run.adapterType ?? null,
+        adapterType: run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null,
         trialBudget: live.trialBudget ?? {},
         trialAdapters: live.trialAdapters ?? {},
       });
@@ -1530,7 +1600,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           accountId: view.accountId,
           roleBands: live.roleBands,
           contextCaps: live.contextCaps,
-          adapterType: params.adapterType ?? null,
+          adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
           trialBudget: live.trialBudget ?? {},
           trialAdapters: live.trialAdapters ?? {},
         });

@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.3, all-providers)
+# Model Capacity plugin (v0.2.4, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -70,6 +70,11 @@ mapping uses resolved actual models.
    (`trials.maxInFlightPerFamily`, default 2), and bypass the burn check
    (their burn is unmeasured by definition; the in-flight cap bounds the
    blast radius). `defer` happens only when no account has headroom.
+   Run events rarely carry `adapterType`, so the tick resolves it from the
+   agent record (`agents.read`, already declared; 10-min TTL, 500-entry
+   cap, failures never cached) and stamps it onto the runs; the live view
+   publishes the fresh map for the memory-only hook and event-time path.
+   An agent that does not resolve keeps trial arms gated (stable defer).
 7. **Concurrency** `C* = sum(requiredRate_a/E_a) x D` (Little's law,
    `D = 0.186h` measured fleet mean run duration). `E_a` is calibrated
    per account from lane weekly-used deltas divided by event runs

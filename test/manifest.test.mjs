@@ -5,8 +5,8 @@ import { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_K
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.3');
-  assert.equal(PLUGIN_VERSION, '0.2.3');
+  assert.equal(manifest.version, '0.2.4');
+  assert.equal(PLUGIN_VERSION, '0.2.4');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -25,7 +25,7 @@ test('lane endpoint pinned to the allowlist in schema', () => {
   );
 });
 
-test('v0.2.3 default manifest holds run.model.resolve with the exact env keys', () => {
+test('v0.2.4 default manifest holds run.model.resolve with the exact env keys', () => {
   assert.ok(manifest.capabilities.includes('run.model.resolve'));
   // Exactly the env keys decide may set: nothing more, nothing less.
   assert.deepEqual(MODEL_ROUTING_ENV_KEYS, [
@@ -64,7 +64,7 @@ test('shadow entrypoints use no build step', () => {
   assert.equal(manifest.entrypoints.worker, './src/worker.mjs');
 });
 
-test('v0.2.3 schema declares trials and modelAaOverrides', () => {
+test('v0.2.4 schema declares trials and modelAaOverrides', () => {
   const props = manifest.instanceConfigSchema.properties;
   assert.equal(props.trials.properties.maxInFlightPerAccount.default, 2);
   assert.equal(props.trials.properties.maxInFlightPerFamily.default, 2);

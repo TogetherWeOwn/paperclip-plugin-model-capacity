@@ -257,3 +257,41 @@ test('water-filling spreads ten decisions across three equal metered accounts', 
   assert.deepEqual(Object.values(counts).sort(), [3, 3, 4]);
   for (const a of capacity.body.accounts) assert.ok(a.targetShare > 0, `${a.accountId} carries a target share`);
 });
+
+test('trial gemini arm decidable from the agent record when the event lacks adapterType', async () => {
+  // The adapter gate fix: agent.run.started carries no adapterType, so the
+  // tick resolves it from the agent record (10-min TTL cache) and the
+  // gemini trial arm becomes decidable for a claude_local agent.
+  const geminiReactive = () => rawAcct({
+    lane: 'ag-1', provider: 'antigravity', key: 'g1', meter: 'reactive', quality: 'reactive',
+    models: ['gemini-2-5-flash'],
+  });
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [geminiReactive()],
+    agentGets: { 'agent-9': { adapterType: 'claude_local' } },
+    steps: [{ now: TICK, fire: [started('run-t', TICK - 60000)] }],
+  });
+  const { shadow } = await run();
+  assert.equal(shadow.body.entries.length, 1);
+  const [entry] = shadow.body.entries;
+  assert.deepEqual([entry.trial, entry.family], [true, 'gemini']);
+});
+
+test('unresolvable agent adapter keeps trial arms gated (stable deferral)', async () => {
+  // Lookup failure falls back to current behavior: no invented
+  // eligibility, the trial-only ladder defers with the stable reason.
+  const geminiReactive = () => rawAcct({
+    lane: 'ag-1', provider: 'antigravity', key: 'g1', meter: 'reactive', quality: 'reactive',
+    models: ['gemini-2-5-flash'],
+  });
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [geminiReactive()],
+    agentGets: {},
+    steps: [{ now: TICK, fire: [started('run-u', TICK - 60000)] }],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(shadow.body.entries.length, 0);
+  assert.ok(capacity.body.shadow.skippedNoDecision >= 1);
+});
