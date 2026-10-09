@@ -11,10 +11,13 @@
  * Response JSON:
  *   { observedAt, accounts: [{ lane, provider, accountKey, health,
  *     weekly: { used, resetsAt }, fiveHour: { used, resetsAt },
- *     observedAt, quality }] }
+ *     observedAt, quality }], modelStats, pricingTiers }
  * where `used` is 0..1 or null, `resetsAt` ISO or null, and `quality` is
  * passive|live|cached|unknown. The host service does passive-first plus a
- * single-account live pull on stale accounts, server-side.
+ * single-account live pull on stale accounts, server-side. modelStats and
+ * pricingTiers (context price cliffs + measured prompt distribution, see
+ * tiers.mjs) pass through here; feeds that predate them carry nothing and
+ * the plugin prices every arm at base cost.
  *
  * Pure functions only: request building, the overstrike allowlist guard,
  * and response parsing. Actual HTTP goes through `ctx.http.fetch` at the
@@ -155,6 +158,10 @@ export function parseLaneBody(body, nowMs = Date.now()) {
     observedAt,
     observedAtMs: msOrNull(observedAt),
     accounts: list.filter(a => a && typeof a === 'object').map(a => parseLaneAccount(a, nowMs)),
+    // Context-tier feed (tolerant: malformed shapes degrade to no tiers,
+    // never a crash; tiers.mjs validates per entry).
+    modelStats: body?.modelStats && typeof body.modelStats === 'object' ? body.modelStats : null,
+    pricingTiers: Array.isArray(body?.pricingTiers) ? body.pricingTiers : [],
     atMs: nowMs,
     source: 'cliproxy-lane',
   };
