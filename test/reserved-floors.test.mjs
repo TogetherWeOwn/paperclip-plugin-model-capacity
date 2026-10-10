@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocateDemandCaps, applyReservedFloors, computeReservedFloor } from '../src/concurrency.mjs';
 import { holdCaps, SMOOTHING_DEFAULTS } from '../src/smoothing.mjs';
-import { breakerKey, breakerSuspendsFloors, createBreakerStore, DEFAULT_BREAKERS } from '../src/breakers.mjs';
+import { breakerKey, breakerSuspendsFloors, createBreakerStore, DEFAULT_BREAKERS, noteKnownArms, breakerHousekeep, breakerStoreFromJSON, breakerStoreToJSON } from '../src/breakers.mjs';
 import { resolveConfig, validateConfigShape, createModelCapacityPlugin } from '../src/plugin.mjs';
 
 // Reserved per-agent floors: config-only, empty by default. Placeholders only,
@@ -113,6 +113,26 @@ test('ceiling: floors win, others give back new slots only, never below running'
   }
   assert.ok(r.entries.reduce((s, e) => s + e.allocated, 0) <= 15);
   assert.deepEqual(r.applied, ['agent-a']);
+});
+
+test('ceiling: an agent already above its floor is never cut below it', () => {
+  // agent-a holds 10 with floor 8 (the floor did not lift it); the give-back
+  // used to protect only lifted agents and cut agent-a to 4. Floored agents
+  // give back only slots above max(floor, running).
+  const spec = { base: 4, perQueued: 20, max: 8 };
+  const entries = [
+    { agentId: 'agent-a', running: 2, queued: 90, demand: 92, allocated: 10, maxConcurrentRuns: 10, reason: 'full-demand' },
+    { agentId: 'agent-b', running: 2, queued: 105, demand: 107, allocated: 2, maxConcurrentRuns: 2, reason: 'proportional' },
+  ];
+  const r = applyReservedFloors(entries, {
+    reservedFloors: { 'agent-a': spec, 'agent-b': spec }, ceiling: 12,
+  });
+  const byId = new Map(r.entries.map(e => [e.agentId, e]));
+  assert.equal(byId.get('agent-b').allocated, 8);
+  assert.equal(byId.get('agent-b').reason, 'reserved-floor');
+  assert.ok(byId.get('agent-a').allocated >= 8, `agent-a cut to ${byId.get('agent-a').allocated}`);
+  assert.equal(byId.get('agent-a').floor, 8);
+  assert.equal(r.floors['agent-a'].applied, false);
 });
 
 test('breaker open on the agent arm: the floor does not apply, cap holds at running', () => {
@@ -226,20 +246,60 @@ const openStore = (pairs, atMs) => ({
   seen: [],
 });
 
-test('breaker guard: suspends only while every tracked arm reads open', () => {
+test('breaker guard: suspends only while every servable arm reads open', () => {
   const now = 1_750_000_000_000;
+  const noted = (store, pairs) => {
+    noteKnownArms(store, pairs.map(([accountId, armId]) => ({ accountId, armId })), now);
+    return store;
+  };
   assert.equal(breakerSuspendsFloors(createBreakerStore(), now, DEFAULT_BREAKERS), false);
   assert.equal(
-    breakerSuspendsFloors(openStore([['acct-a', 'arm-1'], ['acct-b', 'arm-2']], now), now, DEFAULT_BREAKERS),
+    breakerSuspendsFloors(
+      noted(openStore([['acct-a', 'arm-1'], ['acct-b', 'arm-2']], now), [['acct-a', 'arm-1'], ['acct-b', 'arm-2']]),
+      now, DEFAULT_BREAKERS,
+    ),
     true,
+    'fleet-wide cooling suspends',
   );
-  const half = openStore([['acct-a', 'arm-1']], now - 7 * 3600 * 1000);
+  const half = noted(openStore([['acct-a', 'arm-1']], now - 7 * 3600 * 1000), [['acct-a', 'arm-1']]);
   assert.equal(breakerSuspendsFloors(half, now, DEFAULT_BREAKERS), false, 'cool-off elapsed: half-open serves');
   assert.equal(
-    breakerSuspendsFloors(openStore([['acct-a', 'arm-1']], now), now, { ...DEFAULT_BREAKERS, enabled: false }),
+    breakerSuspendsFloors(
+      noted(openStore([['acct-a', 'arm-1']], now), [['acct-a', 'arm-1']]),
+      now, { ...DEFAULT_BREAKERS, enabled: false },
+    ),
     false,
     'disabled breaker never suspends',
   );
+});
+
+test('breaker guard: one tripped arm does not suspend the fleet', () => {
+  // The failure map only holds arms that have failed; the guard decides from
+  // the tick-noted servable universe, so a lone cooling arm leaves floors on
+  // (placement avoids it) instead of starving every floored agent for the
+  // whole 6h cool-off.
+  const now = 1_750_000_000_000;
+  const store = openStore([['acct-a', 'rare-arm']], now);
+  noteKnownArms(store, [
+    { accountId: 'acct-a', armId: 'rare-arm' },
+    { accountId: 'acct-a', armId: 'arm-2' },
+    { accountId: 'acct-b', armId: 'arm-1' },
+  ], now);
+  assert.equal(breakerSuspendsFloors(store, now, DEFAULT_BREAKERS), false);
+  // Five hours later the rare arm still cools, and floors still stay on.
+  assert.equal(breakerSuspendsFloors(store, now + 5 * 3600 * 1000, DEFAULT_BREAKERS), false);
+});
+
+test('breaker guard: known arms persist and prune', () => {
+  const now = 1_750_000_000_000;
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'a', armId: 'x' }, { accountId: 'b', armId: 'y' }], now);
+  const round = breakerStoreFromJSON(breakerStoreToJSON(store, { nowMs: now }));
+  assert.deepEqual(Object.keys(round.known).sort(), [breakerKey('a', 'x'), breakerKey('b', 'y')].sort());
+  // An arm the ladders drop stops pinning floors off after a day.
+  breakerHousekeep(round, now + 25 * 3600 * 1000, DEFAULT_BREAKERS);
+  assert.deepEqual(Object.keys(round.known), []);
+  assert.equal(breakerSuspendsFloors(round, now + 25 * 3600 * 1000, DEFAULT_BREAKERS), false);
 });
 
 // --- /caps wiring: the floor binds last and stays auditable.

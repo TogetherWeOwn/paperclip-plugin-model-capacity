@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { decide, roleRungWindow, roleLadderAccess } from '../src/decide.mjs';
-import { computeConcurrencyTarget, roleDemandBound } from '../src/concurrency.mjs';
+import { allocateDemandCaps, computeConcurrencyTarget, roleDemandBound } from '../src/concurrency.mjs';
 
 // Per-role target: the target counts only capacity the roles can use.
 // Live evidence (12:37Z): target ~20 of which ~9 slots came from a lane that
@@ -153,6 +153,39 @@ test('role-exclusive pools under deep queues are not discounted by the other rol
   });
   assert.ok(Math.abs(idle.target - 18.6) < 1e-9, `idle ${idle.target}`);
   assert.equal(idle.demandBound, null);
+});
+
+test('the demand bound counts runs already in flight, not just queued issues', () => {
+  // Live failure: 4 reviewer runs in flight sit on in_review issues (no
+  // queued-issue count sees them) while agent-b has 1 queued issue. A
+  // queued-only bound reads 1 and drops the served target under the running
+  // total, so the allocator sheds running-first and agent-b gets 0 while
+  // capacity sits idle. With the in-flight runs joined per role the bound
+  // reads 5 and agent-b gets its slot.
+  // 9.3 slots each: ample capacity, so the bound follows demand, not quota.
+  const accounts = [acct('a1', { hoursToReset: 10 }), acct('a2', { hoursToReset: 10 })];
+  const roleAccess = { a1: access(yes, yes), a2: access(yes, yes) };
+  const queuedOnly = computeConcurrencyTarget({
+    accounts, roleAccess, roleDemand: { doer: 1, thinker: 0, other: 0 },
+  });
+  assert.ok(Math.abs(queuedOnly.demandBound - 1) < 1e-9, `queued-only bound ${queuedOnly.demandBound}`);
+  const withRunning = computeConcurrencyTarget({
+    accounts, roleAccess,
+    roleDemand: { doer: 1, thinker: 0, other: 0 },
+    roleRunning: { doer: 4, thinker: 0, other: 0 },
+  });
+  assert.ok(withRunning.demandBound >= 5, `bound ${withRunning.demandBound} must cover 4 running + 1 queued`);
+  // End to end through the allocator at the pre-bound target of 10: the old
+  // bound (1) pins agent-b to 0, the joined bound funds its queued slot.
+  const agents = [
+    { agentId: 'reviewer', running: 4, queued: 0 },
+    { agentId: 'agent-b', running: 0, queued: 1 },
+  ];
+  const starved = allocateDemandCaps(Math.min(10, queuedOnly.demandBound), agents, 75);
+  assert.equal(starved.find(a => a.agentId === 'agent-b').allocated, 0);
+  const served = allocateDemandCaps(Math.min(10, withRunning.demandBound), agents, 75);
+  assert.equal(served.find(a => a.agentId === 'agent-b').allocated, 1);
+  assert.equal(served.find(a => a.agentId === 'reviewer').allocated, 5, 'running plus headroom');
 });
 
 test('roleDemandBound: a shared pool fills the other roles after exclusive demand', () => {

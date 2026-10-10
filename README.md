@@ -312,10 +312,11 @@ by default (no behaviour change until set). The floor is
 at 10 queued, 6 at 40, 8 at 105, and demand itself when idle. Floors apply
 last -- after the allocator and the hold -- so smoothing never takes a
 floored cap below its floor (`reason: reserved-floor`, mirrored in
-`maxConcurrentRuns`). Floors win the fleet ceiling: past it, non-floored
-agents give back new slots first, never below their running count. While
-every tracked arm is breaker-open (cooling) floors suspend and floored caps
-hold at running, so failed runs on cooled models cannot rise. Cost: past
+`maxConcurrentRuns`). Floors win the fleet ceiling: past it, agents give back
+only slots above their protection line (`max(floor, running)` for floored
+agents, running for the rest). While every
+servable arm is breaker-open (fleet-wide cooling) floors suspend and floored
+caps hold at running, so failed runs on cooled models cannot rise. Cost: past
 target the fleet can run over it by at most the floors' new slots (8 for the
 example entry); no agent loses a running slot.
 

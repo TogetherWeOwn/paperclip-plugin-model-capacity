@@ -61,7 +61,7 @@ import {
   sanitizeBreakers, classifyArmError, breakerState,
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
-  breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore,
+  breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
@@ -1203,11 +1203,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     {
       const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
       const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+      const servable = [];
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         for (const r of ladder?.rungs ?? []) {
           r.breaker = breakerState(breakers, key, r?.armId, nowMs, breakersCfg);
+          if (typeof r?.armId === 'string' && r.armId.length > 0) servable.push({ accountId: key, armId: r.armId });
         }
       }
+      // Servable-arm universe for the reserved-floor guard (/caps reads it):
+      // decided from arms that can actually serve, never from the
+      // failure-tracking map alone.
+      noteKnownArms(breakers, servable, nowMs);
+      breakerStores.set(companyId, breakers);
     }
     // Tier-derived compact windows ride each rung arm (arm.cap, keyed by
     // model) into the hook and event-time paths via the live view below as
@@ -1565,6 +1572,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         historyOf: k => rateHistories[k] ?? [],
         spanMsOf: k => viewByKey.get(k)?.rateSpanMs ?? null,
         runsInSpan: spanMs => runsInGroupSpan(gid, spanMs),
+        // Per-member run counts: a member with no measurable delta voids the
+        // sample unless it served nothing in the span (see pools.mjs).
+        runsInSpanFor: (k, spanMs) => startedOnCountWhere(ledger, k, nowMs - spanMs, calibrationAccountOf),
         nowMs,
       });
       const entry = smoothValue(Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
@@ -1676,7 +1686,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       manual: config.roles.excludeFamilies,
       roleOf: agentId => roleOf(config, agentId),
       familyOf: outcomeFamilyOf,
-      accountGroups: ordered.map(a => groupByRung(ladders[a.accountId]?.rungs ?? [])),
+      // Empty-role guard reads the same arms placement can use: healthy
+      // accounts only, with breaker-open arms filtered out. Unfiltered rungs
+      // let a role look accessible only through an unhealthy account or a
+      // cooling arm, and then the guard keeps the data gates while every run
+      // for that role defers.
+      accountGroups: ordered
+        .filter(a => a?.health === 'healthy')
+        .map(a => filterBreakerRungs(
+          groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
+        )),
       roleBands,
       trialRoles: config.trials.roles,
     });
@@ -1694,6 +1713,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       roleAccess[a.accountId] = entry;
     }
     const demand = await roleDemandFor(companyId, config, nowMs);
+    // In-flight runs per role join the demand bound (see concurrency.mjs):
+    // the queued-issue count cannot see runs on in_review issues, chat or
+    // heartbeat runs, and a queued-only bound can otherwise drop the served
+    // target below what is already running. Same running definition as the
+    // census below (verified live runs only).
+    const roleRunning = { doer: 0, thinker: 0, other: 0 };
+    for (const r of ledger.values()) {
+      if (r?.status !== 'running' || r?.unverified === true) continue;
+      const agentId = r?.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0 || agentId === 'unknown') continue;
+      const role = roleOf(config, agentId);
+      if (Object.hasOwn(roleRunning, role)) roleRunning[role] += 1;
+    }
     const concurrency = computeConcurrencyTarget({
       accounts: ordered.map(a => {
         const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
@@ -1713,6 +1745,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       maxTotal: config.concurrency.maxTotal,
       roleAccess,
       roleDemand: demand.byRole,
+      roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
     });
     for (const row of concurrency.perAccount) row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
@@ -2666,8 +2699,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
         // Reserved floors run LAST, after the allocator and the hold, so
         // smoothing never takes a floored cap below its floor. Memory-only
-        // breaker read: while every tracked arm is breaker-open (cooling)
-        // floors suspend and floored caps hold at running.
+        // breaker read: while every servable arm is breaker-open (fleet-wide
+        // cooling) floors suspend and floored caps hold at running.
         const resolved = lastConfig.get(companyId);
         const reservedFloors = resolved?.caps?.reservedFloors ?? {};
         let floorsSuspended = false;

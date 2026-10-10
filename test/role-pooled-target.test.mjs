@@ -111,12 +111,20 @@ const issue = (id, assigneeAgentId, status = 'todo') => ({ id, assigneeAgentId, 
 // Meta lane the model maps to.
 const museRuns = () => Array.from({ length: 13 }, (_, i) =>
   startedEvt(`muse-${i}`, T0 + 1 * MIN + i * MIN, 'eng', 'muse-spark-1.3-contributor'));
+// The same runs finished: they still count as started (calibration keeps its
+// run count) but nothing is in flight, so queue-composition tests isolate
+// queued demand. Bare finishes carry no issue linkage, so they are never
+// judged progress evidence for the outcome gate.
+const museFinishes = () => Array.from({ length: 13 }, (_, i) => ({
+  type: 'agent.run.finished', companyId: 'acme', entityId: `muse-${i}`,
+  payload: { run: { agentId: 'eng' } }, occurredAt: new Date(T0 + 14 * MIN + i * MIN).toISOString(),
+}));
 
-async function runScenario(d, { extraSteps = 0 } = {}) {
+async function runScenario(d, { extraSteps = 0, finishRuns = false } = {}) {
   await d.setup();
   await d.step({ at: T0, step: 0 });
   await d.step({ at: T0 + 12 * MIN, step: 1, fire: museRuns() });
-  await d.step({ at: T0 + 24 * MIN, step: 2 });
+  await d.step({ at: T0 + 24 * MIN, step: 2, fire: finishRuns ? museFinishes() : [] });
   for (let i = 0; i < extraSteps; i++) await d.step({ at: T0 + (36 + 12 * i) * MIN, step: 3 + i });
   return d.capacity();
 }
@@ -176,7 +184,10 @@ test('#1 capacity no role can use adds nothing; the report keeps the quota-only 
 test('#1 with only thinker work queued, Meta capacity drops out of the served target', async () => {
   const doerWork = drive({ config: ROLES_CONFIG, queued: { todo: queue('eng', 40), in_progress: [] } });
   const thinkerWork = drive({ config: ROLES_CONFIG, queued: { todo: queue('planner', 40), in_progress: [] } });
-  const [a, b] = [await runScenario(doerWork), await runScenario(thinkerWork)];
+  // Finished calibration runs: nothing in flight, so the bound isolates the
+  // queued composition (in-flight runs join the bound per role -- see
+  // role-target.test.mjs -- and would otherwise pull Meta back in).
+  const [a, b] = [await runScenario(doerWork, { finishRuns: true }), await runScenario(thinkerWork, { finishRuns: true })];
   // The capacity series does not move with the queue; the bound does.
   assert.ok(Math.abs(a.targetRaw - b.targetRaw) < 1e-9, 'queue composition does not move the capacity target');
   assert.ok(b.demandBound < a.demandBound, `thinker-only ${b.demandBound} should be below doer-only ${a.demandBound}`);
@@ -187,9 +198,10 @@ test('#1 with only thinker work queued, Meta capacity drops out of the served ta
 
 test('#1 a queue surge lifts the served target at once, not on the EWMA half-life', async () => {
   // Thin queue: the served target is bounded by the few queued issues.
+  // Finished calibration runs, so no in-flight work joins the bound.
   const queued = { todo: queue('eng', 2), in_progress: [] };
   const d = drive({ config: ROLES_CONFIG, queued });
-  const thin = await runScenario(d);
+  const thin = await runScenario(d, { finishRuns: true });
   assert.ok(thin.demandBound <= 2 + 1e-9, `thin bound ${thin.demandBound}`);
   assert.ok(thin.target <= 2 + 1e-9);
   // 60 more issues arrive. The capacity series is unchanged, so the
