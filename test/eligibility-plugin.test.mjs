@@ -35,8 +35,10 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false } = {}) {
-  const claudeLane = lane('claude-1', 'claude', 'a1', 0.95);
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false } = {}) {
+  const claudeLane = spentClaude
+    ? lane('claude-1', 'claude', 'a1', 1, 0)
+    : lane('claude-1', 'claude', 'a1', 0.95);
   if (unhealthyClaude) claudeLane.health = 'unhealthy';
   const store = new Map();
   const jobs = new Map();
@@ -307,6 +309,22 @@ test('an unhealthy account cannot strand a role in defer: the guard reads only a
   const cap = await d.capacity();
   assert.equal(cap.eligibility.roles.doer.suspended, true);
   assert.ok(cap.eligibility.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
+});
+
+test('a weekly-spent account cannot strand a role in defer: the guard skips it like an unhealthy one', async () => {
+  // Claude reads healthy with an idle 5h meter but its weekly window is
+  // spent, so placement excludes it and only Meta (Muse) remains, which the
+  // quality gate keeps off doers. The empty-role guard must skip the spent
+  // account too; reading it as usable keeps the gate on while every doer run
+  // defers.
+  const d = drive({ config: { enforce: true, roles: ROLES_CFG }, spentClaude: true });
+  await d.setup();
+  await d.tick();
+  const h = await d.hook('run-1', 'eng-doer');
+  assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed, never deferred');
+  assert.match(h.reason, /rung 0 on meta:m1/);
+  const cap = await d.capacity();
+  assert.equal(cap.eligibility.roles.doer.suspended, true);
 });
 
 test('the published family outcomes and the gate attribute a run to the same family', async () => {
