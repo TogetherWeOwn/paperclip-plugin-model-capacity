@@ -31,6 +31,12 @@
  * the 5h meter stays the burst guard. No capability, egress, secret or
  * env-key change.
  *
+ * v0.2.22 = BREAKER STATE PERSISTS: breaker-v1 was keyed by the in-memory
+ * NUL-joined pair key; Postgres jsonb rejects the NUL escape, so every
+ * write with a known or tripped arm failed and the tick's state froze.
+ * Persisted keys are now the JSON pair; loading re-keys from each entry.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -66,7 +72,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.21';
+export const PLUGIN_VERSION = '0.2.22';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

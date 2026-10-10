@@ -5,6 +5,7 @@ import {
   createBreakerStore, breakerStoreFromJSON, breakerStoreToJSON,
   breakerState, breakerAllows, breakerProbeRunId, recordArmFailure,
   startProbe, resolveProbe, breakerHousekeep, filterBreakerRungs, breakerReport,
+  noteKnownArms, breakerKey,
 } from '../src/breakers.mjs';
 import { createLedger, recordStart, recordDecision, recordTerminal, terminalRecords } from '../src/ledger.mjs';
 import { decide } from '../src/decide.mjs';
@@ -285,7 +286,7 @@ test('manifest breakers schema defaults match the code defaults', () => {
   assert.equal(props.breakers.properties.maxCooloffHours.default, 48);
   assert.deepEqual(props.breakers.properties.fatalPatterns.default, DEFAULT_BREAKERS.fatalPatterns);
   assert.deepEqual(props.breakers.properties.vetoPatterns.default, DEFAULT_BREAKERS.vetoPatterns);
-  assert.equal(PLUGIN_VERSION, '0.2.21');
+  assert.equal(PLUGIN_VERSION, '0.2.22');
 });
 
 test('/capacity armBreakers lists tracked arms with effective state', () => {
@@ -300,4 +301,21 @@ test('/capacity armBreakers lists tracked arms with effective state', () => {
   assert.equal(report[0].cooloffHours, 6);
   assert.equal(report[0].probeRunId, null);
   assert.match(report[0].lastError, /auth_unavailable/);
+});
+
+// Postgres jsonb rejects the NUL escape, and the in-memory pair key uses NUL.
+// A persisted store keyed that way failed every breaker-v1 write live.
+test('the persisted breaker store holds no NUL and round-trips its pair keys', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'meta:m1', armId: 'muse-spark-1.3' }, { accountId: 'claude:a1', armId: 'claude-haiku-5-5' }], T0);
+  const err = 'INVALID_ARGUMENT: model gemini-2.5-pro is not supported';
+  recordArmFailure(store, 'meta:m1', 'muse-spark-1.3', { atMs: T0, errorText: err }, T0, cfg);
+  recordArmFailure(store, 'meta:m1', 'muse-spark-1.3', { atMs: T0 + MIN, errorText: err }, T0 + MIN, cfg);
+  const json = breakerStoreToJSON(store, { nowMs: T0 + MIN, cfg });
+  assert.ok(Object.keys(json.known).length === 2 && Object.keys(json.arms).length === 1);
+  assert.equal(JSON.stringify(json).includes('\\u0000'), false, 'no NUL escape reaches plugin_state');
+  const back = breakerStoreFromJSON(JSON.parse(JSON.stringify(json)));
+  assert.deepEqual(Object.keys(back.known).sort(), [breakerKey('claude:a1', 'claude-haiku-5-5'), breakerKey('meta:m1', 'muse-spark-1.3')].sort());
+  assert.deepEqual(Object.keys(back.arms), [breakerKey('meta:m1', 'muse-spark-1.3')]);
+  assert.equal(breakerState(back, 'meta:m1', 'muse-spark-1.3', T0 + MIN, cfg), breakerState(store, 'meta:m1', 'muse-spark-1.3', T0 + MIN, cfg));
 });
