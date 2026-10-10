@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
+import { decide, placementArm, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
 
 const arm = (armId, model, effort, family, Q, contextWindow = 1000000) => ({ armId, model, effort, family, Q, C: 1, contextWindow });
 const ladderRungs = [
@@ -119,4 +119,12 @@ test('empty rungs at and below the pointer climb to the next fitting arm', () =>
   assert.equal(decide({ ...base, role: 'thinker', excludedFamilies: ['haiku'], roleBands: capped }).kind, 'defer');
   assert.equal(decide({ ...base, role: 'thinker', roleBands: open, excludedFamilies: ['haiku'], fiveHourHeadroomPct: 0.002, reservePct: 0 }).kind, 'decide');
   assert.equal(decide({ ...base, role: 'thinker', roleBands: open, excludedFamilies: ['haiku', 'sol'], fiveHourHeadroomPct: 0.002, reservePct: 0 }).kind, 'defer');
+});
+
+test('placementArm follows the same climb as decide', () => {
+  const open = { thinker: { floorRung: 0, ceilingRung: null }, doer: { floorRung: 0, ceilingRung: null } };
+  const rungs = ladderRungs.map(g => ({ ...g, arms: g.arms.map(a => ({ ...a, qFleet: a.Q / 10 })) }));
+  const d = decide({ ...base, ladderRungs: rungs, role: 'thinker', roleBands: open, excludedFamilies: ['haiku'], pointer: 0 });
+  const p = placementArm(rungs, { role: 'thinker', roleBands: open, excludedFamilies: ['haiku'], pointer: 0 });
+  assert.deepEqual([p.armId, p.rung, p.quality], [d.armId, d.rung, 0.2]);
 });
