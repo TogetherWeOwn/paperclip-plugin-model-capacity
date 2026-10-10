@@ -261,7 +261,17 @@ export function decide({
     if (!adapterAllowsTrial(trialAdapters, adapterType, arm.family)) return false;
     return (trialBudget?.[arm.family] ?? 0) > 0;
   };
-  for (let rung = target; rung >= floor; rung--) {
+  // Pacing picks the target rung and walks DOWN to the role floor. When no
+  // arm fits anywhere at or below it (every lower arm excluded for the role,
+  // or over the 5h burn check) walk UP to the ceiling before giving up: the
+  // pointer is a pacing preference, and an empty low rung must not strand
+  // the role on an account that serves it higher up (a thinker on a Codex
+  // lane whose low rungs are all luna, an account whose floor arm was
+  // excluded). Upward picks still pass every exclusion and burn check.
+  const order = [];
+  for (let rung = target; rung >= floor; rung--) order.push(rung);
+  for (let rung = target + 1; rung <= ceiling; rung++) order.push(rung);
+  for (const rung of order) {
     const entry = ladderRungs.find(r => r.rung === rung);
     const arms = (entry?.arms ?? []).filter(a => (a.contextWindow ?? Number.MAX_SAFE_INTEGER) >= requiredWindow);
     const fitting = arms.filter(a => {

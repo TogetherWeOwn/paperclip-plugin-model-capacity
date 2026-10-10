@@ -103,3 +103,20 @@ test('proven arms ignore trial gating entirely', () => {
   assert.equal(d.kind, 'decide');
   assert.equal(d.trial, false);
 });
+
+// A role whose arms at and below the pacing pointer are all excluded is not
+// stranded: decide climbs to the first fitting arm above the pointer.
+test('empty rungs at and below the pointer climb to the next fitting arm', () => {
+  const open = { thinker: { floorRung: 0, ceilingRung: null }, doer: { floorRung: 0, ceilingRung: null } };
+  const d = decide({ ...base, role: 'thinker', roleBands: open, excludedFamilies: ['haiku'], pointer: 0 });
+  assert.equal(d.kind, 'decide');
+  assert.deepEqual([d.model, d.rung], ['gpt-6.1-sol', 1]);
+  // The downward walk still wins when it finds an arm.
+  assert.equal(decide({ ...base, role: 'thinker', roleBands: open, pointer: 2, excludedFamilies: ['haiku'] }).rung, 2);
+  assert.equal(decide({ ...base, role: 'thinker', roleBands: open, pointer: 1, excludedFamilies: ['haiku'] }).rung, 1);
+  // Climbing respects the ceiling and the burn check.
+  const capped = { thinker: { floorRung: 0, ceilingRung: 0 }, doer: { floorRung: 0, ceilingRung: null } };
+  assert.equal(decide({ ...base, role: 'thinker', excludedFamilies: ['haiku'], roleBands: capped }).kind, 'defer');
+  assert.equal(decide({ ...base, role: 'thinker', roleBands: open, excludedFamilies: ['haiku'], fiveHourHeadroomPct: 0.002, reservePct: 0 }).kind, 'decide');
+  assert.equal(decide({ ...base, role: 'thinker', roleBands: open, excludedFamilies: ['haiku', 'sol'], fiveHourHeadroomPct: 0.002, reservePct: 0 }).kind, 'defer');
+});
