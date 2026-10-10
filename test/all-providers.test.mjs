@@ -218,7 +218,8 @@ test('a weekly-exhausted account with an idle 5h meter is excluded, never placed
   for (const e of shadow.body.entries) assert.notEqual(e.accountId, 'claude:spent');
   // The concurrency census does not count it as a healthy contributor.
   const row = (capacity.body.perAccount ?? []).find(r => r.accountId === 'claude:spent');
-  if (row) assert.equal(row.slots, 0);
+  assert.ok(row, 'the spent account has a census row');
+  assert.deepEqual([row.reason, row.slots], ['excluded', 0]);
 });
 
 test('a weekly window just above the exhaustion floor keeps the 5h burst guard', async () => {
