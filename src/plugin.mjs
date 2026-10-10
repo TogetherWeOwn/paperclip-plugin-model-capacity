@@ -1912,6 +1912,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     let observed = 0;
     let shadowSkippedNoDecision = 0;
     const keepAgents = new Set(config.roles.keepAgentIds);
+    // Pinned agents' configured model and the account serving it, published
+    // in the live view so the hook and event-time path can count a pinned
+    // run against that account the moment it starts.
+    const keptByAgent = {};
+    for (const agentId of keepAgents) {
+      const kept = await resolveActualModel(companyId, { model: null, modelSource: null, issueId: null, agentId }, modelCaches);
+      // Feed model lists first; else the account whose ladder serves it.
+      const canon = canonicalModelName(kept.model);
+      const accountId = accountOfModel(kept.model)
+        ?? (canon ? ordered.find(a => (ladders[a.accountId]?.rungs ?? []).some(r => canonicalModelName(r.model) === canon))?.accountId : null)
+        ?? null;
+      if (kept.model != null && accountId != null) keptByAgent[agentId] = { model: kept.model, accountId };
+    }
     for (const run of candidates) {
       if (keepAgents.has(run.agentId)) {
         // Pinned agent: the hook keeps its configured model, so shadow
@@ -2103,6 +2116,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       thinkerAgentIds: config.roles.thinkerAgentIds,
       doerAgentIds: config.roles.doerAgentIds,
       keepAgentIds: config.roles.keepAgentIds,
+      keptByAgent,
       // Effective exclusion tokens per role (operator list + quality and
       // outcome gates): the hook and the event-time path read these.
       excludeFamilies: roleExclusions,
@@ -2433,6 +2447,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return out;
   }
 
+  // A pinned agent's run, counted on the account serving its configured
+  // model (published by the last tick). Not enforced and no arm: the
+  // breaker and trial accounting ignore it; decisionsSinceTick counts it.
+  async function recordKeptDecision(companyId, live, runId, agentId) {
+    const kept = live?.keptByAgent?.[agentId];
+    if (!kept || runId == null) return;
+    const ledger = await getOrLoadLedger(companyId);
+    recordDecision(ledger, {
+      runId: String(runId), agentId: String(agentId ?? 'unknown'), accountId: kept.accountId,
+      armId: null, enforced: false, wouldModel: kept.model,
+      family: inferFamily(canonicalModelName(kept.model)),
+      reason: 'kept: agent pinned to its configured model (roles.keepAgentIds)',
+    }, clock());
+  }
+
   async function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
@@ -2445,8 +2474,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     if (run?.runId != null) {
       if (ledgers.get(companyId)?.get(String(run.runId))?.decidedAccount != null) return null;
     }
-    // Pinned agents never get a routed decision; the tick records their kept model.
-    if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(run?.agentId)) return null;
+    // Pinned agents never get a routed decision: record the kept model so the
+    // run counts against its serving account before the next tick.
+    if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(run?.agentId)) {
+      await recordKeptDecision(companyId, live, run?.runId, run?.agentId);
+      return null;
+    }
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
     const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
@@ -2812,6 +2845,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       // Operator-pinned agents (gating roles) always run their configured model.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
+        await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
         return { kind: 'keep' };
       }
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };

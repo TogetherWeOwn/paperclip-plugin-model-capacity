@@ -35,7 +35,7 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false } = {}) {
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, agentModels = {} } = {}) {
   const claudeLane = spentClaude
     ? lane('claude-1', 'claude', 'a1', 1, 0)
     : lane('claude-1', 'claude', 'a1', 0.95);
@@ -62,7 +62,7 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
         }),
       }),
     },
-    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    agents: { get: async (id) => ({ adapterType: 'claude-code', ...(agentModels[id] ? { adapterConfig: { model: agentModels[id] } } : {}) }) },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: () => {} },
@@ -333,6 +333,25 @@ test('a pinned agent keeps its configured model under enforce; other agents are 
   await d.tick();
   assert.deepEqual(await d.hook('run-1', 'planner'), { kind: 'keep' });
   assert.equal((await d.hook('run-2', 'eng-doer')).kind, 'decide');
+});
+
+test('pinned runs count against their serving account at once, before the next tick', async () => {
+  // The pinned agent runs Muse on meta:m1, the account a doer would
+  // otherwise take. Pinned hooks between ticks must add pressure on m1 so
+  // water-filling sends the doer elsewhere; without the kept decision the
+  // doer still lands on m1.
+  const cfg = { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
+  const control = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
+  await control.setup();
+  await control.tick();
+  assert.match((await control.hook('run-d0', 'eng-doer')).reason, /meta:m1/);
+  const d = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
+  await d.setup();
+  await d.tick();
+  for (let i = 0; i < 40; i += 1) assert.deepEqual(await d.hook(`run-p${i}`, 'planner'), { kind: 'keep' });
+  const h = await d.hook('run-d1', 'eng-doer');
+  assert.equal(h.kind, 'decide');
+  assert.doesNotMatch(h.reason, /meta:m1/, 'pinned runs already fill meta:m1');
 });
 
 test('the published family outcomes and the gate attribute a run to the same family', async () => {
