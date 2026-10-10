@@ -338,3 +338,36 @@ test('lastRuns is never shorter than minRuns; the validator says so', () => {
     normalizeOutcomeGate({ minRuns: 12, lastRuns: 5 }));
   assert.deepEqual(g.doer.gated, ['muse'], 'a too-short slice no longer disables the gate');
 });
+
+test('a family the operator excluded is no benchmark: usable families are not gated against it', () => {
+  // Thinkers: muse 0.40 (excluded by the operator), sonnet 0.25, 40 runs each.
+  // Against muse, sonnet is under 0.75 of the best and would be gated, which
+  // would leave the role neither family.
+  const recs = [
+    ...many(16, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'progressed', seed: 0 }),
+    ...many(24, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'noChange', seed: 100 }),
+    ...many(10, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'progressed', seed: 200 }),
+    ...many(30, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'noChange', seed: 300 }),
+  ];
+  assert.deepEqual(gate(recs).thinker.gated, ['sonnet'], 'without the exclusion muse is the benchmark');
+  const g = outcomeGates(recs, { nowMs: NOW, cfg: G, roleOf, familyOf, excludedFamilies: { thinker: ['Muse'] } });
+  assert.deepEqual(g.thinker.gated, []);
+  assert.deepEqual(g.thinker.best, { family: 'sonnet', rate: 0.25 });
+  assert.equal(g.thinker.families.muse.rate, 0.4, 'the excluded family is still reported');
+  // Only the role it is excluded for: doers keep muse as a benchmark.
+  const doerRecs = recs.map(r => ({ ...r, agentId: 'doer-1' }));
+  assert.deepEqual(outcomeGates(doerRecs, { nowMs: NOW, cfg: G, roleOf, familyOf, excludedFamilies: { thinker: ['muse'] } }).doer.gated, ['sonnet']);
+  // An arm token excludes one arm, not the family: muse stays the benchmark.
+  const arm1 = outcomeGates(recs, { nowMs: NOW, cfg: G, roleOf, familyOf, excludedFamilies: { thinker: [armToken('muse-xhigh')] } });
+  assert.deepEqual(arm1.thinker.gated, ['sonnet']);
+  // End to end: the operator list reaches the gate through buildEligibility.
+  const arms = [arm('muse-xhigh', 'muse', 0.6), arm('sonnet-max', 'sonnet', 0.9)];
+  const e = buildEligibility({
+    arms, records: recs, nowMs: NOW, minQuality: { doer: null, thinker: null, other: null }, outcomeGate: G,
+    manual: { thinker: ['muse'] }, roleOf, familyOf,
+    accountGroups: [groupsFor(arms)], roleBands: bands, trialRoles: ['doer', 'other'],
+  });
+  assert.deepEqual(e.exclusions.thinker, ['muse']);
+  assert.equal(e.report.roles.thinker.suspended, false);
+  assert.equal(e.report.arms.find(a => a.armId === 'sonnet-max').eligible.thinker.ok, true);
+});

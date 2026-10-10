@@ -365,7 +365,9 @@ runs, its progress rate is below `minProgressRate`, AND below
 `relativeToBest` of the best-measured family's rate for the same role. The
 relative clause means the best family is never gated and a role where every
 family reads low (reviewers answer in comments, which the plugin cannot
-see) keeps all of them. Recovery is by aging: a gated family gets no new
+see) keeps all of them. A family in `roles.excludeFamilies` for the role is
+still reported but is never the benchmark: a family that cannot serve the
+role does not gate the ones that can (`arm:` tokens leave the family in). Recovery is by aging: a gated family gets no new
 runs, its evidence leaves the window (the ledger keeps 24 hours), it drops
 under `minRuns` and is eligible again; if it still does not do the job,
 `minRuns` runs later it is gated again.

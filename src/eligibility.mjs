@@ -15,8 +15,8 @@
  *     share of the family's recent finished runs that made progress on their
  *     issue (a status move to a disposition; see outcomes.mjs). Below the
  *     bar, and clearly worse than the best family measured for the same
- *     role, the family is ineligible for
- *     that role. Recovery is by evidence aging: a gated family gets no new
+ *     role (among families the operator has not excluded for it), the
+ *     family is ineligible for that role. Recovery is by evidence aging: a gated family gets no new
  *     runs, its old ones leave the window (the ledger keeps 24h), it drops
  *     under `minRuns` and is eligible again; if it still does not do the
  *     job, `minRuns` runs later it is gated again.
@@ -153,8 +153,12 @@ export function qualityVerdicts(arms, minQuality, { minFleetArms = MIN_FLEET_ARM
  * are injected. Only finished runs with a judged outcome are evidence:
  * failed runs belong to the arm breaker, cancelled runs say nothing about
  * the model, and an unreadable outcome is not a miss.
+ * excludedFamilies: the operator's list per role ({ [role]: [token] }); a
+ * family on it is still reported but is never the role's benchmark, since
+ * a family that cannot serve the role says nothing about the ones that can.
+ * `arm:` tokens exclude one arm, not the family, and are ignored here.
  */
-export function outcomeGates(records, { nowMs, cfg = DEFAULT_OUTCOME_GATE, roleOf, familyOf }) {
+export function outcomeGates(records, { nowMs, cfg = DEFAULT_OUTCOME_GATE, roleOf, familyOf, excludedFamilies }) {
   const out = {};
   for (const role of ELIGIBILITY_ROLES) out[role] = { families: {}, gated: [], best: null };
   if (cfg?.enabled === false) return out;
@@ -184,9 +188,10 @@ export function outcomeGates(records, { nowMs, cfg = DEFAULT_OUTCOME_GATE, roleO
       const progressed = recent.filter(x => x.progressed).length;
       stats.set(family, { judged: recent.length, progressed, rate: progressed / recent.length });
     }
+    const excluded = new Set(normalizeExcludedFamilies(excludedFamilies?.[role]).filter(t => !t.startsWith(ARM_TOKEN_PREFIX)));
     let best = null;
     for (const [family, s] of stats) {
-      if (s.judged < cfg.minRuns) continue;
+      if (s.judged < cfg.minRuns || excluded.has(family.toLowerCase())) continue;
       if (best == null || s.rate > best.rate || (s.rate === best.rate && family < best.family)) best = { family, rate: s.rate };
     }
     for (const [family, s] of [...stats].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
@@ -225,7 +230,7 @@ export function buildEligibility({
   accountGroups = [], roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
 }) {
   const quality = qualityVerdicts(arms, minQuality, { minFleetArms });
-  const outcomes = outcomeGates(records, { nowMs, cfg: outcomeGate, roleOf, familyOf });
+  const outcomes = outcomeGates(records, { nowMs, cfg: outcomeGate, roleOf, familyOf, excludedFamilies: manual });
   const exclusions = {};
   const roles = {};
   const warnings = [];
