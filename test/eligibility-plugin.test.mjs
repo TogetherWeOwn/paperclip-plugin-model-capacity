@@ -327,6 +327,14 @@ test('a weekly-spent account cannot strand a role in defer: the guard skips it l
   assert.equal(cap.eligibility.roles.doer.suspended, true);
 });
 
+test('a pinned agent keeps its configured model under enforce; other agents are still routed', async () => {
+  const d = drive({ config: { enforce: true, roles: { ...ROLES_CFG, keepAgentIds: ['planner'] } } });
+  await d.setup();
+  await d.tick();
+  assert.deepEqual(await d.hook('run-1', 'planner'), { kind: 'keep' });
+  assert.equal((await d.hook('run-2', 'eng-doer')).kind, 'decide');
+});
+
 test('the published family outcomes and the gate attribute a run to the same family', async () => {
   const ledger = [{
     runId: 'r-unknown-model', agentId: 'eng-doer', status: 'finished', actualModel: 'unknown', family: 'muse',
