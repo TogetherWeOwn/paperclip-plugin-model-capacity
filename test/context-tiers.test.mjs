@@ -382,7 +382,7 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
       events: { on() {} },
       logger: { info() {}, error() {} },
     };
-    const plugin = createModelCapacityPlugin({ clock: () => TICK });
+    const plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
     await plugin.setup(io);
     await plugin.onConfigChanged(rawConfig, { companyId: 'acme' });
     store.set(skey(AA_STATE_KEY), {

@@ -76,7 +76,7 @@ function rig({ failBreakerReads = false } = {}) {
     seed: (k, v) => { store.set(skey(k), v); },
     read: k => store.get(skey(k)) ?? null,
     boot: async () => {
-      plugin = createModelCapacityPlugin({ clock: () => T });
+      plugin = createModelCapacityPlugin({ clock: () => T, requirePinnedLaneHost: false });
       await plugin.setup(io);
       store.set(skey(AA_SKEY), { fetchedAt: new Date(T).toISOString(), rows: aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });

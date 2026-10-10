@@ -75,7 +75,7 @@ test('a failed ledger load aborts the tick and never wipes the saved ledger', as
   };
   const jobs = new Map();
   const handlers = new Map();
-  const plugin = createModelCapacityPlugin({ clock: () => TICK });
+  const plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
   await plugin.setup(io);
   await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
   store.set(skey(AA_STATE_KEY), {

@@ -77,7 +77,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGe
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     io,
     setNow: ms => { now = ms; },

@@ -429,8 +429,9 @@ resolved at call time and never stored:
 - `cliproxy.laneKeySecretRef` -- Paperclip secret holding the lane key
   for the host-published CLIProxy telemetry endpoint:
   `GET {cliproxy.baseUrl}{cliproxy.accountsPath}`
-  (defaults `https://router.infextion.net` +
-  `/telemetry/cliproxy/live/accounts.json`), sent as the `X-Api-Key`
+  (`baseUrl` defaults to the host pinned at build time, see "Lane host
+  pin" below; `accountsPath` to `/telemetry/cliproxy/live/accounts.json`),
+  sent as the `X-Api-Key`
   header. The response carries per-account `weekly`/`fiveHour`
   `{ used (0..1|null), resetsAt (ISO|null) }`, a `quality`
   flag, the served model ids (`models`), the vendor-meter kind (`meter`:
@@ -444,6 +445,32 @@ never touches CLIProxy directly (private IPs are blocked from
 `ctx.http.fetch`) and the CLIProxy management key stays on the host --
 the host service does passive-first plus single-account live pull,
 server-side. Readings are cached 45s (`cliproxy.cacheTtlSec`).
+
+### Lane host pin
+
+The lane key may only ever be sent to the origin pinned in
+`src/lane-host.mjs` (`LANE_BASE_URLS`). It feeds three places: the
+manifest `cliproxy.baseUrl` enum, `validateConfigShape` (rejects any
+other `baseUrl`), and the `resolveConfig` fallback. The pin is
+compile-time on purpose: config can name only a listed origin, so a
+config write cannot redirect the key.
+
+The public file ships a non-routable placeholder
+(`https://lane-host.invalid`; RFC 2606 `.invalid` never resolves). An
+unpinned build cannot leak the key: the lane read throws
+`cliproxy-lane-host-unpinned` before the lane secret is resolved, so no
+request is made, and `onHealth` reports `degraded` ("Lane host not
+pinned"). `config.example.json` leaves `cliproxy.baseUrl` unset so the
+same file validates against any pin. To deploy,
+replace that one file at package-build time with your real origin, for
+example:
+
+```js
+export const LANE_BASE_URLS = Object.freeze(['https://lane.example.com']);
+```
+
+Keep the real origin out of the public repo. Everything else in `src/`
+stays byte-identical to the repo.
 
 Run facts come from `agent.run.*` events only (started, finished,
 failed, cancelled), recorded into the per-company ledger in memory and
@@ -470,6 +497,8 @@ otherwise, never a silent zero.
 
 - `src/manifest.mjs` -- shadow-default manifest, opt-in `enforceManifest`, `buildManifest` variant flag
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
+- `src/lane-host.mjs` -- build-time lane host pin (public placeholder; replaced at package build)
+- `scripts/check-public-pin.mjs` -- CI-only: fails if the committed pin is not the placeholder (not shipped; an overlaid build fails it by design)
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
 - `src/pools.mjs` -- calibration groups and pooled burn per run

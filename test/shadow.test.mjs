@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createShadowRing, SHADOW_CAPACITY, validRecord } from '../src/shadow.mjs';
 import { validateConfigShape, resolveConfig, createModelCapacityPlugin } from '../src/plugin.mjs';
+import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 
 const record = (runId) => ({
   runId, agentId: 'agent-1', actualModel: 'claude-haiku-5-5(max)', wouldModel: 'gpt-6.1-sol(high)',
@@ -33,7 +34,7 @@ test('config validation rejects bad secret refs, weights, baseUrl, and enforce',
   assert.ok(validateConfigShape({ weights: { terminalBench: -1 } }).length > 0);
   // Lane endpoint pinned: anything off the allowlist is rejected.
   assert.ok(validateConfigShape({ cliproxy: { baseUrl: 'https://telemetry.example.com' } }).length > 0);
-  assert.deepEqual(validateConfigShape({ cliproxy: { baseUrl: 'https://router.infextion.net' } }), []);
+  assert.deepEqual(validateConfigShape({ cliproxy: { baseUrl: LANE_BASE_URLS[0] } }), []);
   assert.ok(validateConfigShape({ enforce: 'yes' }).length > 0);
 });
 
@@ -100,7 +101,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     run: async () => {
       await plugin.setup(fake);
@@ -365,7 +366,7 @@ test('two rising readings plus runs in span calibrate E and recommend a target',
 
 test('config resolution applies documented defaults', () => {
   const c = resolveConfig({});
-  assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
+  assert.equal(c.cliproxy.baseUrl, LANE_BASE_URLS[0]);
   assert.equal(c.cliproxy.accountsPath, '/telemetry/cliproxy/live/accounts.json');
   assert.equal(c.cliproxy.laneKeySecretRef, null);
   assert.equal(c.enforce, false);
@@ -376,7 +377,7 @@ test('config resolution applies documented defaults', () => {
 
 test('non-allowlisted baseUrl falls back to the default instead of carrying the key', () => {
   const c = resolveConfig({ cliproxy: { baseUrl: 'https://telemetry.example.com' } });
-  assert.equal(c.cliproxy.baseUrl, 'https://router.infextion.net');
+  assert.equal(c.cliproxy.baseUrl, LANE_BASE_URLS[0]);
 });
 
 test('prune drops only matching entries and reports the count', () => {

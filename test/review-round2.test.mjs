@@ -86,7 +86,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa() }
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: (ms) => { now = ms; },
     setup: async () => {
