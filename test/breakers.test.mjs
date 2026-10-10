@@ -319,3 +319,19 @@ test('the persisted breaker store holds no NUL and round-trips its pair keys', (
   assert.deepEqual(Object.keys(back.arms), [breakerKey('meta:m1', 'muse-spark-1.3')]);
   assert.equal(breakerState(back, 'meta:m1', 'muse-spark-1.3', T0 + MIN, cfg), breakerState(store, 'meta:m1', 'muse-spark-1.3', T0 + MIN, cfg));
 });
+
+// The most common live write: one arm-fatal failure, not yet tripped. That
+// arm persists through the closed-with-recent-fails branch.
+test('a closed arm with one recent failure persists without NUL and keeps its failure', () => {
+  const store = createBreakerStore();
+  const err = 'INVALID_ARGUMENT: model gemini-2.5-pro is not supported';
+  recordArmFailure(store, 'antigravity:ag1', 'gemini-2.5-pro', { atMs: T0, errorText: err }, T0, cfg);
+  assert.equal(breakerState(store, 'antigravity:ag1', 'gemini-2.5-pro', T0, cfg), 'closed');
+  const json = breakerStoreToJSON(store, { nowMs: T0 + MIN, cfg });
+  assert.equal(JSON.stringify(json).includes('\\u0000'), false, 'no NUL escape reaches plugin_state');
+  assert.equal(Object.keys(json.arms).length, 1);
+  const back = breakerStoreFromJSON(JSON.parse(JSON.stringify(json)));
+  const key = breakerKey('antigravity:ag1', 'gemini-2.5-pro');
+  assert.deepEqual(Object.keys(back.arms), [key]);
+  assert.deepEqual([back.arms[key].state, back.arms[key].fails], ['closed', [T0]]);
+});
