@@ -156,7 +156,7 @@ test('role-exclusive pools under deep queues are not discounted by the other rol
 });
 
 test('the demand bound counts runs already in flight, not just queued issues', () => {
-  // Live failure: 4 reviewer runs in flight sit on in_review issues (no
+  // Live failure: 4 agent-a runs in flight sit on in_review issues (no
   // queued-issue count sees them) while agent-b has 1 queued issue. A
   // queued-only bound reads 1 and drops the served target under the running
   // total, so the allocator sheds running-first and agent-b gets 0 while
@@ -178,14 +178,14 @@ test('the demand bound counts runs already in flight, not just queued issues', (
   // End to end through the allocator at the pre-bound target of 10: the old
   // bound (1) pins agent-b to 0, the joined bound funds its queued slot.
   const agents = [
-    { agentId: 'reviewer', running: 4, queued: 0 },
+    { agentId: 'agent-a', running: 4, queued: 0 },
     { agentId: 'agent-b', running: 0, queued: 1 },
   ];
   const starved = allocateDemandCaps(Math.min(10, queuedOnly.demandBound), agents, 75);
   assert.equal(starved.find(a => a.agentId === 'agent-b').allocated, 0);
   const served = allocateDemandCaps(Math.min(10, withRunning.demandBound), agents, 75);
   assert.equal(served.find(a => a.agentId === 'agent-b').allocated, 1);
-  assert.equal(served.find(a => a.agentId === 'reviewer').allocated, 5, 'running plus headroom');
+  assert.equal(served.find(a => a.agentId === 'agent-a').allocated, 5, 'running plus headroom');
 });
 
 test('roleDemandBound: a shared pool fills the other roles after exclusive demand', () => {
