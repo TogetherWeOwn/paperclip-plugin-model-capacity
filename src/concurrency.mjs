@@ -22,19 +22,63 @@ export const DEFAULT_CONCURRENCY = Object.freeze({
   demandFactor: 1,
 });
 
+export const ROLES = Object.freeze(['doer', 'thinker', 'other']);
+
+export function medianPositive(values) {
+  const v = values.filter(x => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
+  if (v.length === 0) return null;
+  const mid = v.length >> 1;
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+}
+
 /**
  * accounts: [{ accountId, remainingPct (0-1), hoursToReset,
  *   burnPerRunPct (anchor fallback), measuredBurnPerRunPct (E, nullable),
- *   guardActive, healthy (false excludes the account with reason
+ *   calibrationGroup (accounts sharing one measured E; defaults to the
+ *   account), guardActive, healthy (false excludes the account with reason
  *   'excluded'; absent counts as healthy) }]
+ *
+ * Usable capacity, not raw quota: an account's slots only count for the
+ * roles that can take work on it.
+ *   roleAccess: { [accountId]: { doer|thinker|other: { eligible, trialOnly } } }
+ *     -- roleLadderAccess() per role: family exclusions, the role's
+ *     floor..ceiling rung window and trial-role gating already applied.
+ *     Absent entries (or an absent map) count the account for every role.
+ *   roleDemand: { doer, thinker, other } queued issues per role. It does NOT
+ *     weight the target: the target is the sum of the slots of every account
+ *     some role can use, which does not move with the queue (a share
+ *     weighting discounted role-exclusive capacity by the OTHER roles'
+ *     queues, so two disjoint pools both under deep queues read half
+ *     of what they sustain). Demand instead yields `demandBound`: the most
+ *     runs that could be in flight at once if each role runs only as many as
+ *     it has queued issues (a bipartite max flow, exact by min cut over role
+ *     subsets). The plugin applies it AFTER smoothing, so a queue surge lifts
+ *     the served target at once instead of rising on the EWMA half-life.
+ *     Null when demand is absent or all zero (idle or unreadable queue:
+ *     count any capacity some role can use).
+ *   trialSlotCap: a trial-only account sustains at most this many runs in
+ *     flight (the trial cap), whatever its quota says.
+ * Uncalibrated (anchor) burn estimates never dominate: an anchor-fallback
+ * account's burn is floored at the median MEASURED per-run burn, so a
+ * guessed-cheap anchor cannot mint more slots than a measured peer.
  */
-export function computeConcurrencyTarget({ accounts, meanRunDurationHours, demandFactor = 1, maxTotal = 75 } = {}) {
+export function computeConcurrencyTarget({
+  accounts, meanRunDurationHours, demandFactor = 1, maxTotal = 75,
+  roleAccess = null, roleDemand = null, trialSlotCap = 2,
+} = {}) {
   const D = meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours;
   const list = accounts ?? [];
   // Guard decides slots (zero), not knowledge: a guard-capped account with a
   // measured E still counts as calibrated, so an all-guarded fleet reads
   // target 0 (shed everything) instead of weak/null (recommend nothing).
   const anyMeasured = list.some(a => a.measuredBurnPerRunPct > 0);
+  // One measured E per calibration group (pool members share it): the
+  // median is over distinct groups, so a wide pool cannot outvote the rest.
+  const measuredByGroup = new Map();
+  for (const a of list) {
+    if (a.measuredBurnPerRunPct > 0) measuredByGroup.set(a.calibrationGroup ?? a.accountId, a.measuredBurnPerRunPct);
+  }
+  const medianMeasured = medianPositive([...measuredByGroup.values()]);
   const perAccount = list.map(a => {
     if (a.guardActive) {
       return {
@@ -54,18 +98,21 @@ export function computeConcurrencyTarget({ accounts, meanRunDurationHours, deman
     }
     const needPerHour = a.hoursToReset > 0 ? a.remainingPct / a.hoursToReset : 0;
     const measured = a.measuredBurnPerRunPct;
-    const burn = measured > 0 ? measured : a.burnPerRunPct;
+    let burn = measured > 0 ? measured : a.burnPerRunPct;
     if (!(burn > 0)) {
       return {
         accountId: a.accountId, slots: 0, runsPerHour: 0, capped: true, reason: 'uncalibrated', calibrated: false,
         measuredBurnPerRunPct: null, burnPerRunPct: a.burnPerRunPct ?? null, runsInWindow: a.runsInWindow ?? null,
       };
     }
-    const runsPerHour = needPerHour / burn;
     const calibrated = measured > 0;
+    const anchorCapped = !calibrated && medianMeasured != null && burn < medianMeasured;
+    if (anchorCapped) burn = medianMeasured;
+    const runsPerHour = needPerHour / burn;
     return {
       accountId: a.accountId, slots: runsPerHour * D, runsPerHour, capped: false,
       reason: calibrated ? 'ok' : 'anchor-fallback', calibrated,
+      anchorCapped,
       measuredBurnPerRunPct: calibrated ? measured : null, burnPerRunPct: burn,
       runsInWindow: a.runsInWindow ?? null,
     };
@@ -76,14 +123,72 @@ export function computeConcurrencyTarget({ accounts, meanRunDurationHours, deman
       calibration: 'weak', perAccount,
     };
   }
+  // Per-role usable capacity. A role's view of an account is its slots when
+  // an arm is reachable, clipped to the trial cap when only trial arms are.
+  const demand = {};
+  let demandTotal = 0;
+  for (const r of ROLES) {
+    const d = Math.max(0, Number(roleDemand?.[r]) || 0);
+    demand[r] = d;
+    demandTotal += d;
+  }
+  const accessOf = (accountId, role) => {
+    const entry = roleAccess?.[accountId];
+    if (entry == null) return { eligible: true, trialOnly: false };
+    return entry[role] ?? { eligible: false, trialOnly: false };
+  };
+  const roleSlots = Object.fromEntries(ROLES.map(r => [r, { slots: 0, accounts: 0 }]));
+  for (const row of perAccount) {
+    const eligibleRoles = ROLES.filter(r => accessOf(row.accountId, r).eligible);
+    row.eligibleRoles = eligibleRoles;
+    const weight = row.slots > 0 && eligibleRoles.length > 0 ? 1 : 0;
+    // Trial-only: every eligible role can only reach trial arms.
+    row.trialOnly = eligibleRoles.length > 0 && eligibleRoles.every(r => accessOf(row.accountId, r).trialOnly);
+    let usable = row.slots * weight;
+    if (row.trialOnly) usable = Math.min(usable, Math.max(0, trialSlotCap));
+    row.usableSlots = usable;
+    for (const r of eligibleRoles) {
+      if (!(row.slots > 0)) continue;
+      const cap = accessOf(row.accountId, r).trialOnly ? Math.max(0, trialSlotCap) : Infinity;
+      roleSlots[r].slots += Math.min(row.slots, cap);
+      roleSlots[r].accounts += 1;
+    }
+  }
   const measuredCount = perAccount.filter(a => a.calibrated).length;
-  const raw = perAccount.reduce((sum, a) => sum + a.slots, 0) * demandFactor;
+  const slotsTotal = perAccount.reduce((sum, a) => sum + a.slots, 0) * demandFactor;
+  const raw = perAccount.reduce((sum, a) => sum + a.usableSlots, 0) * demandFactor;
   const target = Math.min(raw, maxTotal);
+  const demandBound = demandTotal > 0 ? roleDemandBound(perAccount, demand, demandFactor) : null;
   return {
-    target, raw, maxTotal, demandFactor, meanRunDurationHours: D,
+    target, raw, slotsTotal, demandBound, maxTotal, demandFactor, meanRunDurationHours: D,
+    medianMeasuredBurnPct: medianMeasured,
+    roles: Object.fromEntries(ROLES.map(r => [r, { demand: demand[r], slots: roleSlots[r].slots, accounts: roleSlots[r].accounts }])),
     calibration: measuredCount === perAccount.filter(a => !a.capped).length ? 'measured' : 'partial',
     perAccount,
   };
+}
+
+/**
+ * Most runs that can be in flight at once when role r runs at most demand[r]
+ * and account a funds at most a.usableSlots x factor, an account serving only
+ * its eligible roles. A transportation problem; by max-flow/min-cut it equals
+ * the minimum over role subsets R of
+ *   sum(demand[r], r in R) + sum(capacity of accounts with a role outside R).
+ * Three roles make that eight subsets. Accounts with no eligible role add
+ * nothing.
+ */
+export function roleDemandBound(rows, demand, factor = 1) {
+  let best = Infinity;
+  for (let mask = 0; mask < (1 << ROLES.length); mask++) {
+    let cut = 0;
+    ROLES.forEach((r, i) => { if (mask & (1 << i)) cut += demand[r]; });
+    for (const row of rows) {
+      if (!(row.usableSlots > 0)) continue;
+      if ((row.eligibleRoles ?? []).some(r => !(mask & (1 << ROLES.indexOf(r))))) cut += row.usableSlots * factor;
+    }
+    if (cut < best) best = cut;
+  }
+  return best;
 }
 
 /**

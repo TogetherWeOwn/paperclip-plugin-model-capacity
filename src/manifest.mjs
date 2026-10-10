@@ -7,6 +7,16 @@
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
+ * v0.2.19 = USABLE TARGET + POOLED CALIBRATION + SMOOTHING + QUALITY-AWARE
+ * PLACEMENT: the concurrency target counts only capacity some role can use
+ * (family exclusions, role rung window, trial gating) weighted by queued
+ * demand; same-provider lanes that share a served model calibrate and place
+ * as one pool; the pooled burn and the target are EWMA-smoothed and the
+ * per-agent caps carry decay hysteresis; account placement blends fleet arm
+ * quality with a bounded unspent-allowance term (`placement` config; weight
+ * 0 restores pure water-filling); /capacity reports per-family run
+ * outcomes. No capability, egress, secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -42,7 +52,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.17';
+export const PLUGIN_VERSION = '0.2.19';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -123,10 +133,32 @@ const CONFIG_SCHEMA = {
         doerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
+          description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',
           properties: {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },
             other: { type: 'array', default: [], items: { type: 'string' } },
+          },
+        },
+        minQuality: {
+          type: 'object', additionalProperties: false,
+          description: 'Per-role minimum on the fleet-scored quality Q (AA plus the EEE prior, the ladder\'s weights and blend). An arm below the minimum is ineligible for that role on every account. null turns the minimum off for the role. Defaults: doer -1.0, thinker 0.4, other -1.0.',
+          properties: {
+            doer: { type: ['number', 'null'], default: -1.0 },
+            thinker: { type: ['number', 'null'], default: 0.4 },
+            other: { type: ['number', 'null'], default: -1.0 },
+          },
+        },
+        outcomeGate: {
+          type: 'object', additionalProperties: false,
+          description: 'Measured-outcome gate per (family, role): a family whose recent finished runs made progress on their issue below minProgressRate, and below relativeToBest of the best-measured family for the role, is ineligible for that role until its evidence ages out of the window.',
+          properties: {
+            enabled: { type: 'boolean', default: true },
+            minRuns: { type: 'integer', minimum: 1, default: 12 },
+            minProgressRate: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+            relativeToBest: { type: 'number', minimum: 0, maximum: 1, default: 0.75 },
+            windowHours: { type: 'number', exclusiveMinimum: 0, maximum: 24, default: 24 },
+            lastRuns: { type: 'integer', minimum: 1, default: 40 },
           },
         },
         thinkerFloorRung: { type: 'integer', minimum: 0, default: 2 },
@@ -266,6 +298,14 @@ const CONFIG_SCHEMA = {
       properties: {
         referenceArmId: { type: 'string', default: 'claude-haiku-5-5' },
         referenceBurnPerRunPct: { type: 'number', exclusiveMinimum: 0, default: 0.0005 },
+      },
+    },
+    placement: {
+      type: 'object', additionalProperties: false,
+      description: 'Account placement blend: inside a need band, accounts rank by qualityWeight x fleet quality of the arm they would run + allowanceWeight x unspent allowance on [-1, 1]. The allowance term spans at most 2 x allowanceWeight z-units, so spare allowance breaks ties between similar arms and cannot outbid a larger quality gap. qualityWeight 0 restores pure water-filling.',
+      properties: {
+        qualityWeight: { type: 'number', minimum: 0, default: 1 },
+        allowanceWeight: { type: 'number', minimum: 0, default: 0.35 },
       },
     },
     shadow: {

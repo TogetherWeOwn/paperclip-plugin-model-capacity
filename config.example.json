@@ -15,7 +15,25 @@
     "thinkerFloorRung": 2,
     "thinkerCeilingRung": null,
     "doerFloorRung": 0,
-    "doerCeilingRung": null
+    "doerCeilingRung": null,
+    "excludeFamilies": {
+      "doer": [],
+      "thinker": [],
+      "other": []
+    },
+    "minQuality": {
+      "doer": -1.0,
+      "thinker": 0.4,
+      "other": -1.0
+    },
+    "outcomeGate": {
+      "enabled": true,
+      "minRuns": 12,
+      "minProgressRate": 0.5,
+      "relativeToBest": 0.75,
+      "windowHours": 24,
+      "lastRuns": 40
+    }
   },
   "weights": {
     "terminalBench": 0.36,
@@ -45,6 +63,10 @@
     "solLunaAutoCompactTokens": 240000,
     "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "haikuMaxOutputTokens": 64000
+  },
+  "placement": {
+    "qualityWeight": 1,
+    "allowanceWeight": 0.35
   },
   "enforce": false,
   "trials": {
