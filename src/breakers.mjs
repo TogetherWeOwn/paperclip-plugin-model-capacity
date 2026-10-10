@@ -124,8 +124,16 @@ export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
   return null;
 }
 
-/** Alias-proof pair key: NUL cannot appear in an account or arm id. */
+/** Alias-proof pair key: NUL cannot appear in an account or arm id. In memory only. */
 export const breakerKey = (accountId, armId) => `${String(accountId)}\u0000${String(armId)}`;
+
+/**
+ * Persisted pair key. Postgres jsonb rejects the NUL escape, so a stored map
+ * keyed by `breakerKey` fails the whole plugin_state write. The persisted key
+ * is the JSON pair instead; loading re-keys every entry from its own
+ * accountId/armId, so the stored key is never trusted.
+ */
+const storedKey = (accountId, armId) => JSON.stringify([String(accountId), String(armId)]);
 
 export function createBreakerStore() {
   return { v: 1, seen: [], arms: {}, known: {} };
@@ -169,7 +177,7 @@ export function breakerStoreFromJSON(json) {
   for (const [k, e] of Object.entries(src).slice(0, BREAKER_MAX_ARMS)) {
     if (typeof k !== 'string' || !e || typeof e !== 'object') continue;
     if (e.state !== 'open' && e.state !== 'half-open' && e.state !== 'closed') continue;
-    store.arms[k] = {
+    store.arms[breakerKey(String(e.accountId ?? ''), String(e.armId ?? ''))] = {
       accountId: String(e.accountId ?? ''),
       armId: String(e.armId ?? ''),
       state: e.state,
@@ -187,7 +195,7 @@ export function breakerStoreFromJSON(json) {
   for (const [k, e] of Object.entries(ksrc).slice(0, BREAKER_MAX_KNOWN_ARMS)) {
     if (typeof k !== 'string' || !e || typeof e !== 'object') continue;
     if (typeof e.accountId !== 'string' || typeof e.armId !== 'string') continue;
-    store.known[k] = {
+    store.known[breakerKey(e.accountId, e.armId)] = {
       accountId: e.accountId, armId: e.armId,
       lastSeen: typeof e.lastSeen === 'number' && Number.isFinite(e.lastSeen) ? e.lastSeen : null,
     };
@@ -203,7 +211,7 @@ export function breakerStoreToJSON(store, { nowMs = Date.now(), cfg = DEFAULT_BR
   for (const [k, e] of Object.entries(store?.arms ?? {})) {
     if (!e || typeof e !== 'object') continue;
     if (e.state === 'open' || e.state === 'half-open') {
-      arms[k] = {
+      arms[storedKey(e.accountId, e.armId)] = {
         accountId: e.accountId, armId: e.armId, state: e.state,
         openedAt: e.openedAt, cooloffHours: e.cooloffHours, opens: e.opens,
         fails: (e.fails ?? []).slice(-10), probe: e.probe, lastError: e.lastError,
@@ -213,18 +221,18 @@ export function breakerStoreToJSON(store, { nowMs = Date.now(), cfg = DEFAULT_BR
     }
   }
   closedFresh.sort((a, b) => Math.max(...b[1].fails) - Math.max(...a[1].fails));
-  for (const [k, e] of closedFresh.slice(0, Math.max(0, BREAKER_MAX_ARMS - Object.keys(arms).length))) {
-    arms[k] = {
+  for (const [, e] of closedFresh.slice(0, Math.max(0, BREAKER_MAX_ARMS - Object.keys(arms).length))) {
+    arms[storedKey(e.accountId, e.armId)] = {
       accountId: e.accountId, armId: e.armId, state: 'closed',
       openedAt: e.openedAt, cooloffHours: e.cooloffHours, opens: e.opens,
       fails: (e.fails ?? []).slice(-10), probe: null, lastError: e.lastError,
     };
   }
   const known = {};
-  for (const [k, e] of Object.entries(store?.known ?? {}).slice(0, BREAKER_MAX_KNOWN_ARMS)) {
+  for (const [, e] of Object.entries(store?.known ?? {}).slice(0, BREAKER_MAX_KNOWN_ARMS)) {
     if (!e || typeof e !== 'object') continue;
     if (typeof e.accountId !== 'string' || typeof e.armId !== 'string') continue;
-    known[k] = { accountId: e.accountId, armId: e.armId, lastSeen: e.lastSeen ?? null };
+    known[storedKey(e.accountId, e.armId)] = { accountId: e.accountId, armId: e.armId, lastSeen: e.lastSeen ?? null };
   }
   return {
     v: 1,

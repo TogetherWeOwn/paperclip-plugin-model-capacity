@@ -59,7 +59,12 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
-      set: async (k, v) => { store.set(skey(k), v); },
+      // Postgres jsonb rejects the NUL escape: a value the host cannot store
+      // must fail here exactly as the plugin_state insert fails live.
+      set: async (k, v) => {
+        if (JSON.stringify(v).includes('\\u0000')) throw new Error('unsupported Unicode escape sequence (\\u0000 cannot be converted to text)');
+        store.set(skey(k), v);
+      },
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => lane }) },
