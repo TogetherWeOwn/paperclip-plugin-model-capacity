@@ -101,6 +101,16 @@ test('lane body parses to account snapshots; gaps stay null', () => {
   assert.equal(odd.signalsAtMs, NOW);
 });
 
+test('served ids preserve exact strings; old and malformed feeds fail open', () => {
+  assert.equal(parseLaneBody(body, NOW).servedModels, null);
+  assert.equal(parseLaneBody({ ...body, servedModels: 'gpt-6-luna' }, NOW).servedModels, null);
+  assert.equal(parseLaneBody({ ...body, servedModels: [null, 4, ''] }, NOW).servedModels, null);
+  assert.deepEqual(parseLaneBody({ ...body, servedModels: [] }, NOW).servedModels, []);
+  assert.deepEqual(parseLaneBody({ ...body, servedModels: [
+    'devin/glm-5-3-flash', 'gpt-6-luna', null, '', 12,
+  ] }, NOW).servedModels, ['devin/glm-5-3-flash', 'gpt-6-luna']);
+});
+
 test('reset timestamps accept ISO, epoch ms, and epoch s', () => {
   assert.equal(resetAtMsOf('2026-10-09T19:00:00Z'), Date.parse('2026-10-09T19:00:00Z'));
   assert.equal(resetAtMsOf(1760046000000), 1760046000000);

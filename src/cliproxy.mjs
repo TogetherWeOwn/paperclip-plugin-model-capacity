@@ -9,7 +9,8 @@
  *   header: X-Api-Key: <lane key, resolved from laneKeySecretRef>
  *
  * Response JSON:
- *   { observedAt, accounts: [{ lane, provider, accountKey, health,
+ *   { observedAt, servedModels: [exact CLIProxy /v1/models ids],
+ *     accounts: [{ lane, provider, accountKey, health,
  *     weekly: { used, resetsAt }, fiveHour: { used, resetsAt },
  *     observedAt, quality }], modelStats, pricingTiers }
  * where `used` is 0..1 or null, `resetsAt` ISO or null, and `quality` is
@@ -154,9 +155,15 @@ export function parseLaneBody(body, nowMs = Date.now()) {
   const list = body?.accounts;
   if (!Array.isArray(list)) return null;
   const observedAt = typeof body.observedAt === 'string' ? body.observedAt : null;
+  const servedModels = Array.isArray(body.servedModels)
+    ? body.servedModels.filter(m => typeof m === 'string' && m.trim().length > 0)
+    : null;
   return {
     observedAt,
     observedAtMs: msOrNull(observedAt),
+    // An empty array is authoritative; an absent or wholly malformed list
+    // stays null so older feeds do not suddenly refuse every arm.
+    servedModels: servedModels?.length || body.servedModels?.length === 0 ? servedModels : null,
     accounts: list.filter(a => a && typeof a === 'object').map(a => parseLaneAccount(a, nowMs)),
     // Context-tier feed (tolerant: malformed shapes degrade to no tiers,
     // never a crash; tiers.mjs validates per entry).

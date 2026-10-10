@@ -43,6 +43,10 @@
  * the kept model on the account that serves it. No capability, egress,
  * secret or env-key change.
  *
+ * v0.2.25 = EXACT SERVED IDS: a lane feed with servedModels filters arms
+ * before scoring or building ladders; older feeds remain fail-open. No new
+ * capability, egress, secret or env-key change.
+ *
  * v0.2.24 = DECIDE CLIMBS PAST EMPTY RUNGS: when no arm fits at or below the
  * pacing pointer (lower arms excluded for the role or over the burn check),
  * decide walks up to the role ceiling before deferring. Exclusions, the
@@ -84,7 +88,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.24';
+export const PLUGIN_VERSION = '0.2.25';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
