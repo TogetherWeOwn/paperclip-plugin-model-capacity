@@ -174,7 +174,7 @@ export function validateConfigShape(raw) {
     }
   }
   if (roles) {
-    for (const k of ['thinkerAgentIds', 'doerAgentIds']) {
+    for (const k of ['thinkerAgentIds', 'doerAgentIds', 'keepAgentIds']) {
       if (k in roles && !Array.isArray(roles[k])) errors.push(`roles.${k} must be an array`);
     }
     if ('excludeFamilies' in roles) {
@@ -358,6 +358,7 @@ export function resolveConfig(raw = {}) {
     roles: {
       thinkerAgentIds: raw.roles?.thinkerAgentIds ?? [],
       doerAgentIds: (Array.isArray(raw.roles?.doerAgentIds) ? raw.roles.doerAgentIds : []).filter(id => typeof id === 'string'),
+      keepAgentIds: (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string'),
       excludeFamilies: {
         doer: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.doer),
         thinker: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.thinker),
@@ -1910,7 +1911,52 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       .slice(0, 100);
     let observed = 0;
     let shadowSkippedNoDecision = 0;
+    const keepAgents = new Set(config.roles.keepAgentIds);
+    // Pinned agents' configured model and the account serving it, published
+    // in the live view so the hook and event-time path can count a pinned
+    // run against that account the moment it starts.
+    const keptByAgent = {};
+    for (const agentId of keepAgents) {
+      const kept = await resolveActualModel(companyId, { model: null, modelSource: null, issueId: null, agentId }, modelCaches);
+      // Feed model lists first; else the account whose ladder serves it.
+      const canon = canonicalModelName(kept.model);
+      const accountId = accountOfModel(kept.model)
+        ?? (canon ? ordered.find(a => (ladders[a.accountId]?.rungs ?? []).some(r => canonicalModelName(r.model) === canon))?.accountId : null)
+        ?? null;
+      if (kept.model != null && accountId != null) keptByAgent[agentId] = { model: kept.model, accountId };
+    }
     for (const run of candidates) {
+      if (keepAgents.has(run.agentId)) {
+        // Pinned agent: the hook keeps its configured model, so shadow
+        // reports that model on the account that serves it (the run still
+        // burns that account) instead of a routed pick.
+        const kept = await resolveActualModel(companyId, {
+          model: run.eventModel ?? (run.actualModel !== 'unknown' ? run.actualModel : null),
+          modelSource: run.eventModelSource ?? run.actualModelSource ?? null,
+          issueId: run.issueId ?? null, agentId: run.agentId ?? null,
+        }, modelCaches);
+        const keptAccount = accountOfModel(kept.model);
+        if (kept.model != null && keptAccount != null) {
+          recordDecision(ledger, {
+            runId: run.runId, agentId: run.agentId, accountId: keptAccount,
+            armId: null, enforced: false, wouldModel: kept.model,
+            family: inferFamily(canonicalModelName(kept.model)),
+            reason: 'kept: agent pinned to its configured model (roles.keepAgentIds)', eventTime: false,
+          }, nowMs);
+          const rec = ledger.get(run.runId);
+          if (rec) {
+            rec.actualModel = kept.model;
+            rec.actualModelSource = kept.source;
+            rec.actualModelError = kept.error;
+            rec.actualPending = false;
+            rec.modelMatch = true;
+          }
+          observed += 1;
+        } else {
+          shadowSkippedNoDecision += 1;
+        }
+        continue;
+      }
       const role = roleOf(config, run.agentId);
       let decision = null;
       // Fresh order, cap base, and trial budget per run: decisions write
@@ -2069,6 +2115,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       adapterByAgent,
       thinkerAgentIds: config.roles.thinkerAgentIds,
       doerAgentIds: config.roles.doerAgentIds,
+      keepAgentIds: config.roles.keepAgentIds,
+      keptByAgent,
       // Effective exclusion tokens per role (operator list + quality and
       // outcome gates): the hook and the event-time path read these.
       excludeFamilies: roleExclusions,
@@ -2399,6 +2447,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return out;
   }
 
+  // A pinned agent's run, counted on the account serving its configured
+  // model (published by the last tick). Not enforced and no arm: the
+  // breaker and trial accounting ignore it; decisionsSinceTick counts it.
+  async function recordKeptDecision(companyId, live, runId, agentId) {
+    const kept = live?.keptByAgent?.[agentId];
+    if (!kept || runId == null) return;
+    const ledger = await getOrLoadLedger(companyId);
+    recordDecision(ledger, {
+      runId: String(runId), agentId: String(agentId ?? 'unknown'), accountId: kept.accountId,
+      armId: null, enforced: false, wouldModel: kept.model,
+      family: inferFamily(canonicalModelName(kept.model)),
+      reason: 'kept: agent pinned to its configured model (roles.keepAgentIds)',
+    }, clock());
+  }
+
   async function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
@@ -2410,6 +2473,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // pool pressure and trial use.
     if (run?.runId != null) {
       if (ledgers.get(companyId)?.get(String(run.runId))?.decidedAccount != null) return null;
+    }
+    // Pinned agents never get a routed decision: record the kept model so the
+    // run counts against its serving account before the next tick.
+    if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(run?.agentId)) {
+      await recordKeptDecision(companyId, live, run?.runId, run?.agentId);
+      return null;
     }
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
@@ -2772,6 +2841,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const live = params?.companyId ? liveViews.get(params.companyId) : null;
       if (!live || live.enforce !== true) return { kind: 'keep' };
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+        return { kind: 'keep' };
+      }
+      // Operator-pinned agents (gating roles) always run their configured model.
+      if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
+        await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
         return { kind: 'keep' };
       }
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };

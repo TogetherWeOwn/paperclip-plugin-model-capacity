@@ -265,6 +265,29 @@ test('event-time shadow covers runs that start between ticks', async () => {
   assert.equal(shadow.body.entries[0].runId, 'run-e');
 });
 
+test('a pinned agent keeps its configured model: shadow reports it, event-time never routes it', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    config: { roles: { keepAgentIds: ['agent-9'] } },
+    laneAccounts: [claudeAcct()],
+    steps: [
+      { now: TICK, fire: [started('run-k', TICK - 60000, { model: 'claude-opus-5-5', provider: 'claude' })] },
+      { now: TICK + 60000, fire: [started('run-k2', TICK + 30000, { model: 'claude-opus-5-5', provider: 'claude' })] },
+      { now: TICK + 120000 },
+    ],
+  });
+  const { shadow } = await run();
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  for (const id of ['run-k', 'run-k2']) {
+    const e = byId.get(id);
+    assert.ok(e, `${id} has a shadow entry`);
+    assert.equal(e.wouldModel, 'claude-opus-5-5');
+    assert.match(e.reason, /kept: agent pinned/);
+    assert.equal(e.modelMatch, true);
+    assert.notEqual(e.eventTime, true, 'the event-time path never routes a pinned agent');
+  }
+});
+
 test('measured fleet success graduates a trial family', async () => {
   const at = TICK - 5 * 60000;
   const { run } = drive({

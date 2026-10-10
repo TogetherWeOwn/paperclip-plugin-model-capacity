@@ -37,6 +37,12 @@
  * Persisted keys are now the JSON pair; loading re-keys from each entry.
  * No capability, egress, secret or env-key change.
  *
+ * v0.2.23 = PINNED AGENTS: `roles.keepAgentIds` (empty default) lists agents
+ * whose runs always keep their configured model. The hook answers keep for
+ * them, the event-time path never routes them, and the shadow tick records
+ * the kept model on the account that serves it. No capability, egress,
+ * secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -72,7 +78,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.22';
+export const PLUGIN_VERSION = '0.2.23';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -151,6 +157,7 @@ const CONFIG_SCHEMA = {
       properties: {
         thinkerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
         doerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
+        keepAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents whose runs always keep their configured model: the hook answers keep and shadow reports the configured model. For gating roles pinned by the operator (e.g. the code reviewer).' },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
           description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',
