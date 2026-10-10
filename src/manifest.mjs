@@ -24,6 +24,13 @@
  * tracked arm is breaker-open. Empty by default. No capability, egress,
  * secret or env-key change.
  *
+ * v0.2.21 = WEEKLY EXHAUSTION OVERRIDES AN IDLE 5H METER: an account whose
+ * weekly remainder is at or below 1% reads headroom = that remainder (source
+ * `weekly`), reports action `excluded`, and counts as unhealthy for the
+ * eligibility empty-role guard and the concurrency census. Above the floor
+ * the 5h meter stays the burst guard. No capability, egress, secret or
+ * env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -59,7 +66,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.20';
+export const PLUGIN_VERSION = '0.2.21';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

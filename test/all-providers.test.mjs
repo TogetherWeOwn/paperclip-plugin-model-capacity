@@ -195,6 +195,43 @@ test('pool headroom falls back to weekly when 5h is missing; legacy feeds stay n
   );
 });
 
+test('a weekly-exhausted account with an idle 5h meter is excluded, never placed', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [
+      claudeAcct({ lane: 'claude-spent', key: 'spent', weekly: 1, fiveHour: 0, reset: '2026-11-08T16:09:11Z' }),
+      claudeAcct({ lane: 'claude-ok', key: 'ok', weekly: 0.3, fiveHour: 0.5 }),
+    ],
+    steps: [{ now: TICK, fire: [started('run-w', TICK - 60000, { model: 'claude-haiku-5-5', provider: 'claude' })] }],
+  });
+  const { capacity, shadow } = await run();
+  const byId = new Map(capacity.body.accounts.map(a => [a.accountId, a]));
+  const spent = byId.get('claude:spent');
+  // The binding window is the weekly one: headroom 0, not the idle 5h's 1.
+  assert.deepEqual([spent.headroomPct, spent.headroomSource, spent.action], [0, 'weekly', 'excluded']);
+  assert.match(spent.reason, /weekly window exhausted/);
+  const ok = byId.get('claude:ok');
+  assert.deepEqual([ok.headroomPct, ok.headroomSource], [0.5, 'five-hour']);
+  assert.notEqual(ok.action, 'excluded');
+  // No decision lands on the spent account.
+  assert.ok(shadow.body.entries.length >= 1);
+  for (const e of shadow.body.entries) assert.notEqual(e.accountId, 'claude:spent');
+  // The concurrency census does not count it as a healthy contributor.
+  const row = (capacity.body.perAccount ?? []).find(r => r.accountId === 'claude:spent');
+  if (row) assert.equal(row.slots, 0);
+});
+
+test('a weekly window just above the exhaustion floor keeps the 5h burst guard', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [claudeAcct({ lane: 'claude-low', key: 'low', weekly: 0.95, fiveHour: 0.1 })],
+  });
+  const { capacity } = await run();
+  const a = capacity.body.accounts.find(x => x.accountId === 'claude:low');
+  assert.deepEqual([a.headroomPct, a.headroomSource], [0.9, 'five-hour']);
+  assert.notEqual(a.action, 'excluded');
+});
+
 test('models with no AA match are listed unscored with their servers, never invented', async () => {
   const { run } = drive({
     nowMs: TICK,

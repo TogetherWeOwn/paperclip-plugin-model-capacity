@@ -5,8 +5,8 @@ import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MO
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.20');
-  assert.equal(PLUGIN_VERSION, '0.2.20');
+  assert.equal(manifest.version, '0.2.21');
+  assert.equal(PLUGIN_VERSION, '0.2.21');
 });
 
 test('no database grant: no database block, no db capabilities', () => {

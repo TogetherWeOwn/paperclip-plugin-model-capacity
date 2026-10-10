@@ -83,6 +83,9 @@ import {
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 
 const NS = 'model-capacity';
+// Weekly remainder at or below this floor: the account cannot serve runs
+// until its weekly window resets, whatever its 5h meter reads.
+const WEEKLY_EXHAUSTED_PCT = 0.01;
 const AA_KEY = 'aa-snapshot-v1';
 const TRIAL_KEY = 'trial-families-v1';
 const PACING_KEY = 'pacing-v1';
@@ -1306,10 +1309,35 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // (vendor publishes no meter at all) carry no headroom signal; their
       // eligibility comes from health alone (see select.mjs).
       const reactive = isReactiveAccount(account);
-      const headroomPct = fiveHourUsed != null
-        ? Math.max(0, 1 - fiveHourUsed)
-        : (weeklyUsed != null && Array.isArray(account.models) ? Math.max(0, 1 - weeklyUsed) : null);
-      const headroomSource = fiveHourUsed != null ? 'five-hour' : (headroomPct != null ? 'weekly-fallback' : null);
+      // A spent weekly window overrides an idle 5h meter: a weekly-exhausted
+      // account whose 5h meter read 0% used showed headroom 1 and drew a
+      // third of all decisions. Above the exhaustion floor the 5h meter
+      // stays the burst guard and weekly pacing stays the controller's job.
+      const fiveHourRemaining = fiveHourUsed != null ? Math.max(0, 1 - fiveHourUsed) : null;
+      const weeklyRemaining = weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null;
+      const weeklySpent = weeklyRemaining != null && weeklyRemaining <= WEEKLY_EXHAUSTED_PCT;
+      let headroomPct = null;
+      let headroomSource = null;
+      if (weeklySpent) {
+        headroomPct = weeklyRemaining;
+        headroomSource = 'weekly';
+      } else if (fiveHourRemaining != null) {
+        headroomPct = fiveHourRemaining;
+        headroomSource = 'five-hour';
+      } else if (weeklyRemaining != null && Array.isArray(account.models)) {
+        headroomPct = weeklyRemaining;
+        headroomSource = 'weekly-fallback';
+      }
+      // A healthy feed entry whose weekly window is spent cannot serve runs
+      // until it resets: report it excluded instead of narrating a hold.
+      if (account.health === 'healthy' && weeklySpent) {
+        step = {
+          ...step,
+          guardActive: false,
+          action: 'excluded',
+          reason: `excluded: weekly window exhausted (${Math.round(weeklyRemaining * 1000) / 10}% left) -- resets ${hoursToReset != null ? `in ${Math.round(hoursToReset)}h` : 'at an unknown time'}`,
+        };
+      }
       accountViews.push({
         accountId: key,
         arms: (ladders[key]?.rungs ?? []).map(r => ({
@@ -1692,7 +1720,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // cooling arm, and then the guard keeps the data gates while every run
       // for that role defers.
       accountGroups: ordered
-        .filter(a => a?.health === 'healthy')
+        .filter(a => a?.health === 'healthy' && a?.action !== 'excluded')
         .map(a => filterBreakerRungs(
           groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
         )),
@@ -1738,7 +1766,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           measuredBurnPerRunPct: groupE.get(gid) ?? null,
           runsInWindow: runsInGroupSpan(gid, rateWindowMs),
           guardActive: a.guardActive,
-          healthy: a.health === 'healthy',
+          healthy: a.health === 'healthy' && a.action !== 'excluded',
         };
       }),
       meanRunDurationHours: config.concurrency.meanRunDurationHours,
