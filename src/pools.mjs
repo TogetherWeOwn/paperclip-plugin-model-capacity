@@ -84,20 +84,30 @@ export function buildCalibrationGroups(accounts, keys) {
  *   historyOf(key): [{ atMs, usedPct }] weekly-used readings, oldest first
  *   spanMsOf(key): measured-rate span for the key (null: no measured rate)
  *   runsInSpan(spanMs): runs started on ANY member within the span
+ *   runsInSpanFor(key, spanMs): runs started on ONE member within the span
+ *     (optional; without it a short-history member voids the sample, since
+ *     its share of the run count cannot be proven empty)
  * The span is the shortest member span so every contributing member's delta
  * covers the same window the run count does. Members without a measured
  * rate contribute nothing; a counter reset (negative delta) on any member
- * voids the sample (see below).
+ * voids the sample (see below). A member with fewer than two in-span
+ * readings adds no burn delta but its served runs stay in the run count, so
+ * any sum over the rest would understate E: the sample is void unless the
+ * member served no runs in the span (then skipping it is exact).
  */
-export function pooledBurnPerRun({ memberKeys, historyOf, spanMsOf, runsInSpan, nowMs }) {
+export function pooledBurnPerRun({ memberKeys, historyOf, spanMsOf, runsInSpan, runsInSpanFor = null, nowMs }) {
   const spans = memberKeys.map(spanMsOf).filter(s => s != null && s > 0);
   if (spans.length === 0) return null;
   const spanMs = Math.min(...spans);
   let delta = 0;
   let contributing = 0;
+  const short = [];
   for (const k of memberKeys) {
     const inSpan = (historyOf(k) ?? []).filter(p => nowMs - p.atMs <= spanMs);
-    if (inSpan.length < 2) continue;
+    if (inSpan.length < 2) {
+      short.push(k);
+      continue;
+    }
     const d = inSpan[inSpan.length - 1].usedPct - inSpan[0].usedPct;
     // A falling counter is a weekly-window reset inside the span: that
     // lane's burn is unknowable, but the runs it served are still in the
@@ -111,5 +121,13 @@ export function pooledBurnPerRun({ memberKeys, historyOf, spanMsOf, runsInSpan, 
   }
   const n = runsInSpan(spanMs);
   if (!(delta > 0) || !(n > 0)) return null;
+  // A short-history member adds no burn delta but its served runs stay in
+  // the run count, so any sum over the rest would understate E: the sample
+  // is void unless the member served no runs in the span (then skipping it
+  // is exact). Without per-member counts that cannot be proven, so void.
+  for (const k of short) {
+    const served = typeof runsInSpanFor === 'function' ? runsInSpanFor(k, spanMs) : null;
+    if (!(served === 0)) return null;
+  }
   return { burnPerRunPct: delta / n, deltaPct: delta, runs: n, spanMs, contributing, members: memberKeys.length };
 }

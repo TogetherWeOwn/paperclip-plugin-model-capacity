@@ -61,9 +61,9 @@ import {
   sanitizeBreakers, classifyArmError, breakerState,
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
-  breakerStoreToJSON, createBreakerStore,
+  breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
 import {
@@ -270,6 +270,27 @@ export function validateConfigShape(raw) {
       else if (Array.isArray(b[k]) && b[k].some(s => typeof s !== 'string')) errors.push(`breakers.${k} must be an array of strings`);
     }
   }
+  if (raw.caps != null) {
+    if (typeof raw.caps !== 'object' || Array.isArray(raw.caps)) {
+      errors.push('caps must be an object');
+    } else if ('reservedFloors' in raw.caps) {
+      const rf = raw.caps.reservedFloors;
+      if (rf == null || typeof rf !== 'object' || Array.isArray(rf)) {
+        errors.push('caps.reservedFloors must be an object of agent id to floor');
+      } else {
+        for (const [agentId, spec] of Object.entries(rf)) {
+          if (spec == null || typeof spec !== 'object' || Array.isArray(spec)) {
+            errors.push(`caps.reservedFloors.${agentId} must be an object of base, perQueued and max`);
+          } else {
+            if (!Number.isInteger(spec.base) || spec.base < 0) errors.push(`caps.reservedFloors.${agentId}.base must be an integer >= 0`);
+            if (!Number.isInteger(spec.perQueued) || spec.perQueued < 1) errors.push(`caps.reservedFloors.${agentId}.perQueued must be an integer >= 1`);
+            if (!Number.isInteger(spec.max) || spec.max < 0) errors.push(`caps.reservedFloors.${agentId}.max must be an integer >= 0`);
+            else if (Number.isInteger(spec.base) && spec.max < spec.base) errors.push(`caps.reservedFloors.${agentId}.max must be >= base`);
+          }
+        }
+      }
+    }
+  }
   return errors;
 }
 
@@ -414,7 +435,33 @@ export function resolveConfig(raw = {}) {
     // (2 arm-fatal failures in 30 min -> 6h cool-off, doubling to 48h) with a
     // half-open single-probe recovery. Nested only; sanitizeBreakers coerces.
     breakers: sanitizeBreakers(raw.breakers),
+    // Reserved per-agent floors: `{ [agentId]: { base, perQueued, max } }`,
+    // empty by default (no behaviour change until set). Invalid entries are
+    // dropped here (the validator reports them); fromEntries defines own
+    // data properties, so a '__proto__' agent id stays a key, never the
+    // prototype.
+    caps: {
+      reservedFloors: sanitizeReservedFloors(raw.caps?.reservedFloors),
+    },
   };
+}
+
+/**
+ * Keep only well-formed floor specs: base integer >= 0, perQueued integer
+ * >= 1, max integer >= base. Anything else reads as unconfigured.
+ */
+function sanitizeReservedFloors(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const kept = [];
+  for (const [agentId, spec] of Object.entries(raw)) {
+    if (typeof agentId !== 'string' || agentId.length === 0) continue;
+    if (spec == null || typeof spec !== 'object' || Array.isArray(spec)) continue;
+    if (!Number.isInteger(spec.base) || spec.base < 0) continue;
+    if (!Number.isInteger(spec.perQueued) || spec.perQueued < 1) continue;
+    if (!Number.isInteger(spec.max) || spec.max < spec.base) continue;
+    kept.push([agentId, { base: spec.base, perQueued: spec.perQueued, max: spec.max }]);
+  }
+  return Object.fromEntries(kept);
 }
 
 // Weekly window length for schedule-error math (the lane reports `used`
@@ -1156,11 +1203,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     {
       const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
       const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+      const servable = [];
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         for (const r of ladder?.rungs ?? []) {
           r.breaker = breakerState(breakers, key, r?.armId, nowMs, breakersCfg);
+          if (typeof r?.armId === 'string' && r.armId.length > 0) servable.push({ accountId: key, armId: r.armId });
         }
       }
+      // Servable-arm universe for the reserved-floor guard (/caps reads it):
+      // decided from arms that can actually serve, never from the
+      // failure-tracking map alone.
+      noteKnownArms(breakers, servable, nowMs);
+      breakerStores.set(companyId, breakers);
     }
     // Tier-derived compact windows ride each rung arm (arm.cap, keyed by
     // model) into the hook and event-time paths via the live view below as
@@ -1518,6 +1572,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         historyOf: k => rateHistories[k] ?? [],
         spanMsOf: k => viewByKey.get(k)?.rateSpanMs ?? null,
         runsInSpan: spanMs => runsInGroupSpan(gid, spanMs),
+        // Per-member run counts: a member with no measurable delta voids the
+        // sample unless it served nothing in the span (see pools.mjs).
+        runsInSpanFor: (k, spanMs) => startedOnCountWhere(ledger, k, nowMs - spanMs, calibrationAccountOf),
         nowMs,
       });
       const entry = smoothValue(Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
@@ -1629,7 +1686,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       manual: config.roles.excludeFamilies,
       roleOf: agentId => roleOf(config, agentId),
       familyOf: outcomeFamilyOf,
-      accountGroups: ordered.map(a => groupByRung(ladders[a.accountId]?.rungs ?? [])),
+      // Empty-role guard reads the same arms placement can use: healthy
+      // accounts only, with breaker-open arms filtered out. Unfiltered rungs
+      // let a role look accessible only through an unhealthy account or a
+      // cooling arm, and then the guard keeps the data gates while every run
+      // for that role defers.
+      accountGroups: ordered
+        .filter(a => a?.health === 'healthy')
+        .map(a => filterBreakerRungs(
+          groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
+        )),
       roleBands,
       trialRoles: config.trials.roles,
     });
@@ -1647,6 +1713,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       roleAccess[a.accountId] = entry;
     }
     const demand = await roleDemandFor(companyId, config, nowMs);
+    // In-flight runs per role join the demand bound (see concurrency.mjs):
+    // the queued-issue count cannot see runs on in_review issues, chat or
+    // heartbeat runs, and a queued-only bound can otherwise drop the served
+    // target below what is already running. Same running definition as the
+    // census below (verified live runs only).
+    const roleRunning = { doer: 0, thinker: 0, other: 0 };
+    for (const r of ledger.values()) {
+      if (r?.status !== 'running' || r?.unverified === true) continue;
+      const agentId = r?.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0 || agentId === 'unknown') continue;
+      const role = roleOf(config, agentId);
+      if (Object.hasOwn(roleRunning, role)) roleRunning[role] += 1;
+    }
     const concurrency = computeConcurrencyTarget({
       accounts: ordered.map(a => {
         const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
@@ -1666,6 +1745,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       maxTotal: config.concurrency.maxTotal,
       roleAccess,
       roleDemand: demand.byRole,
+      roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
     });
     for (const row of concurrency.perAccount) row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
@@ -2617,7 +2697,30 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
-        return { status: 200, body: { atMs, calibration, target, agents } };
+        // Reserved floors run LAST, after the allocator and the hold, so
+        // smoothing never takes a floored cap below its floor. Memory-only
+        // breaker read: while every servable arm is breaker-open (fleet-wide
+        // cooling) floors suspend and floored caps hold at running.
+        const resolved = lastConfig.get(companyId);
+        const reservedFloors = resolved?.caps?.reservedFloors ?? {};
+        let floorsSuspended = false;
+        let floorSummary = {};
+        if (Object.keys(reservedFloors).length > 0) {
+          try {
+            const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+            floorsSuspended = breakerSuspendsFloors(bstore, nowMs, resolved?.breakers ?? DEFAULT_BREAKERS);
+          } catch (error) {
+            ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
+          }
+          const floored = applyReservedFloors(agents, {
+            reservedFloors,
+            ceiling: cap.maxTotal ?? 75,
+            blockedAgentIds: floorsSuspended ? Object.keys(reservedFloors) : [],
+          });
+          agents = floored.entries;
+          floorSummary = floored.floors;
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },

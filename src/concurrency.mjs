@@ -52,10 +52,18 @@ export function medianPositive(values) {
  *     of what they sustain). Demand instead yields `demandBound`: the most
  *     runs that could be in flight at once if each role runs only as many as
  *     it has queued issues (a bipartite max flow, exact by min cut over role
- *     subsets). The plugin applies it AFTER smoothing, so a queue surge lifts
- *     the served target at once instead of rising on the EWMA half-life.
+ *     subsets), PLUS the runs already in flight per role (`roleRunning`):
+ *     /caps counts every running ledger run -- including runs on in_review
+ *     issues, chat and heartbeat runs that no queued-issue count sees -- so
+ *     a bound from queued issues alone can drop the served target below what
+ *     is already running, and the allocator then sheds running-first and
+ *     starts nothing new while capacity sits idle. The plugin applies it
+ *     AFTER smoothing, so a queue surge lifts the served target at once
+ *     instead of rising on the EWMA half-life.
  *     Null when demand is absent or all zero (idle or unreadable queue:
  *     count any capacity some role can use).
+ *   roleRunning: { doer, thinker, other } runs already in flight per role.
+ *     Absent (or all zero) reads exactly as today.
  *   trialSlotCap: a trial-only account sustains at most this many runs in
  *     flight (the trial cap), whatever its quota says.
  * Uncalibrated (anchor) burn estimates never dominate: an anchor-fallback
@@ -64,7 +72,7 @@ export function medianPositive(values) {
  */
 export function computeConcurrencyTarget({
   accounts, meanRunDurationHours, demandFactor = 1, maxTotal = 75,
-  roleAccess = null, roleDemand = null, trialSlotCap = 2,
+  roleAccess = null, roleDemand = null, roleRunning = null, trialSlotCap = 2,
 } = {}) {
   const D = meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours;
   const list = accounts ?? [];
@@ -158,7 +166,14 @@ export function computeConcurrencyTarget({
   const slotsTotal = perAccount.reduce((sum, a) => sum + a.slots, 0) * demandFactor;
   const raw = perAccount.reduce((sum, a) => sum + a.usableSlots, 0) * demandFactor;
   const target = Math.min(raw, maxTotal);
-  const demandBound = demandTotal > 0 ? roleDemandBound(perAccount, demand, demandFactor) : null;
+  // In-flight runs join the bound's demand per role (never the target: the
+  // target counts usable capacity, which does not move with the queue). A
+  // queued-only bound can otherwise read below the running total and shed
+  // work that already exists.
+  const boundDemand = Object.fromEntries(ROLES.map(r => [
+    r, demand[r] + Math.max(0, Number(roleRunning?.[r]) || 0),
+  ]));
+  const demandBound = demandTotal > 0 ? roleDemandBound(perAccount, boundDemand, demandFactor) : null;
   return {
     target, raw, slotsTotal, demandBound, maxTotal, demandFactor, meanRunDurationHours: D,
     medianMeasuredBurnPct: medianMeasured,
@@ -327,6 +342,107 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
     agentId: e.agentId, demand: e.demand, running: e.running, queued: e.queued,
     allocated: e.allocated, maxConcurrentRuns: e.allocated, reason: e.reason,
   }));
+}
+
+/**
+ * Reserved per-agent floor: `min(demand, clamp(base + floor(queued /
+ * perQueued), base, max))` with demand = running + queued. Config-only and
+ * empty by default; the operator sets entries under `caps.reservedFloors`.
+ * Returns null for a missing or invalid spec (the validator reports those;
+ * the allocator ignores them), so an unset floor never moves a cap.
+ */
+export function computeReservedFloor(running, queued, spec) {
+  const r = Math.max(0, Math.floor(running ?? 0));
+  const q = Math.max(0, Math.floor(queued ?? 0));
+  const base = spec?.base;
+  const perQueued = spec?.perQueued;
+  const max = spec?.max;
+  if (!Number.isInteger(base) || base < 0) return null;
+  if (!Number.isInteger(perQueued) || perQueued < 1) return null;
+  if (!Number.isInteger(max) || max < base) return null;
+  const clamped = Math.min(Math.max(base + Math.floor(q / perQueued), base), max);
+  return Math.min(r + q, clamped);
+}
+
+/**
+ * Apply reserved floors LAST: after allocateDemandCaps and after the
+ * holdCaps hysteresis, so smoothing never takes a cap below a floor.
+ *
+ * entries: allocateDemandCaps()/holdCaps output. reservedFloors:
+ * `{ [agentId]: { base, perQueued, max } }` (already sanitized; invalid
+ * entries are ignored). blockedAgentIds: agents whose floor is suspended
+ * while every arm they can use is breaker-open -- their cap holds where the
+ * allocator put it (never below running), and the floor stays visible for
+ * audit. Returns `{ entries, applied, floors }` where `applied` lists the
+ * lifted agents and `floors` maps each configured agent to
+ * `{ floor, applied, blocked }`.
+ *
+ * Floors win the ceiling: when floors push the sum over it, agents give back
+ * only slots above their protection line (largest first, one slot at a
+ * time) -- max(floor, running) for configured, non-suspended agents,
+ * running for everyone else (a cap under running is fiction). Floored agents
+ * are never cut below their floor; when even running plus floors hold the
+ * total over the ceiling it reports as-is, like running does today.
+ */
+export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75, blockedAgentIds = [] } = {}) {
+  const list = (entries ?? []).map(e => ({ ...e }));
+  const specs = new Map(Object.entries(reservedFloors ?? {}));
+  const blocked = new Set(blockedAgentIds ?? []);
+  const cap = Math.max(1, Math.floor(ceiling ?? 75));
+  const applied = [];
+  // Map accumulator, same '__proto__' discipline as the allocator above:
+  // agentIds are host strings, and indexing a plain object with
+  // '__proto__' would hit the prototype setter. fromEntries at the end
+  // defines own data properties, so the snapshot reads back safely.
+  const floorMap = new Map();
+  for (const e of list) {
+    if (typeof e.agentId !== 'string' || e.agentId.length === 0) continue;
+    if (!specs.has(e.agentId)) continue;
+    const floor = computeReservedFloor(e.running, e.queued, specs.get(e.agentId));
+    if (floor == null) continue;
+    const summary = { floor, applied: false, blocked: false };
+    floorMap.set(e.agentId, summary);
+    if (blocked.has(e.agentId)) {
+      e.floor = floor;
+      e.floorBlocked = true;
+      summary.blocked = true;
+      continue;
+    }
+    e.floor = floor;
+    if (floor > e.allocated) {
+      e.allocated = floor;
+      e.maxConcurrentRuns = floor;
+      e.reason = 'reserved-floor';
+      applied.push(e.agentId);
+      summary.applied = true;
+    }
+  }
+  // Fleet bound: floors win. Every configured, non-suspended agent is
+  // protected down to max(floor, running) -- not just the agents the floor
+  // lifted (one already at or above its floor can otherwise be cut below
+  // it) -- and every other agent down to its running count (a cap under
+  // running is fiction). Only slots above that line are given back, largest
+  // first, one slot at a time.
+  const sum = () => list.reduce((s, e) => s + e.allocated, 0);
+  const protectLine = (e) => {
+    const summary = floorMap.get(e.agentId);
+    const running = Math.max(0, Math.floor(e.running ?? 0));
+    if (summary && !summary.blocked && summary.floor != null) return Math.max(summary.floor, running);
+    return running;
+  };
+  let guard = list.length * 400;
+  while (sum() > cap && guard-- > 0) {
+    let best = -1;
+    let bestNew = 0;
+    for (let i = 0; i < list.length; i++) {
+      const fresh = list[i].allocated - protectLine(list[i]);
+      if (fresh > bestNew) { best = i; bestNew = fresh; }
+    }
+    if (best < 0) break;
+    list[best].allocated -= 1;
+    list[best].maxConcurrentRuns = list[best].allocated;
+  }
+  return { entries: list, applied, floors: Object.fromEntries(floorMap) };
 }
 
 /** Integer split of total by weights, largest remainder, index-stable. */

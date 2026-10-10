@@ -298,7 +298,27 @@ at/above target the fleet starts nothing new. No cap lands below
 `running`; only pre-existing running can hold a total over target.
 Each entry reports `demand`, `running`, `allocated`, and `reason`
 (`full-demand` | `headroom` | `proportional` | `floor-running` |
-`capped-ceiling`). Weak calibration (no target) returns `agents: []`.
+`capped-ceiling` | `reserved-floor`). Entries with a configured floor also
+report `floor` (and `floorBlocked: true` while suspended); the body carries
+`reservedFloors` (per-agent floor, applied, blocked) and `floorsSuspended`
+for audit. Weak calibration (no target) returns `agents: []`.
+
+### Reserved per-agent floors
+
+`caps.reservedFloors` maps an agent id to `{ base, perQueued, max }`, empty
+by default (no behaviour change until set). The floor is
+`min(demand, clamp(base + floor(queued / perQueued), base, max))` with
+`demand = running + queued`: with `base 4, perQueued 20, max 8` it reads 4
+at 10 queued, 6 at 40, 8 at 105, and demand itself when idle. Floors apply
+last -- after the allocator and the hold -- so smoothing never takes a
+floored cap below its floor (`reason: reserved-floor`, mirrored in
+`maxConcurrentRuns`). Floors win the fleet ceiling: past it, agents give back
+only slots above their protection line (`max(floor, running)` for floored
+agents, running for the rest). While every
+servable arm is breaker-open (fleet-wide cooling) floors suspend and floored
+caps hold at running, so failed runs on cooled models cannot rise. Cost: past
+target the fleet can run over it by at most the floors' new slots (8 for the
+example entry); no agent loses a running slot.
 
 ## Configuration
 

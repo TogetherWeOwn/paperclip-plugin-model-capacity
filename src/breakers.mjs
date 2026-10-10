@@ -26,6 +26,11 @@ export const BREAKER_KEY = 'breaker-v1';
 export const BREAKER_MAX_ARMS = 500;
 export const BREAKER_MAX_SEEN = 1000;
 export const BREAKER_ERROR_TEXT_MAX = 500;
+// Servable-arm universe for the reserved-floor guard: (account, arm) pairs
+// the tick last saw on a ladder, with the tick it was last seen. Bounded and
+// stale-pruned by housekeep; untracked arms read closed (servable).
+export const BREAKER_MAX_KNOWN_ARMS = 2000;
+export const BREAKER_KNOWN_STALE_MS = 24 * 3600 * 1000;
 
 export const DEFAULT_BREAKERS = {
   enabled: true,
@@ -123,7 +128,33 @@ export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
 export const breakerKey = (accountId, armId) => `${String(accountId)}\u0000${String(armId)}`;
 
 export function createBreakerStore() {
-  return { v: 1, seen: [], arms: {} };
+  return { v: 1, seen: [], arms: {}, known: {} };
+}
+
+/**
+ * Once per tick: record the (account, arm) pairs the fleet can serve (every
+ * rung arm on every ladder). The failure-tracking `arms` map only holds arms
+ * that have failed -- healthy arms are never added -- so the floor guard
+ * cannot decide from it alone. `known` is that universe: keyed like `arms`,
+ * `{ accountId, armId, lastSeen }`, bounded, stale-pruned by housekeep.
+ */
+export function noteKnownArms(store, arms, nowMs) {
+  if (!store || typeof store !== 'object') return;
+  if (store.known == null || typeof store.known !== 'object') store.known = {};
+  for (const a of arms ?? []) {
+    const accountId = a?.accountId;
+    const armId = a?.armId;
+    if (typeof accountId !== 'string' || accountId.length === 0) continue;
+    if (typeof armId !== 'string' || armId.length === 0) continue;
+    store.known[breakerKey(accountId, armId)] = { accountId, armId, lastSeen: nowMs };
+  }
+  const keys = Object.keys(store.known);
+  if (keys.length > BREAKER_MAX_KNOWN_ARMS) {
+    keys
+      .sort((x, y) => (store.known[x]?.lastSeen ?? 0) - (store.known[y]?.lastSeen ?? 0))
+      .slice(0, keys.length - BREAKER_MAX_KNOWN_ARMS)
+      .forEach(k => { delete store.known[k]; });
+  }
 }
 
 const asNum = (v, d = null) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
@@ -150,6 +181,15 @@ export function breakerStoreFromJSON(json) {
         ? { runId: e.probe.runId, startedAt: asNum(e.probe.startedAt, 0) ?? 0 }
         : null,
       lastError: typeof e.lastError === 'string' ? e.lastError.slice(0, 200) : null,
+    };
+  }
+  const ksrc = json.known && typeof json.known === 'object' ? json.known : {};
+  for (const [k, e] of Object.entries(ksrc).slice(0, BREAKER_MAX_KNOWN_ARMS)) {
+    if (typeof k !== 'string' || !e || typeof e !== 'object') continue;
+    if (typeof e.accountId !== 'string' || typeof e.armId !== 'string') continue;
+    store.known[k] = {
+      accountId: e.accountId, armId: e.armId,
+      lastSeen: typeof e.lastSeen === 'number' && Number.isFinite(e.lastSeen) ? e.lastSeen : null,
     };
   }
   return store;
@@ -180,10 +220,17 @@ export function breakerStoreToJSON(store, { nowMs = Date.now(), cfg = DEFAULT_BR
       fails: (e.fails ?? []).slice(-10), probe: null, lastError: e.lastError,
     };
   }
+  const known = {};
+  for (const [k, e] of Object.entries(store?.known ?? {}).slice(0, BREAKER_MAX_KNOWN_ARMS)) {
+    if (!e || typeof e !== 'object') continue;
+    if (typeof e.accountId !== 'string' || typeof e.armId !== 'string') continue;
+    known[k] = { accountId: e.accountId, armId: e.armId, lastSeen: e.lastSeen ?? null };
+  }
   return {
     v: 1,
     seen: (store?.seen ?? []).filter(s => typeof s === 'string').slice(-BREAKER_MAX_SEEN),
     arms,
+    known,
   };
 }
 
@@ -215,6 +262,30 @@ export function breakerAllows(store, accountId, armId, nowMs, cfg = DEFAULT_BREA
     if (probeLive(e, nowMs, cfg)) return false;
   }
   return true;
+}
+
+/**
+ * Reserved-floor guard: true only while every servable arm reads breaker-open
+ * (fleet-wide cooling). Extra floor slots are safe while ANY arm can serve --
+ * placement already avoids cooled arms, so they land on healthy ones -- and
+ * only a fleet-wide cooling suspends floors, holding floored caps at running
+ * so failed runs on cooled models cannot rise. Half-open arms serve (the
+ * probe slot). Decided from the tick-noted `known` arm universe, never from
+ * the failure-tracking map alone: that map only holds arms that have failed
+ * (healthy arms are never added, quiet closed entries are pruned), so "every
+ * tracked arm is open" goes true on a single tripped arm. An arm with no
+ * entry reads closed (servable); no known arms means nothing provably
+ * cooling, so floors stay on. A disabled breaker never suspends.
+ */
+export function breakerSuspendsFloors(store, nowMs, cfg = DEFAULT_BREAKERS) {
+  if (cfg?.enabled === false) return false;
+  const known = store?.known ?? {};
+  const keys = Object.keys(known);
+  if (keys.length === 0) return false;
+  return keys.every(k => {
+    const e = known[k];
+    return breakerState(store, e?.accountId, e?.armId, nowMs, cfg) === 'open';
+  });
 }
 
 /** RunId currently occupying the half-open probe slot, if any. */
@@ -348,6 +419,13 @@ export function breakerHousekeep(store, nowMs, cfg = DEFAULT_BREAKERS) {
       e.fails = (e.fails ?? []).filter(f => nowMs - f <= windowMs);
       if (e.fails.length === 0) delete store.arms[key];
     }
+  }
+  // The servable-arm universe follows the ladders: drop arms the tick has
+  // not seen lately so a removed account cannot pin floors off, and keep it
+  // bounded between persists.
+  for (const key of Object.keys(store?.known ?? {})) {
+    const lastSeen = store.known[key]?.lastSeen;
+    if (typeof lastSeen !== 'number' || nowMs - lastSeen > BREAKER_KNOWN_STALE_MS) delete store.known[key];
   }
   return transitions;
 }

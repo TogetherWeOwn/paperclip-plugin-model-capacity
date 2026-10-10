@@ -58,6 +58,11 @@
     "maxTotal": 75,
     "meanRunDurationHours": 0.186
   },
+  "caps": {
+    "reservedFloors": {
+      "agent-a": { "base": 4, "perQueued": 20, "max": 8 }
+    }
+  },
   "contextCaps": {
     "solLunaMaxTokens": 260000,
     "solLunaAutoCompactTokens": 240000,

@@ -81,13 +81,35 @@ test('unmeasurable inputs yield null, never a guessed E', () => {
 
 test('a lane with short history is left out, the rest still count', () => {
   const hists = { a: history(0.1, 0.2), b: history(0.3, 0.3), c: [{ atMs: NOW - 5 * MIN, usedPct: 0.3 }] };
+  const served = { a: 6, b: 4, c: 0 };
   const pooled = pooledBurnPerRun({
     memberKeys: ['a', 'b', 'c'], historyOf: k => hists[k], spanMsOf: k => (k === 'c' ? null : 60 * MIN),
-    runsInSpan: () => 10, nowMs: NOW,
+    runsInSpan: () => 10, runsInSpanFor: (k) => served[k] ?? 0, nowMs: NOW,
   });
   assert.ok(Math.abs(pooled.burnPerRunPct - 0.1 / 10) < 1e-9);
   assert.equal(pooled.contributing, 1);
   assert.equal(pooled.members, 3);
+});
+
+test('a short-history lane that served runs voids the sample (its runs stay in the count)', () => {
+  // Lane c joined mid-span and served 4 of the 10 runs with no measurable
+  // delta: summing only lane a over all 10 runs would read half the true E.
+  const hists = { a: history(0.1, 0.2), b: history(0.3, 0.3), c: [{ atMs: NOW - 5 * MIN, usedPct: 0.3 }] };
+  const served = { a: 4, b: 2, c: 4 };
+  const base = {
+    memberKeys: ['a', 'b', 'c'], historyOf: k => hists[k], spanMsOf: k => (k === 'c' ? null : 60 * MIN),
+    runsInSpan: () => 10, nowMs: NOW,
+  };
+  assert.equal(
+    pooledBurnPerRun({ ...base, runsInSpanFor: (k) => served[k] ?? 0 }),
+    null,
+    'served runs with no delta: no sample, the smoothed E carries over',
+  );
+  assert.equal(
+    pooledBurnPerRun(base),
+    null,
+    'without per-member counts the empty share cannot be proven: no sample',
+  );
 });
 
 test('a weekly-window reset on any member voids the sample (the runs it served stay in the count)', () => {

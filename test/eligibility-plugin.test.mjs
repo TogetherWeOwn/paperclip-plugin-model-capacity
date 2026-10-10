@@ -35,7 +35,9 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null }) {
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false } = {}) {
+  const claudeLane = lane('claude-1', 'claude', 'a1', 0.95);
+  if (unhealthyClaude) claudeLane.health = 'unhealthy';
   const store = new Map();
   const jobs = new Map();
   const skey = k => JSON.stringify(k);
@@ -54,7 +56,7 @@ function drive({ config = {}, ledger = null, warnings = null }) {
           observedAt: new Date(nowMs).toISOString(),
           // Meta holds the biggest deficit, so without a gate the doer goes
           // to Muse; claude stays decidable on five-hour headroom.
-          accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), lane('claude-1', 'claude', 'a1', 0.95)],
+          accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), claudeLane],
         }),
       }),
     },
@@ -287,6 +289,24 @@ test('a role the gates would empty is suspended, never a defer loop', async () =
   assert.equal(cap.eligibility.roles.doer.suspended, true);
   assert.ok(cap.eligibility.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
   assert.deepEqual(cap.roleExclusionsEffective.doer, []);
+});
+
+test('an unhealthy account cannot strand a role in defer: the guard reads only arms placement can use', async () => {
+  // Claude unhealthy: placement can only use Meta (Muse), which the quality
+  // gate keeps off doers. The empty-role guard must read the same arms --
+  // healthy accounts with breaker-open arms filtered out -- so it suspends
+  // the quality gate for doers instead of keeping it while every doer run
+  // defers on headroom. Reading unfiltered rungs (or unhealthy accounts)
+  // leaves the gate on and the role empty.
+  const d = drive({ config: { enforce: true, roles: ROLES_CFG }, unhealthyClaude: true });
+  await d.setup();
+  await d.tick();
+  const h = await d.hook('run-1', 'eng-doer');
+  assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed, never deferred');
+  assert.match(h.model, /muse-spark/);
+  const cap = await d.capacity();
+  assert.equal(cap.eligibility.roles.doer.suspended, true);
+  assert.ok(cap.eligibility.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
 });
 
 test('the published family outcomes and the gate attribute a run to the same family', async () => {
