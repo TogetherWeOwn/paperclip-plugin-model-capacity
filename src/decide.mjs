@@ -168,7 +168,7 @@ export function roleLadderAccess(ladderRungs, {
 /**
  * The arm decide() would pick on this ladder for a role, ignoring the
  * per-run gates (headroom, burn, adapter, trial budget): walk from the
- * pointer down to the role floor, take the first rung with a reachable arm,
+ * pointer down to the role floor, then up to the ceiling, take the first rung with a reachable arm,
  * rank by the role's account-relative Q exactly as decide() does. Returns
  * that arm's FLEET-comparable quality (qFleet / qFleetThinker, ride the
  * rungs) so placement can compare arms across accounts, or null when no arm
@@ -186,7 +186,12 @@ export function placementArm(ladderRungs, {
   const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
   const trialOk = (Array.isArray(trialRoles) ? trialRoles : []).includes(role);
   const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
-  for (let rung = clamp(pointer ?? floor, floor, ceiling); rung >= floor; rung--) {
+  // Same walk as decide(): pointer down to the floor, then up to the ceiling.
+  const target = clamp(pointer ?? floor, floor, ceiling);
+  const order = [];
+  for (let rung = target; rung >= floor; rung--) order.push(rung);
+  for (let rung = target + 1; rung <= ceiling; rung++) order.push(rung);
+  for (const rung of order) {
     const entry = groups.find(g => g.rung === rung);
     const arms = (entry?.arms ?? []).filter(a =>
       !armExcluded(a, excluded) && (a?.trial !== true || trialOk));
@@ -261,7 +266,17 @@ export function decide({
     if (!adapterAllowsTrial(trialAdapters, adapterType, arm.family)) return false;
     return (trialBudget?.[arm.family] ?? 0) > 0;
   };
-  for (let rung = target; rung >= floor; rung--) {
+  // Pacing picks the target rung and walks DOWN to the role floor. When no
+  // arm fits anywhere at or below it (every lower arm excluded for the role,
+  // or over the 5h burn check) walk UP to the ceiling before giving up: the
+  // pointer is a pacing preference, and an empty low rung must not strand
+  // the role on an account that serves it higher up (a thinker on a Codex
+  // lane whose low rungs are all luna, an account whose floor arm was
+  // excluded). Upward picks still pass every exclusion and burn check.
+  const order = [];
+  for (let rung = target; rung >= floor; rung--) order.push(rung);
+  for (let rung = target + 1; rung <= ceiling; rung++) order.push(rung);
+  for (const rung of order) {
     const entry = ladderRungs.find(r => r.rung === rung);
     const arms = (entry?.arms ?? []).filter(a => (a.contextWindow ?? Number.MAX_SAFE_INTEGER) >= requiredWindow);
     const fitting = arms.filter(a => {
