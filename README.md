@@ -389,8 +389,9 @@ leave a role with no arm (a single-provider fleet), the fewest of its entries
 are suspended for that role, strongest banned family first, and the data gates
 keep as much strength as the role allows (`manual-suspended`, with the
 `entries` named, in `/capacity`). Otherwise the operator list applies as
-written. A lane outage lifts the list for the ticks it lasts, because only
-healthy accounts count; the ban returns when the lane does.
+written. Only healthy, non-excluded accounts with arms whose breakers are
+closed count, so a lane outage, an excluded account or open arm breakers can
+lift the list for as long as they hold; the ban returns when they recover.
 
 Defaults (all configurable):
 

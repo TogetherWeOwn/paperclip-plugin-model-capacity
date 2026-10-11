@@ -296,16 +296,18 @@ function subsetsOfSize(items, size, from = 0) {
 
 /**
  * The cheapest state that leaves the role an arm: the fewest operator entries
- * lifted (strongest banned family first among equals), then the data gates in
- * their order (strongest kept). Null when no arm serves the role at all.
+ * lifted, then the strongest data gates kept, then the strongest banned
+ * families lifted. Null when no arm serves the role at all.
  */
 function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
   if (!serves([])) return null;
   for (let size = 0; size <= order.length; size++) {
-    for (const lifted of subsetsOfSize(order, size)) {
-      const kept = manualList.filter(t => !lifted.includes(t));
-      const active = attempts.find(a => serves([...kept, ...tokensFor(a)]));
-      if (active) return { active, lifted };
+    const subsets = subsetsOfSize(order, size);
+    for (const active of attempts) {
+      for (const lifted of subsets) {
+        const kept = manualList.filter(t => !lifted.includes(t));
+        if (serves([...kept, ...tokensFor(active)])) return { active, lifted };
+      }
     }
   }
   return null;

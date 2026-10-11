@@ -184,6 +184,19 @@ test('a lift keeps the quality floor: only the banned family that serves is rest
   assert.ok(!e.report.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
 });
 
+test('equal-size lifts tie-break on data gates first: the lift that keeps the floor wins', () => {
+  const solUnhealthy = arm('gpt-6-1-sol-xhigh', 'sol', 0.9);
+  const solLow = arm('gpt-6-1-sol-low', 'sol', -1.5);
+  const lunaHigh = arm('luna-high', 'luna', -0.2);
+  const e = build([solUnhealthy, solLow, lunaHigh], {
+    manual: { doer: ['sol', 'luna'], thinker: [], other: [] },
+    accountGroups: [groupsFor([solLow, lunaHigh])],
+  });
+  assert.deepEqual(e.report.roles.doer.suspendedManual, ['luna']);
+  assert.deepEqual(e.report.roles.doer.suspendedGates, [], 'lifting sol would have dropped the floor');
+  assert.equal(decideFor([solLow, lunaHigh], 'doer', e.exclusions.doer).armId, 'luna-high');
+});
+
 test('an entry whose only arms are on a lane with no healthy account is not lifted', () => {
   const sol = arm('gpt-6-1-sol', 'sol', 0.9);
   const e = build([sol, ...META], {
