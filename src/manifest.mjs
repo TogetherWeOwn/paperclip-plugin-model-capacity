@@ -43,15 +43,23 @@
  * the kept model on the account that serves it. No capability, egress,
  * secret or env-key change.
  *
- * v0.2.25 = EXACT SERVED IDS: a lane feed with servedModels filters arms
- * before scoring or building ladders; older feeds remain fail-open. No new
- * capability, egress, secret or env-key change.
- *
  * v0.2.24 = DECIDE CLIMBS PAST EMPTY RUNGS: when no arm fits at or below the
  * pacing pointer (lower arms excluded for the role or over the burn check),
  * decide walks up to the role ceiling before deferring. Exclusions, the
  * burn check and the role window still apply. No capability, egress,
  * secret or env-key change.
+ *
+ * v0.2.25 = EXACT SERVED IDS: a lane feed with servedModels filters arms
+ * before scoring or building ladders; older feeds remain fail-open. No new
+ * capability, egress, secret or env-key change.
+ *
+ * v0.2.26 = OUTCOME BENCHMARK SKIPS UNSERVABLE FAMILIES: a family that
+ * cannot serve a role is never the outcome gate's benchmark for it, so it
+ * cannot gate the families that can: the operator's list, a quality-gated
+ * family, one whose arms are all covered by `arm:` tokens, or one with no
+ * arm in the fleet (its runs stay in the 24h window). The benchmark follows
+ * the quality suspension, so a suspended quality gate lets its families
+ * benchmark again. No capability, egress, secret or env-key change.
  *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
@@ -88,7 +96,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.25';
+export const PLUGIN_VERSION = '0.2.26';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
