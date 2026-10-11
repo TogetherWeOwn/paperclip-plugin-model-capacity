@@ -61,6 +61,14 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.27 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
+ * dropped when the same family has a newer or better arm (higher fleet Q,
+ * cost <=) on any qualified account with headroom, so old Sol on Devin no
+ * longer survives next to gpt-6.1-sol on Codex; Devin is fallback-only for
+ * models a qualified native also serves (band 3, after every need band)
+ * while Devin-unique models (swe-*, etc.) keep band 1. No capability,
+ * egress, secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -96,7 +104,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.26';
+export const PLUGIN_VERSION = '0.2.27';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

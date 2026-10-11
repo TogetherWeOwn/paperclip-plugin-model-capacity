@@ -214,9 +214,16 @@ frozen clock can never double-count.
    measured the result is `calibration: weak` with no target and no caps.
    Guard-capped accounts contribute zero; a 75 hard ceiling binds the
    total. Slots count only for roles that can use the account (v0.2.19).
-8. **Allocation (water-filling, v0.2.3)**: each decision goes to the
-   largest `(targetShare_a - inFlight_a)` inside the need band
-   (metered-behind, then reactive, then metered-ahead/over-burning).
+8. **Allocation (water-filling, v0.2.3; v0.2.27 adds fallback band)**:
+   each decision goes to the largest `(targetShare_a - inFlight_a)` inside
+   the need band (metered-behind, then reactive, then metered-ahead/
+   over-burning, then aggregator fallback-only last). A Devin lane serving
+   only models a qualified native also serves is fallback-only (owner rule
+   2026-09-17); Devin-unique models (swe-*, etc.) keep the reactive band.
+   A rung is also dropped fleet-wide when the same family has a newer or
+   better arm (higher fleet Q, cost <=) on a qualified account with
+   headroom, so old Sol on Devin never survives next to gpt-6.1-sol on
+   Codex (TOG-21579).
    `targetShare_a = requiredRate_a / E_a` (same term as the C*
    concurrency target). In-flight is pooled at the **provider level**:
    CLIProxy round-robins same-provider lanes onto shared credentials, so
