@@ -543,7 +543,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
-      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null };
+      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null };
     }
     const body = await cliproxyLaneGet(companyId, config);
     const parsed = parseLaneBody(body, nowMs);
@@ -555,6 +555,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const snapshot = {
       accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs,
       modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers, eeeSnapshot: eee,
+      servedModels: parsed.servedModels,
     };
     cache.set('accounts', snapshot, nowMs);
     return snapshot;
@@ -585,6 +586,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // suspended), logged at most once an hour per company and kind so a
   // standing override is visible in the log without a line per tick.
   const eligibilityWarnedAt = new Map();
+  const missingServedModelsWarned = new Set();
   const ELIGIBILITY_WARN_EVERY_MS = 60 * 60 * 1000;
   function warnEligibility(companyId, warnings, nowMs) {
     for (const w of warnings ?? []) {
@@ -690,7 +692,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return (trialState?.graduated ?? []).includes(family);
   }
 
-  function buildAccountLadders({ accounts, aaSnapshot, eeeSnapshot = null, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null, nowMs = null }) {
+  function buildAccountLadders({ accounts, servedModels = null, aaSnapshot, eeeSnapshot = null, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null, nowMs = null }) {
     // EEE prior: usable only when the artifact is fresh; otherwise every
     // arm keeps its AA-only score (bit-for-bit identical to today).
     const tickNow = nowMs ?? clock();
@@ -701,15 +703,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // Dynamic arms from the models the feed reports served, minus ids the
     // classic table already binds. No provider list involved: the feed is
     // the only coverage source.
-    const servedModels = new Set();
+    const accountModels = new Set();
     for (const account of accounts ?? []) {
       for (const m of account?.models ?? []) {
         const canon = canonicalModelName(m);
-        if (canon) servedModels.add(canon);
+        if (canon) accountModels.add(canon);
       }
     }
     const classicModels = new Set(classic.arms.map(a => a.model));
-    const { bindings } = buildDynamicBindings([...servedModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides });
+    const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides });
     const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings);
     const arms = [...classic.arms, ...dynamic.arms];
     const skipped = [...classic.skipped, ...dynamic.unscored.map(u => ({ model: u.model, reason: u.reason }))];
@@ -722,14 +724,36 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         .filter(a => (a?.models ?? []).map(canonicalModelName).includes(u.model))
         .map(a => accountKey(a));
     }
+    // Account models establish coverage, but only the exact id emitted by
+    // the resolver proves CLIProxy can serve an arm. Keep old feeds unchanged.
+    const servedIds = Array.isArray(servedModels) ? new Set(servedModels) : null;
+    const unservable = [];
+    const accountArms = (accounts ?? []).map((account, i) => {
+      const eligible = [];
+      const refused = new Set();
+      for (const arm of armsForAccount(arms, account)) {
+        if (!servedIds || servedIds.has(arm.model)) {
+          eligible.push(arm);
+        } else if (!refused.has(arm.model)) {
+          refused.add(arm.model);
+          unservable.push({
+            model: account?.models?.find(m => canonicalModelName(m) === arm.model) ?? arm.model,
+            accountId: keyOf(account, i), emitted: arm.model,
+          });
+        }
+      }
+      return eligible;
+    });
     // Context-tier costing (see tiers.mjs): C_eff = base x E[multiplier]
     // per arm, ordered by the EFFECTIVE cost. The fleet baseline (median E
     // over tiered models with measured stats) prices tiered-but-unmeasured
-    // arms -- never the cheap tier, never dropped.
+    // arms -- never the cheap tier, never dropped. An unservable arm must
+    // not change the prices of arms that can run; old feeds keep their baseline.
+    const pricedArms = servedIds ? accountArms.flat() : arms;
     const tierModels = [];
     {
       const seen = new Set();
-      for (const a of arms) {
+      for (const a of pricedArms) {
         if (a?.model && !seen.has(a.model)) {
           seen.add(a.model);
           tierModels.push(a.model);
@@ -759,8 +783,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const fleetArms = [];
     {
       const seenArm = new Set();
-      for (const account of accounts ?? []) {
-        for (const a of armsForAccount(arms, account)) {
+      for (const eligible of accountArms) {
+        for (const a of eligible) {
           if (!seenArm.has(a.armId)) {
             seenArm.add(a.armId);
             fleetArms.push(a);
@@ -784,7 +808,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const account = accounts[i];
       // Per-account scoring: quality support and cost profile are the
       // account's own arm set, so one provider's gaps never punish another.
-      const served = armsForAccount(arms, account);
+      const served = accountArms[i];
       const scored = new Map(computeComposite(served, config.weights).map(s => [s.armId, s]));
       // EEE blend: null Q_eee (no informing rows) keeps Q_aa untouched, so
       // unmeasured arms (e.g. haiku-5-5) are neither helped nor harmed. The
@@ -883,7 +907,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // wins per model key). Family-keyed caps leak one model's window onto
     // untiered same-family siblings, so each rung arm carries its own cap
     // and decide() reads it off the chosen arm.
-    const tierCaps = tierCapsByModel(arms.map(a => ({
+    const tierCaps = tierCapsByModel(pricedArms.map(a => ({
       model: a.model,
       cap: armTierCap({
         model: a.model,
@@ -903,7 +927,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       armId: a.armId, family: a.family, model: a.model, effort: a.effort,
       qFleet: fleetQ(a.armId, fleetAlphaDoer), qFleetThinker: fleetQ(a.armId, fleetAlphaThinker),
     }));
-    return { ladders, fleet, skipped, arms: arms.map(a => a.armId), unscored, tierCaps, tierBaseline, withinNoise: blocked };
+    return { ladders, fleet, skipped, arms: arms.map(a => a.armId), unscored, unservable, tierCaps, tierBaseline, withinNoise: blocked };
   }
 
   function accountKey(account) {
@@ -1163,6 +1187,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       2 * 3600 * 1000,
     );
     const snapshot = await readAccounts(companyId, config, nowMs);
+    if (snapshot.source === 'cliproxy-lane' && snapshot.servedModels == null) {
+      if (!missingServedModelsWarned.has(companyId)) {
+        missingServedModelsWarned.add(companyId);
+        warnEligibility(companyId, [{
+          code: 'served-models-missing',
+          message: 'lane feed has no valid servedModels list; routing remains fail-open',
+        }], nowMs);
+      }
+    } else {
+      missingServedModelsWarned.delete(companyId);
+    }
     const aaSnapshot = await ctx.state.get(scopeKey(companyId, AA_KEY));
     const pacingState = (await ctx.state.get(scopeKey(companyId, PACING_KEY))) ?? {};
     const prevLadders = (await ctx.state.get(scopeKey(companyId, LADDER_KEY)))?.ladders ?? {};
@@ -1197,8 +1232,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, fleet: fleetArmScores, skipped, unscored, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
-      accounts: snapshot.accounts, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
+    const { ladders, fleet: fleetArmScores, skipped, unscored, unservable, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
+      accounts: snapshot.accounts, servedModels: snapshot.servedModels, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
     // Breaker state rides each rung arm so ops can see why an arm is
@@ -2280,6 +2315,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accounts: accountViews,
       skippedArms: skipped,
       unscored,
+      unservable,
       contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
       trialTransitions,

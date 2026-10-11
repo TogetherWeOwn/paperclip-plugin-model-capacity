@@ -56,6 +56,7 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
         status: 200,
         json: async () => ({
           observedAt: new Date(nowMs).toISOString(),
+          servedModels: ['muse-spark-1.3-contributor', 'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
           // Meta holds the biggest deficit, so without a gate the doer goes
           // to Muse; claude stays decidable on five-hour headroom.
           accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), claudeLane],

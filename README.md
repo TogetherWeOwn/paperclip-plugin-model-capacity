@@ -27,8 +27,12 @@ strip, dots->dashes, `-free`/`-1m`/date-suffix strip, `-contributor` to xhigh
 effort) plus a small `MODEL_AA_OVERRIDES` table for verified mismatches
 (operator-extendable via `modelAaOverrides`). Models with no AA match build
 no arm and are reported `unscored` on `/capacity` (with the serving
-accounts), never silently dropped and never invented. Families without fleet
-success history route as capped trials (doer and other roles by default;
+accounts), never silently dropped and never invented. When the feed carries
+top-level `servedModels` (exact CLIProxy `/v1/models` ids), only an arm whose
+emitted model id occurs in that list reaches a ladder. `/capacity.unservable`
+reports refused `{ model, accountId, emitted }` entries; an absent or invalid
+list leaves old routing unchanged and logs one warning. An empty valid list
+refuses all arms. Families without fleet success history route as capped trials (doer and other roles by default;
 thinkers never; adapter-gated) until measured success graduates them; reactive accounts (vendor publishes no
 meter) are eligible while healthy. Shadow decisions are recorded event-time
 from `agent.run.started` when the resolver is absent, and run->account
@@ -433,10 +437,11 @@ resolved at call time and never stored:
   `/telemetry/cliproxy/live/accounts.json`), sent as the `X-Api-Key`
   header. The response carries per-account `weekly`/`fiveHour`
   `{ used (0..1|null), resetsAt (ISO|null) }`, a `quality`
-  flag, the served model ids (`models`), the vendor-meter kind (`meter`:
-  absent/`reactive` = the vendor publishes no usage numbers), and the pool
-  name where applicable. Until the ref is wired the plugin runs degraded:
-  no live reads, ladders frozen, shadow records the gap.
+  flag, the per-account model ids (`models`), the exact proxy-wide
+  `GET /v1/models` ids (`servedModels` at the top level), the vendor-meter
+  kind (`meter`: absent/`reactive` = the vendor publishes no usage numbers),
+  and the pool name where applicable. Until the ref is wired the plugin runs
+  degraded: no live reads, ladders frozen, shadow records the gap.
 
 The CLIProxy client only ever issues that one GET. Anything else is
 blocked in code and covered by the allowlist test. The plugin worker
