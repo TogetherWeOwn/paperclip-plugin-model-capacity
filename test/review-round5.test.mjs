@@ -5,6 +5,7 @@ import {
   calibrationAccount, trimLedger,
 } from '../src/ledger.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Review round 5 probes, one regression test each:
 // (1) E-calibration must count actual burn, not shadow picks;
@@ -87,7 +88,7 @@ test('(3) /shadow honors the requested limit; size is the full decided count', a
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(nowMs).toISOString(), accounts: [] }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: [] }, nowMs) }) },
     agents: { get: async () => null },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register() {} },
@@ -126,7 +127,7 @@ test('(4) concurrent first ticks share one ledger load', async () => {
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(nowMs).toISOString(),
           accounts: [{
             lane: 'kimi-k1', provider: 'kimi', accountKey: 'k1', health: 'healthy',
@@ -134,7 +135,7 @@ test('(4) concurrent first ticks share one ledger load', async () => {
             fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
             observedAt: new Date(nowMs).toISOString(), quality: 'live',
           }],
-        }),
+        }, nowMs),
       }),
     },
     agents: { get: async () => null },

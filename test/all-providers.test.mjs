@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfigShape, createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
@@ -72,7 +73,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
       },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {

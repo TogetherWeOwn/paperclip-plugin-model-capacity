@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Regression tests for the six Paperclip Review warnings on PR #8
 // (hook + event-time run accounting). Each test fails on the pre-fix code.
@@ -64,7 +65,7 @@ function drive({ nowMs, config = {}, laneAccounts = [], agentGets = {} }) {
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {

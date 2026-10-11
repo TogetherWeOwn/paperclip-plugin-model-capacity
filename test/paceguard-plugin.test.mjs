@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, resolveConfig, validateConfigShape } from '../src/plugin.mjs';
 import { manifest } from '../src/manifest.mjs';
 import { DEFAULT_PACE_GUARD } from '../src/paceguard.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // The pace guard through the plugin: the enforcing hook, the event-time
 // shadow path and the shadow tick all order accounts with the same guard, so
@@ -56,7 +57,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: lane }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: lane }, now) }) },
     agents: { get: async (id) => agentGets[id] ?? null },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
@@ -354,6 +355,21 @@ test('runs the hook deferred do not hold the pool: it refills once the real runs
     'idle again: under its cap, not paced');
   assert.equal((await d.hook('run-2')).kind, 'decide', 'the first waiting run is admitted');
   assert.equal((await d.hook('run-3')).kind, 'defer', 'and the next still waits for it');
+});
+
+test('a lane without ready credentials is outside the pool: its position does not move the mean', async () => {
+  // Lane a1 is 4 points behind plan and ready; lane a2 is far ahead but has
+  // no ready credential, so it can serve nothing. The pool is a1 alone.
+  const ready = claudeLane(0.6, 48);
+  const unready = { ...claudeLane(0.99, 48), accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
+  const d = drive({ config: { enforce: true }, accounts: [ready, unready] });
+  await d.setup();
+  await d.tick();
+  const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.equal(pool.lanes, 1);
+  assert.equal(pool.state, 'on-plan');
+  assert.ok(pool.planAhead < 0.02, `planAhead ${pool.planAhead}`);
+  for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
 });
 
 test('/capacity reports the guard state per pool', async () => {
