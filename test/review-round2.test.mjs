@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { DEFAULT_ACCOUNTS_PATH } from '../src/cliproxy.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Regression tests for Paperclip Review round 2 on ca2956a (3 regressions +
 // 1 gap). Each test mirrors the reviewer's probe and fails on the pre-fix
@@ -64,7 +65,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa() }
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {

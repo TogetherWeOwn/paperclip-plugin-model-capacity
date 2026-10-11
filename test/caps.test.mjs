@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocateDemandCaps } from '../src/concurrency.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'capped-ceiling']);
 
@@ -199,7 +200,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: { get: async () => null },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { DEFAULT_MIN_QUALITY, DEFAULT_OUTCOME_GATE } from '../src/eligibility.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Eligibility from data, end to end: the Q minimum and the measured-outcome
 // gate keep Muse off doers WITHOUT a hand-written ban, the emergency
@@ -35,8 +36,10 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false } = {}) {
-  const claudeLane = lane('claude-1', 'claude', 'a1', 0.95);
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, agentModels = {} } = {}) {
+  const claudeLane = spentClaude
+    ? lane('claude-1', 'claude', 'a1', 1, 0)
+    : lane('claude-1', 'claude', 'a1', 0.95);
   if (unhealthyClaude) claudeLane.health = 'unhealthy';
   const store = new Map();
   const jobs = new Map();
@@ -52,15 +55,16 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(nowMs).toISOString(),
+          servedModels: ['muse-spark-1.3-contributor', 'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
           // Meta holds the biggest deficit, so without a gate the doer goes
           // to Muse; claude stays decidable on five-hour headroom.
           accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), claudeLane],
-        }),
+        }, nowMs),
       }),
     },
-    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    agents: { get: async (id) => ({ adapterType: 'claude-code', ...(agentModels[id] ? { adapterConfig: { model: agentModels[id] } } : {}) }) },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: () => {} },
@@ -307,6 +311,49 @@ test('an unhealthy account cannot strand a role in defer: the guard reads only a
   const cap = await d.capacity();
   assert.equal(cap.eligibility.roles.doer.suspended, true);
   assert.ok(cap.eligibility.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
+});
+
+test('a weekly-spent account cannot strand a role in defer: the guard skips it like an unhealthy one', async () => {
+  // Claude reads healthy with an idle 5h meter but its weekly window is
+  // spent, so placement excludes it and only Meta (Muse) remains, which the
+  // quality gate keeps off doers. The empty-role guard must skip the spent
+  // account too; reading it as usable keeps the gate on while every doer run
+  // defers.
+  const d = drive({ config: { enforce: true, roles: ROLES_CFG }, spentClaude: true });
+  await d.setup();
+  await d.tick();
+  const h = await d.hook('run-1', 'eng-doer');
+  assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed, never deferred');
+  assert.match(h.reason, /rung 0 on meta:m1/);
+  const cap = await d.capacity();
+  assert.equal(cap.eligibility.roles.doer.suspended, true);
+});
+
+test('a pinned agent keeps its configured model under enforce; other agents are still routed', async () => {
+  const d = drive({ config: { enforce: true, roles: { ...ROLES_CFG, keepAgentIds: ['planner'] } } });
+  await d.setup();
+  await d.tick();
+  assert.deepEqual(await d.hook('run-1', 'planner'), { kind: 'keep' });
+  assert.equal((await d.hook('run-2', 'eng-doer')).kind, 'decide');
+});
+
+test('pinned runs count against their serving account at once, before the next tick', async () => {
+  // The pinned agent runs Muse on meta:m1, the account a doer would
+  // otherwise take. Pinned hooks between ticks must add pressure on m1 so
+  // water-filling sends the doer elsewhere; without the kept decision the
+  // doer still lands on m1.
+  const cfg = { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
+  const control = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
+  await control.setup();
+  await control.tick();
+  assert.match((await control.hook('run-d0', 'eng-doer')).reason, /meta:m1/);
+  const d = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
+  await d.setup();
+  await d.tick();
+  for (let i = 0; i < 40; i += 1) assert.deepEqual(await d.hook(`run-p${i}`, 'planner'), { kind: 'keep' });
+  const h = await d.hook('run-d1', 'eng-doer');
+  assert.equal(h.kind, 'decide');
+  assert.doesNotMatch(h.reason, /meta:m1/, 'pinned runs already fill meta:m1');
 });
 
 test('the published family outcomes and the gate attribute a run to the same family', async () => {

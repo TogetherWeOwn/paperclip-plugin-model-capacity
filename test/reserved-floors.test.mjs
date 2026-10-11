@@ -4,6 +4,7 @@ import { allocateDemandCaps, applyReservedFloors, computeReservedFloor } from '.
 import { holdCaps, SMOOTHING_DEFAULTS } from '../src/smoothing.mjs';
 import { breakerKey, breakerSuspendsFloors, createBreakerStore, DEFAULT_BREAKERS, noteKnownArms, breakerHousekeep, breakerStoreFromJSON, breakerStoreToJSON } from '../src/breakers.mjs';
 import { resolveConfig, validateConfigShape, createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Reserved per-agent floors: config-only, empty by default. Placeholders only,
 // never real agent ids.
@@ -339,7 +340,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: { get: async () => null },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

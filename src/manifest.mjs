@@ -30,6 +30,43 @@
  * tracked arm is breaker-open. Empty by default. No capability, egress,
  * secret or env-key change.
  *
+ * v0.2.21 = WEEKLY EXHAUSTION OVERRIDES AN IDLE 5H METER: an account whose
+ * weekly remainder is at or below 1% reads headroom = that remainder (source
+ * `weekly`), reports action `excluded`, and counts as unhealthy for the
+ * eligibility empty-role guard and the concurrency census. Above the floor
+ * the 5h meter stays the burst guard. No capability, egress, secret or
+ * env-key change.
+ *
+ * v0.2.22 = BREAKER STATE PERSISTS: breaker-v1 was keyed by the in-memory
+ * NUL-joined pair key; Postgres jsonb rejects the NUL escape, so every
+ * write with a known or tripped arm failed and the tick's state froze.
+ * Persisted keys are now the JSON pair; loading re-keys from each entry.
+ * No capability, egress, secret or env-key change.
+ *
+ * v0.2.23 = PINNED AGENTS: `roles.keepAgentIds` (empty default) lists agents
+ * whose runs always keep their configured model. The hook answers keep for
+ * them, the event-time path never routes them, and the shadow tick records
+ * the kept model on the account that serves it. No capability, egress,
+ * secret or env-key change.
+ *
+ * v0.2.24 = DECIDE CLIMBS PAST EMPTY RUNGS: when no arm fits at or below the
+ * pacing pointer (lower arms excluded for the role or over the burn check),
+ * decide walks up to the role ceiling before deferring. Exclusions, the
+ * burn check and the role window still apply. No capability, egress,
+ * secret or env-key change.
+ *
+ * v0.2.25 = EXACT SERVED IDS: a lane feed with servedModels filters arms
+ * before scoring or building ladders; older feeds remain fail-open. No new
+ * capability, egress, secret or env-key change.
+ *
+ * v0.2.26 = OUTCOME BENCHMARK SKIPS UNSERVABLE FAMILIES: a family that
+ * cannot serve a role is never the outcome gate's benchmark for it, so it
+ * cannot gate the families that can: the operator's list, a quality-gated
+ * family, one whose arms are all covered by `arm:` tokens, or one with no
+ * arm in the fleet (its runs stay in the 24h window). The benchmark follows
+ * the quality suspension, so a suspended quality gate lets its families
+ * benchmark again. No capability, egress, secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -66,7 +103,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.20';
+export const PLUGIN_VERSION = '0.2.26';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -146,6 +183,7 @@ const CONFIG_SCHEMA = {
       properties: {
         thinkerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
         doerAgentIds: { type: 'array', default: [], items: { type: 'string' } },
+        keepAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents whose runs always keep their configured model: the hook answers keep and shadow reports the configured model. For gating roles pinned by the operator (e.g. the code reviewer).' },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
           description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',

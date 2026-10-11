@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Per-role target, smoothing and pooled calibration end to end through the shadow tick, on the live
 // shape of 2026-10-09: eight Meta lanes behind one round-robin pool (every
@@ -64,7 +65,7 @@ function drive({ config = {}, queued = null, issuesList = null } = {}) {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts }, now) }) },
     agents: { get: async () => ({ adapterType: 'claude-code' }) },
     issues: {
       get: async () => null,

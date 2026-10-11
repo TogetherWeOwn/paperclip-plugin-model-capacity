@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // The SDK contract for ctx reads is positional --
 // PluginIssuesClient.get(issueId, companyId) /
@@ -41,7 +42,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(now).toISOString(),
           accounts: [{
             lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
@@ -49,7 +50,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
             fiveHour: { used: 0.1, resetsAt: '2026-10-09T03:59:00Z' },
             observedAt: new Date(now).toISOString(), quality: 'live',
           }],
-        }),
+        }, now),
       }),
     },
     agents: {

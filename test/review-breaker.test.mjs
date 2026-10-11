@@ -5,6 +5,7 @@ import {
   DEFAULT_BREAKERS, sanitizeBreakers, createBreakerStore, breakerStoreToJSON,
   breakerState, recordArmFailure,
 } from '../src/breakers.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Review fold-in (PR #11): one regression test per finding.
 //
@@ -64,7 +65,7 @@ function rig({ failBreakerReads = false } = {}) {
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => laneBody() }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(laneBody(), T) }) },
     agents: { get: async () => ({ adapterType: 'claude-code' }) },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { orderAccountsForRun, allowanceOf, DEFAULT_PLACEMENT } from '../src/select.mjs';
 import { decide, placementArm } from '../src/decide.mjs';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Placement ignored model quality. 06:25-08:45Z two thirds
 // of all runs went to Muse because Meta had the most unspent allowance.
@@ -211,13 +212,13 @@ function drive({ config = {} } = {}) {
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(TICK).toISOString(),
           accounts: [
             lane('meta-1', 'meta', 'm1', 0.05, ['muse-spark-1.3-contributor']),
             lane('claude-1', 'claude', 'a1', 0.9, ['claude-haiku-5-5']),
           ],
-        }),
+        }, TICK),
       }),
     },
     agents: { get: async () => ({ adapterType: 'claude-code' }) },

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfigShape, createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
@@ -59,10 +60,15 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
-      set: async (k, v) => { store.set(skey(k), v); },
+      // Postgres jsonb rejects the NUL escape: a value the host cannot store
+      // must fail here exactly as the plugin_state insert fails live.
+      set: async (k, v) => {
+        if (JSON.stringify(v).includes('\\u0000')) throw new Error('unsupported Unicode escape sequence (\\u0000 cannot be converted to text)');
+        store.set(skey(k), v);
+      },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {
@@ -195,6 +201,44 @@ test('pool headroom falls back to weekly when 5h is missing; legacy feeds stay n
   );
 });
 
+test('a weekly-exhausted account with an idle 5h meter is excluded, never placed', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [
+      claudeAcct({ lane: 'claude-spent', key: 'spent', weekly: 1, fiveHour: 0, reset: '2026-11-08T16:09:11Z' }),
+      claudeAcct({ lane: 'claude-ok', key: 'ok', weekly: 0.3, fiveHour: 0.5 }),
+    ],
+    steps: [{ now: TICK, fire: [started('run-w', TICK - 60000, { model: 'claude-haiku-5-5', provider: 'claude' })] }],
+  });
+  const { capacity, shadow } = await run();
+  const byId = new Map(capacity.body.accounts.map(a => [a.accountId, a]));
+  const spent = byId.get('claude:spent');
+  // The binding window is the weekly one: headroom 0, not the idle 5h's 1.
+  assert.deepEqual([spent.headroomPct, spent.headroomSource, spent.action], [0, 'weekly', 'excluded']);
+  assert.match(spent.reason, /weekly window exhausted/);
+  const ok = byId.get('claude:ok');
+  assert.deepEqual([ok.headroomPct, ok.headroomSource], [0.5, 'five-hour']);
+  assert.notEqual(ok.action, 'excluded');
+  // No decision lands on the spent account.
+  assert.ok(shadow.body.entries.length >= 1);
+  for (const e of shadow.body.entries) assert.notEqual(e.accountId, 'claude:spent');
+  // The concurrency census does not count it as a healthy contributor.
+  const row = (capacity.body.perAccount ?? []).find(r => r.accountId === 'claude:spent');
+  assert.ok(row, 'the spent account has a census row');
+  assert.deepEqual([row.reason, row.slots], ['excluded', 0]);
+});
+
+test('a weekly window just above the exhaustion floor keeps the 5h burst guard', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [claudeAcct({ lane: 'claude-low', key: 'low', weekly: 0.95, fiveHour: 0.1 })],
+  });
+  const { capacity } = await run();
+  const a = capacity.body.accounts.find(x => x.accountId === 'claude:low');
+  assert.deepEqual([a.headroomPct, a.headroomSource], [0.9, 'five-hour']);
+  assert.notEqual(a.action, 'excluded');
+});
+
 test('models with no AA match are listed unscored with their servers, never invented', async () => {
   const { run } = drive({
     nowMs: TICK,
@@ -220,6 +264,29 @@ test('event-time shadow covers runs that start between ticks', async () => {
   assert.equal(shadow.body.entries.length, 1);
   assert.equal(shadow.body.entries[0].eventTime, true);
   assert.equal(shadow.body.entries[0].runId, 'run-e');
+});
+
+test('a pinned agent keeps its configured model: shadow reports it, event-time never routes it', async () => {
+  const { run } = drive({
+    nowMs: TICK,
+    config: { roles: { keepAgentIds: ['agent-9'] } },
+    laneAccounts: [claudeAcct()],
+    steps: [
+      { now: TICK, fire: [started('run-k', TICK - 60000, { model: 'claude-opus-5-5', provider: 'claude' })] },
+      { now: TICK + 60000, fire: [started('run-k2', TICK + 30000, { model: 'claude-opus-5-5', provider: 'claude' })] },
+      { now: TICK + 120000 },
+    ],
+  });
+  const { shadow } = await run();
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  for (const id of ['run-k', 'run-k2']) {
+    const e = byId.get(id);
+    assert.ok(e, `${id} has a shadow entry`);
+    assert.equal(e.wouldModel, 'claude-opus-5-5');
+    assert.match(e.reason, /kept: agent pinned/);
+    assert.equal(e.modelMatch, true);
+    assert.notEqual(e.eventTime, true, 'the event-time path never routes a pinned agent');
+  }
 });
 
 test('measured fleet success graduates a trial family', async () => {

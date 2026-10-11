@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { createLedger, ledgerToJSON, ledgerFromJSON, recordStart } from '../src/ledger.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Reviewer probe (round 7): getOrLoadLedger's load-failure fallback used to
 // serve the TICK too, so one failed ledger-v1 read after a restart let the
@@ -66,7 +67,7 @@ test('a failed ledger load aborts the tick and never wipes the saved ledger', as
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(TICK).toISOString(), accounts: [kimiLane()] }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(TICK).toISOString(), accounts: [kimiLane()] }, TICK) }) },
     agents: { get: async () => null },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

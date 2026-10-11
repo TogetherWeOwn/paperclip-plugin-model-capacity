@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { canonicalModelName } from '../src/arms.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Claude Code CLI >= 2.1.291 runs claude-haiku-5-5 at contextWindow 200000
 // and IGNORES CLAUDE_CODE_MAX_CONTEXT_TOKENS for claude-* ids (the
@@ -51,7 +52,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = [] }) {
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {

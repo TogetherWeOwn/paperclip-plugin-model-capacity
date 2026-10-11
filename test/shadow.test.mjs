@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createShadowRing, SHADOW_CAPACITY, validRecord } from '../src/shadow.mjs';
 import { validateConfigShape, resolveConfig, createModelCapacityPlugin } from '../src/plugin.mjs';
 import { LANE_BASE_URLS } from '../src/lane-host.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const record = (runId) => ({
   runId, agentId: 'agent-1', actualModel: 'claude-haiku-5-5(max)', wouldModel: 'gpt-6.1-sol(high)',
@@ -94,7 +95,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: { get: strictGet('agents', agentGets, failAgentGet) },
     issues: { get: strictGet('issues', issueGets, failIssueGet) },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

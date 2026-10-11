@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Reviewer probe (round 6): loadLedger used to read the memory overlay
 // BEFORE awaiting the ledger-v1 state read, then blind-set the merged
@@ -56,7 +57,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(TICK).toISOString(), accounts: [kimiLane()] }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(TICK).toISOString(), accounts: [kimiLane()] }, TICK) }) },
     agents: { get: async (agentId, companyId) => (agentId === 'agent-9' ? { adapterType: 'claude-code' } : null) },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },

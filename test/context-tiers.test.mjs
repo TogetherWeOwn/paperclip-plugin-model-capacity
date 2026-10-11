@@ -9,6 +9,7 @@ import {
   fleetBaselineForModels, median,
 } from '../src/tiers.mjs';
 import { parseLaneBody } from '../src/cliproxy.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Context pricing tiers (owner requirement): models whose per-request price
 // rises past a prompt threshold reprice the ladder (C_eff = base x E[m]) and
@@ -320,9 +321,10 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
     fractionOver: { '500000': 0.2 }, cacheReadShare: 0, meanOutputTokens: 1000,
   };
   const book = { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 };
-  const laneBody = (withTiers) => ({
+  const laneBody = (withTiers, servedModels) => ({
     observedAt: new Date(TICK).toISOString(),
     accounts: [laneAccount(['cheap-sol', 'pricey-luna'])],
+    ...(servedModels ? { servedModels } : {}),
     ...(withTiers ? {
       modelStats: {
         schemaVersion: 1, observedAt: new Date(TICK).toISOString(), windowHours: 24,
@@ -365,7 +367,7 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
     armMap,
     calibration: { referenceArmId: 'pricey-luna', referenceBurnPerRunPct: 0.0005 },
   };
-  const runTick = async (withTiers) => {
+  const runTick = async (withTiers, servedModels) => {
     store.clear();
     jobs.clear();
     const io = {
@@ -375,7 +377,7 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
         set: async (k, v) => { store.set(skey(k), v); },
       },
       secrets: { resolve: async () => 'lane-key' },
-      http: { fetch: async () => ({ status: 200, json: async () => laneBody(withTiers) }) },
+      http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(laneBody(withTiers, servedModels), TICK) }) },
       agents: { get: async () => null },
       issues: { get: async () => null, list: async () => [] },
       jobs: { register: (n, fn) => { jobs.set(n, fn); } },
@@ -429,6 +431,12 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
   assert.equal(hookOut.env[AUTO_COMPACT_ENV_KEY], '448000');
   // Fleet baseline = median(4.92, 1.1) = 3.01; only the feasible luna window.
   closeTo(tiered.capacity.contextTiers.baselineMultiplier, 3.01);
+  const filtered = await runTick(true, ['pricey-luna']);
+  assert.deepEqual(filtered.ladder.ladders['claude:a1'].rungs.map(r => r.model), ['pricey-luna']);
+  assert.deepEqual(filtered.capacity.unservable, [
+    { model: 'cheap-sol', accountId: 'claude:a1', emitted: 'cheap-sol' },
+  ]);
+  closeTo(filtered.capacity.contextTiers.baselineMultiplier, 1.1);
   assert.deepEqual(
     tiered.capacity.contextTiers.caps,
     { 'pricey-luna': { maxTokens: 468000, autoCompactTokens: 448000 } },
