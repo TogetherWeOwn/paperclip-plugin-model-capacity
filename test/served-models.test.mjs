@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { canonicalModelName } from '../src/arms.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const NOW = Date.parse('2026-10-10T20:25:00Z');
 const SERVED = JSON.parse(readFileSync(new URL('./served-models-20261010.json', import.meta.url), 'utf8'));
@@ -27,6 +28,13 @@ const positives = [
   ['claude-opus-5-5', 'claude'],
   ['meta/muse-spark-1.3-contributor', 'meta'],
 ];
+
+// Exact bare emitted ids behind the prefixed discovery names above. Prefixed
+// names are never treated as readiness aliases: the synthetic feed states the
+// bare proxy id explicitly.
+const emittedByProvider = {
+  codex: ['gpt-6.1-sol'], claude: ['claude-sonnet-5-5'], meta: ['muse-spark-1.3-contributor'],
+};
 
 function account(raw, provider, i) {
   return {
@@ -62,7 +70,7 @@ async function start(lane, rows) {
       set: async (k, v) => { store.set(key(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, NOW, { emitted: emittedByProvider }) }) },
     agents: { get: async () => null },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },

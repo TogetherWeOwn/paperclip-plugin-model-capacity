@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Owner requirement (blind-tested live): the plugin keeps working whatever
 // accounts are in CLIProxy, and auto-detects added, removed and disabled
@@ -51,10 +52,10 @@ function drive({ config = {}, lanes = [], agentGets = {}, aa = baseAa(), ringSee
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(now).toISOString(),
           accounts: currentLanes.map(a => ({ ...a, observedAt: new Date(now).toISOString() })),
-        }),
+        }, now),
       }),
     },
     agents: {
