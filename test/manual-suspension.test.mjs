@@ -173,3 +173,56 @@ test('no arm for a role at all: nothing is suspended and the role stays empty', 
   assert.deepEqual(e.report.roles.doer.suspendedManual, []);
   assert.ok(!codes(e).includes('manual-suspended'));
 });
+
+test('a lift keeps the quality floor: only the banned family that serves is restored', () => {
+  const arms = [arm('muse-weak', 'muse', -1.5), arm('muse-mid', 'muse', -0.2), arm('muse-top', 'muse', 0.35)];
+  const e = build(arms, { manual: { doer: ['muse'], thinker: [], other: [] } });
+  assert.deepEqual(e.report.roles.doer.suspendedManual, ['muse']);
+  assert.deepEqual(e.report.roles.doer.suspendedGates, [], 'the quality floor still holds');
+  assert.deepEqual(e.exclusions.doer, ['arm:muse-weak']);
+  assert.equal(decideFor(arms, 'doer', e.exclusions.doer).armId, 'muse-top');
+  assert.ok(!e.report.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'doer'));
+});
+
+test('an entry whose only arms are on a lane with no healthy account is not lifted', () => {
+  const sol = arm('gpt-6-1-sol', 'sol', 0.9);
+  const e = build([sol, ...META], {
+    manual: { doer: ['sol', 'muse'], thinker: [], other: [] },
+    accountGroups: [groupsFor(META)],
+  });
+  assert.deepEqual(e.report.roles.doer.suspendedManual, ['muse'], 'sol cannot serve, so only muse lifts');
+  assert.ok(e.exclusions.doer.includes('sol'));
+  assert.equal(decideFor(META, 'doer', e.exclusions.doer).armId, 'muse-spark-1.3');
+});
+
+test('an entry outside the role rung window is not lifted', () => {
+  const floorRung = 2;
+  const roleBands = { ...bands, thinker: { floorRung, ceilingRung: null } };
+  const muse = arm('muse-spark-1.3', 'muse', 0.9, { qFleetThinker: 0.9 });
+  const sol = arm('gpt-6-1-sol', 'sol', 0.5, { qFleetThinker: 0.5 });
+  const ladder = [{ rung: 0, arms: [muse] }, { rung: 1, arms: [] }, { rung: 2, arms: [sol] }];
+  const e = buildEligibility({
+    arms: [muse, sol], records: [], nowMs: NOW, minQuality: normalizeMinQuality(undefined),
+    outcomeGate: DEFAULT_OUTCOME_GATE, manual: { doer: [], thinker: ['muse', 'sol'], other: [] },
+    roleOf, familyOf, accountGroups: [ladder], roleBands, trialRoles: ['doer', 'other'], minFleetArms: 1,
+  });
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, ['sol']);
+  const d = decide({
+    runId: 'r-thinker', agentId: 'thinker-1', role: 'thinker', ladderRungs: ladder, pointer: 0,
+    accountId: 'acct-1', fiveHourHeadroomPct: null, burnPerRunPct: {}, roleBands, trialRoles: ['doer', 'other'],
+    excludedFamilies: e.exclusions.thinker,
+  });
+  assert.equal(d.armId, 'gpt-6-1-sol');
+});
+
+test('a provider with no healthy lane lifts the operator ban for that tick; a healthy lane keeps it', () => {
+  const fleet = [...CLAUDE, ...META];
+  const manual = { doer: ['muse'], thinker: [], other: [] };
+  const healthy = build(fleet, { manual, accountGroups: [groupsFor(CLAUDE), groupsFor(META)] });
+  assert.deepEqual(healthy.report.roles.doer.suspendedManual, []);
+  assert.deepEqual(healthy.exclusions.doer, ['muse']);
+  assert.ok(decideFor(CLAUDE, 'doer', healthy.exclusions.doer).armId.startsWith('claude-'));
+  const degraded = build(fleet, { manual, accountGroups: [groupsFor(META)] });
+  assert.deepEqual(degraded.report.roles.doer.suspendedManual, ['muse']);
+  assert.equal(decideFor(META, 'doer', degraded.exclusions.doer).armId, 'muse-spark-1.3');
+});

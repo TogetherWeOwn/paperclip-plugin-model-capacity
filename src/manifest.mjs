@@ -62,10 +62,10 @@
  * benchmark again. No capability, egress, secret or env-key change.
  *
  * v0.2.27 = OPERATOR LIST YIELDS: when the operator's list alone would leave
- * a role with no arm, the data gates yield, then the list's entries are
- * suspended for that role, strongest banned family first (`manual-suspended`
- * in /capacity). A single-provider fleet keeps deciding every role. No
- * capability, egress, secret or env-key change.
+ * a role with no arm, the fewest of its entries are suspended for that role,
+ * strongest banned family first, and the data gates keep as much strength as
+ * the role allows (`manual-suspended` in /capacity). A single-provider fleet
+ * keeps deciding every role. No capability, egress, secret or env-key change.
  *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
@@ -184,7 +184,7 @@ const CONFIG_SCHEMA = {
         keepAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents whose runs always keep their configured model: the hook answers keep and shadow reports the configured model. For gating roles pinned by the operator (e.g. the code reviewer).' },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
-          description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',
+          description: 'Emergency override: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate. If this list alone would leave a role with no arm, the fewest entries needed are suspended for that role (manual-suspended in /capacity). A warning is logged while this is non-empty.',
           properties: {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },

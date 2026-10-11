@@ -385,10 +385,12 @@ cannot be placed on a ladder in the first place; it is listed as
 outcome gate is given back for that role first, then the quality minimum
 (`role-empty-suspended`, with the `gates` named, in `/capacity`); a role can
 never be emptied into a defer loop by data. If the operator list alone would
-leave a role with no arm (a single-provider fleet), the data gates yield first
-and then the list's entries are suspended for that role, the strongest banned
-family first (`manual-suspended`, with the `entries` named, in `/capacity`).
-Otherwise the operator list applies as written.
+leave a role with no arm (a single-provider fleet), the fewest of its entries
+are suspended for that role, strongest banned family first, and the data gates
+keep as much strength as the role allows (`manual-suspended`, with the
+`entries` named, in `/capacity`). Otherwise the operator list applies as
+written. A lane outage lifts the list for the ticks it lasts, because only
+healthy accounts count; the ban returns when the lane does.
 
 Defaults (all configurable):
 

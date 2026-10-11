@@ -31,9 +31,10 @@
  * role where every family reads low, e.g. reviewers who answer in comments,
  * keeps them all), and if the data gates would leave a role with no arm on
  * any account they are suspended for that role (reported, never a defer
- * loop). If the operator's list alone would empty a role, the data gates
- * yield first and then the list's entries are suspended for that role, the
- * strongest banned family first (reported as `manual-suspended`).
+ * loop). If the operator's list alone would empty a role, the fewest of its
+ * entries are suspended for that role, strongest banned family first, and
+ * the data gates keep as much strength as the role allows (reported as
+ * `manual-suspended`).
  */
 
 import { ARM_TOKEN_PREFIX, armToken, normalizeExcludedFamilies, roleLadderAccess } from './decide.mjs';
@@ -283,6 +284,33 @@ function manualSuspensionOrder(manualList, arms, role) {
     .map(x => x.token);
 }
 
+/** Every subset of `items` with `size` members, earlier items first. */
+function subsetsOfSize(items, size, from = 0) {
+  if (size === 0) return [[]];
+  const out = [];
+  for (let i = from; i <= items.length - size; i++) {
+    for (const rest of subsetsOfSize(items, size - 1, i + 1)) out.push([items[i], ...rest]);
+  }
+  return out;
+}
+
+/**
+ * The cheapest state that leaves the role an arm: the fewest operator entries
+ * lifted (strongest banned family first among equals), then the data gates in
+ * their order (strongest kept). Null when no arm serves the role at all.
+ */
+function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
+  if (!serves([])) return null;
+  for (let size = 0; size <= order.length; size++) {
+    for (const lifted of subsetsOfSize(order, size)) {
+      const kept = manualList.filter(t => !lifted.includes(t));
+      const active = attempts.find(a => serves([...kept, ...tokensFor(a)]));
+      if (active) return { active, lifted };
+    }
+  }
+  return null;
+}
+
 /**
  * The full picture for one tick.
  *
@@ -361,20 +389,15 @@ export function buildEligibility({
       ...(a.quality ? qualityTokens : []),
       ...(a.outcome ? (a.quality ? outcomeStrictTokens : outcomeBaseTokens) : []),
     ];
-    let active = attempts[0];
-    if ((qualityTokens.length + outcomeStrictTokens.length > 0)
-      && !accessible(role, [...manualList, ...tokensFor(active)]) && accessible(role, manualList)) {
-      active = attempts.find(a => accessible(role, [...manualList, ...tokensFor(a)])) ?? attempts[3];
-    }
-    let suspendedManual = [];
-    if (!accessible(role, manualList) && accessible(role, [])) {
-      active = attempts[3];
-      const order = manualSuspensionOrder(manualList, arms, role);
-      for (let n = 1; n <= order.length; n++) {
-        suspendedManual = order.slice(0, n);
-        if (accessible(role, manualList.filter(t => !suspendedManual.includes(t)))) break;
-      }
-    }
+    const state = firstServingState({
+      attempts,
+      tokensFor,
+      manualList,
+      order: manualSuspensionOrder(manualList, arms, role),
+      serves: tokens => accessible(role, tokens),
+    });
+    const active = state?.active ?? attempts[0];
+    const suspendedManual = state?.lifted ?? [];
     const keptManual = manualList.filter(t => !suspendedManual.includes(t));
     const activeOutcomeTokens = active.quality ? outcomeStrictTokens : outcomeBaseTokens;
     const suspendedGates = [
