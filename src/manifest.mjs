@@ -61,6 +61,15 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.28 = PACE GUARD: a provider pool whose lanes average above the linear
+ * weekly plan (plus `pacing.guard.marginPct`) is held at max(1, ceil(paced
+ * slots)) runs in flight; further runs go to other pools or the hook defers
+ * (`pacing.guard.retryAfterMs`). The hook, the event-time path and the
+ * shadow tick order accounts through the same guard, so they agree.
+ * Unknown plan position or share, and reactive lanes, fail open.
+ * `/capacity` reports `paceGuard`. No capability, egress, secret or env-key
+ * change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -96,7 +105,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.26';
+export const PLUGIN_VERSION = '0.2.28';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([

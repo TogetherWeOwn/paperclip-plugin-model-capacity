@@ -191,6 +191,9 @@ frozen clock can never double-count.
    only breaks ties while no rate is measured yet. At most one rung per
    10 min. The 5h guard overrides everything: above 80% the account floors
    and sheds load, rejoining below 50%.
+   The **pace guard** (below) is the hard brake behind this ordering: a
+   pool that has spent ahead of its weekly plan stops taking runs at its
+   cap instead of merely sorting last.
 6. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
    test-fail +1, rate-limit reroutes, context-window filter. Trial arms
    (families without fleet success: gemini, kimi, grok, claude-4-6, ...)
@@ -323,6 +326,65 @@ servable arm is breaker-open (fleet-wide cooling) floors suspend and floored
 caps hold at running, so failed runs on cooled models cannot rise. Cost: past
 target the fleet can run over it by at most the floors' new slots (8 for the
 example entry); no agent loses a running slot.
+
+### Pace guard
+
+Ordering alone never stops spend: an account ahead of plan sorts into the
+last need band, but when every account that can serve a run is ahead, one is
+still picked, and a fleet ahead of plan keeps burning (a Claude lane went 78%
+to 90% in two hours). The guard adds the brake. Per provider pool (lanes
+that share one credential bucket):
+
+    ahead  = mean(weeklyUsed - elapsedFraction) over the pool's lanes > marginPct
+    slots  = sum over lanes of targetShare x meanRunDurationHours
+    cap    = max(1, ceil(slots))
+
+A pool that is ahead and already has `cap` runs in flight is **paced**: its
+lanes leave the allocation order, so the run goes to another pool, or, when
+every pool is paced, the hook answers `defer` with a `pace guard: ...`
+reason and `pacing.guard.retryAfterMs`. A pool that is not ahead is never
+touched. `slots` is the same term as the per-account concurrency target, so
+the cap follows the plan: it shrinks as an account spends ahead and widens as
+the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
+
+The enforcing hook, the event-time shadow path and the shadow tick all order
+accounts through `orderAccountsWithPacing` with the same plan positions and
+knobs, so they hold and release a pool alike (a run being decided never
+counts against its own pool). A held run gets no shadow decision;
+`shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
+(`enabled`, `marginPct`, `retryAfterMs`, and one entry per pool with
+`planAhead`, `pacedSlots`, `cap`, `inFlight` and `state`: `paced`, `ahead`,
+`on-plan`, `not-measured`) and each account carries `planAhead`.
+
+Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
+0.02: lead on the plan tolerated before the cap applies), `retryAfterMs`
+(default 300000). The retry hint is longer than the plain no-headroom
+defer (60s) on purpose: a slot frees when a run finishes, and the host
+gives up on a run after a fixed number of deferrals.
+
+Fails open (the existing caps apply): unknown reset or weekly reading,
+unknown target share, a pool that includes a reactive (unmetered) lane, or
+no run duration.
+
+Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
+
+- The guard acts only above plan plus margin. A pool behind plan is bounded
+  by the concurrency caps, not by the guard; with caps held at the paced
+  target the guard changes nothing, and with caps at 3x the target it is what
+  keeps a fleet from running dry days early (out of quota at hour 98-110 of
+  168 unguarded; 163 guarded, finishing at 99% with a lead on plan of at
+  most 9 points).
+- The floor of 1 in flight can overspend an account whose single run burns
+  faster than the plan: one run in flight burns `E / D` of a lane's week per
+  hour (E = weekly share one run costs, D = mean run hours), against a plan
+  rate of 0.6%/h for a week. At E = 0.5% / D = 0.5h (1%/h) a lone lane is out
+  of quota at hour 99, at E = 1% at hour 50, at E = 2% at hour 25. Pacing
+  those needs a rate gate (fractional slots as a duty cycle); the guard
+  does not have one.
+- A pool is judged on the mean of its lanes. A pool of one lane far ahead and
+  one far behind reads on plan; steering by lane needs the lane feed.
+- A finished run leaves the pooled in-flight count at the next tick (at most
+  a minute), so a released slot is seen on the next attempt, not instantly.
 
 ## Configuration
 
@@ -482,6 +544,7 @@ otherwise, never a silent zero.
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
 - `src/pools.mjs` -- calibration groups and pooled burn per run
+- `src/select.mjs`, `src/paceguard.mjs` -- account ordering and the pace guard
 - `src/smoothing.mjs` -- EWMA and per-agent cap hysteresis
 - `src/outcomes.mjs` -- run outcome classification and per-family report
 - `src/shadow.mjs` -- bounded shadow ring (unit-tested legacy helper)
