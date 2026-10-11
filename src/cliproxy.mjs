@@ -12,7 +12,11 @@
  *   { observedAt, servedModels: [exact CLIProxy /v1/models ids],
  *     accounts: [{ lane, provider, accountKey, health,
  *     weekly: { used, resetsAt }, fiveHour: { used, resetsAt },
- *     observedAt, quality }], modelStats, pricingTiers }
+ *     observedAt, quality, credentialAvailability: { version: 1,
+ *       models: [{ model, provider, accountId, servingCredentials,
+ *         readyCredentials, observedAt, expiresAt }] } }], modelStats, pricingTiers }
+ * Readiness is exact-account/model, counts-only and fail-closed; README
+ * defines producer intersection and the 120s maximum observation age.
  * where `used` is 0..1 or null, `resetsAt` ISO or null, and `quality` is
  * passive|live|cached|unknown. The host service does passive-first plus a
  * single-account live pull on stale accounts, server-side. modelStats and
@@ -28,6 +32,8 @@
  * HARD RULE: this client only ever issues that one GET. Anything else is
  * blocked in code and covered by the allowlist test.
  */
+
+import { parseCredentialAvailability } from './availability.mjs';
 
 export const DEFAULT_BASE_URL = 'https://router.infextion.net';
 export const DEFAULT_ACCOUNTS_PATH = '/telemetry/cliproxy/live/accounts.json';
@@ -120,8 +126,10 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
   const rawModels = Array.isArray(entry?.models)
     ? entry.models.filter(m => typeof m === 'string' && m.length > 0)
     : null;
+  const accountId = `${entry?.provider ?? 'unknown'}:${entry?.accountKey ?? entry?.lane ?? 'x'}`;
   return {
-    accountId: `${entry?.provider ?? 'unknown'}:${entry?.accountKey ?? entry?.lane ?? 'x'}`,
+    accountId,
+    credentialAvailability: parseCredentialAvailability(entry?.credentialAvailability, { accountId, provider: entry?.provider, nowMs }),
     lane: entry?.lane ?? null,
     provider: entry?.provider ?? null,
     pool: entry?.pool ?? null,
@@ -158,13 +166,19 @@ export function parseLaneBody(body, nowMs = Date.now()) {
   const servedModels = Array.isArray(body.servedModels)
     ? body.servedModels.filter(m => typeof m === 'string' && m.trim().length > 0)
     : null;
+  const accounts = list.filter(a => a && typeof a === 'object').map(a => parseLaneAccount(a, nowMs));
+  const identityCounts = new Map();
+  for (const a of accounts) identityCounts.set(a.accountId, (identityCounts.get(a.accountId) ?? 0) + 1);
+  for (const a of accounts) {
+    if (identityCounts.get(a.accountId) > 1) a.credentialAvailability = { status: 'ambiguous-account', models: [] };
+  }
   return {
     observedAt,
     observedAtMs: msOrNull(observedAt),
     // An empty array is authoritative; an absent or wholly malformed list
     // stays null so older feeds do not suddenly refuse every arm.
     servedModels: servedModels?.length || body.servedModels?.length === 0 ? servedModels : null,
-    accounts: list.filter(a => a && typeof a === 'object').map(a => parseLaneAccount(a, nowMs)),
+    accounts,
     // Context-tier feed (tolerant: malformed shapes degrade to no tiers,
     // never a crash; tiers.mjs validates per entry).
     modelStats: body?.modelStats && typeof body.modelStats === 'object' ? body.modelStats : null,

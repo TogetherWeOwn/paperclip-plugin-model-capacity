@@ -9,6 +9,7 @@ import {
   fleetBaselineForModels, median,
 } from '../src/tiers.mjs';
 import { parseLaneBody } from '../src/cliproxy.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Context pricing tiers (owner requirement): models whose per-request price
 // rises past a prompt threshold reprice the ladder (C_eff = base x E[m]) and
@@ -376,7 +377,7 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
         set: async (k, v) => { store.set(skey(k), v); },
       },
       secrets: { resolve: async () => 'lane-key' },
-      http: { fetch: async () => ({ status: 200, json: async () => laneBody(withTiers, servedModels) }) },
+      http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(laneBody(withTiers, servedModels), TICK) }) },
       agents: { get: async () => null },
       issues: { get: async () => null, list: async () => [] },
       jobs: { register: (n, fn) => { jobs.set(n, fn); } },

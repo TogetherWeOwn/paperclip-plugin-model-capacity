@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Startup/upgrade reconciliation under the ledger: legacy persisted runs and
 // shadow-ring entries migrate into one record per runId. Restart reconcile
@@ -62,7 +63,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
       },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {
