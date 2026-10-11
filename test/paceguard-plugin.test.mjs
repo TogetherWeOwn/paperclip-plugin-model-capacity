@@ -45,7 +45,7 @@ const runEvent = (runId, atMs, type = 'agent.run.started', agentId = 'agent-9') 
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ config = {}, accounts }) {
+function drive({ config = {}, accounts, agentGets = {} }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -57,7 +57,7 @@ function drive({ config = {}, accounts }) {
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: lane }) }) },
-    agents: { get: async () => null },
+    agents: { get: async (id) => agentGets[id] ?? null },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -266,46 +266,94 @@ test('shadow tick holds both of two running runs on a one-slot pool: the pool re
   assert.equal((await d.api('capacity')).body.shadow.skippedPaced, 2);
 });
 
-test('plugin loop: across six simulated hours the ahead pool holds at its cap and refills as runs finish', async () => {
-  // 0.9h runs make the share 1.67 slots: cap 2. One tick a minute, one new
-  // queued run offered to the hook a minute (a deferred run is re-offered).
-  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD() });
+test('plugin loop: six contended hours hold the ahead pool at its cap and refill it as runs finish', async () => {
+  // 0.9h runs make the share 1.67 slots: cap 2. Four runs are always queued;
+  // the host claims each (agent.run.started), asks the hook, and re-asks a
+  // deferred run every retryAfterMs (5 min). Agent config names the model, so
+  // the tick attributes the waiting runs to the pool as it does in production.
+  const RETRY_MIN = 5;
+  const RUN_MIN = 54;
+  const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
+  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
-  const RUN_MIN = 54;
-  const live = new Map(); // runId -> finish minute
+  const running = new Map(); // runId -> finish minute
+  const waiting = new Map(); // runId -> next minute the host asks again
   let seq = 0;
-  let waiting = null;
   let started = 0;
-  let deferred = 0;
+  let deferrals = 0;
   let peak = 0;
   for (let m = 1; m <= 360; m++) {
     const at = TICK + m * 60000;
     d.setNow(at);
-    for (const [runId, endMin] of [...live]) {
+    for (const [runId, endMin] of [...running]) {
       if (endMin <= m) {
         await d.fire(runEvent(runId, at, 'agent.run.finished'));
-        live.delete(runId);
+        running.delete(runId);
       }
     }
-    await d.tick();
-    waiting ??= `loop-${seq++}`;
-    const out = await d.hook(waiting);
-    if (out.kind === 'decide') {
-      await d.fire(runEvent(waiting, at));
-      live.set(waiting, m + RUN_MIN);
-      waiting = null;
-      started += 1;
-    } else {
-      deferred += 1;
-      assert.match(out.reason, /pace guard/);
+    while (running.size + waiting.size < 6) {
+      const runId = `loop-${seq++}`;
+      await d.fire(runEvent(runId, at));
+      waiting.set(runId, m);
     }
-    peak = Math.max(peak, live.size);
-    assert.ok(live.size <= 2, `minute ${m}: ${live.size} in flight on a cap of 2`);
+    await d.tick();
+    for (const [runId, nextTry] of [...waiting]) {
+      if (nextTry > m) continue;
+      const out = await d.hook(runId);
+      if (out.kind === 'decide') {
+        waiting.delete(runId);
+        running.set(runId, m + RUN_MIN);
+        started += 1;
+      } else {
+        assert.equal(out.kind, 'defer');
+        assert.match(out.reason, /pace guard/);
+        assert.equal(out.retryAfterMs, RETRY_MIN * 60000);
+        waiting.set(runId, m + RETRY_MIN);
+        deferrals += 1;
+      }
+    }
+    peak = Math.max(peak, running.size);
+    assert.ok(running.size <= 2, `minute ${m}: ${running.size} in flight on a cap of 2`);
   }
   assert.equal(peak, 2, 'the pool is filled to its cap');
-  assert.ok(started >= 11, `slots are refilled as runs finish: ${started} runs in 6h (2 slots / 0.9h = 13 at best)`);
-  assert.ok(deferred > 0, 'and runs beyond the cap waited');
+  // 2 slots / 0.9h over 6h is 13 runs; retry spacing and tick lag cost at most
+  // a couple. With waiting runs counted as in flight the pool wedges at 8.
+  assert.ok(started >= 12, `slots are refilled as runs finish, not wedged by the waiting runs: ${started} started in 6h`);
+  assert.ok(deferrals > started, 'and the runs beyond the cap waited');
+});
+
+test('runs the hook deferred do not hold the pool: it refills once the real runs finish', async () => {
+  // The host claims a run (agent.run.started) before the hook answers, so a
+  // deferred run sits in the ledger as running; the tick then attributes it
+  // to the pool its agent's configured model serves. Counted as in flight,
+  // two waiting runs would hold an idle one-slot pool at its cap until the
+  // host gave up on them.
+  const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
+  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  await d.setup();
+  await d.tick();
+  let at = TICK + 30000;
+  d.setNow(at);
+  await d.fire(runEvent('run-1', at));
+  assert.equal((await d.hook('run-1')).kind, 'decide');
+  for (const id of ['run-2', 'run-3']) {
+    await d.fire(runEvent(id, at));
+    assert.equal((await d.hook(id)).kind, 'defer', `${id} waits behind run-1`);
+  }
+  at += 60000;
+  d.setNow(at);
+  await d.tick(); // backfills the waiting runs' actual account from agent config
+  const held = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.equal(held.inFlight, 1, 'only the running run counts');
+  at += 60000;
+  d.setNow(at);
+  await d.fire(runEvent('run-1', at, 'agent.run.finished'));
+  await d.tick();
+  assert.equal((await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude').state, 'ahead',
+    'idle again: under its cap, not paced');
+  assert.equal((await d.hook('run-2')).kind, 'decide', 'the first waiting run is admitted');
+  assert.equal((await d.hook('run-3')).kind, 'defer', 'and the next still waits for it');
 });
 
 test('/capacity reports the guard state per pool', async () => {
@@ -326,6 +374,36 @@ test('/capacity reports the guard state per pool', async () => {
   assert.ok(pool.pacedSlots > 0 && pool.pacedSlots < 1);
   const acct = cap.accounts.find(a => a.accountId === 'claude:a1');
   assert.ok(acct.planAhead > 0.18 && acct.planAhead < 0.19);
+});
+
+test('a reset further away than one weekly window is an unknown position: it fails open', async () => {
+  // 30% used with 240h to reset cannot sit on a 168h window. Clamped, it
+  // would read 30 points ahead of plan and throttle a lane with no real lead.
+  for (const hoursLeft of [240, 600]) {
+    const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.3, hoursLeft)] });
+    await d.setup();
+    await d.tick();
+    const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
+    assert.equal(pool.state, 'not-measured', `${hoursLeft}h`);
+    assert.equal(pool.planAhead, null);
+    for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', `${hoursLeft}h ${id}`);
+  }
+});
+
+test('a reset that already passed is an unknown position too (stale reading)', async () => {
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.99, -3)] });
+  await d.setup();
+  await d.tick();
+  assert.equal((await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude')?.state ?? 'not-measured', 'not-measured');
+});
+
+test('a window that has just reset (reset one week out, clock skew of minutes) is still measured', async () => {
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.3, 168.2)] });
+  await d.setup();
+  await d.tick();
+  const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.equal(pool.state, 'ahead', '30% used at hour 0 is ahead of plan');
+  assert.ok(Math.abs(pool.planAhead - 0.3) < 1e-9);
 });
 
 test('/capacity reports a behind-plan pool as on-plan, and an unknown reset as not measured', async () => {

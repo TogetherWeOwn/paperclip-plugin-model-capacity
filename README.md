@@ -202,7 +202,8 @@ frozen clock can never double-count.
    unlisted adapters get no trial arms), a free per-family in-flight slot
    (`trials.maxInFlightPerFamily`, default 2), and bypass the burn check
    (their burn is unmeasured by definition; the in-flight cap bounds the
-   blast radius). `defer` happens only when no account has headroom.
+   blast radius). `defer` happens when no account has headroom, or when
+   the pace guard holds every pool that could serve the run.
    Run events rarely carry `adapterType`, so the tick resolves it from the
    agent record (`agents.read`, already declared; 10-min TTL, 500-entry
    cap, failures never cached) and stamps it onto the runs; the live view
@@ -244,8 +245,10 @@ The resolve hook is memory-only: it reads the live view the last tick
 published and performs zero I/O, so it always answers inside the host's
 1.5s RPC deadline. Unknown company, `enforce: false`, a human operator
 override (`issueOverrideModel`), and tick staleness over 120s all answer
-`keep`. Only an all-accounts-no-headroom fleet answers `defer`
-(`retryAfterMs` 60000). Every enforced decision is recorded in the ledger
+`keep`. `defer` is answered only when nothing could be decided: an
+all-accounts-no-headroom fleet (`retryAfterMs` 60000), or every pool held by
+the pace guard (`retryAfterMs` from `pacing.guard`, 300000 by default; the
+reason starts `pace guard:`). Every enforced decision is recorded in the ledger
 with `enforced:true` (memory-only; the next tick persists it).
 
 Eligibility: health must read exactly `healthy` (unknown/unavailable/
@@ -350,7 +353,7 @@ the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
 The enforcing hook, the event-time shadow path and the shadow tick all order
 accounts through `orderAccountsWithPacing` with the same plan positions and
 knobs, so they hold and release a pool alike (a run being decided never
-counts against its own pool). A held run gets no shadow decision;
+counts against its own pool, and neither do runs the hook deferred). A held run gets no shadow decision;
 `shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
 (`enabled`, `marginPct`, `retryAfterMs`, and one entry per pool with
 `planAhead`, `pacedSlots`, `cap`, `inFlight` and `state`: `paced`, `ahead`,
@@ -383,8 +386,14 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   does not have one.
 - A pool is judged on the mean of its lanes. A pool of one lane far ahead and
   one far behind reads on plan; steering by lane needs the lane feed.
-- A finished run leaves the pooled in-flight count at the next tick (at most
-  a minute), so a released slot is seen on the next attempt, not instantly.
+- The cap counts runs that are executing, read from the run ledger at the time
+  of the decision: a finished run frees its slot at its terminal event, and a
+  run the hook deferred (waiting, not running) is not counted, or two waiting
+  runs would hold an idle one-slot pool until the host gave up on them. The
+  set of deferred runs is memory-only: after a worker restart, a waiting run
+  counts again until the hook next defers it (its next retry).
+- A reset more than one window (plus an hour) away, or already past, is an
+  unknown plan position and fails open.
 
 ## Configuration
 

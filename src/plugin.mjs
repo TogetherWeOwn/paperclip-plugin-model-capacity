@@ -490,6 +490,9 @@ function sanitizeReservedFloors(raw) {
 // Weekly window length for schedule-error math (the lane reports `used`
 // fractions plus reset timestamps; the host owns staleness/live-pull).
 const WEEKLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
+// A reset reported this far past one window still reads as a window that has
+// just rolled over (feed and host clocks differ by minutes, not hours).
+const PLAN_WINDOW_SLACK_MS = 3600 * 1000;
 
 function windowStartMs(resetsAtMs) {
   if (resetsAtMs == null) return null;
@@ -505,6 +508,50 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
   const breakerLoads = new Map(); // companyId -> in-flight first-load promise (single-flight)
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
+  // Runs the enforcing hook deferred, per company: runId -> deferredAt. The
+  // host claims a run (agent.run.started) before the hook answers, so a
+  // deferred run sits in the ledger as running and the tick attributes it
+  // to the pool its model serves; it is waiting, not executing, so the pace
+  // guard leaves it out of its in-flight count. Memory-only (a restart
+  // re-adds a run the next time the hook defers it); cleared when the hook
+  // decides the run or it reaches a terminal state.
+  const deferredRuns = new Map();
+  const markDeferred = (companyId, runId, atMs, horizonMs) => {
+    if (runId == null) return;
+    let m = deferredRuns.get(companyId);
+    if (!m) { m = new Map(); deferredRuns.set(companyId, m); }
+    m.delete(String(runId));
+    m.set(String(runId), atMs);
+    // Bounded: entries older than the in-flight horizon no longer count
+    // anywhere, and the oldest go first past the ledger's own cap.
+    for (const [id, at] of m) {
+      if (atMs - at < horizonMs && m.size <= LEDGER_CAP) break;
+      m.delete(id);
+    }
+  };
+  const clearDeferred = (companyId, runId) => {
+    if (runId != null) deferredRuns.get(companyId)?.delete(String(runId));
+  };
+  /**
+   * Pooled in-flight for the pace guard: records that are actually
+   * executing, i.e. non-terminal, verified and inside the horizon, minus
+   * runs the hook deferred (waiting, not running) and minus the run being
+   * decided (it must not hold its own pool at the cap).
+   */
+  const paceInFlightByPool = (companyId, ledger, { nowMs, horizonMs, selfRunId = null, poolOf }) => {
+    const waiting = deferredRuns.get(companyId);
+    const self = selfRunId != null ? String(selfRunId) : null;
+    const census = inflightByAccount(ledger, {
+      nowMs, horizonMs,
+      skip: r => r?.runId === self || waiting?.has(r?.runId) === true,
+    });
+    const pools = {};
+    for (const [id, n] of Object.entries(census.byAccount)) {
+      const p = poolOf(id);
+      pools[p] = (pools[p] ?? 0) + n;
+    }
+    return pools;
+  };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
   // Live view per company, populated by every tick for the memory-only
@@ -1328,13 +1375,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ? requiredRatePerHour({ remainingPct: remaining, hoursToReset })
         : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
-      // Plan position: weekly used minus the linear plan (positive = ahead).
-      // Null while either input is unknown; the controller reads that as 0,
-      // the pace guard reads it as "not measured" and stays out of the way.
-      const planAhead = weeklyUsed != null && startMs != null && resetAtMs != null
+      const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
-        : null;
-      const positionError = planAhead ?? 0;
+        : 0;
+      // Plan position for the pace guard: the same error, but only while the
+      // reading sits on a weekly window (reset ahead of now and no further
+      // than one window plus clock slack). scheduleError clamps outside it,
+      // which would read a lane 30% used with a reset 10 days out as 30
+      // points ahead; the guard treats that as unknown and stays out of the way.
+      const onWindow = resetAtMs != null && resetAtMs >= nowMs && startMs - nowMs <= PLAN_WINDOW_SLACK_MS;
+      const planAhead = weeklyUsed != null && onWindow ? positionError : null;
       const ceiling = (ladders[key]?.rungs.length ?? 1) - 1;
       let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
         {
@@ -1900,16 +1950,6 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       return { pools, byAccount: cur.byAccount };
     };
-    // A run being decided is already in the census when it is running (the
-    // tick decides runs that started up to 15 min ago). Ordering has always
-    // counted it; the pace guard must not, or a run would be held at the
-    // cap by its own slot (the hook already excludes its own run).
-    const selfPoolOf = (runId) => {
-      const rec = runId != null ? ledger.get(runId) : null;
-      if (rec == null || !isInflight(rec, nowMs, staleHorizonMs)) return null;
-      const a = attributedAccount(rec);
-      return a != null ? poolOfKey(a) : null;
-    };
     // The pace guard's knobs, shared by the tick, the live view (hook and
     // event-time path) and the /capacity report.
     const paceOpts = { ...config.pacing.guard, meanRunDurationHours: config.concurrency.meanRunDurationHours };
@@ -1934,7 +1974,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     };
     const allocationOrder = (role, selfRunId = null) => {
       const { pools, byAccount } = freshPressure();
-      const selfPool = selfPoolOf(selfRunId);
+      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
       return orderAccountsWithPacing(
         accountViews.map(v => ({
           accountId: v.accountId,
@@ -1947,7 +1987,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           meter: v.meter,
           quality: v.quality,
           inFlight: pools[v.pool] ?? 0,
-          paceInFlight: Math.max(0, (pools[v.pool] ?? 0) - (v.pool === selfPool ? 1 : 0)),
+          paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           placementQ: placementQualityFor(v.accountId, v.pointer, role),
@@ -2237,6 +2277,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
       paceGuard: paceOpts,
+      staleHorizonMs,
     });
     // Event-time decisions that landed since the previous tick (memory-only
     // reporting stat; the ledger itself is the merge).
@@ -2493,24 +2534,23 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       poolPending[p] = (poolPending[p] ?? 0) + 1;
       lanePending.set(q.decidedAccount, (lanePending.get(q.decidedAccount) ?? 0) + 1);
     }
-    // The caller's own run may already sit in the frozen counts: an
-    // event-time decision made before the last tick published is in
-    // decidedRunIds and counted in the pooled in-flight. It must not hold
-    // its own pool at the cap, so it is taken back out here.
-    let selfPool = null;
-    if (excludeRunId != null && live.decidedRunIds?.has(excludeRunId)) {
-      const rec = ledgers.get(companyId)?.get(excludeRunId);
-      if (rec?.decidedAccount != null && !isTerminalStatus(rec.status) && rec.unverified !== true) {
-        selfPool = poolOf(rec.decidedAccount);
-      }
-    }
+    // The pace guard counts from the ledger itself, fresh at call time (the
+    // frozen pooled count plus pending decisions above drives ordering
+    // only): executing runs, without the ones the hook deferred and without
+    // the caller's own run.
+    const pacePools = live.paceGuard?.enabled === true && ledgers.has(companyId)
+      ? paceInFlightByPool(companyId, ledgers.get(companyId), {
+        nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
+      })
+      : {};
     return orderAccountsWithPacing(
       (live.accounts ?? []).map(a => {
         const p = poolOf(a.accountId);
         return {
           ...a,
           targetShare: a.targetShare ?? null,
-          inFlight: Math.max(0, (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0) - (p === selfPool ? 1 : 0)),
+          inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
+          paceInFlight: pacePools[p] ?? 0,
           pool: p,
           laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
           placementQ: placementArm(a.ladderRungs ?? [], {
@@ -2765,6 +2805,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           recordStart(evtLedger, entry, entry.at);
         } else {
           recordTerminal(evtLedger, entry, status, entry.at);
+          clearDeferred(companyId, entry.runId);
         }
         const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
         st.seen += 1;
@@ -2933,8 +2974,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
      * network, or db reads -- so it always answers inside the host's 1.5s
      * RPC deadline. Fail-safe order: unknown company, enforce off, human
      * operator override, and stale/freshness gaps all answer `keep` (the
-     * agent default runs). Only when no account has headroom does it
-     * `defer` (~60s retry). Every enforced decision is recorded in the
+     * agent default runs). It `defer`s only when nothing could be decided:
+     * no account has headroom (~60s retry), or the pace guard holds every
+     * pool that could serve the run (pacing.guard.retryAfterMs). Every enforced decision is recorded in the
      * ledger with `enforced:true` (memory-only; the next tick persists it).
      *
      * Note: ResolveRunModelParams carries no retry/context signals, so each
@@ -3031,6 +3073,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
             continue;
           }
+          clearDeferred(params.companyId, params.runId);
           const hookLedger = await getOrLoadLedger(params.companyId);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
@@ -3060,6 +3103,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Nothing decided. When the pace guard dropped a pool, the wait is for
       // one of its runs to finish (minutes), not for headroom: say so and
       // retry on that scale so the host does not burn its retry budget.
+      markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000);
       if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
