@@ -15,7 +15,7 @@
  *     share of the family's recent finished runs that made progress on their
  *     issue (a status move to a disposition; see outcomes.mjs). Below the
  *     bar, and clearly worse than the best family measured for the same
- *     role (among families the operator has not excluded for it), the
+ *     role (among families that can serve it), the
  *     family is ineligible for that role. Recovery is by evidence aging: a gated family gets no new
  *     runs, its old ones leave the window (the ledger keeps 24h), it drops
  *     under `minRuns` and is eligible again; if it still does not do the
@@ -153,10 +153,13 @@ export function qualityVerdicts(arms, minQuality, { minFleetArms = MIN_FLEET_ARM
  * are injected. Only finished runs with a judged outcome are evidence:
  * failed runs belong to the arm breaker, cancelled runs say nothing about
  * the model, and an unreadable outcome is not a miss.
- * excludedFamilies: the operator's list per role ({ [role]: [token] }); a
- * family on it is still reported but is never the role's benchmark, since
- * a family that cannot serve the role says nothing about the ones that can.
- * `arm:` tokens exclude one arm, not the family, and are ignored here.
+ * excludedFamilies: families skipped as the role's benchmark
+ * ({ [role]: [token] }); a skipped family is still reported but never the
+ * benchmark, since a family that cannot serve the role says nothing about
+ * the ones that can. buildEligibility passes the operator's list plus every
+ * family with no usable arm for the role (quality-failed, or every arm
+ * covered by an `arm:` token, or no arm in the fleet at all). Bare `arm:`
+ * tokens exclude one arm, not the family, and are ignored here.
  */
 export function outcomeGates(records, { nowMs, cfg = DEFAULT_OUTCOME_GATE, roleOf, familyOf, excludedFamilies }) {
   const out = {};
@@ -216,12 +219,57 @@ export function outcomeGates(records, { nowMs, cfg = DEFAULT_OUTCOME_GATE, roleO
 }
 
 /**
+ * Families with at least one arm that can serve the role: the arm passes
+ * the role's quality check (unless ignored) and is not covered by an `arm:`
+ * token in the operator's list. Lowercased family names.
+ */
+function usableFamiliesForRole(arms, quality, manualArmSet, role, ignoreQuality) {
+  const usable = new Set();
+  for (const a of arms ?? []) {
+    const fam = String(a?.family ?? '').toLowerCase();
+    if (!fam) continue;
+    if (manualArmSet.has(armToken(a?.armId))) continue;
+    if (!ignoreQuality && quality?.[role]?.[a?.armId]?.ok === false) continue;
+    usable.add(fam);
+  }
+  return usable;
+}
+
+/**
+ * Distinct measured families per role, using the same evidence filter as
+ * outcomeGates (finished, judged, in-window, known family and role). Covers
+ * families whose runs are still in the window but which have no arm left in
+ * the fleet: with no usable arm they cannot benchmark the role either.
+ */
+function recordFamiliesByRole(records, { nowMs, cfg, roleOf, familyOf }) {
+  const out = { doer: new Set(), thinker: new Set(), other: new Set() };
+  const windowMs = (cfg?.windowHours ?? DEFAULT_OUTCOME_GATE.windowHours) * 3600000;
+  for (const r of records ?? []) {
+    if (r?.status !== 'finished') continue;
+    if (r.progress !== 'progressed' && r.progress !== 'noChange') continue;
+    if (!isFiniteNumber(r.terminalAt) || r.terminalAt > nowMs || nowMs - r.terminalAt > windowMs) continue;
+    const family = familyOf?.(r);
+    if (typeof family !== 'string' || family.length === 0 || family === 'unknown') continue;
+    const role = roleOf?.(r.agentId);
+    if (!out[role]) continue;
+    out[role].add(family.toLowerCase());
+  }
+  return out;
+}
+
+/**
  * The full picture for one tick.
  *
  * arms: unique arms across the fleet's ladders ({ armId, family, model,
  *   effort, qFleet, qFleetThinker }).
  * accountGroups: per-account grouped rungs (for the empty-role guard).
  * manual: the operator's emergency list ({ doer, thinker, other } families).
+ *
+ * The outcome benchmark skips every family that cannot serve the role:
+ * the operator's list, plus families with no usable arm (quality-failed,
+ * all arms covered by `arm:` tokens, or no arm in the fleet). The quality
+ * gate can be suspended for a role, so both benchmark sets are computed
+ * and the one matching `active.quality` is used.
  *
  * Returns { exclusions: { role: [token] }, report }.
  */
@@ -230,21 +278,46 @@ export function buildEligibility({
   accountGroups = [], roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
 }) {
   const quality = qualityVerdicts(arms, minQuality, { minFleetArms });
-  const outcomes = outcomeGates(records, { nowMs, cfg: outcomeGate, roleOf, familyOf, excludedFamilies: manual });
+  const manualByRole = {};
+  for (const role of ELIGIBILITY_ROLES) manualByRole[role] = normalizeExcludedFamilies(manual?.[role]);
+  // Benchmark skips: the operator's list plus every family with no usable
+  // arm. Strict (quality applies) and base (quality suspended, only `arm:`
+  // tokens block) variants, so the benchmark follows `active.quality`.
+  const armsFamilies = new Set();
+  for (const a of arms ?? []) {
+    const fam = String(a?.family ?? '').toLowerCase();
+    if (fam) armsFamilies.add(fam);
+  }
+  const recordFams = recordFamiliesByRole(records, { nowMs, cfg: outcomeGate, roleOf, familyOf });
+  const strictSkip = {};
+  const baseSkip = {};
+  for (const role of ELIGIBILITY_ROLES) {
+    const manualArmSet = new Set(manualByRole[role].filter(t => t.startsWith(ARM_TOKEN_PREFIX)));
+    const usableStrict = usableFamiliesForRole(arms, quality, manualArmSet, role, false);
+    const usableBase = usableFamiliesForRole(arms, quality, manualArmSet, role, true);
+    const known = new Set([...armsFamilies, ...recordFams[role]]);
+    strictSkip[role] = [...known].filter(f => !usableStrict.has(f));
+    baseSkip[role] = [...known].filter(f => !usableBase.has(f));
+  }
+  const withSkip = (skip) => Object.fromEntries(
+    ELIGIBILITY_ROLES.map(role => [role, [...manualByRole[role], ...skip[role]]]),
+  );
+  const outcomesStrict = outcomeGates(records, { nowMs, cfg: outcomeGate, roleOf, familyOf, excludedFamilies: withSkip(strictSkip) });
+  const outcomesBase = outcomeGates(records, { nowMs, cfg: outcomeGate, roleOf, familyOf, excludedFamilies: withSkip(baseSkip) });
   const exclusions = {};
   const roles = {};
   const warnings = [];
-  const manualByRole = {};
   const suspendedByRole = {};
+  const finalOutcomes = {};
   const accessible = (role, tokens) => (accountGroups ?? []).some(groups => roleLadderAccess(groups, {
     role, roleBands, excludedFamilies: tokens, trialRoles,
   }).eligible);
 
   for (const role of ELIGIBILITY_ROLES) {
-    const manualList = normalizeExcludedFamilies(manual?.[role]);
-    manualByRole[role] = manualList;
+    const manualList = manualByRole[role];
     const qualityTokens = (arms ?? []).filter(a => quality[role][a.armId]?.ok === false).map(a => armToken(a.armId));
-    const outcomeTokens = outcomes[role].gated;
+    const outcomeStrictTokens = outcomesStrict[role].gated;
+    const outcomeBaseTokens = outcomesBase[role].gated;
     // If the data gates would empty the role, give back the least trusted
     // first: the empirical outcome gate (noisy, small samples), then the
     // benchmark minimum, then both. Only the operator list is never dropped.
@@ -254,15 +327,22 @@ export function buildEligibility({
       { quality: false, outcome: true },
       { quality: false, outcome: false },
     ];
-    const tokensFor = (a) => [...(a.quality ? qualityTokens : []), ...(a.outcome ? outcomeTokens : [])];
+    // The outcome tokens follow the quality flag: with the quality gate on,
+    // the benchmark skips quality-blocked families (strict); with it
+    // suspended those families can serve, so the benchmark uses the base set.
+    const tokensFor = (a) => [
+      ...(a.quality ? qualityTokens : []),
+      ...(a.outcome ? (a.quality ? outcomeStrictTokens : outcomeBaseTokens) : []),
+    ];
     let active = attempts[0];
-    if (qualityTokens.length + outcomeTokens.length > 0
+    if ((qualityTokens.length + outcomeStrictTokens.length > 0)
       && !accessible(role, [...manualList, ...tokensFor(active)]) && accessible(role, manualList)) {
       active = attempts.find(a => accessible(role, [...manualList, ...tokensFor(a)])) ?? attempts[3];
     }
+    const activeOutcomeTokens = active.quality ? outcomeStrictTokens : outcomeBaseTokens;
     const suspendedGates = [
       ...(!active.quality && qualityTokens.length > 0 ? ['quality'] : []),
-      ...(!active.outcome && outcomeTokens.length > 0 ? ['outcome'] : []),
+      ...(!active.outcome && activeOutcomeTokens.length > 0 ? ['outcome'] : []),
     ];
     if (suspendedGates.length > 0) {
       warnings.push({
@@ -275,12 +355,13 @@ export function buildEligibility({
     suspendedByRole[role] = new Set(suspendedGates);
     const tokens = [...new Set([...manualList, ...tokensFor(active)])];
     exclusions[role] = tokens;
+    finalOutcomes[role] = active.quality ? outcomesStrict[role] : outcomesBase[role];
     roles[role] = {
       excludedFamilies: tokens.filter(t => !t.startsWith(ARM_TOKEN_PREFIX)),
       excludedArms: tokens.filter(t => t.startsWith(ARM_TOKEN_PREFIX)).map(t => t.slice(ARM_TOKEN_PREFIX.length)),
       suspended: suspendedGates.length > 0,
       suspendedGates,
-      outcome: outcomes[role],
+      outcome: finalOutcomes[role],
     };
   }
 
@@ -317,7 +398,7 @@ export function buildEligibility({
         if (suspendedByRole[role].has('quality')) reasons.push(`suspended: ${qv.reason}`);
         else { ok = false; reasons.push(qv.reason); }
       }
-      const og = outcomes[role].families[a.family];
+      const og = finalOutcomes[role].families[a.family];
       if (og?.gated) {
         if (suspendedByRole[role].has('outcome')) reasons.push(`suspended: outcome-gate: ${og.reason}`);
         else { ok = false; reasons.push(`outcome-gate: ${og.reason}`); }

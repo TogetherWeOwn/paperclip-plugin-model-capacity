@@ -53,10 +53,13 @@
  * before scoring or building ladders; older feeds remain fail-open. No new
  * capability, egress, secret or env-key change.
  *
- * v0.2.26 = OUTCOME BENCHMARK SKIPS EXCLUDED FAMILIES: a family in
- * `roles.excludeFamilies` for a role is never the outcome gate's benchmark
- * for that role, so it cannot gate the families that can serve it. No
- * capability, egress, secret or env-key change.
+ * v0.2.26 = OUTCOME BENCHMARK SKIPS UNSERVABLE FAMILIES: a family that
+ * cannot serve a role is never the outcome gate's benchmark for it, so it
+ * cannot gate the families that can: the operator's list, a quality-gated
+ * family, one whose arms are all covered by `arm:` tokens, or one with no
+ * arm in the fleet (its runs stay in the 24h window). The benchmark follows
+ * the quality suspension, so a suspended quality gate lets its families
+ * benchmark again. No capability, egress, secret or env-key change.
  *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-

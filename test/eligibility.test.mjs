@@ -371,3 +371,41 @@ test('a family the operator excluded is no benchmark: usable families are not ga
   assert.equal(e.report.roles.thinker.suspended, false);
   assert.equal(e.report.arms.find(a => a.armId === 'sonnet-max').eligible.thinker.ok, true);
 });
+
+test('a quality-gated family is no benchmark: the gate compares only families that can serve the role', () => {
+  // Same run mix, but no operator list: muse still cannot serve thinkers
+  // (Q 0.32 < thinker minimum 0.4), so sonnet must not be gated against it.
+  const recs = [
+    ...many(16, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'progressed', seed: 0 }),
+    ...many(24, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'noChange', seed: 100 }),
+    ...many(10, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'progressed', seed: 200 }),
+    ...many(30, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'noChange', seed: 300 }),
+  ];
+  const arms = [
+    arm('muse-xhigh', 'muse', 0.32), arm('sonnet-max', 'sonnet', 0.86),
+    arm('opus-max', 'opus', 1.2), arm('gemini-pro', 'gemini', 0.83),
+    arm('sol-max', 'sol', 0.33), arm('astra-max', 'astra', 0.20),
+    arm('haiku-max', 'haiku', 0.0), arm('luna-max', 'luna', -0.5),
+  ];
+  const base = {
+    arms, records: recs, nowMs: NOW,
+    minQuality: { doer: null, thinker: 0.4, other: null }, outcomeGate: G,
+    manual: {}, roleOf, familyOf,
+    accountGroups: [groupsFor(arms)], roleBands: bands, trialRoles: ['doer', 'other'],
+  };
+  const e = buildEligibility(base);
+  assert.deepEqual(e.report.roles.thinker.outcome.best, { family: 'sonnet', rate: 0.25 });
+  assert.deepEqual(e.report.roles.thinker.outcome.gated, []);
+  assert.equal(e.report.roles.thinker.outcome.families.muse.rate, 0.4, 'the quality-gated family is still reported');
+  assert.equal(e.report.arms.find(a => a.armId === 'sonnet-max').eligible.thinker.ok, true);
+  assert.ok(!e.exclusions.thinker.includes('sonnet'), 'sonnet is not outcome-gated');
+  // A family whose only arm carries an `arm:` token is likewise no benchmark,
+  // even when its quality passes.
+  const passing = arms.map(a => (a.armId === 'muse-xhigh' ? arm('muse-xhigh', 'muse', 0.9) : a));
+  const e2 = buildEligibility({
+    ...base, arms: passing, accountGroups: [groupsFor(passing)],
+    manual: { thinker: [armToken('muse-xhigh')] },
+  });
+  assert.deepEqual(e2.report.roles.thinker.outcome.best, { family: 'sonnet', rate: 0.25 });
+  assert.deepEqual(e2.report.roles.thinker.outcome.gated, []);
+});
