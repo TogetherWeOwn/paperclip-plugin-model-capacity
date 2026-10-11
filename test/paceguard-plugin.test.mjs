@@ -4,6 +4,7 @@ import { createModelCapacityPlugin, resolveConfig, validateConfigShape } from '.
 import { manifest } from '../src/manifest.mjs';
 import { DEFAULT_PACE_GUARD } from '../src/paceguard.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { createBreakerStore, breakerStoreToJSON, recordArmFailure, sanitizeBreakers } from '../src/breakers.mjs';
 
 // The pace guard through the plugin: the enforcing hook, the event-time
 // shadow path and the shadow tick all order accounts with the same guard, so
@@ -67,6 +68,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
   const plugin = createModelCapacityPlugin({ clock: () => now });
   return {
     setNow: ms => { now = ms; },
+    seed: (key, value) => { store.set(skey(key), value); },
     setAccounts: a => { lane = a; },
     setup: async () => {
       await plugin.setup(io);
@@ -183,7 +185,6 @@ test('hook: with a second pool behind plan, the run goes there; with none left i
   assert.deepEqual(models.map(m => m.split('-')[0]), ['gemini', 'gemini', 'claude']);
   const fourth = await d.hook('run-4');
   assert.equal(fourth.kind, 'defer', 'claude is at its cap and gemini has no trial slot left');
-  assert.match(fourth.reason, /pace guard: claude /);
 });
 
 test('hook: a run the event-time path already decided does not hold the pool against itself', async () => {
@@ -370,6 +371,88 @@ test('a lane without ready credentials is outside the pool: its position does no
   assert.equal(pool.state, 'on-plan');
   assert.ok(pool.planAhead < 0.02, `planAhead ${pool.planAhead}`);
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
+});
+
+test('a deferred run that later runs anyway (the hook keeps it) counts as executing again', async () => {
+  const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
+  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  await d.setup();
+  await d.tick();
+  let at = TICK + 30000;
+  d.setNow(at);
+  await d.fire(runEvent('run-1', at));
+  assert.equal((await d.hook('run-1')).kind, 'decide');
+  await d.fire(runEvent('run-2', at));
+  assert.equal((await d.hook('run-2')).kind, 'defer', 'run-2 waits behind run-1');
+  // The operator pins a model on run-2's issue; the retry keeps it and it runs.
+  assert.deepEqual(await d.hook('run-2', { issueOverrideModel: 'claude-opus-5-5' }), { kind: 'keep' });
+  at += 60000;
+  d.setNow(at);
+  await d.tick();
+  await d.fire(runEvent('run-1', at, 'agent.run.finished'));
+  const out = await d.hook('run-3');
+  assert.equal(out.kind, 'defer', 'run-2 is executing on a cap of one, so run-3 still waits');
+  assert.match(out.reason, /1 of 1 in flight/);
+});
+
+test('an unmeasured lane in the pool makes the whole pool fail open', async () => {
+  const unknownReset = { ...claudeLane(0.5, 48), accountKey: 'a2', lane: 'claude-2', weekly: { used: 0.5, resetsAt: null } };
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), unknownReset] });
+  await d.setup();
+  await d.tick();
+  const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.equal(pool.state, 'not-measured');
+  for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
+});
+
+test('the long retry is for a fleet held entirely by the guard, not for a trial slot another pool lacks', async () => {
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
+  // Claude is held (one run), gemini's two trial slots are full: gemini is not
+  // paced, so the wait is the plain one.
+  const fourth = await d.hook('run-4');
+  assert.equal(fourth.kind, 'defer');
+  assert.equal(fourth.retryAfterMs, 60000);
+  assert.equal(fourth.reason, 'no account has headroom right now');
+});
+
+test('validateConfigShape tolerates a non-object pacing like before the guard existed', () => {
+  for (const pacing of [5, 'abc', true, [], null]) {
+    assert.doesNotThrow(() => validateConfigShape({ pacing }), JSON.stringify(pacing));
+  }
+});
+
+test('tick and hook agree on pool membership when a lane\'s every arm is breaker-open', async () => {
+  // a1 is 18 points ahead and ready; a2 is far behind plan but every arm on
+  // it is breaker-open, so it cannot serve and is not part of the pool. The
+  // hook already built the pool from breaker-filtered rungs; the tick must too.
+  const mk = () => [claudeLane(0.9, 48), { ...claudeLane(0.2, 48), accountKey: 'a2', lane: 'claude-2' }];
+  const probe = drive({ config: { enforce: true }, accounts: mk() });
+  await probe.setup();
+  await probe.tick();
+  const ladders = (await probe.api('ladder')).body.ladders;
+  const armIds = (ladders['claude:a2']?.rungs ?? []).map(r => r.armId);
+  assert.ok(armIds.length > 0, 'a2 has arms');
+  const cfg = sanitizeBreakers();
+  const seed = createBreakerStore();
+  for (const armId of armIds) {
+    recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 120000, errorText: 'auth_unavailable' }, TICK - 120000, cfg);
+    recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 60000, errorText: 'auth_unavailable' }, TICK - 60000, cfg);
+  }
+  const d = drive({ config: { enforce: true }, accounts: mk() });
+  await d.setup();
+  d.seed({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' }, breakerStoreToJSON(seed, { nowMs: TICK, cfg }));
+  await d.tick();
+  assert.equal((await d.hook('run-1')).kind, 'decide');
+  assert.equal((await d.hook('run-2')).kind, 'defer', 'the hook holds a1 alone at its cap');
+  d.setNow(TICK + 60000);
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const pool = cap.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.equal(pool.lanes, 1, 'the tick report counts a1 alone');
+  assert.equal(pool.state, 'paced');
 });
 
 test('/capacity reports the guard state per pool', async () => {

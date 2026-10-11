@@ -19,9 +19,9 @@
  * every pool is paced, is deferred. Below the cap, or when not ahead, the
  * guard changes nothing.
  *
- * Fail open: a pool whose plan position or share is unknown, whose lanes
- * include a reactive (unmetered) account, or that has no run duration to
- * convert shares into slots is never paced; the existing caps apply. The
+ * Fail open: a pool with any lane of unknown plan position or share, whose
+ * lanes include a reactive (unmetered) account, or that has no run duration
+ * to convert shares into slots is never paced; the existing caps apply. The
  * minimum of 1 in flight keeps a lightly-ahead account serving instead of
  * stalling it; the price is that a deeply-ahead account (slots below 1) can
  * spend above plan until its headroom reserve takes it out.
@@ -94,12 +94,14 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     out.push(entry);
     if (!enabled) continue;
     if (members.some(isReactiveAccount)) continue;
-    const positions = members.map(v => v.planAhead).filter(finite);
-    if (positions.length === 0) continue;
-    entry.planAhead = mean(positions);
-    const shares = members.map(v => v.targetShare).filter(s => finite(s) && s >= 0);
+    // One lane of unknown position or share makes the whole pool unmeasured:
+    // leaving it out would size the cap from the other lanes alone and
+    // throttle a pool whose real capacity is not known.
+    const positions = members.map(v => v.planAhead);
+    const shares = members.map(v => v.targetShare);
     const hours = pacing.meanRunDurationHours;
-    if (shares.length === 0 || !(finite(hours) && hours > 0)) continue;
+    if (!positions.every(finite) || !shares.every(s => finite(s) && s >= 0) || !(finite(hours) && hours > 0)) continue;
+    entry.planAhead = mean(positions);
     entry.pacedSlots = shares.reduce((s, x) => s + x, 0) * hours;
     // The epsilon keeps an exact integer of slots from rounding up on
     // float noise (0.2 x 10 is 2.0000000000000004).

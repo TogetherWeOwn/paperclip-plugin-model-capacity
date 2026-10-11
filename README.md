@@ -447,8 +447,10 @@ that share one credential bucket):
 
 A pool that is ahead and already has `cap` runs in flight is **paced**: its
 lanes leave the allocation order, so the run goes to another pool, or, when
-every pool is paced, the hook answers `defer` with a `pace guard: ...`
-reason and `pacing.guard.retryAfterMs`. A pool that is not ahead is never
+the guard has dropped every pool that could serve it, the hook answers
+`defer` with a `pace guard: ...` reason and `pacing.guard.retryAfterMs`. If
+another pool is left but has nothing to decide (a full trial slot, say), the
+defer is the plain 60s one. A pool that is not ahead is never
 touched. `slots` is the same term as the per-account concurrency target, so
 the cap follows the plan: it shrinks as an account spends ahead and widens as
 the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
@@ -468,9 +470,11 @@ Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
 defer (60s) on purpose: a slot frees when a run finishes, and the host
 gives up on a run after a fixed number of deferrals.
 
-Fails open (the existing caps apply): unknown reset or weekly reading,
-unknown target share, a pool that includes a reactive (unmetered) lane, or
-no run duration.
+Fails open (the existing caps apply): a pool with ANY lane of unknown reset,
+weekly reading or target share (leaving that lane out would size the cap from
+the others alone), a pool that includes a reactive (unmetered) lane, or no
+run duration. A lane without ready credentials, or whose every arm is
+breaker-open, is not part of the pool in any of the three paths.
 
 Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
 
@@ -497,6 +501,12 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   counts again until the hook next defers it (its next retry).
 - A reset more than one window (plus an hour) away, or already past, is an
   unknown plan position and fails open.
+- A run whose terminal event never arrives (a worker restart can lose one)
+  keeps its slot until the in-flight horizon, `max(3 x mean run duration,
+  2h)`, the same horizon every in-flight count uses. On a pool with a cap of
+  1 or 2 that can hold arrivals for up to two hours, longer than the host's
+  deferral budget; `/capacity` shows `inFlight` against `cap` so it is
+  visible. The guard errs towards spending less, never more.
 
 ## Configuration
 

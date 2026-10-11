@@ -168,7 +168,7 @@ export function validateConfigShape(raw) {
     if (typeof v !== 'number' || !(v >= 0)) errors.push(`eeeWeights.${k} must be a non-negative number`);
   }
   if (pacing && (pacing.guardHighPct <= pacing.guardRejoinPct)) errors.push('pacing.guardHighPct must exceed pacing.guardRejoinPct');
-  if (pacing && 'guard' in pacing) {
+  if (pacing != null && typeof pacing === 'object' && !Array.isArray(pacing) && 'guard' in pacing) {
     const g = pacing.guard;
     if (g == null || typeof g !== 'object' || Array.isArray(g)) {
       errors.push('pacing.guard must be an object');
@@ -2001,7 +2001,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const { pools, byAccount } = freshPressure();
       const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
       return orderAccountsWithPacing(
-        accountViews.filter(v => rungsHaveEligibleArms(credentialGroupsFor(ladders[v.accountId]))).map(v => ({
+        accountViews.filter(v => rungsHaveEligibleArms(filterBreakerRungs(
+          credentialGroupsFor(ladders[v.accountId]), breakers, v.accountId, nowMs, breakersCfg))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -3071,15 +3072,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
      * identical for identical params until the next tick moves it.
      */
     async onResolveRunModel(params) {
-      const live = params?.companyId ? liveViews.get(params.companyId) : null;
-      if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return { kind: 'keep' };
-      if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+      // A run the hook keeps executes on its default model whatever it was
+      // told before: it is no longer waiting, so the pace guard counts it.
+      const keep = () => {
+        clearDeferred(params?.companyId, params?.runId);
         return { kind: 'keep' };
+      };
+      const live = params?.companyId ? liveViews.get(params.companyId) : null;
+      if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return keep();
+      if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+        return keep();
       }
       // Operator-pinned agents (gating roles) always run their configured model.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
-        return { kind: 'keep' };
+        return keep();
       }
       // Every defer below leaves the run waiting, not executing: the pace
       // guard stops counting it as in flight until the hook decides it.
@@ -3095,7 +3102,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const hookLedger = await getOrLoadLedger(params.companyId);
       // Config changes can land while the ledger load yields, even when the
       // tick cannot refresh the live view. Enforce off is an immediate kill switch.
-      if (!enforceCompanies.has(params.companyId)) return { kind: 'keep' };
+      if (!enforceCompanies.has(params.companyId)) return keep();
       const role = roleOf({ roles: {
         thinkerAgentIds: live.thinkerAgentIds,
         doerAgentIds: live.doerAgentIds,
@@ -3203,10 +3210,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
         return deferred(credentialDefer(params.companyId));
       }
-      // When the pace guard dropped a pool, the wait is for one of its runs
-      // to finish (minutes), not for headroom: say so and retry on that
-      // scale so the host does not burn its retry budget.
-      if (paced.length > 0) {
+      // When the pace guard dropped EVERY pool that could serve, the wait is
+      // for one of their runs to finish (minutes), not for headroom: say so
+      // and retry on that scale so the host does not burn its retry budget.
+      // A pool left in the order that merely had nothing to decide (a trial
+      // slot, say) keeps the plain retry.
+      if (paced.length > 0 && order.length === 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
         return deferred({

@@ -101,15 +101,25 @@ test('the pool is judged on the mean plan position of its lanes, and its slots a
   assert.equal(ahead.paced[0].lanes, 2);
 });
 
-test('lanes with an unknown position are left out of the mean and the sum, not counted as zero', () => {
-  const r = run([
-    lane('claude:1', { planAhead: 0.2, targetShare: 4, inFlight: 1 }),
-    lane('claude:2', { planAhead: null, targetShare: null, inFlight: 1 }),
+test('a pool with any lane of unknown position or share is not measured: it fails open', () => {
+  // Leaving the unknown lane out would size the cap from the other lane alone
+  // and throttle a pool whose real capacity is not known.
+  const unknownBoth = run([
+    lane('claude:1', { planAhead: 0.2, targetShare: 4, inFlight: 9 }),
+    lane('claude:2', { planAhead: null, targetShare: null, inFlight: 9 }),
   ]);
-  // Pooled in-flight is the larger of the lanes' pooled counts: 1. Cap = ceil(0.8) = 1: paced.
-  assert.deepEqual(ids(r), []);
-  assert.ok(Math.abs(r.paced[0].planAhead - 0.2) < 1e-9);
-  assert.ok(Math.abs(r.paced[0].pacedSlots - 0.8) < 1e-9);
+  assert.deepEqual(ids(unknownBoth), ['claude:1', 'claude:2']);
+  assert.equal(unknownBoth.pools[0].state, 'not-measured');
+  const unknownShare = run([
+    lane('claude:1', { planAhead: 0.2, targetShare: 4, inFlight: 9 }),
+    lane('claude:2', { planAhead: 0.2, targetShare: null, inFlight: 9 }),
+  ]);
+  assert.deepEqual(ids(unknownShare), ['claude:1', 'claude:2']);
+  const unknownPosition = run([
+    lane('claude:1', { planAhead: 0.2, targetShare: 4, inFlight: 9 }),
+    lane('claude:2', { planAhead: undefined, targetShare: 4, inFlight: 9 }),
+  ]);
+  assert.deepEqual(ids(unknownPosition), ['claude:1', 'claude:2']);
 });
 
 test('a pool mixing in a reactive lane is not paced (its in-flight count cannot be judged)', () => {
