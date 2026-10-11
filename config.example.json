@@ -74,6 +74,9 @@
     "allowanceWeight": 0.35
   },
   "enforce": false,
+  "credentialReadiness": {
+    "enforce": false
+  },
   "trials": {
     "maxInFlightPerAccount": 2,
     "maxInFlightPerFamily": 2,

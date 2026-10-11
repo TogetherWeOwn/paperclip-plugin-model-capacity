@@ -31,7 +31,7 @@ async function start(accounts, rows = null, configure = () => {}) {
   const warnings = [];
   const key = k => JSON.stringify(k);
   const config = {
-    enforce: true, cliproxy: { laneKeySecretRef: SECRET },
+    enforce: true, credentialReadiness: { enforce: true }, cliproxy: { laneKeySecretRef: SECRET },
     trials: { maxInFlightPerAccount: 10 },
     armMap: accounts.flatMap(a => a.models.map(model => ({
       aaSlug: model, model, effort: 'max', family: 'sol', providers: [a.provider],
@@ -64,6 +64,10 @@ async function start(accounts, rows = null, configure = () => {}) {
     setFetchStatus: value => { fetchStatus = value; },
     setEnforce: value => {
       config.enforce = value;
+      return plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    setCredentialEnforce: value => {
+      config.credentialReadiness.enforce = value;
       return plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
@@ -555,6 +559,40 @@ test('a dominated backup inherits its unavailable incumbent rung, not a cheaper 
   assert.equal(backupOnly[0].model, 'model-backup');
   assert.equal(backupOnly[0].rung, 1);
   assert.equal((await d.hook('backup-cannot-enter-rung-zero')).kind, 'defer');
+});
+
+test('readiness off preserves legacy routing and target while reporting all-cooling evidence', async () => {
+  const d = await start([account(MODEL, 'antigravity', 'synthetic', 0)], null, config => {
+    config.credentialReadiness.enforce = false;
+  });
+  await d.tick();
+  const hook = await d.hook('off-mode-all-cooling');
+  assert.equal(hook.kind, 'decide');
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.targetRaw, null);
+  assert.equal(capacity.credentialAvailability.mode, 'off');
+  assert.equal(capacity.credentialAvailability.validEnvelopeAccounts, 1);
+  assert.equal(capacity.credentialAvailability.countsByReason['all-cooling'], 1);
+  assert.equal(capacity.credentialAvailability.totalAccounts, 1);
+  assert.ok(!d.warnings.some(w => String(w.details.code).startsWith('credential-availability-')));
+});
+
+test('credential readiness config flips change hook and event admission immediately', async () => {
+  const d = await start([account()]);
+  await d.tick();
+  assert.equal((await d.hook('flip-on')).kind, 'defer');
+  await d.startRun('event-on');
+  assert.equal((await d.api('shadow')).body.entries.some(row => row.runId === 'event-on'), false);
+
+  await d.setCredentialEnforce(false);
+  await d.startRun('event-off');
+  await d.tick();
+  assert.equal((await d.api('shadow')).body.entries.some(row => row.runId === 'event-off'), true);
+
+  await d.setCredentialEnforce(true);
+  assert.equal((await d.hook('flip-on-pending-tick')).kind, 'decide');
+  await d.tick();
+  assert.equal((await d.hook('flip-on-again')).kind, 'defer');
 });
 
 test('legacy frozen cooldown text and timestamps cannot manufacture fresh readiness', () => {

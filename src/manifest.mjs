@@ -96,7 +96,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.26';
+export const PLUGIN_VERSION = '0.2.29';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -290,6 +290,13 @@ const CONFIG_SCHEMA = {
     enforce: {
       type: 'boolean', default: false,
       description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
+    },
+    credentialReadiness: {
+      type: 'object', required: ['enforce'], additionalProperties: false,
+      description: 'Credential-readiness admission is opt-in until every lane account publishes a valid envelope. Check /capacity counts before enabling.',
+      properties: {
+        enforce: { type: 'boolean', default: false },
+      },
     },
     trials: {
       type: 'object', additionalProperties: false,

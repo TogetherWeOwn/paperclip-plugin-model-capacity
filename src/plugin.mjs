@@ -256,6 +256,20 @@ export function validateConfigShape(raw) {
     }
   }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
+  if (raw.credentialReadiness != null) {
+    const readiness = raw.credentialReadiness;
+    if (typeof readiness !== 'object' || Array.isArray(readiness)) {
+      errors.push('credentialReadiness must be an object');
+    } else {
+      if (!Object.hasOwn(readiness, 'enforce')) errors.push('credentialReadiness.enforce is required');
+      if ('enforce' in readiness && typeof readiness.enforce !== 'boolean') {
+        errors.push('credentialReadiness.enforce must be a boolean');
+      }
+      for (const key of Object.keys(readiness)) {
+        if (key !== 'enforce') errors.push(`credentialReadiness.${key} is not a known key`);
+      }
+    }
+  }
   if (raw.breakers != null && (typeof raw.breakers !== 'object' || Array.isArray(raw.breakers))) {
     errors.push('breakers must be an object');
   } else if (raw.breakers) {
@@ -396,6 +410,9 @@ export function resolveConfig(raw = {}) {
     // Kill switch for run.model.resolve enforcement. False (default): the
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
+    credentialReadiness: {
+      enforce: raw.credentialReadiness?.enforce === true,
+    },
     // Trial lanes and arms: families without fleet success history route
     // through adapters that opt in for roles that opt in (default doer +
     // other; thinkers never), capped in flight per account and per family,
@@ -918,7 +935,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         candidates, rankingRungs: ranking.rungs, previousRungs,
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
       };
-      const admitted = credentialLadderFor(credentialRanking, credentialNow);
+      const admitted = credentialLadderFor(credentialRanking, credentialNow, config.credentialReadiness.enforce);
       ladders[keyOf(account, i)] = {
         ...admitted,
         rankingRungs: ranking.rungs,
@@ -1260,12 +1277,26 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accounts: snapshot.accounts, servedModels: snapshot.servedModels, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
+    const credentialReadinessEnforced = config.credentialReadiness.enforce;
     const credentialAlarm = credentialAdmission.length > 0 && !credentialAdmission.some(row => row.eligible);
-    if (credentialAdmission.some(row => !row.eligible)) warnEligibility(companyId, [{
+    if (credentialReadinessEnforced && credentialAdmission.some(row => !row.eligible)) warnEligibility(companyId, [{
       code: credentialAlarm ? 'credential-availability-all-unavailable' : 'credential-availability-excluded',
       message: credentialAlarm ? 'no arm has fresh ready credential evidence; admission closed'
         : 'arms without fresh ready credential evidence excluded before ranking',
     }], nowMs);
+    const credentialCounts = new Map();
+    for (const row of credentialAdmission) {
+      credentialCounts.set(row.reason, (credentialCounts.get(row.reason) ?? 0) + 1);
+    }
+    const credentialAvailabilityReport = {
+      version: 1,
+      mode: credentialReadinessEnforced ? 'on' : 'off',
+      alarm: credentialAlarm,
+      models: credentialAdmission,
+      countsByReason: Object.fromEntries(credentialCounts),
+      validEnvelopeAccounts: snapshot.accounts.filter(a => a?.credentialAvailability?.status === 'valid').length,
+      totalAccounts: snapshot.accounts.length,
+    };
     // Breaker state rides each rung arm so ops can see why an arm is
     // unpickable; decide-time filtering (tick loop, live view) does the actual
     // excluding. Breaker account space is the ladder key (view accountId).
@@ -1789,7 +1820,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accountGroups: ordered
         .filter(a => a?.health === 'healthy' && a?.action !== 'excluded')
         .map(a => filterBreakerRungs(
-          credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg,
+          credentialGroupsFor(ladders[a.accountId], nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg,
         )),
       roleBands,
       trialRoles: config.trials.roles,
@@ -1798,7 +1829,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
     const roleAccess = Object.create(null);
     for (const a of ordered) {
-      const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg);
+      const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId], nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg);
       const entry = {};
       for (const role of ROLES) {
         entry[role] = roleLadderAccess(groups, {
@@ -1914,7 +1945,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // Readiness can expire between candidate awaits: never memoize the
     // quality of an arm that is no longer admitted.
     const placementQualityFor = (accountId, pointer, role) => {
-      const groups = filterBreakerRungs(credentialGroupsFor(ladders[accountId]), breakers, accountId, nowMs, breakersCfg);
+      const groups = filterBreakerRungs(credentialGroupsFor(ladders[accountId], nowMs, config.credentialReadiness.enforce), breakers, accountId, nowMs, breakersCfg);
       return placementArm(groups, {
         role, roleBands, excludedFamilies: roleExclusions[role],
         trialRoles: config.trials.roles, pointer,
@@ -1923,7 +1954,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const allocationOrder = (role) => {
       const { pools, byAccount } = freshPressure();
       return orderAccountsForRun(
-        accountViews.filter(v => rungsHaveEligibleArms(credentialGroupsFor(ladders[v.accountId]))).map(v => ({
+        accountViews.filter(v => rungsHaveEligibleArms(credentialGroupsFor(ladders[v.accountId], nowMs, config.credentialReadiness.enforce))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -2046,7 +2077,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
         const roleRungs = filterRungsByExcludedFamilies(
-          credentialGroupsFor(ladder), roleExclusions[role]);
+          credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), roleExclusions[role]);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
@@ -2170,6 +2201,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     liveViews.set(companyId, {
       atMs: nowMs,
       enforce: config.enforce === true,
+      credentialReadinessEnforced: config.credentialReadiness.enforce,
       // RunIds whose decisions the frozen counts above already reflect.
       // Hook/event-time pressure is the ledger decisions NOT in this set --
       // structural, so a frozen clock can never double-count the tick's own
@@ -2215,7 +2247,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
-          ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder), breakers, a.accountId, nowMs, breakersCfg),
+          ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg),
           credentialRanking: ladder?.credentialRanking,
           burnPerRunPct: ladder?.burnPerRunPct ?? {},
         };
@@ -2346,7 +2378,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       skippedArms: skipped,
       unscored,
       unservable,
-      credentialAvailability: { version: 1, alarm: credentialAlarm, models: credentialAdmission },
+      credentialAvailability: credentialAvailabilityReport,
       contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
       trialTransitions,
@@ -2401,8 +2433,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return { status: 'shadow', observed };
   }
 
-  function credentialLadderFor(ranking, nowMs) {
-    const ready = ranking.candidates.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible);
+  function credentialReadinessEnforced(companyId) {
+    const config = lastConfig.get(companyId);
+    const live = liveViews.get(companyId);
+    // Disabling is an immediate safety escape hatch. Enabling takes effect
+    // with the next tick, which publishes an admission view built in that mode.
+    return config?.credentialReadiness?.enforce === true
+      && live?.credentialReadinessEnforced === true;
+  }
+
+  function credentialLadderFor(ranking, nowMs, enforce = true) {
+    const ready = enforce
+      ? ranking.candidates.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
+      : ranking.candidates;
     const byArm = new Map(ready.map(c => [c.armId, c]));
     const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
     const benchmark = ranking.rankingRungs;
@@ -2422,26 +2465,32 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return { ...admitted, rungs };
   }
 
-  function credentialGroupsFor(ladder, nowMs = clock()) {
+  function credentialGroupsFor(ladder, nowMs = clock(), enforce = true) {
     const ranking = ladder?.credentialRanking;
-    if (!ranking) return filterCredentialRungs(ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []), nowMs);
-    const admitted = credentialLadderFor(ranking, nowMs);
+    if (!ranking) {
+      const groups = ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []);
+      return enforce ? filterCredentialRungs(groups, nowMs) : groups;
+    }
+    const admitted = credentialLadderFor(ranking, nowMs, enforce);
     const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
     // decide and placement use group count as topRung; retain empty shells
     // just like the breaker and family-exclusion filters.
     return ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
   }
 
-  function decisionCredentialReady(decision, groups) {
+  function decisionCredentialReady(decision, groups, companyId) {
+    if (!credentialReadinessEnforced(companyId)) return true;
     const arm = groups.flatMap(group => group.arms ?? []).find(a => a.armId === decision.armId);
     return credentialReadiness(arm?.credentialEvidence, clock()).eligible;
   }
 
   function credentialDefer(companyId, reason = 'no fresh ready credential evidence') {
-    warnEligibility(companyId, [{ code: reason === 'routing snapshot stale or invalid'
-      ? 'credential-availability-stale-snapshot' : 'credential-availability-all-unavailable',
-      message: `${reason}; admission deferred`,
-    }], clock());
+    if (credentialReadinessEnforced(companyId)) {
+      warnEligibility(companyId, [{ code: reason === 'routing snapshot stale or invalid'
+        ? 'credential-availability-stale-snapshot' : 'credential-availability-all-unavailable',
+        message: `${reason}; admission deferred`,
+      }], clock());
+    }
     return { kind: 'defer', retryAfterMs: 60000, reason };
   }
 
@@ -2512,7 +2561,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     return orderAccountsForRun(
       (live.accounts ?? []).map(a => ({
-        ...a, ladderRungs: filterBreakerRungs(credentialGroupsFor(a),
+        ...a, ladderRungs: filterBreakerRungs(credentialGroupsFor(a, clock(), credentialReadinessEnforced(companyId)),
           breakerStores.get(companyId) ?? createBreakerStore(), a.accountId, clock(),
           lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS),
       })).filter(a => rungsHaveEligibleArms(a.ladderRungs)).map(a => {
@@ -2581,8 +2630,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
     if (!live || !config) return null;
-    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
-      credentialDefer(companyId, 'routing snapshot stale or invalid');
+    const credentialEnforced = credentialReadinessEnforced(companyId);
+    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
+      || (credentialEnforced && clock() < live.atMs)) {
+      if (credentialEnforced) credentialDefer(companyId, 'routing snapshot stale or invalid');
       return null;
     }
     // Already covered: the hook (or an earlier event) decided this runId.
@@ -2642,7 +2693,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
       // The pending load was joined before selection; the next tick
       // persists this record. actualPending until a tick backfills it.
-      if (!decisionCredentialReady(d, roleRungs)) continue;
+      if (!decisionCredentialReady(d, roleRungs, companyId)) continue;
       recordDecision(ledger, {
         runId: String(run.runId ?? 'unknown'),
         agentId: String(run.agentId ?? 'unknown'),
@@ -2658,7 +2709,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }, clock());
       return d;
     }
-    if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
+    if (credentialReadinessEnforced(companyId)
+      && !(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a, clock(), true)))) {
       credentialDefer(companyId);
     }
     return null;
@@ -2950,9 +3002,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
      * network, or db reads. The host's RPC deadline is 1.5s; no latency
      * guarantee is implied by synthetic tests. Fail-safe order: unknown company, enforce off, human
      * operator overrides answer `keep` (the agent default runs). Enforced
-     * stale snapshots, unavailable credentials, and no headroom answer
-     * `defer` (~60s retry). Every enforced decision is recorded in the
-     * ledger with `enforced:true` (memory-only; the next tick persists it).
+     * When credential-readiness admission is enabled, stale snapshots or
+     * unavailable credentials defer (~60s retry); when it is off, stale
+     * snapshots answer `keep` and readiness does not filter candidates. No
+     * headroom still defers. Every enforced decision is recorded in the ledger
+     * with `enforced:true` (memory-only; the next tick persists it).
      *
      * Note: ResolveRunModelParams carries no retry/context signals, so each
      * call is decided fresh (retryCount 0, failureClass none, contextTokens
@@ -2970,8 +3024,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
         return { kind: 'keep' };
       }
-      if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
-        return credentialDefer(params.companyId, 'routing snapshot stale or invalid');
+      const credentialEnforced = credentialReadinessEnforced(params.companyId);
+      if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
+        || (credentialEnforced && clock() < live.atMs)) {
+        return credentialEnforced
+          ? credentialDefer(params.companyId, 'routing snapshot stale or invalid')
+          : { kind: 'keep' };
       }
       // Join any ledger load before selection; no await may split admission,
       // the half-open probe claim, and the recorded/emitted decision.
@@ -3051,7 +3109,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // rather than piling a second enforced run onto one probe.
           // Slipped runs cannot occur: with the slot claimed, every later
           // hook filters the arm out until its terminal resolves.
-          if (!decisionCredentialReady(d, roleRungs)) continue;
+          if (!decisionCredentialReady(d, roleRungs, params.companyId)) continue;
           if (d.armId != null && params?.runId != null
             && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
             && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
@@ -3082,7 +3140,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           };
         }
       }
-      if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
+      if (credentialReadinessEnforced(params.companyId)
+        && !(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a, clock(), true)))) {
         return credentialDefer(params.companyId);
       }
       return { kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' };

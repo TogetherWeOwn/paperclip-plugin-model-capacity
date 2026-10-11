@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
+import { validateConfigShape } from '../src/plugin.mjs';
 
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
@@ -54,6 +55,18 @@ test('enforce kill switch defaults false in schema', () => {
     manifest.instanceConfigSchema.properties.contextCaps.properties.autoCompactEnvKey.default,
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   );
+});
+
+test('credential readiness admission is a strict opt-in object', () => {
+  const schema = manifest.instanceConfigSchema.properties.credentialReadiness;
+  assert.equal(schema.type, 'object');
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.required, ['enforce']);
+  assert.equal(schema.properties.enforce.type, 'boolean');
+  assert.equal(schema.properties.enforce.default, false);
+  assert.ok(validateConfigShape({ credentialReadiness: { enforce: false } }).length === 0);
+  assert.ok(validateConfigShape({ credentialReadiness: { enforce: 'true' } }).some(e => e.includes('must be a boolean')));
+  assert.ok(validateConfigShape({ credentialReadiness: { enforce: false, unknown: true } }).some(e => e.includes('not a known key')));
 });
 
 test('jobs and API routes are declared', () => {
