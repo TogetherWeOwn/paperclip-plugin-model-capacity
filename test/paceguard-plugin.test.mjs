@@ -266,6 +266,48 @@ test('shadow tick holds both of two running runs on a one-slot pool: the pool re
   assert.equal((await d.api('capacity')).body.shadow.skippedPaced, 2);
 });
 
+test('plugin loop: across six simulated hours the ahead pool holds at its cap and refills as runs finish', async () => {
+  // 0.9h runs make the share 1.67 slots: cap 2. One tick a minute, one new
+  // queued run offered to the hook a minute (a deferred run is re-offered).
+  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD() });
+  await d.setup();
+  await d.tick();
+  const RUN_MIN = 54;
+  const live = new Map(); // runId -> finish minute
+  let seq = 0;
+  let waiting = null;
+  let started = 0;
+  let deferred = 0;
+  let peak = 0;
+  for (let m = 1; m <= 360; m++) {
+    const at = TICK + m * 60000;
+    d.setNow(at);
+    for (const [runId, endMin] of [...live]) {
+      if (endMin <= m) {
+        await d.fire(runEvent(runId, at, 'agent.run.finished'));
+        live.delete(runId);
+      }
+    }
+    await d.tick();
+    waiting ??= `loop-${seq++}`;
+    const out = await d.hook(waiting);
+    if (out.kind === 'decide') {
+      await d.fire(runEvent(waiting, at));
+      live.set(waiting, m + RUN_MIN);
+      waiting = null;
+      started += 1;
+    } else {
+      deferred += 1;
+      assert.match(out.reason, /pace guard/);
+    }
+    peak = Math.max(peak, live.size);
+    assert.ok(live.size <= 2, `minute ${m}: ${live.size} in flight on a cap of 2`);
+  }
+  assert.equal(peak, 2, 'the pool is filled to its cap');
+  assert.ok(started >= 11, `slots are refilled as runs finish: ${started} runs in 6h (2 slots / 0.9h = 13 at best)`);
+  assert.ok(deferred > 0, 'and runs beyond the cap waited');
+});
+
 test('/capacity reports the guard state per pool', async () => {
   const d = drive({ config: { enforce: true }, accounts: AHEAD() });
   await d.setup();

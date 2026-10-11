@@ -45,8 +45,11 @@ test('the cap is at least 1: an ahead pool with nothing in flight still serves o
   const held = run([lane('claude:1', { targetShare: 1, inFlight: 1 })]);
   assert.deepEqual(ids(held), []);
   assert.equal(held.paced[0].cap, 1);
-  // Even a vanishing share keeps the floor of 1.
+  // Even a vanishing share, or none at all (0 slots), keeps the floor of 1.
   assert.deepEqual(ids(run([lane('claude:1', { targetShare: 0.0001, inFlight: 0 })])), ['claude:1']);
+  const zero = run([lane('claude:1', { targetShare: 0, inFlight: 0 })]);
+  assert.deepEqual(ids(zero), ['claude:1']);
+  assert.equal(zero.pools[0].cap, 1);
 });
 
 test('an exact integer of slots is not rounded up by float noise', () => {
