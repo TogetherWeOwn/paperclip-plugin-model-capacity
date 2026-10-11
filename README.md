@@ -624,8 +624,8 @@ otherwise, never a silent zero.
 ## Open questions
 
 - Wire `cliproxy.laneKeySecretRef` to the lane key (owner decision, see
-  above). `cliproxy.baseUrl`/`accountsPath` are configurable but default
-  to the live lane.
+  above). `cliproxy.baseUrl` and `accountsPath` accept only their pinned
+  values: the build-time lane host (see "Lane host pin") and the feed path.
 - Verify the AA `omniscience` field direction (currently treated as a
   hallucination rate and negated per spec).
 - Per-run burn calibration starts from a configured reference anchor

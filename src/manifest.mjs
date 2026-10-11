@@ -1,11 +1,5 @@
 /**
- * Plugin manifest. v0.2.18 = LANE HOST PIN: the lane host is no longer
- * written in the public source. src/lane-host.mjs holds a non-routable
- * placeholder and the package build replaces that one file with the real
- * origin; the manifest enum, the config validator and the config fallback
- * all read it, so the key still goes to exactly one compile-time origin.
- *
- * v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
+ * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
  * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
  * DEFAULT: the default export holds NO `run.model.resolve` capability and no
  * modelRouting; it observes and records only. The enforce-capable variant
@@ -67,6 +61,14 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.28 = LANE HOST PIN: the lane host is no longer written in the public
+ * source. src/lane-host.mjs holds a non-routable placeholder and the package
+ * build replaces that one file with the real origin; the manifest enum, the
+ * config validator and the config fallback all read it, so the key still
+ * goes to exactly one compile-time origin. An unpinned build refuses the
+ * lane read before it resolves the lane key, and onHealth reports degraded.
+ * With the pin overlaid: no capability, egress, secret or env-key change.
+ *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
  * side model errors: unknown provider/model, auth_unavailable, missing
@@ -103,7 +105,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.26';
+export const PLUGIN_VERSION = '0.2.28';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
