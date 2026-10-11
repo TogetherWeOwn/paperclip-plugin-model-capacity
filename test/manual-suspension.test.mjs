@@ -1,0 +1,175 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { decide } from '../src/decide.mjs';
+import { buildEligibility, normalizeMinQuality, DEFAULT_OUTCOME_GATE } from '../src/eligibility.mjs';
+
+// The operator's list must yield when it alone would leave a role with no
+// arm (single-provider fleets). Every role decides on every fleet shape.
+
+const NOW = 1_750_000_000_000;
+const bands = { thinker: { floorRung: 0, ceilingRung: null }, doer: { floorRung: 0, ceilingRung: null } };
+const arm = (armId, family, qFleet, extra = {}) => ({
+  armId, model: armId, effort: 'max', family, Q: qFleet, qFleet, qFleetThinker: extra.qFleetThinker ?? qFleet,
+  C: 1, trial: false, contextWindow: 1000000, ...extra,
+});
+const groupsFor = (arms) => [{ rung: 0, arms }];
+const roleOf = (id) => (id.startsWith('think') ? 'thinker' : id.startsWith('doer') ? 'doer' : 'other');
+const familyOf = (r) => r.family;
+const ROLES = ['doer', 'thinker', 'other'];
+const LIVE_MANUAL = { doer: ['muse', 'oss'], thinker: ['muse', 'luna', 'sol', 'astra'], other: [] };
+
+const META = [
+  arm('muse-spark-1.1', 'muse', -0.2),
+  arm('muse-spark-1.2', 'muse', 0.1, { qFleetThinker: 0.15 }),
+  arm('muse-spark-1.3', 'muse', 0.35, { qFleetThinker: 0.32 }),
+];
+const CLAUDE = [
+  arm('claude-opus-5-5', 'opus', 1.3, { qFleetThinker: 1.3 }),
+  arm('claude-sonnet-5-5', 'sonnet', 0.9, { qFleetThinker: 0.9 }),
+  arm('claude-haiku-4-5', 'haiku', 0.1, { qFleetThinker: -0.4 }),
+];
+const CODEX = [
+  arm('gpt-6-1-sol', 'sol', 0.33, { qFleetThinker: 0.33 }),
+  arm('gpt-6-astra', 'astra', 0.2, { qFleetThinker: 0.2 }),
+  arm('gpt-oss-120b', 'oss', -1.75, { qFleetThinker: -1.75 }),
+];
+
+const build = (arms, overrides = {}) => buildEligibility({
+  arms,
+  records: [],
+  nowMs: NOW,
+  minQuality: normalizeMinQuality(undefined),
+  outcomeGate: DEFAULT_OUTCOME_GATE,
+  manual: LIVE_MANUAL,
+  roleOf,
+  familyOf,
+  accountGroups: [groupsFor(arms), groupsFor(arms)],
+  roleBands: bands,
+  trialRoles: ['doer', 'other'],
+  minFleetArms: 1,
+  ...overrides,
+});
+
+const decideFor = (arms, role, exclusions) => decide({
+  runId: `r-${role}`,
+  agentId: `${role}-1`,
+  role,
+  ladderRungs: groupsFor(arms),
+  pointer: 0,
+  accountId: 'acct-1',
+  fiveHourHeadroomPct: null,
+  burnPerRunPct: {},
+  roleBands: bands,
+  trialRoles: ['doer', 'other'],
+  excludedFamilies: exclusions,
+});
+
+const codes = (e) => e.report.warnings.map(w => w.code);
+
+test('Meta-only fleet: doers and thinkers decide muse-spark-1.3, nothing defers', () => {
+  const e = build(META);
+  for (const role of ['doer', 'thinker']) {
+    const d = decideFor(META, role, e.exclusions[role]);
+    assert.notEqual(d.kind, 'defer', `${role} must not defer`);
+    assert.equal(d.armId, 'muse-spark-1.3', `${role} picks the best muse arm`);
+  }
+});
+
+test('Meta-only fleet: the operator muse ban is suspended, reported as manual-suspended', () => {
+  const e = build(META);
+  assert.deepEqual(e.report.roles.doer.suspendedManual, ['muse']);
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, ['muse']);
+  assert.equal(e.report.roles.doer.suspended, true);
+  const w = e.report.warnings.find(x => x.code === 'manual-suspended' && x.role === 'thinker');
+  assert.ok(w, 'thinker gets a manual-suspended warning');
+  assert.deepEqual(w.entries, ['muse']);
+  assert.ok(codes(e).includes('manual-exclusions'));
+});
+
+test('Meta-only fleet: the thinker quality gate yields before the manual list does', () => {
+  const e = build(META);
+  const q = e.report.warnings.find(x => x.code === 'role-empty-suspended' && x.role === 'thinker');
+  assert.deepEqual(q.gates, ['quality'], 'muse fails the 0.4 thinker minimum, so that gate yields');
+  assert.deepEqual(codes(e).filter(c => c === 'manual-suspended').length, 2, 'doer and thinker');
+});
+
+test('Meta-only fleet: the report marks the muse arm as suspended, not blocked, for doers', () => {
+  const e = build(META);
+  const row = e.report.arms.find(a => a.armId === 'muse-spark-1.3');
+  assert.equal(row.eligible.doer.ok, true);
+  assert.ok(row.eligible.doer.reasons.includes('suspended: manual-exclusion: muse'));
+});
+
+test('Meta-only fleet with too few scored arms: no quality gate, manual still yields', () => {
+  const e = build(META, { minFleetArms: 8 });
+  assert.ok(codes(e).includes('fleet-too-small'));
+  assert.equal(decideFor(META, 'doer', e.exclusions.doer).armId, 'muse-spark-1.3');
+  assert.equal(decideFor(META, 'thinker', e.exclusions.thinker).armId, 'muse-spark-1.3');
+});
+
+test('Claude-only fleet: every role decides on Claude, no manual suspension', () => {
+  const e = build(CLAUDE);
+  for (const role of ROLES) {
+    const d = decideFor(CLAUDE, role, e.exclusions[role]);
+    assert.notEqual(d.kind, 'defer', `${role} must not defer`);
+    assert.ok(d.armId.startsWith('claude-'), `${role} stays on a Claude arm`);
+  }
+  assert.ok(!codes(e).includes('manual-suspended'));
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, []);
+});
+
+test('Codex-only fleet: thinkers decide; the quality gate yields before the operator list (cascade order)', () => {
+  // gpt-oss-120b is not on the thinker list, so the list alone does not empty
+  // the role. The quality gate yields first, so the thinker gets the oss arm.
+  // This is the cascade as specified; it is flagged in the PR for an owner call.
+  const e = build(CODEX);
+  const d = decideFor(CODEX, 'thinker', e.exclusions.thinker);
+  assert.notEqual(d.kind, 'defer');
+  assert.equal(d.armId, 'gpt-oss-120b');
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, []);
+  assert.ok(e.report.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'thinker'));
+});
+
+test('Codex-only fleet: doers keep the manual oss ban and decide on sol', () => {
+  const e = build(CODEX);
+  const d = decideFor(CODEX, 'doer', e.exclusions.doer);
+  assert.notEqual(d.kind, 'defer');
+  assert.equal(d.armId, 'gpt-6-1-sol');
+  assert.deepEqual(e.report.roles.doer.suspendedManual, [], 'doers never needed the list to yield');
+  assert.ok(e.exclusions.doer.includes('oss'), 'the oss ban holds');
+});
+
+test('mixed fleet: a live Claude arm means no manual suspension for any role', () => {
+  const mixed = [...CLAUDE, ...META, ...CODEX];
+  const e = build(mixed);
+  for (const role of ROLES) {
+    const d = decideFor(mixed, role, e.exclusions[role]);
+    assert.notEqual(d.kind, 'defer', `${role} must not defer`);
+  }
+  assert.equal(decideFor(mixed, 'doer', e.exclusions.doer).armId.startsWith('claude-'), true);
+  assert.equal(decideFor(mixed, 'thinker', e.exclusions.thinker).armId, 'claude-opus-5-5');
+  assert.ok(!codes(e).includes('manual-suspended'));
+});
+
+test('strongest banned family lifts first when the list alone empties a role', () => {
+  const arms = [arm('muse-spark-1.3', 'muse', 0.35), arm('gpt-oss-120b', 'oss', -1.75)];
+  const e = build(arms, { manual: { doer: ['oss', 'muse'], thinker: [], other: [] } });
+  assert.deepEqual(e.report.roles.doer.suspendedManual, ['muse'], 'muse outranks oss, so only muse lifts');
+  assert.equal(decideFor(arms, 'doer', e.exclusions.doer).armId, 'muse-spark-1.3');
+});
+
+test('an arm-token entry in the list is suspended like a family entry', () => {
+  const arms = [arm('gpt-6-1-sol-xhigh', 'sol', 0.33, { qFleetThinker: 0.33 })];
+  const e = build(arms, { manual: { doer: [], thinker: ['arm:gpt-6-1-sol-xhigh'], other: [] } });
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, ['arm:gpt-6-1-sol-xhigh']);
+  assert.equal(decideFor(arms, 'thinker', e.exclusions.thinker).armId, 'gpt-6-1-sol-xhigh');
+  const row = e.report.arms.find(a => a.armId === 'gpt-6-1-sol-xhigh');
+  assert.equal(row.eligible.thinker.ok, true);
+});
+
+test('no arm for a role at all: nothing is suspended and the role stays empty', () => {
+  const e = build(CLAUDE, { accountGroups: [], manual: { doer: ['muse'], thinker: [], other: [] } });
+  assert.deepEqual(e.exclusions.doer, ['muse']);
+  assert.deepEqual(e.report.roles.doer.suspendedManual, []);
+  assert.ok(!codes(e).includes('manual-suspended'));
+});

@@ -384,8 +384,11 @@ cannot be placed on a ladder in the first place; it is listed as
 **Safety.** If the gates would leave a role with no arm on any account, the
 outcome gate is given back for that role first, then the quality minimum
 (`role-empty-suspended`, with the `gates` named, in `/capacity`); a role can
-never be emptied into a defer loop by data. The operator list always
-applies.
+never be emptied into a defer loop by data. If the operator list alone would
+leave a role with no arm (a single-provider fleet), the data gates yield first
+and then the list's entries are suspended for that role, the strongest banned
+family first (`manual-suspended`, with the `entries` named, in `/capacity`).
+Otherwise the operator list applies as written.
 
 Defaults (all configurable):
 

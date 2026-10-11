@@ -31,7 +31,9 @@
  * role where every family reads low, e.g. reviewers who answer in comments,
  * keeps them all), and if the data gates would leave a role with no arm on
  * any account they are suspended for that role (reported, never a defer
- * loop); only the operator's list still applies.
+ * loop). If the operator's list alone would empty a role, the data gates
+ * yield first and then the list's entries are suspended for that role, the
+ * strongest banned family first (reported as `manual-suspended`).
  */
 
 import { ARM_TOKEN_PREFIX, armToken, normalizeExcludedFamilies, roleLadderAccess } from './decide.mjs';
@@ -258,6 +260,30 @@ function recordFamiliesByRole(records, { nowMs, cfg, roleOf, familyOf }) {
 }
 
 /**
+ * Operator entries in the order their bans lift when they alone would empty
+ * a role: the strongest banned family first (its best quality for the role),
+ * so the role gets the least costly family back. Unscored entries go last;
+ * ties keep the list order.
+ */
+function manualSuspensionOrder(manualList, arms, role) {
+  const bestQ = (token) => {
+    let best = null;
+    for (const a of arms ?? []) {
+      const q = armQuality(a, role);
+      if (q == null) continue;
+      const fam = String(a?.family ?? '').toLowerCase();
+      if (token !== fam && token !== armToken(a.armId)) continue;
+      if (best == null || q > best) best = q;
+    }
+    return best;
+  };
+  return manualList
+    .map((token, i) => ({ token, i, q: bestQ(token) ?? -Infinity }))
+    .sort((x, y) => (x.q === y.q ? x.i - y.i : (x.q > y.q ? -1 : 1)))
+    .map(x => x.token);
+}
+
+/**
  * The full picture for one tick.
  *
  * arms: unique arms across the fleet's ladders ({ armId, family, model,
@@ -308,6 +334,7 @@ export function buildEligibility({
   const roles = {};
   const warnings = [];
   const suspendedByRole = {};
+  const manualSuspendedByRole = {};
   const finalOutcomes = {};
   const accessible = (role, tokens) => (accountGroups ?? []).some(groups => roleLadderAccess(groups, {
     role, roleBands, excludedFamilies: tokens, trialRoles,
@@ -320,7 +347,7 @@ export function buildEligibility({
     const outcomeBaseTokens = outcomesBase[role].gated;
     // If the data gates would empty the role, give back the least trusted
     // first: the empirical outcome gate (noisy, small samples), then the
-    // benchmark minimum, then both. Only the operator list is never dropped.
+    // benchmark minimum, then both. The operator list yields last.
     const attempts = [
       { quality: true, outcome: true },
       { quality: true, outcome: false },
@@ -339,6 +366,16 @@ export function buildEligibility({
       && !accessible(role, [...manualList, ...tokensFor(active)]) && accessible(role, manualList)) {
       active = attempts.find(a => accessible(role, [...manualList, ...tokensFor(a)])) ?? attempts[3];
     }
+    let suspendedManual = [];
+    if (!accessible(role, manualList) && accessible(role, [])) {
+      active = attempts[3];
+      const order = manualSuspensionOrder(manualList, arms, role);
+      for (let n = 1; n <= order.length; n++) {
+        suspendedManual = order.slice(0, n);
+        if (accessible(role, manualList.filter(t => !suspendedManual.includes(t)))) break;
+      }
+    }
+    const keptManual = manualList.filter(t => !suspendedManual.includes(t));
     const activeOutcomeTokens = active.quality ? outcomeStrictTokens : outcomeBaseTokens;
     const suspendedGates = [
       ...(!active.quality && qualityTokens.length > 0 ? ['quality'] : []),
@@ -352,15 +389,25 @@ export function buildEligibility({
         message: `the ${suspendedGates.join(' and ')} gate would leave no eligible arm for ${role}; suspended for this role`,
       });
     }
+    if (suspendedManual.length > 0) {
+      warnings.push({
+        code: 'manual-suspended',
+        role,
+        entries: suspendedManual,
+        message: `the operator's ${role} exclusions would leave no eligible arm for ${role}; suspended for this role: ${suspendedManual.join(', ')}`,
+      });
+    }
     suspendedByRole[role] = new Set(suspendedGates);
-    const tokens = [...new Set([...manualList, ...tokensFor(active)])];
+    manualSuspendedByRole[role] = new Set(suspendedManual);
+    const tokens = [...new Set([...keptManual, ...tokensFor(active)])];
     exclusions[role] = tokens;
     finalOutcomes[role] = active.quality ? outcomesStrict[role] : outcomesBase[role];
     roles[role] = {
       excludedFamilies: tokens.filter(t => !t.startsWith(ARM_TOKEN_PREFIX)),
       excludedArms: tokens.filter(t => t.startsWith(ARM_TOKEN_PREFIX)).map(t => t.slice(ARM_TOKEN_PREFIX.length)),
-      suspended: suspendedGates.length > 0,
+      suspended: suspendedGates.length > 0 || suspendedManual.length > 0,
       suspendedGates,
+      suspendedManual,
       outcome: finalOutcomes[role],
     };
   }
@@ -389,9 +436,11 @@ export function buildEligibility({
     for (const role of ELIGIBILITY_ROLES) {
       const reasons = [];
       let ok = true;
-      if (manualByRole[role].includes(String(a.family ?? '').toLowerCase()) || manualByRole[role].includes(armToken(a.armId))) {
-        ok = false;
-        reasons.push(`manual-exclusion: ${a.family}`);
+      const manualHits = [String(a.family ?? '').toLowerCase(), armToken(a.armId)]
+        .filter(t => manualByRole[role].includes(t));
+      if (manualHits.length > 0) {
+        if (manualHits.every(t => manualSuspendedByRole[role].has(t))) reasons.push(`suspended: manual-exclusion: ${a.family}`);
+        else { ok = false; reasons.push(`manual-exclusion: ${a.family}`); }
       }
       const qv = quality[role][a.armId];
       if (qv?.ok === false) {
