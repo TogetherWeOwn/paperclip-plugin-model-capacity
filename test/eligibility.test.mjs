@@ -409,3 +409,52 @@ test('a quality-gated family is no benchmark: the gate compares only families th
   assert.deepEqual(e2.report.roles.thinker.outcome.best, { family: 'sonnet', rate: 0.25 });
   assert.deepEqual(e2.report.roles.thinker.outcome.gated, []);
 });
+
+test('suspended quality lets its families benchmark again; a family with no arm never benchmarks', () => {
+  // Same run mix: muse 0.40, sonnet 0.25 over 40 runs each.
+  const recs = [
+    ...many(16, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'progressed', seed: 0 }),
+    ...many(24, { agentId: 'think-1', model: 'muse-spark-1.3-contributor', progress: 'noChange', seed: 100 }),
+    ...many(10, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'progressed', seed: 200 }),
+    ...many(30, { agentId: 'think-1', model: 'claude-sonnet-5-5', progress: 'noChange', seed: 300 }),
+  ];
+  const full = [
+    arm('muse-xhigh', 'muse', 0.32), arm('sonnet-max', 'sonnet', 0.86),
+    arm('opus-max', 'opus', 1.2), arm('gemini-pro', 'gemini', 0.83),
+    arm('sol-max', 'sol', 0.33), arm('astra-max', 'astra', 0.20),
+    arm('haiku-max', 'haiku', 0.0), arm('luna-max', 'luna', -0.5),
+  ];
+  const baseOf = (arms) => ({
+    arms, records: recs, nowMs: NOW,
+    minQuality: { doer: null, thinker: 0.4, other: null }, outcomeGate: G,
+    manual: {}, roleOf, familyOf,
+    accountGroups: [groupsFor(arms)], roleBands: bands, trialRoles: ['doer', 'other'],
+  });
+  // (a) Every thinker arm under the 0.4 minimum: the quality gate suspends,
+  // so muse may benchmark again and gate sonnet.
+  const low = [
+    arm('muse-xhigh', 'muse', 0.32), arm('sonnet-max', 'sonnet', 0.30),
+    arm('opus-max', 'opus', 0.35), arm('gemini-pro', 'gemini', 0.33),
+    arm('sol-max', 'sol', 0.33), arm('astra-max', 'astra', 0.20),
+    arm('haiku-max', 'haiku', 0.0), arm('luna-max', 'luna', -0.5),
+  ];
+  const suspended = buildEligibility(baseOf(low));
+  assert.deepEqual(suspended.report.roles.thinker.suspendedGates, ['quality']);
+  assert.deepEqual(suspended.report.roles.thinker.outcome.best, { family: 'muse', rate: 0.4 });
+  assert.deepEqual(suspended.report.roles.thinker.outcome.gated, ['sonnet']);
+  assert.deepEqual(suspended.exclusions.thinker, ['sonnet'], 'the base-set outcome token stays applied while quality is suspended');
+  // Same low fleet, but the account serves only the sonnet arm: the base-set
+  // outcome token would empty the role, so both gates suspend together.
+  const single = buildEligibility({ ...baseOf(low), accountGroups: [groupsFor([low[1]])] });
+  assert.deepEqual(single.report.roles.thinker.suspendedGates, ['quality', 'outcome']);
+  assert.deepEqual(single.report.roles.thinker.outcome.best, { family: 'muse', rate: 0.4 });
+  assert.deepEqual(single.report.roles.thinker.outcome.gated, ['sonnet']);
+  assert.deepEqual(single.exclusions.thinker, []);
+  // (b) The 8-arm fleet minus the muse arm: muse has runs in the window but
+  // no arm in the fleet, so it never benchmarks.
+  const noMuse = full.filter((a) => a.armId !== 'muse-xhigh');
+  const e = buildEligibility(baseOf(noMuse));
+  assert.deepEqual(e.report.roles.thinker.outcome.best, { family: 'sonnet', rate: 0.25 });
+  assert.deepEqual(e.report.roles.thinker.outcome.gated, []);
+  assert.equal(e.report.roles.thinker.outcome.families.muse.rate, 0.4, 'runs without an arm are still reported');
+});
