@@ -47,7 +47,7 @@ import {
   DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
 } from './eee.mjs';
 import { fillCosts } from './cost.mjs';
-import { buildLadder } from './ladder.mjs';
+import { buildLadder, LOW_COVERAGE_THRESHOLD, LOW_COVERAGE_MAX_RUNG } from './ladder.mjs';
 import {
   armTierCost, armTierCap, tierCapsByModel, tierModelKey, fleetBaselineForModels,
 } from './tiers.mjs';
@@ -914,16 +914,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             eeePrior: eq.eeePrior?.Qeee ?? null,
           };
       });
-      const candidateByArm = new Map(candidates.map(c => [c.armId, c]));
-      const admitted = buildLadder(
-        candidates.filter(c => credentialReadiness(c.credentialEvidence, credentialNow).eligible),
-        previousRungs, gateByArm, heldPairs);
+      const credentialRanking = {
+        candidates, rankingRungs: ranking.rungs, previousRungs,
+        gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
+      };
+      const admitted = credentialLadderFor(credentialRanking, credentialNow);
       ladders[keyOf(account, i)] = {
         ...admitted,
-        rungs: admitted.rungs.map(r => ({ ...candidateByArm.get(r.armId), ...r })),
         rankingRungs: ranking.rungs,
         rankingWithinNoise: ranking.withinNoise,
-        credentialRanking: { candidates, previousRungs, gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs },
+        credentialRanking,
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
@@ -1789,7 +1789,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accountGroups: ordered
         .filter(a => a?.health === 'healthy' && a?.action !== 'excluded')
         .map(a => filterBreakerRungs(
-          groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
+          credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg,
         )),
       roleBands,
       trialRoles: config.trials.roles,
@@ -1798,7 +1798,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
     const roleAccess = Object.create(null);
     for (const a of ordered) {
-      const groups = filterBreakerRungs(groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg);
+      const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg);
       const entry = {};
       for (const role of ROLES) {
         entry[role] = roleLadderAccess(groups, {
@@ -2401,13 +2401,35 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return { status: 'shadow', observed };
   }
 
-  function credentialGroupsFor(ladder, nowMs = clock()) {
-    const ranking = ladder?.credentialRanking;
-    if (!ranking) return filterCredentialRungs(ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []), nowMs);
+  function credentialLadderFor(ranking, nowMs) {
     const ready = ranking.candidates.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible);
     const byArm = new Map(ready.map(c => [c.armId, c]));
     const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
-    return groupByRung(admitted.rungs.map(r => ({ ...byArm.get(r.armId), ...r })));
+    const benchmark = ranking.rankingRungs;
+    const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
+    // Admission may revive dominated backups, but must not move the pacing
+    // pointer or role bands into another benchmark rung. A revived backup
+    // occupies the lowest benchmark rung whose incumbent strictly dominates it.
+    const rungs = admitted.rungs.flatMap(r => {
+      const rung = rungByArm.get(r.armId) ?? benchmark.find(b =>
+        b.Q >= r.Q && b.C <= r.C && (b.Q > r.Q || b.C < r.C))?.rung;
+      if (rung == null) return [];
+      return [{
+        ...byArm.get(r.armId), ...r, rung,
+        maxRung: r.coverage < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : benchmark.length - 1,
+      }];
+    });
+    return { ...admitted, rungs };
+  }
+
+  function credentialGroupsFor(ladder, nowMs = clock()) {
+    const ranking = ladder?.credentialRanking;
+    if (!ranking) return filterCredentialRungs(ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []), nowMs);
+    const admitted = credentialLadderFor(ranking, nowMs);
+    const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
+    // decide and placement use group count as topRung; retain empty shells
+    // just like the breaker and family-exclusion filters.
+    return ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
   }
 
   function decisionCredentialReady(decision, groups) {
@@ -2939,7 +2961,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
      */
     async onResolveRunModel(params) {
       const live = params?.companyId ? liveViews.get(params.companyId) : null;
-      if (!live || live.enforce !== true) return { kind: 'keep' };
+      if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return { kind: 'keep' };
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return { kind: 'keep' };
       }
@@ -2954,6 +2976,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Join any ledger load before selection; no await may split admission,
       // the half-open probe claim, and the recorded/emitted decision.
       const hookLedger = await getOrLoadLedger(params.companyId);
+      // Config changes can land while the ledger load yields, even when the
+      // tick cannot refresh the live view. Enforce off is an immediate kill switch.
+      if (!enforceCompanies.has(params.companyId)) return { kind: 'keep' };
       const role = roleOf({ roles: {
         thinkerAgentIds: live.thinkerAgentIds,
         doerAgentIds: live.doerAgentIds,

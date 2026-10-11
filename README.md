@@ -75,13 +75,18 @@ each account; otherwise its affected arms are ineligible:
   accounts. Unknown fields are discarded. Do not publish raw credential IDs, filenames,
   tokens, error messages, or credential management payloads.
 
-Admission narrows scored arms **before** Pareto/rung ranking and account
-placement; it does not change fleet scoring/calibration or the tier-price
-baseline. Benchmark incumbency and the durable pacing range survive readiness
-flaps. The cached candidates include dominated alternatives: when an incumbent
-expires, the existing ranking algorithm can expose a still-ready backup,
-including trial families with the same bounded budgets. Tick shadow, event-time
-shadow and enforced resolve use the same evidence and recheck expiry between
+All served arms are scored first; their Pareto survivors receive benchmark
+rungs. Admission then narrows ready candidates before the existing Pareto
+survivor selection and account placement, without changing fleet
+scoring/calibration or the tier-price baseline. Benchmark incumbency, rung numbers and the durable pacing range survive
+readiness flaps; empty benchmark rung slots remain in the decision ladder so
+pointers and role floors/ceilings cannot silently shift to another model.
+The cached candidates include dominated alternatives: when an incumbent expires,
+the existing ranking algorithm can expose a still-ready backup at the lowest
+benchmark rung whose incumbent strictly dominates it, including trial families
+with the same bounded budgets. The existing coverage-derived `maxRung` field is
+retained as metadata; the current decision engine does not enforce it.
+Tick shadow, event-time shadow and enforced resolve use the same evidence and recheck expiry between
 ticks. Existing awaits complete before selection/probe claims/recording; evidence
 is parsed against the post-fetch clock. Tick attribution reads occur before
 selection, including for candidates ultimately deferred (per-tick caches bound
@@ -96,6 +101,9 @@ as a live probe. Partial refusal logs `credential-availability-excluded`.
 Enforced stale/invalid routing snapshots defer and log the separate
 `credential-availability-stale-snapshot` code. These warnings retain the existing
 per-company/per-code hourly throttle; persisted tick diagnostics remain available.
+Setting `enforce: false` immediately restores `keep`, even during feed failures
+or a pending ledger load; it does not mark stale credential evidence healthy.
+Re-enabling requires an enforcing live view and still applies freshness checks.
 
 **Rollout is fail-closed.** Feeds predating this contract no longer admit arms,
 even if `servedModels` is present. Ship and verify the producer contract first,

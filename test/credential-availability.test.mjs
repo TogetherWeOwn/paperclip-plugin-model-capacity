@@ -23,6 +23,7 @@ function account(model = MODEL, provider = 'antigravity', key = 'synthetic', rea
 
 async function start(accounts, rows = null, configure = () => {}) {
   let now = NOW;
+  let fetchStatus = 200;
   const lane = { observedAt: ISO, servedModels: accounts.flatMap(a => a.models), accounts };
   const store = new Map();
   const jobs = new Map();
@@ -43,7 +44,7 @@ async function start(accounts, rows = null, configure = () => {}) {
     config: { get: async () => config },
     state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
     secrets: { resolve: async () => 'synthetic-lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: fetchStatus, json: async () => lane }) },
     agents: { get: async () => null }, issues: { get: async () => null, list: async () => [] },
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },
     events: { on: (name, fn) => { events.set(name, fn); } },
@@ -60,6 +61,11 @@ async function start(accounts, rows = null, configure = () => {}) {
     lane, warnings,
     seedState: (stateKey, value) => store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey }), value),
     setNow: value => { now = value; },
+    setFetchStatus: value => { fetchStatus = value; },
+    setEnforce: value => {
+      config.enforce = value;
+      return plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
     tick: () => jobs.get('shadow-tick')({}),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     hook: runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 }),
@@ -406,6 +412,149 @@ test('impossible calendar dates cannot be normalized into fresh evidence', () =>
     observedAt: '2026-02-30T00:00:00Z', expiresAt: '2026-03-02T00:02:00Z',
   });
   assert.equal(readiness(raw, MODEL, Date.parse('2026-03-02T00:00:00Z')).reason, 'malformed');
+});
+
+test('enforce off stops stale-snapshot deferral during a failing tick', async () => {
+  const d = await start([account(MODEL, 'antigravity', 'a', 1)]);
+  await d.tick();
+  d.setFetchStatus(503);
+  d.setNow(NOW + 180000);
+  await assert.rejects(d.tick(), /shadow-tick-failed/);
+  assert.equal((await d.hook('outage-enforced')).kind, 'defer');
+  await d.setEnforce(false);
+  assert.deepEqual(await d.hook('outage-disabled'), { kind: 'keep' });
+  await d.setEnforce(true);
+  assert.equal((await d.hook('outage-reenabled')).kind, 'defer', 'enabling cannot bypass stale evidence');
+});
+
+test('enforce off while resolve yields stops a fresh-view decision', async () => {
+  const d = await start([account(MODEL, 'antigravity', 'a', 1)]);
+  await d.tick();
+  const pending = d.hook('disabled-during-ledger-load');
+  await d.setEnforce(false);
+  assert.deepEqual(await pending, { kind: 'keep' });
+});
+
+function threeRungAccount() {
+  const raw = account('model-a', 'partner', 'a', 1);
+  for (const model of ['model-b', 'model-c']) {
+    const next = account(model, 'partner', 'a', 1);
+    raw.models.push(model);
+    raw.credentialAvailability.models.push(...next.credentialAvailability.models);
+  }
+  return raw;
+}
+
+for (const ceiling of [null, 1]) {
+  test(`cooling rung zero preserves pointer one and doer ceiling ${ceiling} in all paths`, async () => {
+    const raw = threeRungAccount();
+    raw.credentialAvailability.models[0].readyCredentials = 0;
+    const d = await start([raw], null, config => {
+      config.roles.doerAgentIds = ['agent-9'];
+      config.roles.doerCeilingRung = ceiling;
+    });
+    d.seedState('pacing-v1', { 'partner:a': { pointer: 1, lastMoveAtMs: NOW, guardActive: false } });
+    await d.startRun('cooled-low-tick');
+    await d.tick();
+    const tick = (await d.api('shadow')).body.entries.find(e => e.runId === 'cooled-low-tick');
+    assert.equal(tick.rung, 1);
+    assert.match(tick.wouldModel, /^model-b/);
+    const rungs = (await d.api('ladder')).body.ladders['partner:a'].rungs;
+    assert.deepEqual(rungs.map(r => r.rung), [1, 2]);
+    assert.equal((await d.hook('cooled-low-hook')).model, 'model-b');
+    await d.startRun('cooled-low-event');
+    await d.tick();
+    const event = (await d.api('shadow')).body.entries.find(e => e.runId === 'cooled-low-event');
+    assert.equal(event.eventTime, true);
+    assert.equal(event.rung, 1);
+    assert.match(event.wouldModel, /^model-b/);
+  });
+}
+
+test('expiry of the low rung between ticks cannot promote pointer one to rung two', async () => {
+  const raw = threeRungAccount();
+  raw.credentialAvailability.models[0].expiresAt = new Date(NOW + 1000).toISOString();
+  const d = await start([raw]);
+  d.seedState('pacing-v1', { 'partner:a': { pointer: 1, lastMoveAtMs: NOW, guardActive: false } });
+  await d.tick();
+  assert.equal((await d.hook('low-rung-fresh')).model, 'model-b');
+  d.setNow(NOW + 1000);
+  assert.equal((await d.hook('low-rung-expired')).model, 'model-b');
+});
+
+test('cooling middle rung keeps the higher rung out of a doer ceiling one', async () => {
+  const raw = threeRungAccount();
+  raw.credentialAvailability.models[1].readyCredentials = 0;
+  const d = await start([raw], null, config => {
+    config.roles.doerAgentIds = ['agent-9'];
+    config.roles.doerCeilingRung = 1;
+  });
+  d.seedState('pacing-v1', { 'partner:a': { pointer: 1, lastMoveAtMs: NOW, guardActive: false } });
+  await d.tick();
+  assert.equal((await d.hook('middle-cooled-ceiling')).model, 'model-a');
+});
+
+test('cooling the low and middle rungs still allows a full-coverage top-rung model', async () => {
+  const raw = threeRungAccount();
+  raw.credentialAvailability.models[0].readyCredentials = 0;
+  raw.credentialAvailability.models[1].readyCredentials = 0;
+  const d = await start([raw]);
+  d.seedState('pacing-v1', { 'partner:a': { pointer: 2, lastMoveAtMs: NOW, guardActive: false } });
+  await d.tick();
+  const rungs = (await d.api('ladder')).body.ladders['partner:a'].rungs;
+  assert.equal(rungs[0].rung, 2);
+  assert.equal(rungs[0].maxRung, 2);
+  const hook = await d.hook('only-top-ready');
+  assert.equal(hook.model, 'model-c');
+  assert.match(hook.reason, /rung 2/);
+});
+
+test('cooling top rung cannot lower a thinker floor, and recovery restores it', async () => {
+  const raw = threeRungAccount();
+  raw.credentialAvailability.models[2].readyCredentials = 0;
+  const d = await start([raw], null, config => {
+    config.roles.thinkerAgentIds = ['agent-9'];
+    config.roles.thinkerFloorRung = 2;
+  });
+  d.seedState('pacing-v1', { 'partner:a': { pointer: 2, lastMoveAtMs: NOW, guardActive: false } });
+  await d.tick();
+  assert.equal((await d.hook('top-cooled-thinker')).kind, 'defer');
+  raw.credentialAvailability.models[2].readyCredentials = 1;
+  d.setNow(NOW + 50000);
+  await d.tick();
+  const hook = await d.hook('top-recovered-thinker');
+  assert.equal(hook.model, 'model-c');
+  assert.match(hook.reason, /rung 2/);
+});
+
+test('a dominated backup inherits its unavailable incumbent rung, not a cheaper role band', async () => {
+  const raw = threeRungAccount();
+  const backup = account('model-backup', 'partner', 'a', 1);
+  raw.models.push(...backup.models);
+  raw.credentialAvailability.models.push(...backup.credentialAvailability.models);
+  raw.credentialAvailability.models[1].readyCredentials = 0;
+  raw.credentialAvailability.models[2].readyCredentials = 0;
+  const d = await start([raw], [
+    { slug: 'model-a', intelligenceIndex: 60, intelligenceIndexCostPerTask: 1 },
+    { slug: 'model-b', intelligenceIndex: 80, intelligenceIndexCostPerTask: 2 },
+    { slug: 'model-c', intelligenceIndex: 90, intelligenceIndexCostPerTask: 3 },
+    { slug: 'model-backup', intelligenceIndex: 70, intelligenceIndexCostPerTask: 4 },
+  ], config => {
+    config.roles.doerAgentIds = ['agent-9'];
+    config.roles.doerCeilingRung = 0;
+  });
+  d.seedState('pacing-v1', { 'partner:a': { pointer: 1, lastMoveAtMs: NOW, guardActive: false } });
+  await d.tick();
+  const rungs = (await d.api('ladder')).body.ladders['partner:a'].rungs;
+  assert.equal(rungs.find(r => r.model === 'model-backup').rung, 1);
+  assert.equal((await d.hook('revived-backup-role-ceiling')).model, 'model-a');
+  raw.credentialAvailability.models[0].readyCredentials = 0;
+  d.setNow(NOW + 50000);
+  await d.tick();
+  const backupOnly = (await d.api('ladder')).body.ladders['partner:a'].rungs;
+  assert.equal(backupOnly[0].model, 'model-backup');
+  assert.equal(backupOnly[0].rung, 1);
+  assert.equal((await d.hook('backup-cannot-enter-rung-zero')).kind, 'defer');
 });
 
 test('legacy frozen cooldown text and timestamps cannot manufacture fresh readiness', () => {
