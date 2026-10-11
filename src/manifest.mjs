@@ -269,6 +269,15 @@ const CONFIG_SCHEMA = {
         rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
         rateWindowMin: { type: 'number', minimum: 10, default: 60 },
         rateMinSpanMin: { type: 'number', minimum: 5, default: 10 },
+        guard: {
+          type: 'object', additionalProperties: false,
+          description: 'Pace guard: a provider pool whose lanes average above the linear weekly plan (plus marginPct) is held at max(1, ceil(paced slots)) runs in flight; further runs go to other pools or are deferred. Applies to the enforcing hook, the event-time path and the shadow tick alike. Unknown plan position, unknown share and reactive lanes fail open.',
+          properties: {
+            enabled: { type: 'boolean', default: true },
+            marginPct: { type: 'number', minimum: 0, maximum: 1, default: 0.02, description: 'Lead on the plan (fraction of the weekly quota) tolerated before the cap applies.' },
+            retryAfterMs: { type: 'integer', minimum: 1000, default: 300000, description: 'Retry hint when the hook defers because every eligible pool is held; longer than the plain no-headroom retry because a slot frees when a run finishes.' },
+          },
+        },
       },
     },
     concurrency: {

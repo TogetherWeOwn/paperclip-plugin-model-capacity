@@ -62,6 +62,7 @@ const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
  * unhealthy lanes and metered lanes without headroom).
  *
  * lanes: [{ planAhead (nullable), targetShare (nullable), inFlight (pooled),
+ *   paceInFlight (optional override of inFlight for the cap check),
  *   meter/quality (reactive detection) }]
  * pacing: { enabled, marginPct, meanRunDurationHours } or null
  * Returns one entry per pool (`key` is the caller's poolKeyOf value):
@@ -80,7 +81,12 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
   const out = [];
   for (const [key, members] of groups) {
     const pool = members[0]?.pool ?? key;
-    const inFlight = Math.max(0, ...members.map(v => (finite(v.inFlight) ? v.inFlight : 0)));
+    // paceInFlight, when given, is the pooled count without the run being
+    // decided (callers whose inFlight still includes it); else inFlight.
+    const inFlight = Math.max(0, ...members.map(v => {
+      const n = finite(v.paceInFlight) ? v.paceInFlight : v.inFlight;
+      return finite(n) ? n : 0;
+    }));
     const entry = {
       key, pool, lanes: members.length, planAhead: null, pacedSlots: null, cap: null,
       inFlight, ahead: false, paced: false, state: enabled ? 'not-measured' : 'off',

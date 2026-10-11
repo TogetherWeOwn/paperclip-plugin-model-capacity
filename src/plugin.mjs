@@ -71,11 +71,12 @@ import {
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
 } from './outcomes.mjs';
 import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
-import { orderAccountsForRun, DEFAULT_PLACEMENT } from './select.mjs';
+import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
+import { normalizePaceGuard } from './paceguard.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
-  recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount,
+  recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount, attributedAccount,
   trialInflight, reconcileLedger, startedOnCountWhere,
   terminalRecords, shadowEntries, trimLedger, mergeLedger, migrateLegacy,
   isLedgerTerminal as isTerminalStatus, TRIAL_WINDOW_MS, LEDGER_CAP,
@@ -166,6 +167,20 @@ export function validateConfigShape(raw) {
     if (typeof v !== 'number' || !(v >= 0)) errors.push(`eeeWeights.${k} must be a non-negative number`);
   }
   if (pacing && (pacing.guardHighPct <= pacing.guardRejoinPct)) errors.push('pacing.guardHighPct must exceed pacing.guardRejoinPct');
+  if (pacing && 'guard' in pacing) {
+    const g = pacing.guard;
+    if (g == null || typeof g !== 'object' || Array.isArray(g)) {
+      errors.push('pacing.guard must be an object');
+    } else {
+      if ('enabled' in g && typeof g.enabled !== 'boolean') errors.push('pacing.guard.enabled must be a boolean');
+      if ('marginPct' in g && !(typeof g.marginPct === 'number' && g.marginPct >= 0 && g.marginPct <= 1)) {
+        errors.push('pacing.guard.marginPct must be a number in [0, 1]');
+      }
+      if ('retryAfterMs' in g && !(Number.isInteger(g.retryAfterMs) && g.retryAfterMs >= 1000)) {
+        errors.push('pacing.guard.retryAfterMs must be an integer >= 1000');
+      }
+    }
+  }
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
@@ -386,6 +401,10 @@ export function resolveConfig(raw = {}) {
       // relative-only, so a legacy value here is accepted and ignored.
       rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
       rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
+      // Hard in-flight cap for a pool that is ahead of its linear weekly plan
+      // (see paceguard.mjs); the same knobs feed the hook, the event-time
+      // path and the shadow tick.
+      guard: normalizePaceGuard(raw.pacing?.guard),
     },
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
@@ -1309,9 +1328,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ? requiredRatePerHour({ remainingPct: remaining, hoursToReset })
         : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
-      const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
+      // Plan position: weekly used minus the linear plan (positive = ahead).
+      // Null while either input is unknown; the controller reads that as 0,
+      // the pace guard reads it as "not measured" and stays out of the way.
+      const planAhead = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
-        : 0;
+        : null;
+      const positionError = planAhead ?? 0;
       const ceiling = (ladders[key]?.rungs.length ?? 1) - 1;
       let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
         {
@@ -1410,6 +1433,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ratePoints: measured?.points ?? 0,
         rateHistoryPoints: history.length,
         requiredRatePerHour: required,
+        planAhead,
       });
     }
     const ordered = orderAccounts(accountViews.map(a => ({ ...a, remainingPct: a.remainingPct ?? 0 })));
@@ -1876,6 +1900,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       return { pools, byAccount: cur.byAccount };
     };
+    // A run being decided is already in the census when it is running (the
+    // tick decides runs that started up to 15 min ago). Ordering has always
+    // counted it; the pace guard must not, or a run would be held at the
+    // cap by its own slot (the hook already excludes its own run).
+    const selfPoolOf = (runId) => {
+      const rec = runId != null ? ledger.get(runId) : null;
+      if (rec == null || !isInflight(rec, nowMs, staleHorizonMs)) return null;
+      const a = attributedAccount(rec);
+      return a != null ? poolOfKey(a) : null;
+    };
+    // The pace guard's knobs, shared by the tick, the live view (hook and
+    // event-time path) and the /capacity report.
+    const paceOpts = { ...config.pacing.guard, meanRunDurationHours: config.concurrency.meanRunDurationHours };
     // Fleet quality of the arm each account would run for this role (see
     // placementArm): the placement blend ranks accounts by it, so unspent
     // allowance breaks ties between similar arms instead of picking the
@@ -1895,9 +1932,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       placementQuality.set(memoKey, q);
       return q;
     };
-    const allocationOrder = (role) => {
+    const allocationOrder = (role, selfRunId = null) => {
       const { pools, byAccount } = freshPressure();
-      return orderAccountsForRun(
+      const selfPool = selfPoolOf(selfRunId);
+      return orderAccountsWithPacing(
         accountViews.map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
@@ -1909,11 +1947,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           meter: v.meter,
           quality: v.quality,
           inFlight: pools[v.pool] ?? 0,
+          paceInFlight: Math.max(0, (pools[v.pool] ?? 0) - (v.pool === selfPool ? 1 : 0)),
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           placementQ: placementQualityFor(v.accountId, v.pointer, role),
+          planAhead: v.planAhead,
         })),
-        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement },
+        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts },
       );
     };
     // Fresh trial budgets per candidate: decisions write through to the
@@ -1946,6 +1986,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       .slice(0, 100);
     let observed = 0;
     let shadowSkippedNoDecision = 0;
+    let shadowSkippedPaced = 0;
     const keepAgents = new Set(config.roles.keepAgentIds);
     // Pinned agents' configured model and the account serving it, published
     // in the live view so the hook and event-time path can count a pinned
@@ -1998,7 +2039,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // straight into the ledger, so earlier decisions in this tick already
       // narrow the winner's shortfall and consume budget structurally --
       // the next run spreads elsewhere without any pending-side state.
-      for (const sel of allocationOrder(role)) {
+      const allocation = allocationOrder(role, run.runId);
+      for (const sel of allocation.order) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
         if (!view || !ladder) continue;
@@ -2087,6 +2129,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         observed += 1;
       } else {
         shadowSkippedNoDecision += 1;
+        if (allocation.paced.length > 0) shadowSkippedPaced += 1;
       }
     }
 
@@ -2184,6 +2227,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           resetAtMs: view?.resetAtMs ?? null,
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
+          planAhead: view?.planAhead ?? null,
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
           ladderRungs: filterBreakerRungs(groupByRung(ladder?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg),
@@ -2192,6 +2236,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }),
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
+      paceGuard: paceOpts,
     });
     // Event-time decisions that landed since the previous tick (memory-only
     // reporting stat; the ledger itself is the merge).
@@ -2283,6 +2328,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
+    // Pace guard verdict per pool with the tick's final in-flight counts
+    // (the role only affects placement quality, never the guard).
+    const paceReport = allocationOrder('doer').pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
@@ -2352,6 +2400,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       runsObserved: ledger.size,
       runsCandidates: candidates.length,
       runsSource: 'events',
+      paceGuard: {
+        enabled: paceOpts.enabled,
+        marginPct: paceOpts.marginPct,
+        retryAfterMs: paceOpts.retryAfterMs,
+        pools: paceReport,
+      },
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
@@ -2360,6 +2414,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         mergedEventTime,
         backfilledActuals,
         skippedNoDecision: shadowSkippedNoDecision,
+        skippedPaced: shadowSkippedPaced,
       },
     });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
@@ -2419,9 +2474,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * In-flight is the pooled pressure the last tick published plus every
    * queued hook/event decision since, deduped by runId (same-provider
    * lanes share one bucket). Spreads objects so per-call counts never
-   * mutate the view. The pooled value drives ORDERING only; the reactive
-   * per-account cap is checked separately against per-account counts
-   * (see the hook and event-time loops).
+   * mutate the view. The pooled value drives ORDERING and the pace guard;
+   * the reactive per-account cap is checked separately against per-account
+   * counts (see the hook and event-time loops).
+   * Returns { order, paced, pools } (see orderAccountsWithPacing): the pace
+   * guard reads the same knobs and plan positions the tick used, so the
+   * hook, the event-time path and the tick hold and release a pool alike.
    */
   function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = []) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
@@ -2435,13 +2493,24 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       poolPending[p] = (poolPending[p] ?? 0) + 1;
       lanePending.set(q.decidedAccount, (lanePending.get(q.decidedAccount) ?? 0) + 1);
     }
-    return orderAccountsForRun(
+    // The caller's own run may already sit in the frozen counts: an
+    // event-time decision made before the last tick published is in
+    // decidedRunIds and counted in the pooled in-flight. It must not hold
+    // its own pool at the cap, so it is taken back out here.
+    let selfPool = null;
+    if (excludeRunId != null && live.decidedRunIds?.has(excludeRunId)) {
+      const rec = ledgers.get(companyId)?.get(excludeRunId);
+      if (rec?.decidedAccount != null && !isTerminalStatus(rec.status) && rec.unverified !== true) {
+        selfPool = poolOf(rec.decidedAccount);
+      }
+    }
+    return orderAccountsWithPacing(
       (live.accounts ?? []).map(a => {
         const p = poolOf(a.accountId);
         return {
           ...a,
           targetShare: a.targetShare ?? null,
-          inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
+          inFlight: Math.max(0, (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0) - (p === selfPool ? 1 : 0)),
           pool: p,
           laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
           placementQ: placementArm(a.ladderRungs ?? [], {
@@ -2450,7 +2519,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           })?.quality ?? null,
         };
       }),
-      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null },
+      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null, pacing: live.paceGuard ?? null },
     );
   }
 
@@ -2518,7 +2587,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
-    const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
+    const { order } = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
     // views drives ordering only -- comparing the pool total against the
@@ -2902,7 +2971,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // this hook resolves, so a queued shadow entry for THIS runId must not
       // count against it in ordering, caps, or budgets.
       const selfId = params?.runId != null ? String(params.runId) : null;
-      const order = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
+      const { order, paced } = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
@@ -2987,6 +3056,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             reason: d.reason,
           };
         }
+      }
+      // Nothing decided. When the pace guard dropped a pool, the wait is for
+      // one of its runs to finish (minutes), not for headroom: say so and
+      // retry on that scale so the host does not burn its retry budget.
+      if (paced.length > 0) {
+        const guard = live.paceGuard ?? {};
+        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        return {
+          kind: 'defer',
+          retryAfterMs: guard.retryAfterMs ?? 300000,
+          reason: `pace guard: ${held.join('; ')}`,
+        };
       }
       return { kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' };
     },

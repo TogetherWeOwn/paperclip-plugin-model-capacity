@@ -43,6 +43,11 @@ const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// These fixtures hold several concurrent runs on lanes that read 30% spent at
+// the start of the week (ahead of plan). Their subject is which account a run maps to and how decisions spread, not the
+// pace guard (see paceguard*.test.mjs), so the guard is off here.
+const NO_GUARD = { pacing: { guard: { enabled: false } } };
+
 function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {} }) {
   const store = new Map();
   const jobs = new Map();
@@ -150,6 +155,7 @@ test('exhausted reactive lane gets nothing: health gates eligibility', async () 
 test('run maps to its account from the resolved actual model', async () => {
   const { run } = drive({
     nowMs: TICK,
+    config: NO_GUARD,
     laneAccounts: [claudeAcct(), kimiAcct()],
     issueGets: { 'iss-k': { assigneeAdapterOverrides: { adapterConfig: { model: 'kimi-k3-256k' } } } },
     steps: [{
@@ -327,6 +333,7 @@ test('water-filling spreads ten decisions across three equal metered accounts', 
   for (let i = 0; i < 10; i++) fires.push(started(`run-wf-${i}`, TICK - 60000));
   const { run } = drive({
     nowMs: TICK,
+    config: NO_GUARD,
     laneAccounts: [mk('p1', 'a1'), mk('p2', 'a2'), mk('p3', 'a3')],
     steps: [{ now: TICK, fire: fires }],
   });
