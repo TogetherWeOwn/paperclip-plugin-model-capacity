@@ -323,7 +323,9 @@ function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
  * accountGroups: per-account grouped rungs (for the empty-role guard).
  * structuralGroups: every account's grouped rungs, health- and
  *   breaker-independent (for the structural-emptiness gate on the
- *   operator's list). Defaults to accountGroups.
+ *   operator's list; within the readiness-admitted fleet, since arms
+ *   without fresh ready evidence never reach the ladders). Defaults to
+ *   accountGroups.
  * manual: the operator's emergency list ({ doer, thinker, other } families).
  *
  * The outcome benchmark skips every family that cannot serve the role:

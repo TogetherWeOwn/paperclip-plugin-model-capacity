@@ -47,7 +47,7 @@ import {
   DEFAULT_EEE_DECAY_HALF_LIFE_DAYS,
 } from './eee.mjs';
 import { fillCosts } from './cost.mjs';
-import { buildLadder } from './ladder.mjs';
+import { buildLadder, LOW_COVERAGE_THRESHOLD, LOW_COVERAGE_MAX_RUNG } from './ladder.mjs';
 import {
   armTierCost, armTierCap, tierCapsByModel, tierModelKey, fleetBaselineForModels,
 } from './tiers.mjs';
@@ -71,16 +71,18 @@ import {
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
 } from './outcomes.mjs';
 import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
-import { orderAccountsForRun, DEFAULT_PLACEMENT } from './select.mjs';
+import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
+import { normalizePaceGuard } from './paceguard.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
-  recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount,
+  recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount, attributedAccount,
   trialInflight, reconcileLedger, startedOnCountWhere,
   terminalRecords, shadowEntries, trimLedger, mergeLedger, migrateLegacy,
   isLedgerTerminal as isTerminalStatus, TRIAL_WINDOW_MS, LEDGER_CAP,
 } from './ledger.mjs';
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
+import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
 
 const NS = 'model-capacity';
 // Weekly remainder at or below this floor: the account cannot serve runs
@@ -166,6 +168,20 @@ export function validateConfigShape(raw) {
     if (typeof v !== 'number' || !(v >= 0)) errors.push(`eeeWeights.${k} must be a non-negative number`);
   }
   if (pacing && (pacing.guardHighPct <= pacing.guardRejoinPct)) errors.push('pacing.guardHighPct must exceed pacing.guardRejoinPct');
+  if (pacing != null && typeof pacing === 'object' && !Array.isArray(pacing) && 'guard' in pacing) {
+    const g = pacing.guard;
+    if (g == null || typeof g !== 'object' || Array.isArray(g)) {
+      errors.push('pacing.guard must be an object');
+    } else {
+      if ('enabled' in g && typeof g.enabled !== 'boolean') errors.push('pacing.guard.enabled must be a boolean');
+      if ('marginPct' in g && !(typeof g.marginPct === 'number' && g.marginPct >= 0 && g.marginPct <= 1)) {
+        errors.push('pacing.guard.marginPct must be a number in [0, 1]');
+      }
+      if ('retryAfterMs' in g && !(Number.isInteger(g.retryAfterMs) && g.retryAfterMs >= 1000)) {
+        errors.push('pacing.guard.retryAfterMs must be an integer >= 1000');
+      }
+    }
+  }
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
@@ -386,6 +402,10 @@ export function resolveConfig(raw = {}) {
       // relative-only, so a legacy value here is accepted and ignored.
       rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
       rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
+      // Hard in-flight cap for a pool that is ahead of its linear weekly plan
+      // (see paceguard.mjs); the same knobs feed the hook, the event-time
+      // path and the shadow tick.
+      guard: normalizePaceGuard(raw.pacing?.guard),
     },
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
@@ -471,6 +491,9 @@ function sanitizeReservedFloors(raw) {
 // Weekly window length for schedule-error math (the lane reports `used`
 // fractions plus reset timestamps; the host owns staleness/live-pull).
 const WEEKLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
+// A reset reported this far past one window still reads as a window that has
+// just rolled over (feed and host clocks differ by minutes, not hours).
+const PLAN_WINDOW_SLACK_MS = 3600 * 1000;
 
 function windowStartMs(resetsAtMs) {
   if (resetsAtMs == null) return null;
@@ -486,6 +509,50 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
   const breakerLoads = new Map(); // companyId -> in-flight first-load promise (single-flight)
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
+  // Runs the enforcing hook deferred, per company: runId -> deferredAt. The
+  // host claims a run (agent.run.started) before the hook answers, so a
+  // deferred run sits in the ledger as running and the tick attributes it
+  // to the pool its model serves; it is waiting, not executing, so the pace
+  // guard leaves it out of its in-flight count. Memory-only (a restart
+  // re-adds a run the next time the hook defers it); cleared when the hook
+  // decides the run or it reaches a terminal state.
+  const deferredRuns = new Map();
+  const markDeferred = (companyId, runId, atMs, horizonMs) => {
+    if (runId == null) return;
+    let m = deferredRuns.get(companyId);
+    if (!m) { m = new Map(); deferredRuns.set(companyId, m); }
+    m.delete(String(runId));
+    m.set(String(runId), atMs);
+    // Bounded: entries older than the in-flight horizon no longer count
+    // anywhere, and the oldest go first past the ledger's own cap.
+    for (const [id, at] of m) {
+      if (atMs - at < horizonMs && m.size <= LEDGER_CAP) break;
+      m.delete(id);
+    }
+  };
+  const clearDeferred = (companyId, runId) => {
+    if (runId != null) deferredRuns.get(companyId)?.delete(String(runId));
+  };
+  /**
+   * Pooled in-flight for the pace guard: records that are actually
+   * executing, i.e. non-terminal, verified and inside the horizon, minus
+   * runs the hook deferred (waiting, not running) and minus the run being
+   * decided (it must not hold its own pool at the cap).
+   */
+  const paceInFlightByPool = (companyId, ledger, { nowMs, horizonMs, selfRunId = null, poolOf }) => {
+    const waiting = deferredRuns.get(companyId);
+    const self = selfRunId != null ? String(selfRunId) : null;
+    const census = inflightByAccount(ledger, {
+      nowMs, horizonMs,
+      skip: r => r?.runId === self || waiting?.has(r?.runId) === true,
+    });
+    const pools = {};
+    for (const [id, n] of Object.entries(census.byAccount)) {
+      const p = poolOf(id);
+      pools[p] = (pools[p] ?? 0) + n;
+    }
+    return pools;
+  };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
   // Live view per company, populated by every tick for the memory-only
@@ -546,7 +613,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null };
     }
     const body = await cliproxyLaneGet(companyId, config);
-    const parsed = parseLaneBody(body, nowMs);
+    // Validate observation time after the fetch, never against tick start.
+    const parsed = parseLaneBody(body, clock());
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
     // EEE prior rides the same lane body (`eeeScores` key, same pattern as
     // the existing `modelStats`/`pricingTiers` keys): absent or malformed
@@ -696,6 +764,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // EEE prior: usable only when the artifact is fresh; otherwise every
     // arm keeps its AA-only score (bit-for-bit identical to today).
     const tickNow = nowMs ?? clock();
+    const credentialNow = clock();
     const eeeLive = eeeUsable(eeeSnapshot, { nowMs: tickNow, maxAgeDays: config.eee.maxAgeDays })
       ? eeeSnapshot.scores : null;
     const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
@@ -728,11 +797,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // the resolver proves CLIProxy can serve an arm. Keep old feeds unchanged.
     const servedIds = Array.isArray(servedModels) ? new Set(servedModels) : null;
     const unservable = [];
+    const credentialAdmission = [];
     const accountArms = (accounts ?? []).map((account, i) => {
       const eligible = [];
       const refused = new Set();
       for (const arm of armsForAccount(arms, account)) {
         if (!servedIds || servedIds.has(arm.model)) {
+          const evidence = credentialEvidenceFor(account, arm.model);
+          const readiness = credentialReadiness(evidence, credentialNow);
+          if (!refused.has(arm.model)) {
+            refused.add(arm.model);
+            credentialAdmission.push({ accountId: keyOf(account, i), provider: account.provider,
+              model: arm.model, evaluatedAtMs: credentialNow, ...readiness, evidence });
+          }
+          // Keep calibration fixed across credential flaps; admission is
+          // applied to scored candidates before Pareto/placement ranking.
           eligible.push(arm);
         } else if (!refused.has(arm.model)) {
           refused.add(arm.model);
@@ -866,16 +945,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // ride back in as heldPairs, so a held challenger stays gated against
       // its incumbent until the 95% bar clears (see ladder.mjs).
       const prev = previousLadders?.[keyOf(account, i)] ?? {};
-      const { rungs, dominated, dropped, withinNoise } = buildLadder(
-        eligible, prev.rungs ?? [], gateByArm, prev.withinNoise ?? []);
-      ladders[keyOf(account, i)] = {
-        rungs: rungs.map(r => {
+      // Preserve benchmark incumbency independently of transient readiness.
+      // Retain all scored candidates so expiry can expose a formerly dominated
+      // but ready alternative without waiting for another telemetry tick.
+      const previousRungs = prev.rankingRungs ?? prev.rungs ?? [];
+      const heldPairs = prev.rankingWithinNoise ?? prev.withinNoise ?? [];
+      const ranking = buildLadder(eligible, previousRungs, gateByArm, heldPairs);
+      const candidates = eligible.map(r => {
           const arm = byArm.get(r.armId);
           const tier = eligibleByArm.get(r.armId);
           const eq = eeeByArm.get(r.armId) ?? {};
           return {
             ...r,
             model: arm.model,
+            credentialEvidence: credentialEvidenceFor(account, arm.model),
             effort: arm.effort,
             family: arm.family,
             trial: !isProvenFamily(trialState, arm.family),
@@ -896,10 +979,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             qFleetThinker: fleetQ(r.armId, fleetAlphaThinker),
             eeePrior: eq.eeePrior?.Qeee ?? null,
           };
-        }),
-        dominated,
-        dropped,
-        withinNoise,
+      });
+      const credentialRanking = {
+        candidates, rankingRungs: ranking.rungs, previousRungs,
+        gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
+      };
+      const admitted = credentialLadderFor(credentialRanking, credentialNow);
+      ladders[keyOf(account, i)] = {
+        ...admitted,
+        rankingRungs: ranking.rungs,
+        rankingWithinNoise: ranking.withinNoise,
+        credentialRanking,
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
       };
     }
@@ -915,7 +1005,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }),
     })));
     for (const key of Object.keys(ladders)) {
-      for (const r of ladders[key].rungs) {
+      for (const r of [...ladders[key].rungs, ...ladders[key].credentialRanking.candidates]) {
         r.cap = tierCaps[tierModelKey(r.model)] ?? null;
       }
     }
@@ -927,7 +1017,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       armId: a.armId, family: a.family, model: a.model, effort: a.effort,
       qFleet: fleetQ(a.armId, fleetAlphaDoer), qFleetThinker: fleetQ(a.armId, fleetAlphaThinker),
     }));
-    return { ladders, fleet, skipped, arms: arms.map(a => a.armId), unscored, unservable, tierCaps, tierBaseline, withinNoise: blocked };
+    return { ladders, fleet, skipped, arms: arms.map(a => a.armId), unscored, unservable, credentialAdmission, tierCaps, tierBaseline, withinNoise: blocked };
   }
 
   function accountKey(account) {
@@ -1232,10 +1322,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, fleet: fleetArmScores, skipped, unscored, unservable, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
+    const { ladders, fleet: fleetArmScores, skipped, unscored, unservable, credentialAdmission, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
       accounts: snapshot.accounts, servedModels: snapshot.servedModels, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
+    const credentialAlarm = credentialAdmission.length > 0 && !credentialAdmission.some(row => row.eligible);
+    if (credentialAdmission.some(row => !row.eligible)) warnEligibility(companyId, [{
+      code: credentialAlarm ? 'credential-availability-all-unavailable' : 'credential-availability-excluded',
+      message: credentialAlarm ? 'no arm has fresh ready credential evidence; admission closed'
+        : 'arms without fresh ready credential evidence excluded before ranking',
+    }], nowMs);
     // Breaker state rides each rung arm so ops can see why an arm is
     // unpickable; decide-time filtering (tick loop, live view) does the actual
     // excluding. Breaker account space is the ladder key (view accountId).
@@ -1312,7 +1408,15 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
         : 0;
-      const ceiling = (ladders[key]?.rungs.length ?? 1) - 1;
+      // Plan position for the pace guard: the same error, but only while the
+      // reading sits on a weekly window (reset ahead of now and no further
+      // than one window plus clock slack). scheduleError clamps outside it,
+      // which would read a lane 30% used with a reset 10 days out as 30
+      // points ahead; the guard treats that as unknown and stays out of the way.
+      const onWindow = resetAtMs != null && resetAtMs >= nowMs && startMs - nowMs <= PLAN_WINDOW_SLACK_MS;
+      const planAhead = weeklyUsed != null && onWindow ? positionError : null;
+      // Availability narrows selections, never the durable pacing range.
+      const ceiling = (ladders[key]?.rankingRungs.length ?? ladders[key]?.rungs.length ?? 1) - 1;
       let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
         {
           measuredRatePerHour: measured?.ratePerHour ?? null,
@@ -1410,6 +1514,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         ratePoints: measured?.points ?? 0,
         rateHistoryPoints: history.length,
         requiredRatePerHour: required,
+        planAhead,
       });
     }
     const ordered = orderAccounts(accountViews.map(a => ({ ...a, remainingPct: a.remainingPct ?? 0 })));
@@ -1758,7 +1863,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       accountGroups: ordered
         .filter(a => a?.health === 'healthy' && a?.action !== 'excluded')
         .map(a => filterBreakerRungs(
-          groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
+          credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg,
         )),
       // Structural view for the operator-list gate: every lane, health-
       // and breaker-independent, so a lane outage or a cooling arm never
@@ -1772,7 +1877,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
     const roleAccess = Object.create(null);
     for (const a of ordered) {
-      const groups = filterBreakerRungs(groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg);
+      const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg);
       const entry = {};
       for (const role of ROLES) {
         entry[role] = roleLadderAccess(groups, {
@@ -1881,29 +1986,28 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       }
       return { pools, byAccount: cur.byAccount };
     };
+    // The pace guard's knobs, shared by the tick, the live view (hook and
+    // event-time path) and the /capacity report.
+    const paceOpts = { ...config.pacing.guard, meanRunDurationHours: config.concurrency.meanRunDurationHours };
     // Fleet quality of the arm each account would run for this role (see
     // placementArm): the placement blend ranks accounts by it, so unspent
     // allowance breaks ties between similar arms instead of picking the
     // account with the most room regardless of what runs there.
-    // Memoized per (role, account): pointer, ladders and breakers are fixed
-    // for the whole tick (shadow picks never occupy a probe slot), and the
-    // candidate loop asks once per run.
-    const placementQuality = new Map();
+    // Readiness can expire between candidate awaits: never memoize the
+    // quality of an arm that is no longer admitted.
     const placementQualityFor = (accountId, pointer, role) => {
-      const memoKey = `${role}\u0000${accountId}`;
-      if (placementQuality.has(memoKey)) return placementQuality.get(memoKey);
-      const groups = filterBreakerRungs(groupByRung(ladders[accountId]?.rungs ?? []), breakers, accountId, nowMs, breakersCfg);
-      const q = placementArm(groups, {
+      const groups = filterBreakerRungs(credentialGroupsFor(ladders[accountId]), breakers, accountId, nowMs, breakersCfg);
+      return placementArm(groups, {
         role, roleBands, excludedFamilies: roleExclusions[role],
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
-      placementQuality.set(memoKey, q);
-      return q;
     };
-    const allocationOrder = (role) => {
+    const allocationOrder = (role, selfRunId = null) => {
       const { pools, byAccount } = freshPressure();
-      return orderAccountsForRun(
-        accountViews.map(v => ({
+      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
+      return orderAccountsWithPacing(
+        accountViews.filter(v => rungsHaveEligibleArms(filterBreakerRungs(
+          credentialGroupsFor(ladders[v.accountId]), breakers, v.accountId, nowMs, breakersCfg))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -1914,11 +2018,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           meter: v.meter,
           quality: v.quality,
           inFlight: pools[v.pool] ?? 0,
+          paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           placementQ: placementQualityFor(v.accountId, v.pointer, role),
+          planAhead: v.planAhead,
         })),
-        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement },
+        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts },
       );
     };
     // Fresh trial budgets per candidate: decisions write through to the
@@ -1928,7 +2034,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const out = {};
       const fams = new Set(Object.keys(inFlight));
       for (const ladder of Object.values(ladders ?? {})) {
-        for (const r of ladder?.rungs ?? []) if (r?.trial && r?.family) fams.add(r.family);
+        // A dominated trial can become selectable when its incumbent expires.
+        for (const r of ladder?.credentialRanking?.candidates ?? ladder?.rungs ?? []) if (r?.trial && r?.family) fams.add(r.family);
       }
       for (const fam of fams) {
         out[fam] = Math.max(0, config.trials.maxInFlightPerFamily - (inFlight[fam] ?? 0));
@@ -1951,6 +2058,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       .slice(0, 100);
     let observed = 0;
     let shadowSkippedNoDecision = 0;
+    let shadowSkippedPaced = 0;
     const keepAgents = new Set(config.roles.keepAgentIds);
     // Pinned agents' configured model and the account serving it, published
     // in the live view so the hook and event-time path can count a pinned
@@ -1961,7 +2069,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // Feed model lists first; else the account whose ladder serves it.
       const canon = canonicalModelName(kept.model);
       const accountId = accountOfModel(kept.model)
-        ?? (canon ? ordered.find(a => (ladders[a.accountId]?.rungs ?? []).some(r => canonicalModelName(r.model) === canon))?.accountId : null)
+        ?? (canon ? ordered.find(a => (ladders[a.accountId]?.credentialRanking?.candidates ?? ladders[a.accountId]?.rungs ?? []).some(r => canonicalModelName(r.model) === canon))?.accountId : null)
         ?? null;
       if (kept.model != null && accountId != null) keptByAgent[agentId] = { model: kept.model, accountId };
     }
@@ -1997,13 +2105,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         }
         continue;
       }
+      // Resolve attribution before admission: this await may outlive a
+      // credential observation. Selection through ledger recording is sync.
+      const actual = await resolveActualModel(companyId, {
+        model: run.eventModel ?? (run.actualModel !== 'unknown' ? run.actualModel : null),
+        modelSource: run.eventModelSource ?? run.actualModelSource ?? null,
+        issueId: run.issueId ?? null, agentId: run.agentId ?? null,
+      }, modelCaches);
       const role = roleOf(config, run.agentId);
       let decision = null;
       // Fresh order, cap base, and trial budget per run: decisions write
       // straight into the ledger, so earlier decisions in this tick already
       // narrow the winner's shortfall and consume budget structurally --
       // the next run spreads elsewhere without any pending-side state.
-      for (const sel of allocationOrder(role)) {
+      const allocation = allocationOrder(role, run.runId);
+      for (const sel of allocation.order) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
         if (!view || !ladder) continue;
@@ -2018,7 +2134,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
         const roleRungs = filterRungsByExcludedFamilies(
-          groupByRung(ladder.rungs), roleExclusions[role]);
+          credentialGroupsFor(ladder), roleExclusions[role]);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
@@ -2057,11 +2173,6 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // modelMatch exact.
         const wouldModel = decoratedModelFor(decision, run.adapterType ?? null)
           ?? `${decision.model}(${decision.effort ?? 'default'})`;
-        const actual = await resolveActualModel(companyId, {
-          model: run.eventModel ?? (run.actualModel !== 'unknown' ? run.actualModel : null),
-          modelSource: run.eventModelSource ?? run.actualModelSource ?? null,
-          issueId: run.issueId ?? null, agentId: run.agentId ?? null,
-        }, modelCaches);
         const actualModel = actual.model ?? run.actualModel ?? 'unknown';
         recordDecision(ledger, {
           runId: run.runId, agentId: run.agentId, accountId: decision.accountId,
@@ -2092,6 +2203,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         observed += 1;
       } else {
         shadowSkippedNoDecision += 1;
+        if (allocation.paced.length > 0) shadowSkippedPaced += 1;
       }
     }
 
@@ -2137,7 +2249,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     {
       const fams = new Set(Object.keys(liveTrialInFlight));
       for (const ladder of Object.values(ladders ?? {})) {
-        for (const r of ladder?.rungs ?? []) if (r?.trial && r?.family) fams.add(r.family);
+        // A dominated trial can become selectable when its incumbent expires.
+        for (const r of ladder?.credentialRanking?.candidates ?? ladder?.rungs ?? []) if (r?.trial && r?.family) fams.add(r.family);
       }
       for (const fam of fams) {
         liveTrialBudget[fam] = Math.max(0, config.trials.maxInFlightPerFamily - (liveTrialInFlight[fam] ?? 0));
@@ -2189,14 +2302,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           resetAtMs: view?.resetAtMs ?? null,
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
+          planAhead: view?.planAhead ?? null,
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
-          ladderRungs: filterBreakerRungs(groupByRung(ladder?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg),
+          ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder), breakers, a.accountId, nowMs, breakersCfg),
+          credentialRanking: ladder?.credentialRanking,
           burnPerRunPct: ladder?.burnPerRunPct ?? {},
         };
       }),
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
+      paceGuard: paceOpts,
+      staleHorizonMs,
     });
     // Event-time decisions that landed since the previous tick (memory-only
     // reporting stat; the ledger itself is the merge).
@@ -2288,6 +2405,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
+    // Pace guard verdict per pool with the tick's final in-flight counts
+    // (the role only affects placement quality, never the guard).
+    const paceReport = allocationOrder('doer').pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
@@ -2321,6 +2441,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       skippedArms: skipped,
       unscored,
       unservable,
+      credentialAvailability: { version: 1, alarm: credentialAlarm, models: credentialAdmission },
       contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
       trialTransitions,
@@ -2357,6 +2478,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       runsObserved: ledger.size,
       runsCandidates: candidates.length,
       runsSource: 'events',
+      paceGuard: {
+        enabled: paceOpts.enabled,
+        marginPct: paceOpts.marginPct,
+        retryAfterMs: paceOpts.retryAfterMs,
+        pools: paceReport,
+      },
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
@@ -2365,6 +2492,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         mergedEventTime,
         backfilledActuals,
         skippedNoDecision: shadowSkippedNoDecision,
+        skippedPaced: shadowSkippedPaced,
       },
     });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
@@ -2373,6 +2501,50 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       calibration: concurrency.calibration, observed, runs: ledger.size, runsSource: 'events',
     });
     return { status: 'shadow', observed };
+  }
+
+  function credentialLadderFor(ranking, nowMs) {
+    const ready = ranking.candidates.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible);
+    const byArm = new Map(ready.map(c => [c.armId, c]));
+    const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
+    const benchmark = ranking.rankingRungs;
+    const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
+    // Admission may revive dominated backups, but must not move the pacing
+    // pointer or role bands into another benchmark rung. A revived backup
+    // occupies the lowest benchmark rung whose incumbent strictly dominates it.
+    const rungs = admitted.rungs.flatMap(r => {
+      const rung = rungByArm.get(r.armId) ?? benchmark.find(b =>
+        b.Q >= r.Q && b.C <= r.C && (b.Q > r.Q || b.C < r.C))?.rung;
+      if (rung == null) return [];
+      return [{
+        ...byArm.get(r.armId), ...r, rung,
+        maxRung: r.coverage < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : benchmark.length - 1,
+      }];
+    });
+    return { ...admitted, rungs };
+  }
+
+  function credentialGroupsFor(ladder, nowMs = clock()) {
+    const ranking = ladder?.credentialRanking;
+    if (!ranking) return filterCredentialRungs(ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []), nowMs);
+    const admitted = credentialLadderFor(ranking, nowMs);
+    const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
+    // decide and placement use group count as topRung; retain empty shells
+    // just like the breaker and family-exclusion filters.
+    return ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
+  }
+
+  function decisionCredentialReady(decision, groups) {
+    const arm = groups.flatMap(group => group.arms ?? []).find(a => a.armId === decision.armId);
+    return credentialReadiness(arm?.credentialEvidence, clock()).eligible;
+  }
+
+  function credentialDefer(companyId, reason = 'no fresh ready credential evidence') {
+    warnEligibility(companyId, [{ code: reason === 'routing snapshot stale or invalid'
+      ? 'credential-availability-stale-snapshot' : 'credential-availability-all-unavailable',
+      message: `${reason}; admission deferred`,
+    }], clock());
+    return { kind: 'defer', retryAfterMs: 60000, reason };
   }
 
   function groupByRung(rungs) {
@@ -2424,9 +2596,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * In-flight is the pooled pressure the last tick published plus every
    * queued hook/event decision since, deduped by runId (same-provider
    * lanes share one bucket). Spreads objects so per-call counts never
-   * mutate the view. The pooled value drives ORDERING only; the reactive
-   * per-account cap is checked separately against per-account counts
-   * (see the hook and event-time loops).
+   * mutate the view. The pooled value drives ORDERING and the pace guard;
+   * the reactive per-account cap is checked separately against per-account
+   * counts (see the hook and event-time loops).
+   * Returns { order, paced, pools } (see orderAccountsWithPacing): the pace
+   * guard reads the same knobs and plan positions the tick used, so the
+   * hook, the event-time path and the tick hold and release a pool alike.
    */
   function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = []) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
@@ -2440,13 +2615,27 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       poolPending[p] = (poolPending[p] ?? 0) + 1;
       lanePending.set(q.decidedAccount, (lanePending.get(q.decidedAccount) ?? 0) + 1);
     }
-    return orderAccountsForRun(
-      (live.accounts ?? []).map(a => {
+    // The pace guard counts from the ledger itself, fresh at call time (the
+    // frozen pooled count plus pending decisions above drives ordering
+    // only): executing runs, without the ones the hook deferred and without
+    // the caller's own run.
+    const pacePools = live.paceGuard?.enabled === true && ledgers.has(companyId)
+      ? paceInFlightByPool(companyId, ledgers.get(companyId), {
+        nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
+      })
+      : {};
+    return orderAccountsWithPacing(
+      (live.accounts ?? []).map(a => ({
+        ...a, ladderRungs: filterBreakerRungs(credentialGroupsFor(a),
+          breakerStores.get(companyId) ?? createBreakerStore(), a.accountId, clock(),
+          lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS),
+      })).filter(a => rungsHaveEligibleArms(a.ladderRungs)).map(a => {
         const p = poolOf(a.accountId);
         return {
           ...a,
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
+          paceInFlight: pacePools[p] ?? 0,
           pool: p,
           laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
           placementQ: placementArm(a.ladderRungs ?? [], {
@@ -2455,7 +2644,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           })?.quality ?? null,
         };
       }),
-      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null },
+      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null, pacing: live.paceGuard ?? null },
     );
   }
 
@@ -2507,7 +2696,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
     if (!live || !config) return null;
-    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return null;
+    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
+      credentialDefer(companyId, 'routing snapshot stale or invalid');
+      return null;
+    }
     // Already covered: the hook (or an earlier event) decided this runId.
     // The decision lives in the ledger -- one record per runId, first
     // decision wins -- so recording again would double-count the run in
@@ -2521,9 +2713,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       await recordKeptDecision(companyId, live, run?.runId, run?.agentId);
       return null;
     }
+    // Await before admission, not between selection and recording.
+    const ledger = await getOrLoadLedger(companyId);
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
-    const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
+    const { order } = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
     // views drives ordering only -- comparing the pool total against the
@@ -2561,10 +2755,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       });
       if (d.kind !== 'decide') continue;
       const emitAdapter = run.adapterType ?? liveAdapterFor(live, run.agentId) ?? null;
-      // Straight into the ledger via the shared helper (joins the pending
-      // load when one is in flight, so this decision survives it; the next
-      // tick persists the same record). actualPending until a tick backfills it.
-      const ledger = await getOrLoadLedger(companyId);
+      // The pending load was joined before selection; the next tick
+      // persists this record. actualPending until a tick backfills it.
+      if (!decisionCredentialReady(d, roleRungs)) continue;
       recordDecision(ledger, {
         runId: String(run.runId ?? 'unknown'),
         agentId: String(run.agentId ?? 'unknown'),
@@ -2579,6 +2772,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         reason: d.reason,
       }, clock());
       return d;
+    }
+    if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
+      credentialDefer(companyId);
     }
     return null;
   }
@@ -2701,6 +2897,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           recordStart(evtLedger, entry, entry.at);
         } else {
           recordTerminal(evtLedger, entry, status, entry.at);
+          clearDeferred(companyId, entry.runId);
         }
         const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
         st.seen += 1;
@@ -2866,11 +3063,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     /**
      * v0.2.1 enforcement hook. MEMORY-ONLY: it reads the in-memory live view
      * the last tick published and performs zero I/O -- no config, state,
-     * network, or db reads -- so it always answers inside the host's 1.5s
-     * RPC deadline. Fail-safe order: unknown company, enforce off, human
-     * operator override, and stale/freshness gaps all answer `keep` (the
-     * agent default runs). Only when no account has headroom does it
-     * `defer` (~60s retry). Every enforced decision is recorded in the
+     * network, or db reads. The host's RPC deadline is 1.5s; no latency
+     * guarantee is implied by synthetic tests. Fail-safe order: unknown company, enforce off, human
+     * operator overrides answer `keep` (the agent default runs). Enforced
+     * stale snapshots, unavailable credentials, and no headroom answer
+     * `defer` (~60s retry); a pace-guard hold answers `defer` with
+     * pacing.guard.retryAfterMs. Every enforced decision is recorded in the
      * ledger with `enforced:true` (memory-only; the next tick persists it).
      *
      * Note: ResolveRunModelParams carries no retry/context signals, so each
@@ -2879,17 +3077,37 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
      * identical for identical params until the next tick moves it.
      */
     async onResolveRunModel(params) {
-      const live = params?.companyId ? liveViews.get(params.companyId) : null;
-      if (!live || live.enforce !== true) return { kind: 'keep' };
-      if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+      // A run the hook keeps executes on its default model whatever it was
+      // told before: it is no longer waiting, so the pace guard counts it.
+      const keep = () => {
+        clearDeferred(params?.companyId, params?.runId);
         return { kind: 'keep' };
+      };
+      const live = params?.companyId ? liveViews.get(params.companyId) : null;
+      if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return keep();
+      if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
+        return keep();
       }
       // Operator-pinned agents (gating roles) always run their configured model.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
-        return { kind: 'keep' };
+        return keep();
       }
-      if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000) return { kind: 'keep' };
+      // Every defer below leaves the run waiting, not executing: the pace
+      // guard stops counting it as in flight until the hook decides it.
+      const deferred = (out) => {
+        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000);
+        return out;
+      };
+      if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
+        return deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'));
+      }
+      // Join any ledger load before selection; no await may split admission,
+      // the half-open probe claim, and the recorded/emitted decision.
+      const hookLedger = await getOrLoadLedger(params.companyId);
+      // Config changes can land while the ledger load yields, even when the
+      // tick cannot refresh the live view. Enforce off is an immediate kill switch.
+      if (!enforceCompanies.has(params.companyId)) return keep();
       const role = roleOf({ roles: {
         thinkerAgentIds: live.thinkerAgentIds,
         doerAgentIds: live.doerAgentIds,
@@ -2907,7 +3125,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // this hook resolves, so a queued shadow entry for THIS runId must not
       // count against it in ordering, caps, or budgets.
       const selfId = params?.runId != null ? String(params.runId) : null;
-      const order = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
+      const { order, paced } = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
@@ -2962,12 +3180,13 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           // rather than piling a second enforced run onto one probe.
           // Slipped runs cannot occur: with the slot claimed, every later
           // hook filters the arm out until its terminal resolves.
+          if (!decisionCredentialReady(d, roleRungs)) continue;
           if (d.armId != null && params?.runId != null
             && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
             && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
             continue;
           }
-          const hookLedger = await getOrLoadLedger(params.companyId);
+          clearDeferred(params.companyId, params.runId);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
           recordDecision(hookLedger, {
@@ -2993,7 +3212,24 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           };
         }
       }
-      return { kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' };
+      if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
+        return deferred(credentialDefer(params.companyId));
+      }
+      // When the pace guard dropped EVERY pool that could serve, the wait is
+      // for one of their runs to finish (minutes), not for headroom: say so
+      // and retry on that scale so the host does not burn its retry budget.
+      // A pool left in the order that merely had nothing to decide (a trial
+      // slot, say) keeps the plain retry.
+      if (paced.length > 0 && order.length === 0) {
+        const guard = live.paceGuard ?? {};
+        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        return deferred({
+          kind: 'defer',
+          retryAfterMs: guard.retryAfterMs ?? 300000,
+          reason: `pace guard: ${held.join('; ')}`,
+        });
+      }
+      return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
     },
   };
 }

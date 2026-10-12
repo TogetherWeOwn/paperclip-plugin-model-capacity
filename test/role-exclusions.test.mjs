@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { decide, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms } from '../src/decide.mjs';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Role-based family exclusions (live: doers on muse-spark hit the Muse
 // early-stop, succeeding in 2-3 min with no tool calls and no source work).
@@ -102,14 +103,14 @@ function drive({ config = {} }) {
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(TICK).toISOString(),
           // Meta holds the biggest shortfall (near-full weekly allowance
           // against a cheaper per-run burn elsewhere); claude is nearly
           // exhausted weekly but keeps five-hour headroom, so it stays
           // decidable. Fresh lanes order by shortfall, meta first.
           accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), lane('claude-1', 'claude', 'a1', 0.95)],
-        }),
+        }, TICK),
       }),
     },
     agents: { get: async () => ({ adapterType: 'claude-code' }) },

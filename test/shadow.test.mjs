@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createShadowRing, SHADOW_CAPACITY, validRecord } from '../src/shadow.mjs';
 import { validateConfigShape, resolveConfig, createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const record = (runId) => ({
   runId, agentId: 'agent-1', actualModel: 'claude-haiku-5-5(max)', wouldModel: 'gpt-6.1-sol(high)',
@@ -67,6 +68,11 @@ const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// These fixtures hold several concurrent runs on lanes that read 30% spent at
+// the start of the week (ahead of plan). Their subject is how the actual model is resolved, not the
+// pace guard (see paceguard*.test.mjs), so the guard is off here.
+const NO_GUARD = { pacing: { guard: { enabled: false } } };
+
 function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, failIssueGet = null, failAgentGet = null }) {
   const store = new Map();
   const jobs = new Map();
@@ -93,7 +99,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: { get: strictGet('agents', agentGets, failAgentGet) },
     issues: { get: strictGet('issues', issueGets, failIssueGet) },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
@@ -262,6 +268,7 @@ test('issue override beats agent config; the event model beats both', async () =
   const at = TICK - 5 * 60000;
   const { run } = drive({
     nowMs: TICK,
+    config: NO_GUARD,
     steps: [{
       now: TICK,
       fire: [

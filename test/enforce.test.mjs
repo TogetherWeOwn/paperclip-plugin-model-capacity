@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { decide, DEFAULT_CONTEXT_CAPS, MAX_OUTPUT_ENV_KEY } from '../src/decide.mjs';
 import { MODEL_ROUTING_ENV_KEYS } from '../src/manifest.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
@@ -64,7 +65,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGe
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
     agents: { get: strictGet(agentGets, failAgentGet) },
     issues: {
       get: strictGet(issueGets, failIssueGet),
@@ -124,15 +125,20 @@ test('enforce true with fresh state decides from memory with no I/O', async () =
   }
 });
 
-test('unknown company, operator override, and stale ticks answer keep', async () => {
+test('unknown company and operator override answer keep; stale ticks defer (fail-closed)', async () => {
   const d = drive({ nowMs: TICK, config: { enforce: true } });
   await d.setup();
   await d.tick();
   d.killIo();
   assert.deepEqual(await d.hook({ companyId: 'nobody' }), { kind: 'keep' });
   assert.deepEqual(await d.hook({ issueOverrideModel: 'claude-opus-5-5' }), { kind: 'keep' });
+  // A stale routing snapshot also carries stale credential evidence: admission
+  // is fail-closed, so the hook defers instead of keeping an unvetted model.
   d.setNow(TICK + 121000);
-  assert.deepEqual(await d.hook(), { kind: 'keep' });
+  const stale = await d.hook();
+  assert.equal(stale.kind, 'defer');
+  assert.equal(stale.retryAfterMs, 60000);
+  assert.match(stale.reason, /stale/);
 });
 
 test('no headroom anywhere defers with a ~60s retry', async () => {

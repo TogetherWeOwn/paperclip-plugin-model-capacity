@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { DEFAULT_ACCOUNTS_PATH } from '../src/cliproxy.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Regression tests for Paperclip Review round 2 on ca2956a (3 regressions +
 // 1 gap). Each test mirrors the reviewer's probe and fails on the pre-fix
@@ -51,6 +52,11 @@ const runEvent = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// These fixtures hold several concurrent runs on lanes that read 30% spent at
+// the start of the week (ahead of plan). Their subject is water-filling spread, not the
+// pace guard (see paceguard*.test.mjs), so the guard is off here.
+const NO_GUARD = { pacing: { guard: { enabled: false } } };
+
 function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa() }) {
   const store = new Map();
   const jobs = new Map();
@@ -64,7 +70,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa() }
       set: async (k, v) => { store.set(skey(k), v); },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => ({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }) }) },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {
@@ -208,7 +214,7 @@ test('R3a: mapped-model candidates still water-fill (no herd onto one lane)', as
   // account. Pre-fix the double-count guard eats all pending pressure and
   // all 10 land on one lane; the prior head split them across lanes.
   const d = drive({
-    config: {},
+    config: NO_GUARD,
     laneAccounts: [
       meteredLane('alpha', 'a1', ['claude-haiku-5-5']),
       meteredLane('beta', 'a2', ['claude-haiku-5-5']),

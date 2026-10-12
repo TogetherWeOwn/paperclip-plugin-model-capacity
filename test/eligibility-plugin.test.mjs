@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { DEFAULT_MIN_QUALITY, DEFAULT_OUTCOME_GATE } from '../src/eligibility.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Eligibility from data, end to end: the Q minimum and the measured-outcome
 // gate keep Muse off doers WITHOUT a hand-written ban, the emergency
@@ -54,13 +55,13 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => ({
+        json: async () => withSyntheticReadiness({
           observedAt: new Date(nowMs).toISOString(),
           servedModels: ['muse-spark-1.3-contributor', 'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
           // Meta holds the biggest deficit, so without a gate the doer goes
           // to Muse; claude stays decidable on five-hour headroom.
           accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), claudeLane],
-        }),
+        }, nowMs),
       }),
     },
     agents: { get: async (id) => ({ adapterType: 'claude-code', ...(agentModels[id] ? { adapterConfig: { model: agentModels[id] } } : {}) }) },
