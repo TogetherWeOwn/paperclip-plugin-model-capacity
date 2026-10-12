@@ -154,6 +154,8 @@ test('hook: an unattributed waiting run fails open and is exposed in /capacity',
   const d = drive({
     config: {
       enforce: true,
+      // Readiness admission is opt-in (v0.2.37); without it the cooling lane is admitted.
+      credentialReadiness: { enforce: true },
       roles: {
         thinkerAgentIds: ['agent-thinker'],
         excludeFamilies: { thinker: ['gemini'] },
