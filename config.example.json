@@ -58,6 +58,24 @@
       "retryAfterMs": 300000
     }
   },
+  "reviewReserve": {
+    "enabled": true,
+    "providers": ["claude"],
+    "agentIds": null,
+    "windowH": 6,
+    "envWindowH": 3,
+    "envHalfLifeH": 3,
+    "drainH": 8,
+    "rMin": 0.10,
+    "rMax": 0.95,
+    "releaseWeeklyH": 24,
+    "release5hMin": 45,
+    "marginW": 0.10,
+    "margin5h": 0.15,
+    "exhaustedPct": 0.99,
+    "minRunsPerH": 0.1,
+    "runsHalfLifeH": 6
+  },
   "concurrency": {
     "maxTotal": 75,
     "meanRunDurationHours": 0.186

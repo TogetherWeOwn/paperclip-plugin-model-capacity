@@ -537,6 +537,53 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   deferral budget; `/capacity` shows `inFlight` against `cap` so it is
   visible. The guard errs towards spending less, never more.
 
+### Review reserve
+
+The pace guard keeps the fleet on plan, but reviews starve anyway: review
+runs arrive in bursts and compete with bulk work for the same pace. The
+reserve holds a demand-driven share R of each reserved provider's pace
+(default: `claude`) for review runs -- a native port of the host stopgap
+that starved reviews 9 of 47 hours on 72h of fleet data, against 14 for a
+rolling average and 38 for a fixed 50%.
+
+Per reserved provider, each tick:
+
+    burn/h   = closed hourly review burn (quota-% units, priced by
+               burnPerRunPct, so tier-multiplied models burn at tier price)
+    review   = mean + 1 stdev over the trailing `envWindowH` (3) closed
+               hours; rises apply instantly, falls decay on `envHalfLifeH`
+    backlog  = queued review runs x measured % per review run / `drainH` (8h)
+    need     = review + backlog (all %/h)
+    capacity = sum over the provider's accounts below 99% weekly of
+               remaining% / hours-to-reset
+    R        = clamp(need / capacity, `rMin` 0.10, `rMax` 0.95)
+
+Kueue-style lending: with no review run waiting the reserve is lent to other
+work (R sits at the floor, nothing is held) and is reclaimed through
+admission as soon as one queues. Runs are never cancelled; the reserve only
+gates admission of non-review runs. With measurable demand but no measurable
+capacity the reserve fails closed at the cap, so reviews keep their share
+rather than racing unreserved work to zero.
+
+A reserved-provider account whose weekly OR 5h use sits above its scaled
+allowance, `(elapsed + margin) x (1 - R)` per window (`marginW` 0.10 weekly,
+`margin5h` 0.15, mirroring the feed pace guard), is **held** for non-review
+runs: it leaves the allocation order in the tick, the hook and the
+event-time path, and the hook answers `defer` with a `review reserve: ...`
+reason. The hold releases per window in the last `releaseWeeklyH` (24h)
+before a weekly reset and the last `release5hMin` (45 min) before a 5h
+reset, so unused quota is not wasted. Unknown position on a window never
+holds (fail open). Review runs (`reviewReserve.agentIds`, default
+`roles.keepAgentIds`) see the unheld order, and pinned agents keep their
+model before admission, so neither is ever held.
+
+`/capacity` carries `reviewReserve` (`enabled`, `agentIds`, `providers`, per
+provider `reserve`, `lent`, `needPctPerH`, `reviewRatePctPerH`,
+`backlogRatePctPerH`, `capacityPctPerH`, `queuedReviews`, `reviewRunsPerH`,
+`pctPerReviewRun`, `heldAccountIds` and per-account `held`/`window`, plus
+the top-level `heldAccountIds`). `enabled: false` computes nothing and holds
+nobody: admission is bit-for-bit the pre-reserve behavior.
+
 ## Configuration
 
 `placement.qualityWeight` (default 1) and `placement.allowanceWeight`
