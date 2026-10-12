@@ -25,13 +25,33 @@ function account(accountKey, models, { provider = 'partner', health = 'healthy' 
   };
 }
 
+function evidence(accountKey, ready, nowMs) {
+  return {
+    version: 1,
+    models: MODELS.map(model => ({
+      model, provider: 'partner', accountId: `partner:${accountKey}`,
+      servingCredentials: 2, readyCredentials: ready ? 1 : 0,
+      observedAt: new Date(nowMs).toISOString(),
+      expiresAt: new Date(nowMs + 120000).toISOString(),
+    })),
+  };
+}
+
 function makeScenario(name) {
   switch (name) {
     case 'pool-mate-empty-model-list':
       return [account('empty', []), account('working', null)];
     case 'breaker-open-lane':
       return [account('breaker', null)];
+    case 'mixed-evidence': {
+      const ready = account('ready', null);
+      ready.credentialAvailability = evidence('ready', true, TICK);
+      const cooling = account('cooling', null);
+      cooling.credentialAvailability = evidence('cooling', false, TICK);
+      return [ready, cooling];
+    }
     case 'ordinary':
+    case 'tick-decided':
     case 'stale-view':
     case 'future-view':
     case 'backward-clock-step':
@@ -62,11 +82,20 @@ function normalizeEntries(entries) {
   })).sort((a, b) => a.runId.localeCompare(b.runId));
 }
 
+function normalizeLadder(ladders) {
+  const out = {};
+  for (const id of Object.keys(ladders ?? {}).sort()) {
+    out[id] = (ladders[id]?.rungs ?? []).map(r => r?.armId ?? r?.model ?? null);
+  }
+  return out;
+}
+
 export async function runParityCorpus(pluginFactory, repoRoot) {
   const cases = {};
   for (const name of [
     'ordinary', 'pool-mate-empty-model-list', 'breaker-open-lane',
     'stale-view', 'future-view', 'backward-clock-step',
+    'tick-decided', 'mixed-evidence',
   ]) {
     cases[name] = await runCase(pluginFactory, repoRoot, name);
   }
@@ -87,6 +116,8 @@ async function runCase(pluginFactory, repoRoot, name) {
     armMap: ARM_MAP,
     roles: {
       doerAgentIds: ['agent-parity'],
+      // Null bars: the quality gate suspends below 8 scored arms and the
+      // corpus has 2, so any bar here would be a no-op either way.
       minQuality: { doer: null, thinker: null, other: null },
       outcomeGate: { enabled: false },
     },
@@ -143,6 +174,19 @@ async function runCase(pluginFactory, repoRoot, name) {
     `${a.provider}:${a.accountKey}`, rateHistory(`${a.provider}:${a.accountKey}`),
   ])));
 
+  // Runs that start before the first tick have no live view at event time,
+  // so only the tick's own candidate loop can decide them. Two runs: the
+  // second is decided with the first already counting as pressure.
+  if (name === 'tick-decided') {
+    for (const runId of ['tick-decided-early-1', 'tick-decided-early-2']) {
+      await events.get('agent.run.started')({
+        type: 'agent.run.started', companyId: 'parity', entityId: runId,
+        payload: { run: { agentId: 'agent-parity', adapterType: 'claude-code' } },
+        occurredAt: new Date(now).toISOString(),
+      });
+    }
+  }
+
   await jobs.get('shadow-tick')({});
   const hookRunId = `${name}-hook`;
   if (name === 'stale-view') now = TICK + 121000;
@@ -163,9 +207,11 @@ async function runCase(pluginFactory, repoRoot, name) {
   const capacity = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'capacity' })).body;
   const caps = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'caps' })).body;
   const shadow = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'shadow' })).body;
+  const ladder = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'ladder' })).body;
   return {
     hook,
     shadow: normalizeEntries(shadow.entries),
+    ladder: normalizeLadder(ladder.ladders),
     target: capacity.target ?? null,
     targetRaw: capacity.targetRaw ?? null,
     caps: {

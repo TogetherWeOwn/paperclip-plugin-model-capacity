@@ -604,3 +604,71 @@ test('legacy frozen cooldown text and timestamps cannot manufacture fresh readin
   const parsed = parseCredentialAvailability(undefined);
   assert.deepEqual(parsed, { status: 'missing', models: [] });
 });
+
+test('disabling enforcement during a lane fetch holds after the tick lands', async () => {
+  // The tick reads its config BEFORE the lane fetch and publishes AFTER it,
+  // so a shared mutated config object cannot show the race: every config
+  // read here returns a per-call snapshot, and the second tick waits on a
+  // gated fetch while the flip lands mid-flight.
+  const current = {
+    enforce: true, credentialReadiness: { enforce: true }, cliproxy: { laneKeySecretRef: SECRET },
+    trials: { maxInFlightPerAccount: 10 },
+    armMap: [MODEL].map(model => ({
+      aaSlug: model, model, effort: 'max', family: 'sol', providers: ['antigravity'],
+    })),
+    roles: { minQuality: { doer: null, thinker: null, other: null }, outcomeGate: { enabled: false } },
+  };
+  const lane = { observedAt: ISO, servedModels: [MODEL], accounts: [account()] };
+  let now = NOW;
+  const store = new Map();
+  const jobs = new Map();
+  const key = k => JSON.stringify(k);
+  let fetchCalls = 0;
+  let releaseFetch = null;
+  const plugin = createModelCapacityPlugin({ clock: () => now });
+  await plugin.setup({
+    config: { get: async () => structuredClone(current) },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'synthetic-lane-key' },
+    http: { fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 2) await new Promise(resolve => { releaseFetch = resolve; });
+      return { status: 200, json: async () => lane };
+    } },
+    agents: { get: async () => null }, issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (name, fn) => { jobs.set(name, fn); } },
+    events: { on: () => {} },
+    logger: { info() {}, error() {}, warn() {} },
+  });
+  store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }), {
+    fetchedAt: ISO, duplicateSlugs: [], rows: [{ slug: MODEL, intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 }],
+  });
+  await plugin.onConfigChanged(structuredClone(current), { companyId: 'acme' });
+  const tick = () => jobs.get('shadow-tick')({});
+  const hook = runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 });
+  await tick();
+  assert.equal((await hook('race-on')).kind, 'defer');
+  // Past the 45s lane cache so the next tick really fetches, inside the 120s
+  // evidence and live-view bounds so the feed and the view stay fresh.
+  now = NOW + 46000;
+  const inFlight = tick();
+  while (fetchCalls < 2) await new Promise(resolve => setImmediate(resolve));
+  current.credentialReadiness.enforce = false;
+  await plugin.onConfigChanged(structuredClone(current), { companyId: 'acme' });
+  assert.equal((await hook('race-flipped')).kind, 'decide');
+  releaseFetch();
+  await inFlight;
+  assert.equal((await hook('race-after-tick')).kind, 'decide', 'a stale in-flight tick cannot re-enable enforcement');
+  await tick();
+  assert.equal((await hook('race-next-tick')).kind, 'decide');
+});
+
+test('readiness off keeps the all-cooling arm in the served ladder rungs', async () => {
+  const d = await start([account()], null, config => {
+    config.credentialReadiness.enforce = false;
+  });
+  await d.tick();
+  const rungs = (await d.api('ladder')).body.ladders['antigravity:synthetic'].rungs;
+  assert.ok(rungs.length > 0, 'off mode serves the arm on-mode refuses');
+  assert.equal((await d.hook('off-mode-ladder-hook')).kind, 'decide');
+});

@@ -601,6 +601,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const agentAdapterCache = new Map();
   const ADAPTER_TTL_MS = 10 * 60 * 1000;
   const enforceCompanies = new Set(); // companyIds with enforce: true
+  // companyIds with credentialReadiness.enforce: true. Written ONLY by
+  // onConfigChanged (like enforceCompanies): the tick reads its config
+  // before the lane fetch and publishes after it, so a stale in-flight tick
+  // must never move this set back -- otherwise disabling enforcement
+  // mid-tick would re-enable itself when the tick lands.
+  const credentialEnforceCompanies = new Set();
 
   const cacheFor = (companyId, ttlSec) => {
     let c = caches.get(companyId);
@@ -2547,15 +2553,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   }
 
   function credentialReadinessEnforced(companyId) {
-    const config = lastConfig.get(companyId);
     const live = liveViews.get(companyId);
     // Disabling is an immediate safety escape hatch. Enabling takes effect
     // with the next tick, which publishes an admission view built in that mode.
-    return config?.credentialReadiness?.enforce === true
+    // The company set (not the tick-refreshed lastConfig) is read here so a
+    // stale in-flight tick cannot re-enable enforcement after an on-to-off
+    // flip: only onConfigChanged writes the set.
+    return credentialEnforceCompanies.has(companyId)
       && live?.credentialReadinessEnforced === true;
   }
 
-  function credentialLadderFor(ranking, nowMs, enforce = true) {
+  // Omit the flag and admission stays legacy: the default must fail open so
+  // a new or merged call site cannot silently re-enable the readiness filter
+  // in an opt-in-off installation.
+  function credentialLadderFor(ranking, nowMs, enforce = false) {
     const ready = enforce
       ? ranking.candidates.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
       : ranking.candidates;
@@ -2578,7 +2589,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     return { ...admitted, rungs };
   }
 
-  function credentialGroupsFor(ladder, nowMs = clock(), enforce = true) {
+  function credentialGroupsFor(ladder, nowMs = clock(), enforce = false) {
     const ranking = ladder?.credentialRanking;
     if (!ranking) {
       const groups = ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []);
@@ -2998,6 +3009,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       lastConfig.set(companyId, resolveConfig(raw));
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
+      if (raw?.credentialReadiness?.enforce === true) credentialEnforceCompanies.add(companyId);
+      else credentialEnforceCompanies.delete(companyId);
     },
 
     async onValidateConfig(raw) {
