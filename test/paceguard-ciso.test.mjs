@@ -137,27 +137,27 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
 // pool for all the others and nothing is ever decided (trial-budget and
 // shadow-agreement tests pin the deciding behavior). The fail-open is
 // explicit instead: /capacity publishes the unaccounted amount. Here a
-// thinker whose families are all excluded can never be decided, so its
-// started run stays unattributed; the hook still serves the pool minimum
-// while the report shows the 1 unaccounted run.
+// A started run the tick never evaluates stays unattributed: event-time
+// shadow covers only runs started within 15 min, so a run that began 30
+// min ago (still inside the 2 h ledger horizon) is never decided, never
+// counted toward any pool's cap, and published as unaccounted instead --
+// while the hook still serves the pool minimum to decidable runs.
+// (An all-families operator exclusion no longer strands a run for this:
+// post-#25 the list suspends so the role still decides.)
 test('hook: an unattributed waiting run fails open and is exposed in /capacity', async () => {
   const d = drive({
     config: {
       enforce: true,
-      roles: {
-        thinkerAgentIds: ['agent-thinker'],
-        excludeFamilies: { thinker: ['opus', 'sonnet', 'haiku'] },
-      },
+      roles: { thinkerAgentIds: ['agent-thinker'] },
     },
     accounts: [claudeLane(0.9)],
   });
   await d.setup();
-  await d.tick();
-  // The thinker starts a run nobody can decide for it (every family is
-  // excluded for its role) and no model info ever resolves, so the record
-  // stays running and unattributed. The event is stamped at the tick time:
-  // a future anchor would read as stale and leave the census entirely.
-  await d.fire(runEvent('run-X', TICK, 'agent.run.started', 'agent-thinker'));
+  // Fired before the first tick (no live view yet, so no event-time
+  // decision) and backdated past the 15-min shadow window (so no later
+  // tick evaluates it either): the record stays running and unattributed.
+  // A future anchor would read as stale and leave the census entirely.
+  await d.fire(runEvent('run-X', TICK - 30 * MIN, 'agent.run.started', 'agent-thinker'));
   await d.tick();
   const cap = (await d.api('capacity')).body;
   assert.equal(cap.paceGuard.unattributedInFlight, 1, 'the unaccounted run is visible to operators');
