@@ -137,10 +137,11 @@ export function orderAccountsForRun(views, opts = {}) {
 /**
  * orderAccountsForRun plus the pace guard (see paceguard.mjs): lanes of a
  * pool that is ahead of plan and already at its in-flight cap are dropped
- * from the order. Returns { order, paced, pools }:
+ * from the order. Returns { order, paced, pools, reserveHeld }:
  *   order  the allocation order (same sort as before, paced pools removed)
  *   paced  the pools that were dropped, with the numbers that dropped them
  *   pools  every qualified pool's verdict (for reporting)
+ *   reserveHeld  accounts the review reserve holds for non-review runs
  * opts.pacing = { enabled, marginPct, meanRunDurationHours } turns the guard
  * on; absent (null) it is off and `order` is exactly the old ordering. Views
  * may carry `planAhead` (weekly used minus the linear plan; null unknown) and
@@ -148,19 +149,32 @@ export function orderAccountsForRun(views, opts = {}) {
  * pool's verdict, so every pass sees the same pool membership).
  * Callers re-evaluate per run with fresh in-flight counts, so the cap
  * releases the moment a run finishes and the next call sees the lower count.
+ *
+ * opts.reviewReserve = { heldAccountIds, forReview }: the tick's review
+ * reserve (see reviewreserve.mjs) holds named accounts for non-review runs,
+ * so plugin-routed work leaves quota for the Reviewer. Review runs
+ * (forReview true) see the unheld order; absent the option nothing is held.
  */
-export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null } = {}) {
+export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null, reviewReserve = null } = {}) {
   const eligible = (views ?? []).filter(v => {
     if (v == null || v.health !== 'healthy') return false;
     if (isReactiveAccount(v)) return true;
     return v.headroomPct != null && v.headroomPct > reservePct;
   });
+  const heldIds = new Set(reviewReserve?.heldAccountIds ?? []);
+  const forReview = reviewReserve?.forReview === true;
+  const reserveHeld = (!reviewReserve || forReview || heldIds.size === 0)
+    ? []
+    : eligible.filter(v => heldIds.has(v.accountId));
+  const unheld = reserveHeld.length > 0 ? eligible.filter(v => !heldIds.has(v.accountId)) : eligible;
   const poolKeyOf = (v) => (v.pool != null ? `pool:${v.pool}` : `acct:${v.accountId}`);
   // The guard runs before ordering: a paced pool is not a candidate, so
   // placement scores and shortfalls below see only the pools that can serve.
-  const verdicts = paceGuardPools(eligible, { pacing, poolKeyOf });
+  // The reserve hold applies first for the same reason: held accounts never
+  // reach the guard or the sort for non-review runs.
+  const verdicts = paceGuardPools(unheld, { pacing, poolKeyOf });
   const pacedKeys = new Set(verdicts.filter(p => p.paced).map(p => p.key));
-  const routable = eligible.filter(v => !v.held);
+  const routable = unheld.filter(v => !v.held);
   const qualified = pacedKeys.size > 0 ? routable.filter(v => !pacedKeys.has(poolKeyOf(v))) : routable;
   // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
   // only models a qualified native also serves sorts after every need band.
@@ -209,5 +223,8 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
     (a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0),
   );
   const pub = ({ key, ...rest }) => rest;
-  return { order, paced: verdicts.filter(p => p.paced).map(pub), pools: verdicts.map(pub) };
+  const heldPub = reserveHeld.map(v => ({
+    accountId: v.accountId, pool: v.pool ?? null, headroomPct: v.headroomPct ?? null,
+  }));
+  return { order, paced: verdicts.filter(p => p.paced).map(pub), pools: verdicts.map(pub), reserveHeld: heldPub };
 }

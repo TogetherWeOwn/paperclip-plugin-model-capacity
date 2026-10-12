@@ -69,6 +69,13 @@
  * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
  * capability, egress, secret or env-key change.
  *
+ * v0.2.39 = REVIEW-RESERVE REVIEW ROUND: pinned review runs price from
+ * their pinned model (hottest arm only when the model matches nothing), so
+ * a Haiku-pinned reviewer no longer burns at Opus price; a one-sided
+ * rMin/rMax inversion against the other bound's default fails validation
+ * instead of silently resetting both bounds. No capability, egress, secret
+ * or env-key change.
+ *
  * v0.2.38 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
  * dropped when the same family has a newer or better arm (higher fleet Q,
  * cost <=) on any qualified account with headroom, so old Sol on Devin no
@@ -120,6 +127,22 @@
  * goes to exactly one compile-time origin. An unpinned build refuses the
  * lane read before it resolves the lane key, and onHealth reports degraded.
  * With the pin overlaid: no capability, egress, secret or env-key change.
+ *
+ * v0.2.36 = REVIEW RESERVE: the demand-driven share of each reserved
+ * provider's pace (default: claude) held back for review runs -- native port
+ * of the host stopgap. Per-provider R = clamp(review need / sustainable
+ * capacity, 0.10, 0.95); need is the APF-style demand envelope (mean + 1
+ * stdev over the trailing 3 closed hourly review-burn hours, instant rise,
+ * 3h half-life decay) plus queued reviews x measured % per review run over
+ * 8h. No review waiting: the reserve is lent (R at the floor, nothing held)
+ * and reclaimed through admission. Accounts above (elapsed + margin) x (1 -
+ * R) on the weekly or 5h window are held for non-review runs (released in
+ * the last 24h / 45 min before each reset); review runs
+ * (`reviewReserve.agentIds`, default `roles.keepAgentIds`) and pinned agents
+ * bypass. Review burn prices `burnPerRunPct`, so tier-multiplied models burn
+ * at tier price. `/capacity` reports `reviewReserve`. `enabled: false`
+ * restores pre-reserve admission. No capability, egress, secret or env-key
+ * change.
  *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
@@ -340,6 +363,28 @@ const CONFIG_SCHEMA = {
             retryAfterMs: { type: 'integer', minimum: 1000, default: 300000, description: 'Retry hint when the hook defers because every eligible pool is held; longer than the plain no-headroom retry because a slot frees when a run finishes.' },
           },
         },
+      },
+    },
+    reviewReserve: {
+      type: 'object', additionalProperties: false,
+      description: 'Review reserve: the demand-driven share of each reserved provider pace held back for review runs (native port of the host stopgap). A reserved-provider account above (elapsed + margin) x (1 - R) on the weekly or 5h window is held for non-review runs; review runs (agentIds, default roles.keepAgentIds) and pinned agents bypass. enabled:false restores pre-reserve admission.',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        providers: { type: 'array', items: { type: 'string' }, default: ['claude'], description: 'Providers whose pace carries a review reserve.' },
+        agentIds: { type: ['array', 'null'], items: { type: 'string' }, default: null, description: 'Review-agent ids admitted past the hold. Null (default) resolves to roles.keepAgentIds.' },
+        windowH: { type: 'integer', minimum: 1, default: 6, description: 'Closed hourly burn buckets carried in plugin state.' },
+        envWindowH: { type: 'integer', minimum: 1, default: 3, description: 'Demand-envelope window: trailing closed hours for mean + 1 stdev.' },
+        envHalfLifeH: { type: 'number', exclusiveMinimum: 0, default: 3, description: 'Envelope decay half-life (hours): rises apply instantly, falls decay.' },
+        drainH: { type: 'number', exclusiveMinimum: 0, default: 8, description: 'Backlog drain horizon (hours): queued x per-run % spread over this.' },
+        rMin: { type: 'number', minimum: 0, maximum: 1, default: 0.10, description: 'Reserve floor (= lent value while no review waits).' },
+        rMax: { type: 'number', minimum: 0, maximum: 1, default: 0.95, description: 'Reserve cap (also the fail-closed value when capacity is unmeasurable).' },
+        releaseWeeklyH: { type: 'number', exclusiveMinimum: 0, default: 24, description: 'Weekly hold releases this many hours before the weekly reset.' },
+        release5hMin: { type: 'number', exclusiveMinimum: 0, default: 45, description: '5h hold releases this many minutes before the 5h reset.' },
+        marginW: { type: 'number', minimum: 0, maximum: 1, default: 0.10, description: 'Pace margin on the weekly allowance (mirrors the feed pace guard).' },
+        margin5h: { type: 'number', minimum: 0, maximum: 1, default: 0.15, description: 'Pace margin on the 5h allowance (mirrors the feed pace guard).' },
+        exhaustedPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.99, description: 'Weekly used fraction at/above which an account leaves reserve capacity.' },
+        minRunsPerH: { type: 'number', exclusiveMinimum: 0, default: 0.1, description: 'Minimum runs/h before a measured % per review run is trusted.' },
+        runsHalfLifeH: { type: 'number', exclusiveMinimum: 0, default: 6, description: 'Runs-rate EWMA half-life (hours) for the measured % per review run.' },
       },
     },
     concurrency: {
