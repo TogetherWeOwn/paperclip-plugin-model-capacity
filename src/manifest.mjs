@@ -69,6 +69,14 @@
  * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
  * capability, egress, secret or env-key change.
  *
+ * v0.2.38 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
+ * dropped when the same family has a newer or better arm (higher fleet Q,
+ * cost <=) on any qualified account with headroom, so old Sol on Devin no
+ * longer survives next to gpt-6.1-sol on Codex. Devin duplicates of a
+ * qualified native's models are held back from the first routing pass (used
+ * only when the native and unique arms place nothing); Devin-unique models
+ * (swe-*, etc.) keep band 1. No capability, egress, secret or env-key change.
+ *
  * v0.2.37 = OPT-IN CREDENTIAL READINESS: `credentialReadiness.enforce`
  * (default false) gates credential-readiness admission. Off mode admits
  * evidence-free feeds like the pre-enforcement behavior while still parsing
