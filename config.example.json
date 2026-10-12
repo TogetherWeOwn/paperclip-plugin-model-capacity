@@ -51,7 +51,12 @@
     "guardRejoinPct": 0.5,
     "rateDeadbandRel": 0.15,
     "rateWindowMin": 60,
-    "rateMinSpanMin": 10
+    "rateMinSpanMin": 10,
+    "guard": {
+      "enabled": true,
+      "marginPct": 0.02,
+      "retryAfterMs": 300000
+    }
   },
   "concurrency": {
     "maxTotal": 75,

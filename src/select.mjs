@@ -36,6 +36,7 @@
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+import { paceGuardPools } from './paceguard.mjs';
 
 /** Normalized burn deficit; 0 when either rate is unknown or required <= 0. */
 export function deficitOf(view) {
@@ -117,12 +118,35 @@ export function allowanceOf(shortfall, poolShare) {
  * with updated in-flight after every decision is what spreads load: a
  * static order re-used across runs herds every decision onto the same winner.
  */
-export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null } = {}) {
-  const qualified = (views ?? []).filter(v => {
+export function orderAccountsForRun(views, opts = {}) {
+  return orderAccountsWithPacing(views, opts).order;
+}
+
+/**
+ * orderAccountsForRun plus the pace guard (see paceguard.mjs): lanes of a
+ * pool that is ahead of plan and already at its in-flight cap are dropped
+ * from the order. Returns { order, paced, pools }:
+ *   order  the allocation order (same sort as before, paced pools removed)
+ *   paced  the pools that were dropped, with the numbers that dropped them
+ *   pools  every qualified pool's verdict (for reporting)
+ * opts.pacing = { enabled, marginPct, meanRunDurationHours } turns the guard
+ * on; absent (null) it is off and `order` is exactly the old ordering. Views
+ * may carry `planAhead` (weekly used minus the linear plan; null unknown).
+ * Callers re-evaluate per run with fresh in-flight counts, so the cap
+ * releases the moment a run finishes and the next call sees the lower count.
+ */
+export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null } = {}) {
+  const eligible = (views ?? []).filter(v => {
     if (v == null || v.health !== 'healthy') return false;
     if (isReactiveAccount(v)) return true;
     return v.headroomPct != null && v.headroomPct > reservePct;
   });
+  const poolKeyOf = (v) => (v.pool != null ? `pool:${v.pool}` : `acct:${v.accountId}`);
+  // The guard runs before ordering: a paced pool is not a candidate, so
+  // placement scores and shortfalls below see only the pools that can serve.
+  const verdicts = paceGuardPools(eligible, { pacing, poolKeyOf });
+  const pacedKeys = new Set(verdicts.filter(p => p.paced).map(p => p.key));
+  const qualified = pacedKeys.size > 0 ? eligible.filter(v => !pacedKeys.has(poolKeyOf(v))) : eligible;
   const bandOf = (v) => {
     if (isReactiveAccount(v)) return 1;
     // Ahead-of-plan metered accounts sort with the over-burning: burning
@@ -133,7 +157,6 @@ export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel 
     return 0;
   };
   const bandCmp = (a, b) => bandOf(a) - bandOf(b);
-  const poolKeyOf = (v) => (v.pool != null ? `pool:${v.pool}` : `acct:${v.accountId}`);
   const poolShare = new Map();
   const poolInFlight = new Map();
   for (const v of qualified) {
@@ -152,7 +175,7 @@ export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel 
       score.set(v, qw * q + aw * allowanceOf(shortfall(v), poolShare.get(poolKeyOf(v))));
     }
   }
-  return [...qualified].sort((a, b) =>
+  const order = [...qualified].sort((a, b) =>
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
@@ -161,4 +184,6 @@ export function orderAccountsForRun(views, { reservePct = 0.05, rateDeadbandRel 
     ((a.resetAtMs ?? Number.MAX_SAFE_INTEGER) - (b.resetAtMs ?? Number.MAX_SAFE_INTEGER)) ||
     (a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0),
   );
+  const pub = ({ key, ...rest }) => rest;
+  return { order, paced: verdicts.filter(p => p.paced).map(pub), pools: verdicts.map(pub) };
 }
