@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { DEFAULT_BASE_URL, isPlaceholderLaneHost, assertLaneHostPinned, buildLaneRequest } from '../src/cliproxy.mjs';
@@ -133,37 +133,118 @@ test('onHealth degrades when the build did not pin a lane host', async () => {
 // --- the public tree carries no internal host ---
 
 // Hosts the public tree may name. The deployment's real lane host lives
-// only in the package-build overlay of src/lane-host.mjs, never here.
+// only in the package-build overlay of the pin file, never here.
 const PUBLIC_HOSTS = new Set([
   'artificialanalysis.ai',
   'cliproxy', // docker service name used as a negative-test input
+  'z.ai', // model provider named in an error-path fixture, not a lane host
 ]);
 
-// RFC 2606 reserved names: never routable to a real deployment.
-const isReserved = host => host.endsWith('.invalid') || host === 'example.com' || host.endsWith('.example.com');
+// Reserved names: never routable to a real deployment.
+const isReserved = host =>
+  host.endsWith('.invalid') ||
+  host === 'example.com' ||
+  host.endsWith('.example.com') ||
+  host.endsWith('.example') ||
+  host.endsWith('.test') ||
+  host === 'localhost' ||
+  host.endsWith('.localhost');
+
+// Suffixes a bare dotted token must end in to count as a host candidate.
+// Kept tight so code chains (which end in words like "model" or "read")
+// never match; only real host suffixes do.
+const BARE_HOST_SUFFIX = new Set([
+  'com', 'net', 'org', 'io', 'dev', 'app', 'cloud', 'ai',
+  'co', 'us', 'uk', 'de', 'fr', 'jp', 'xyz', 'me', 'so', 'sh', 'cc',
+  'internal', 'corp', 'local', 'lan', 'home', 'intranet', 'private',
+  'invalid', 'example', 'test', 'localhost',
+]);
+
+function collectUrlHosts(text) {
+  const hosts = [];
+  for (const m of text.matchAll(/https?:\/\/([A-Za-z0-9._-]+)/g)) {
+    hosts.push(m[1].toLowerCase());
+  }
+  return hosts;
+}
+
+function collectBareHosts(text) {
+  const hosts = [];
+  for (const m of text.matchAll(/\b([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+)(:[0-9]{2,5})?\b/g)) {
+    const dotted = m[1].toLowerCase();
+    const tld = dotted.split('.').pop();
+    if (!BARE_HOST_SUFFIX.has(tld)) continue;
+    if (!/[a-z]/.test(tld)) continue; // skip version-like numeric tails
+    hosts.push(dotted);
+  }
+  return hosts;
+}
+
+function isAllowlistedHost(host) {
+  return PUBLIC_HOSTS.has(host) || isReserved(host);
+}
+
+function walkFiles(dir, out = []) {
+  for (const entry of readdirSync(dir)) {
+    if (entry === '.git' || entry === 'node_modules') continue;
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) walkFiles(full, out);
+    else if (st.isFile()) out.push(full);
+  }
+  return out;
+}
 
 function trackedFiles() {
-  const out = [join(ROOT, 'README.md'), join(ROOT, 'config.example.json'), join(ROOT, 'package.json')];
-  for (const dir of ['src', 'test']) {
-    for (const f of readdirSync(join(ROOT, dir))) {
-      if (f.endsWith('.mjs')) out.push(join(ROOT, dir, f));
-    }
-  }
-  // lane-host.mjs is the build overlay point: a deployment replaces it.
-  return out.filter(f => !f.endsWith(join('src', 'lane-host.mjs')));
+  // Every file in the worktree except the build overlay point: prose,
+  // workflows and scripts are where a host typically comes back.
+  const overlay = join(ROOT, 'src', 'lane-host.mjs');
+  return walkFiles(ROOT).filter(f => f !== overlay);
 }
 
 test('public files name only allowlisted hosts (no internal host in the tree)', () => {
   const offenders = [];
+  const seen = new Set();
   for (const file of trackedFiles()) {
-    const text = readFileSync(file, 'utf8');
-    for (const m of text.matchAll(/https?:\/\/([A-Za-z0-9._-]+)/g)) {
-      const host = m[1].toLowerCase();
-      if (PUBLIC_HOSTS.has(host) || isReserved(host)) continue;
-      offenders.push(`${file.slice(ROOT.length)}: ${host}`);
+    let text;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const host of [...collectUrlHosts(text), ...collectBareHosts(text)]) {
+      if (isAllowlistedHost(host)) continue;
+      const key = `${file.slice(ROOT.length)}: ${host}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      offenders.push(key);
     }
   }
   assert.deepEqual(offenders, []);
+});
+
+test('host guard scans workflows and scripts, not just src and docs', () => {
+  const files = trackedFiles().map(f => f.slice(ROOT.length));
+  assert.ok(files.some(f => f.endsWith(join('.github', 'workflows', 'ci.yml'))));
+  assert.ok(files.some(f => f.endsWith(join('scripts', 'check-public-pin.mjs'))));
+  assert.ok(!files.some(f => f.endsWith(join('src', 'lane-host.mjs'))));
+});
+
+test('host collectors catch bare and port forms and ignore code chains', () => {
+  const corpNet = '.corp-internal' + '.net';
+  assert.deepEqual(
+    collectUrlHosts('see ' + 'https://' + 'metrics' + corpNet + '/x'),
+    ['metrics' + corpNet],
+  );
+  assert.deepEqual(
+    collectBareHosts('lane at ' + 'router' + corpNet + ':8443'),
+    ['router' + corpNet],
+  );
+  assert.deepEqual(collectBareHosts('lane at ' + 'router' + corpNet), ['router' + corpNet]);
+  assert.deepEqual(collectBareHosts('payload.modelDecision.model and issue.comments.read'), []);
+  assert.deepEqual(collectBareHosts('managed ' + 'Z' + '.ai capacity remains'), ['z.ai']);
+  assert.ok(isAllowlistedHost('z.ai'));
+  assert.ok(!isAllowlistedHost('metrics' + corpNet));
 });
 
 test('example config validates against any pin: it does not set baseUrl', () => {
