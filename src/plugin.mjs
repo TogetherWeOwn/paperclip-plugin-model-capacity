@@ -27,6 +27,8 @@ import {
   DEFAULT_ACCOUNTS_PATH,
   LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
+  isPlaceholderLaneHost,
+  assertLaneHostPinned,
   buildLaneRequest,
   assertLaneRequest,
   parseLaneBody,
@@ -411,7 +413,13 @@ export function resolveConfig(raw = {}) {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
-    contextCaps: { ...DEFAULT_CONTEXT_CAPS, ...(raw.contextCaps ?? {}) },
+    contextCaps: {
+      ...DEFAULT_CONTEXT_CAPS,
+      ...(raw.contextCaps ?? {}),
+      // Explicit false restores base-cost burn (rollback); anything else
+      // keeps the tier-adjusted quota default.
+      tierAffectsQuota: (raw.contextCaps ?? {}).tierAffectsQuota !== false,
+    },
     // Kill switch for run.model.resolve enforcement. False (default): the
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
@@ -500,7 +508,11 @@ function windowStartMs(resetsAtMs) {
   return resetsAtMs - WEEKLY_WINDOW_MS;
 }
 
-export function createModelCapacityPlugin({ clock = Date.now } = {}) {
+// `requirePinnedLaneHost` is a test seam: the unit suite drives the lane
+// read against the public placeholder pin with a fake http client. The
+// worker entry never passes it, so every deployed plugin refuses to read
+// the lane key unless the build pinned a real host.
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true } = {}) {
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -522,8 +534,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   // attempts (12, hard-coded host-side), so a mark older than that lifespan
   // no longer means waiting. Past it the run counts as in flight again --
   // fail closed, exactly like a lost terminal event whose record stays
-  // running until the in-flight horizon. Every retry re-defers and refreshes
-  // the mark, so a run that is genuinely still waiting keeps its exclusion.
+  // running until the in-flight horizon. The host cancels a deferred run at
+  // once and retries it as a new run under a new id, so a mark is never
+  // refreshed: the lifespan bound only matters when the run's terminal
+  // event is lost, and then the stale mark expires instead of hiding an
+  // executing run behind a waiting claim.
   const DEFERRED_MARK_ATTEMPTS = 12;
   const DEFERRED_MARK_SLACK_MS = 60 * 1000;
   const deferredRuns = new Map();
@@ -630,6 +645,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * code path can fetch anywhere else.
    */
   async function cliproxyLaneGet(companyId, config) {
+    if (requirePinnedLaneHost) assertLaneHostPinned(config.cliproxy.baseUrl);
     const laneKey = await ctx.secrets.resolve(config.cliproxy.laneKeySecretRef, { companyId, configPath: 'cliproxy.laneKeySecretRef' });
     const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
     assertLaneRequest({ method: req.method, url: req.url, body: null },
@@ -959,7 +975,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           armId: a.armId,
           Q: blendQ(qAa, qEee, alphaDoer),
           // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
-          // below stays on base cost: price cliffs change money, not tokens.
+          // below uses the same effective cost while
+          // contextCaps.tierAffectsQuota holds (default true): on
+          // subscription lanes quota charges the tier price, not base.
           C: tier.costEffective ?? base,
           coverage: scored.get(a.armId)?.coverage ?? 0,
           costBase: base,
@@ -1020,12 +1038,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
       };
       const admitted = credentialLadderFor(credentialRanking, credentialNow);
+      // Quota burn prices the tier multiplier while tierAffectsQuota holds:
+      // subscription quota charges Haiku over 100k at ~5x base, so pacing,
+      // headroom (decide burn check), concurrency and target shares all see
+      // the effective cost. False restores base-cost burn.
+      const quotaAffects = config.contextCaps?.tierAffectsQuota !== false;
+      const burnCostOf = (e) => quotaAffects
+        ? (e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null)
+        : (costs.get(e.armId)?.C ?? null);
       ladders[keyOf(account, i)] = {
         ...admitted,
         rankingRungs: ranking.rungs,
         rankingWithinNoise: ranking.withinNoise,
         credentialRanking,
-        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
+        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(burnCostOf(e))])),
       };
     }
     // Feasibility-gated compact windows per MODEL (most constraining cap
@@ -2978,12 +3004,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
 
     async onHealth() {
       const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
+      // A build that did not pin a real lane host cannot read the feed.
+      const laneHostPinned = !isPlaceholderLaneHost();
       return {
-        status: configured.size === 0 ? 'degraded' : 'ok',
-        message: enforcing > 0
-          ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
-          : 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, manifest: manifest.id },
+        status: configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok',
+        message: !laneHostPinned
+          ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
+          : enforcing > 0
+            ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
+            : 'Shadow only; no runs are changed.',
+        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id },
       };
     },
 
