@@ -3530,7 +3530,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
-        const also = order.length > 0 ? `; ${order.length} unpaced account(s) also unselectable this call` : '';
+        const also = order.length > 0 ? `; ${new Set(order.map(v => v.accountId)).size} unpaced account(s) also unselectable this call` : '';
         return deferred({
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,

@@ -200,4 +200,5 @@ test('hook: a paced pool plus unselectable unpaced accounts defers on the guard 
   assert.equal(h.retryAfterMs, DEFAULT_PACE_GUARD.retryAfterMs, 'the paced pool waits minutes for a slot, not seconds');
   assert.match(h.reason, /pace guard/);
   assert.match(h.reason, /claude/);
+  assert.match(h.reason, /1 unpaced account\(s\) also unselectable/);
 });

@@ -421,7 +421,7 @@ test('a paced pool plus a trial-full unpaced pool defers on the guard retry', as
   assert.equal(fourth.retryAfterMs, DEFAULT_PACE_GUARD.retryAfterMs);
   assert.match(fourth.reason, /pace guard/);
   assert.match(fourth.reason, /claude/);
-  assert.match(fourth.reason, /unpaced account\(s\) also unselectable/);
+  assert.match(fourth.reason, /1 unpaced account\(s\) also unselectable/);
 });
 
 test('validateConfigShape tolerates a non-object pacing like before the guard existed', () => {
