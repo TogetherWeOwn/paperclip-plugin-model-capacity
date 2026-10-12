@@ -195,14 +195,18 @@ export function isInflight(r, nowMs, horizonMs) {
  * Single-pass in-flight census. Each record contributes at most one unit,
  * so double-counting is structurally impossible (no clamp backstop).
  * Returns { byAccount, unattributed, staleExcluded, unverifiedExcluded }.
+ * `skip(record)` true leaves a record out entirely.
  */
-export function inflightByAccount(ledger, { nowMs, horizonMs }) {
+export function inflightByAccount(ledger, { nowMs, horizonMs, skip = null }) {
   const byAccount = {};
   let unattributed = 0;
   let staleExcluded = 0;
   let unverifiedExcluded = 0;
   for (const r of (ledger ?? new Map()).values()) {
     if (isLedgerTerminal(r?.status)) continue;
+    // Callers that count only runs actually executing (the pace guard)
+    // pass a predicate for records to leave out of every tally.
+    if (skip != null && skip(r)) continue;
     const anchor = anchorOf(r);
     if (anchor == null || !(anchor <= nowMs) || nowMs - anchor >= horizonMs) {
       staleExcluded += 1;
