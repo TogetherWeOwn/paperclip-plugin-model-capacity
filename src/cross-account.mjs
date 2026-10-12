@@ -4,7 +4,7 @@
  *
  * Two owner-reported failure modes live here:
  *
- * 1. Cross-account dominance (TOG-21579): `dominated` in ladder.mjs is
+ * 1. Cross-account dominance: `dominated` in ladder.mjs is
  *    computed per account, so a model dominated on Codex (old Sol) stays
  *    eligible on Devin. Drop a rung when the same family has a newer or
  *    better arm (higher fleet Q, cost <=) on any qualified account with

@@ -324,7 +324,7 @@ frozen clock can never double-count.
    A rung is also dropped fleet-wide when the same family has a newer or
    better arm (higher fleet Q, cost <=) on a qualified account with
    headroom, so old Sol on Devin never survives next to gpt-6.1-sol on
-   Codex (TOG-21579).
+   Codex.
    `targetShare_a = requiredRate_a / E_a` (same term as the C*
    concurrency target). In-flight is pooled at the **provider level**:
    CLIProxy round-robins same-provider lanes onto shared credentials, so

@@ -11,6 +11,9 @@ import {
 } from '../src/cross-account.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import {
+  createBreakerStore, breakerStoreToJSON, recordArmFailure, sanitizeBreakers,
+} from '../src/breakers.mjs';
 
 const view = (accountId, partial = {}) => ({
   accountId,
@@ -238,7 +241,7 @@ const aaRows = () => ([
   { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
   { slug: 'kimi-k3', intelligenceIndex: 55, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
   { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
-  // TOG-21579 pair: same family, newer scores higher at equal cost.
+  // Same-family pair: newer scores higher at equal cost.
   { slug: 'gpt-6-1-sol', intelligenceIndex: 68, intelligenceIndexCostPerTask: 20, price1mInputTokens: 4, price1mOutputTokens: 20 },
   { slug: 'gpt-6-sol', intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 4, price1mOutputTokens: 20 },
 ]);
@@ -309,7 +312,7 @@ const readyLane = (lane, nowMs) => ({
   }),
 });
 
-function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, rows = null }) {
+function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, rows = null, seedStates = [] }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -356,6 +359,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
   return {
     run: async () => {
       await plugin.setup(fake);
+      for (const [k, v] of seedStates) store.set(skey(k), v);
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: rows ?? aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
       for (const s of steps ?? [{ now: nowMs }]) {
@@ -379,11 +383,18 @@ test('tick: ahead-of-plan Codex new Sol beats reactive Devin old Sol end to end'
   // 10-11 case through a real tick: Codex burns 2% -> 9% in 30 min (measured
   // far above required, so band 2) while Devin reactive serves old Sol.
   // Dominance drops the old Sol arm; the run lands on Codex gpt-6.1-sol.
-  const laneAt = (weekly) => [codexSol({ weekly }), devinOldSol()];
+  // observedAt is stamped from the drive clock every tick: a pinned stamp
+  // reports no movement, measures no rate, and leaves Codex in band 0 --
+  // which already beats reactive Devin with or without dominance, so the
+  // placement assertion below would prove nothing.
+  const laneAt = (weekly, now) => [
+    codexSol({ weekly, observedAt: new Date(now).toISOString() }),
+    devinOldSol({ observedAt: new Date(now).toISOString() }),
+  ];
   const at = TICK + 30 * 60000;
   const { run } = drive({
     nowMs: TICK,
-    laneAccounts: (tickNo, now) => laneAt(now <= TICK ? 0.02 : 0.09),
+    laneAccounts: (tickNo, now) => laneAt(now <= TICK ? 0.02 : 0.09, now),
     steps: [
       { now: TICK },
       { now: at, fire: [started('run-sol-1', at - 60000, { adapterType: 'claude-code' })] },
@@ -399,6 +410,33 @@ test('tick: ahead-of-plan Codex new Sol beats reactive Devin old Sol end to end'
   const devin = byId.get('devin:devin-lane-1');
   assert.ok(codex.arms.length > 0, 'Codex keeps its Sol arm');
   assert.deepEqual(devin.arms, [], 'dominance drops old Sol from Devin end to end');
+});
+
+test('tick: control without dominance the same ahead-of-plan run lands on Devin', async () => {
+  // Control for the placement assertion above: Codex still burns 90% -> 97%
+  // in 30 min (band 2, ordering after reactive band 1) but its headroom
+  // comes from the weekly window alone (no 5h meter: 3% left, below the
+  // 5% dominance bar), so nothing is dropped and reactive Devin -- which
+  // orders first -- keeps its arm and serves the run. If the main test
+  // ever passes without dominance, this control catches it.
+  const laneAt = (weekly, now) => [
+    codexSol({ weekly, fiveHour: null, reset5: null, observedAt: new Date(now).toISOString() }),
+    devinOldSol({ observedAt: new Date(now).toISOString() }),
+  ];
+  const at = TICK + 30 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: (tickNo, now) => laneAt(now <= TICK ? 0.90 : 0.97, now),
+    steps: [
+      { now: TICK },
+      { now: at, fire: [started('run-sol-ctrl', at - 60000, { adapterType: 'claude-code' })] },
+    ],
+  });
+  const { shadow, capacity } = await run();
+  assert.equal(shadow.body.entries.length, 1);
+  assert.equal(shadow.body.entries[0].accountId, 'devin:devin-lane-1');
+  const byId = accountsById(capacity);
+  assert.ok(byId.get('devin:devin-lane-1').arms.length > 0, 'no dominance: Devin keeps old Sol');
 });
 
 test('tick: native at its reactive cap falls back to duplicate Devin (arms kept)', async () => {
@@ -447,4 +485,45 @@ test('tick: metered dominator without a weekly reading never dominates', async (
   assert.ok(devin.arms.length > 0, 'unroutable dominator drops nothing');
   assert.equal(shadow.body.entries.length, 1);
   assert.equal(shadow.body.entries[0].accountId, 'devin:devin-lane-1');
+});
+
+test('tick: open breaker on the dominator keeps Devin serving end to end', async () => {
+  // Same ahead-of-plan Codex (2% -> 9% in 30 min) next to reactive Devin,
+  // but Codex new Sol tripped its breaker (two auth failures) before the
+  // tick. The dominator gate excludes it, so Devin keeps old Sol and the
+  // run lands on Devin. Kills the `const breaker = 'closed'` mutant: with
+  // the gate forced shut, Devin loses its arm and the run goes unplaced.
+  const bcfg = sanitizeBreakers();
+  const bstore = createBreakerStore();
+  for (const atMs of [TICK - 2 * 60000, TICK - 60000]) {
+    recordArmFailure(
+      bstore, 'codex:codex-lane-1', 'gpt-6-1-sol',
+      { atMs, errorText: 'auth_unavailable' }, atMs, bcfg,
+    );
+  }
+  const breakerSeed = breakerStoreToJSON(bstore, { nowMs: TICK, cfg: bcfg });
+  const laneAt = (weekly, now) => [
+    codexSol({ weekly, observedAt: new Date(now).toISOString() }),
+    devinOldSol({ observedAt: new Date(now).toISOString() }),
+  ];
+  const at = TICK + 30 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: (tickNo, now) => laneAt(now <= TICK ? 0.02 : 0.09, now),
+    steps: [
+      { now: TICK },
+      { now: at, fire: [started('run-sol-brk', at - 60000, { adapterType: 'claude-code' })] },
+    ],
+    seedStates: [[
+      { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' },
+      breakerSeed,
+    ]],
+  });
+  const { shadow, capacity } = await run();
+  const byId = accountsById(capacity);
+  const devin = byId.get('devin:devin-lane-1');
+  assert.ok(devin.arms.some(a => a.armId === 'gpt-6-sol'), 'open breaker on Codex: Devin keeps old Sol');
+  assert.equal(shadow.body.entries.length, 1);
+  assert.equal(shadow.body.entries[0].accountId, 'devin:devin-lane-1');
+  assert.match(shadow.body.entries[0].wouldModel, /gpt-6-sol/);
 });

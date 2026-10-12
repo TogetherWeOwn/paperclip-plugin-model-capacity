@@ -1875,7 +1875,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // the stale horizon -- never the 60-min rate window, which would drop
     // still-running runs across restarts.
     const viewById = new Map(accountViews.map(v => [v.accountId, v]));
-    // TOG-21579: cross-account dominance + aggregator fallback-only.
+    // Cross-account dominance + aggregator fallback-only.
     // Served models come from the lane feed (authoritative); ladders may
     // already exclude unserved ids. Views without a feed models list fail
     // open (never fallback-only). Dominance uses fleet Q + effective cost;
@@ -1945,6 +1945,18 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const dropKeys = dominatedKeys;
       if (dropKeys.size > 0) {
         for (const [key, ladder] of Object.entries(ladders ?? {})) {
+          // Routing reads the admitted ladder rebuilt from
+          // credentialRanking, not ladder.rungs: dominated candidates must
+          // go too, or credentialLadderFor revives them and the drop only
+          // hides them from the capacity view. rankingRungs stays the
+          // pacing range.
+          const ranking = ladder?.credentialRanking;
+          if (Array.isArray(ranking?.candidates)) {
+            const keptCandidates = ranking.candidates.filter(c => !dropKeys.has(`${key}\u0000${c.armId}`));
+            if (keptCandidates.length !== ranking.candidates.length) {
+              ranking.candidates = keptCandidates;
+            }
+          }
           const before = (ladder?.rungs ?? []).length;
           if (before === 0) continue;
           const kept = (ladder.rungs ?? []).filter(r => !dropKeys.has(`${key}\u0000${r.armId}`));
