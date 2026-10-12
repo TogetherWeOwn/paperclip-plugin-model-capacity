@@ -143,7 +143,9 @@ export function orderAccountsForRun(views, opts = {}) {
  *   pools  every qualified pool's verdict (for reporting)
  * opts.pacing = { enabled, marginPct, meanRunDurationHours } turns the guard
  * on; absent (null) it is off and `order` is exactly the old ordering. Views
- * may carry `planAhead` (weekly used minus the linear plan; null unknown).
+ * may carry `planAhead` (weekly used minus the linear plan; null unknown) and
+ * `held` (true: the lane may not route this pass; it still counts toward its
+ * pool's verdict, so every pass sees the same pool membership).
  * Callers re-evaluate per run with fresh in-flight counts, so the cap
  * releases the moment a run finishes and the next call sees the lower count.
  */
@@ -158,7 +160,8 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // placement scores and shortfalls below see only the pools that can serve.
   const verdicts = paceGuardPools(eligible, { pacing, poolKeyOf });
   const pacedKeys = new Set(verdicts.filter(p => p.paced).map(p => p.key));
-  const qualified = pacedKeys.size > 0 ? eligible.filter(v => !pacedKeys.has(poolKeyOf(v))) : eligible;
+  const routable = eligible.filter(v => !v.held);
+  const qualified = pacedKeys.size > 0 ? routable.filter(v => !pacedKeys.has(poolKeyOf(v))) : routable;
   // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
   // only models a qualified native also serves sorts after every need band.
   // Views without a `models` list fail open (never fallback-only), so older

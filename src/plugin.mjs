@@ -2122,9 +2122,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const allocationOrder = (role, selfRunId = null, duplicates = true) => {
       const { pools, byAccount } = freshPressure();
       const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
+      const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
+        routableGroupsFor(ladders[v.accountId], dups), breakers, v.accountId, nowMs, breakersCfg));
       return orderAccountsWithPacing(
-        accountViews.filter(v => rungsHaveEligibleArms(filterBreakerRungs(
-          routableGroupsFor(ladders[v.accountId], duplicates), breakers, v.accountId, nowMs, breakersCfg))).map(v => ({
+        accountViews.filter(v => routesRun(v, true)).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -2142,6 +2143,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           duplicates,
+          held: !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
           planAhead: v.planAhead,
         })),
@@ -2765,21 +2767,23 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
       })
       : {};
+    const routesRun = (a, dups) => filterBreakerRungs(routableGroupsFor(a, dups),
+      breakerStores.get(companyId) ?? createBreakerStore(), a.accountId, clock(),
+      lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS);
     return orderAccountsWithPacing(
-      (live.accounts ?? []).map(a => ({
-        ...a, ladderRungs: filterBreakerRungs(routableGroupsFor(a, duplicates),
-          breakerStores.get(companyId) ?? createBreakerStore(), a.accountId, clock(),
-          lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS),
-      })).filter(a => rungsHaveEligibleArms(a.ladderRungs)).map(a => {
+      (live.accounts ?? []).filter(a => rungsHaveEligibleArms(routesRun(a, true))).map(a => {
         const p = poolOf(a.accountId);
+        const ladderRungs = routesRun(a, duplicates);
         return {
           ...a,
+          ladderRungs,
+          held: !duplicates && !rungsHaveEligibleArms(ladderRungs),
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
           paceInFlight: pacePools[p] ?? 0,
           pool: p,
           laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
-          placementQ: placementArm(a.ladderRungs ?? [], {
+          placementQ: placementArm(ladderRungs, {
             role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
             trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles, pointer: a.pointer ?? 0,
           })?.quality ?? null,
