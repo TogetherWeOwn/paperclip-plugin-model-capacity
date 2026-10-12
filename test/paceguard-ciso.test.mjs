@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { DEFAULT_PACE_GUARD } from '../src/paceguard.mjs';
-import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { withSyntheticReadiness, syntheticAvailability } from './synthetic-readiness.mjs';
 
 // Regression tests for the CISO re-review on the v0.2.28 pace-guard merge
 // (adverse findings, fixed here). Each test fails on the pre-fix code. The
@@ -66,6 +66,8 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
+  // Unit suite drives the lane read against the public placeholder pin
+  // with a fake http client (see the requirePinnedLaneHost seam).
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
@@ -102,34 +104,32 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
-  // run-2 starts at the tick (host order: started fires before the hook
-  // resolves) with a model the tick maps to the claude pool, then the hook
-  // defers it at the cap and marks it waiting. The event is stamped at the
-  // tick: a future anchor would read as stale and leave the census entirely,
-  // so the exclusion below would prove nothing.
+  // run-2 starts (host order: started fires before the hook resolves) with a
+  // model the tick maps to the claude pool, then the hook defers it at the
+  // cap and marks it waiting. The event is stamped at the tick time: a
+  // future anchor would read as unverified and leave the census through the
+  // read-time prune instead of the TTL, so the TTL assertions below would
+  // pass with the TTL logic removed.
   await d.fire(runEvent('run-2', TICK, 'agent.run.started', 'agent-9', { model: 'claude-opus-5-5' }));
   const def = await d.hook('run-2');
   assert.equal(def.kind, 'defer');
   assert.match(def.reason, /pace guard/);
   // run-1 finishes; run-2 never resolves and no terminal event ever lands.
   await d.fire(runEvent('run-1', TICK + 2 * MIN, 'agent.run.finished'));
-  // +30 min: inside 12 x 300 s + 60 s = 61 min the fresh mark still excludes
-  // run-2, so the freed slot decides. Without the mark run-2 (in flight
-  // since the tick) would hold the cap and this would defer.
+  await d.tick();
+  // Inside 12 x 300 s + 60 s slack = 61 min the mark is fresh, so the pool
+  // reads empty and the next run is admitted.
   d.setNow(TICK + 30 * MIN);
   await d.tick();
-  assert.equal((await d.hook('run-3')).kind, 'decide', 'fresh mark excludes the waiting run; the freed slot decides');
-  // run-3 finishes: without this the +70 min assertion below would hold via
-  // run-3 alone (it fills the cap-1 pool by itself) whether or not run-2's
-  // mark expires, so the test would pass with the TTL check removed.
-  await d.fire(runEvent('run-3', TICK + 31 * MIN, 'agent.run.finished'));
-  // +70 min: past the mark lifespan the abandoned run counts as in flight
-  // again (fail closed), inside the 2 h ledger horizon, so the pool is back
-  // at its cap.
+  assert.equal((await d.hook('run-3')).kind, 'decide', 'fresh mark still hides run-2; the pool has a free slot');
+  // Past the 61 min lifespan, inside the 2 h ledger horizon, the stale mark
+  // drops and run-2 counts as in flight again: the pool is back at its cap.
+  // Same run id as above, so the guard's self-exclusion keeps run-3's own
+  // decided record out of the census and only run-2 can hold the pool.
   d.setNow(TICK + 70 * MIN);
   await d.tick();
   d.killIo();
-  const again = await d.hook('run-4');
+  const again = await d.hook('run-3');
   assert.equal(again.kind, 'defer', 'stale mark must not hide run-2; the pool is still at its cap');
   assert.match(again.reason, /pace guard/);
 });
@@ -140,31 +140,43 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
 // never execute), so counting them lets one burst of fresh starts hold every
 // pool for all the others and nothing is ever decided (trial-budget and
 // shadow-agreement tests pin the deciding behavior). The fail-open is
-// explicit instead: /capacity publishes the unaccounted amount. Here a
-// A started run the tick never evaluates stays unattributed: event-time
-// shadow covers only runs started within 15 min, so a run that began 30
-// min ago (still inside the 2 h ledger horizon) is never decided, never
-// counted toward any pool's cap, and published as unaccounted instead --
-// while the hook still serves the pool minimum to decidable runs.
-// (An all-families operator exclusion no longer strands a run for this:
-// post-#25 the list suspends so the role still decides.)
+// explicit instead: /capacity publishes the unaccounted amount. Here the
+// claude lane is all-cooling (no ready credentials, transient lane state)
+// while the thinker is banned from the healthy gemini family: the ban holds
+// (claude still serves the role structurally, so no suspension lifts it)
+// but nothing anywhere can decide the thinker's run, so its started record
+// stays running and unattributed; the hook still decides for the doer on
+// gemini while the report shows the 1 unaccounted run and no claude pool
+// usage (unmeasured while all-cooling).
 test('hook: an unattributed waiting run fails open and is exposed in /capacity', async () => {
+  const coolingClaude = claudeLane(0.9);
+  coolingClaude.credentialAvailability = syntheticAvailability(coolingClaude, TICK, { serving: 1, ready: 0 });
   const d = drive({
     config: {
       enforce: true,
-      roles: { thinkerAgentIds: ['agent-thinker'] },
+      // Readiness admission is opt-in (v0.2.37); without it the cooling lane is admitted.
+      credentialReadiness: { enforce: true },
+      roles: {
+        thinkerAgentIds: ['agent-thinker'],
+        excludeFamilies: { thinker: ['gemini'] },
+      },
     },
-    accounts: [claudeLane(0.9)],
+    accounts: [coolingClaude, geminiLane()],
   });
   await d.setup();
-  // Fired before the first tick (no live view yet, so no event-time
-  // decision) and backdated past the 15-min shadow window (so no later
-  // tick evaluates it either): the record stays running and unattributed.
-  // A future anchor would read as stale and leave the census entirely.
-  await d.fire(runEvent('run-X', TICK - 30 * MIN, 'agent.run.started', 'agent-thinker'));
+  await d.tick();
+  // The thinker starts a run nobody can decide for it (claude all-cooling,
+  // gemini banned for its role) and no model info ever resolves, so the
+  // record stays running and unattributed. The event is stamped at the tick
+  // time: a future anchor would read as stale and leave the census entirely.
+  await d.fire(runEvent('run-X', TICK, 'agent.run.started', 'agent-thinker'));
   await d.tick();
   const cap = (await d.api('capacity')).body;
   assert.equal(cap.paceGuard.unattributedInFlight, 1, 'the unaccounted run is visible to operators');
+  assert.equal(
+    cap.paceGuard.pools.find(p => p.pool === 'claude')?.inFlight ?? 0, 0,
+    'the unattributed run consumes none of the claude pool cap (unmeasured while all-cooling)',
+  );
   d.killIo();
   const h = await d.hook('run-Y');
   assert.equal(h.kind, 'decide', 'fail open: an unknown run alone never holds the pool');
@@ -188,4 +200,5 @@ test('hook: a paced pool plus unselectable unpaced accounts defers on the guard 
   assert.equal(h.retryAfterMs, DEFAULT_PACE_GUARD.retryAfterMs, 'the paced pool waits minutes for a slot, not seconds');
   assert.match(h.reason, /pace guard/);
   assert.match(h.reason, /claude/);
+  assert.match(h.reason, /1 unpaced account\(s\) also unselectable/);
 });

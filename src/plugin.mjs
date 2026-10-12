@@ -606,7 +606,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // attempts (12, hard-coded host-side), so a mark older than that lifespan
   // no longer means waiting. Past it the run counts as in flight again --
   // fail closed, exactly like a lost terminal event whose record stays
-  // running until the in-flight horizon.
+  // running until the in-flight horizon. The host cancels a deferred run at
+  // once and retries it as a new run under a new id, so a mark is never
+  // refreshed: the lifespan bound only matters when the run's terminal
+  // event is lost, and then the stale mark expires instead of hiding an
+  // executing run behind a waiting claim.
   const DEFERRED_MARK_ATTEMPTS = 12;
   const DEFERRED_MARK_SLACK_MS = 60 * 1000;
   const deferredRuns = new Map();
@@ -3740,7 +3744,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
-        const also = order.length > 0 ? `; ${order.length} unpaced account(s) also unselectable this call` : '';
+        const also = order.length > 0 ? `; ${new Set(order.map(v => v.accountId)).size} unpaced account(s) also unselectable this call` : '';
         return deferred({
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,

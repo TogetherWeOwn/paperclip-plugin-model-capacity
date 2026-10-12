@@ -61,6 +61,12 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.40 = PACE-GUARD DEFER REASON COUNT: the mixed-hold defer reason
+ * counts distinct unpaced accounts (the duplicate-pass order listed each
+ * account twice). The deferred-mark TTL, the mixed-hold defer and
+ * `paceGuard.unattributedInFlight` shipped in 0.2.39 and are unchanged.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.39 = REVIEW-RESERVE REVIEW ROUND: pinned review runs price from
  * their pinned model (hottest arm only when the model matches nothing), so
  * a Haiku-pinned reviewer no longer burns at Opus price; a one-sided
@@ -172,7 +178,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.39';
+export const PLUGIN_VERSION = '0.2.40';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
