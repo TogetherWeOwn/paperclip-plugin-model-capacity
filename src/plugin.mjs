@@ -1805,7 +1805,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (mapped != null) r.actualAccount = mapped;
       }
       if (r.actualModel != null && r.actualModel !== 'unknown' && r.wouldModel != null && r.modelMatch == null) {
-        r.modelMatch = r.actualModel === String(r.wouldModel).split('(')[0] || r.actualModel === r.wouldModel;
+        // Canonical compare: a prefixed emission (`devin/<id>`) matches a
+        // bare actual of the same id (account attribution stays exact).
+        r.modelMatch = canonicalModelName(r.actualModel) === canonicalModelName(r.wouldModel);
       }
       if (r.actualPending === true && r.actualModel != null && r.actualModel !== 'unknown') r.actualPending = false;
     }
@@ -2593,7 +2595,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (decision) {
         // 1M claude runs render decorated so the CLI takes the 1M window;
         // the terminal modelDecision echoes the same string, keeping
-        // modelMatch exact.
+        // modelMatch canonical.
         const wouldModel = decoratedModelFor(decision, run.adapterType ?? null)
           ?? `${decision.model}(${decision.effort ?? 'default'})`;
         const actualModel = actual.model ?? run.actualModel ?? 'unknown';
@@ -2620,8 +2622,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             rec.actualAccount = accountOfModel(actual.model);
           }
           // Did shadow agree with reality? Null while the actual model is
-          // still unknown; true/false once known.
-          rec.modelMatch = actual.model == null ? null : (actual.model === decision.model || actual.model === wouldModel);
+          // still unknown; true/false once known. Canonical: a prefixed
+          // emission matches a bare actual of the same id.
+          rec.modelMatch = actual.model == null ? null
+            : canonicalModelName(actual.model) === canonicalModelName(wouldModel);
         }
         observed += 1;
       } else {

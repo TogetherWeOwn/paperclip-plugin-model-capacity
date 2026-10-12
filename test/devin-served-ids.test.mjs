@@ -92,6 +92,60 @@ test('unknown-provider error is fatal and never escalates the rung', () => {
   assert.equal(unservable.rung, 0, 'unservable failures stay on the pointer rung');
 });
 
+// Shadow agreement stays true when the run reports the bare id of a prefixed
+// decision: the lane routes `devin/<id>` while operators configure the bare
+// id, so the match compares canonical ids, never exact strings.
+test('shadow modelMatch agrees on bare actuals of prefixed decisions', async () => {
+  const lane = {
+    observedAt: new Date(NOW).toISOString(),
+    servedModels: ['devin/gpt-5-5'],
+    accounts: [{
+      lane: 'devin-lane-1', provider: 'devin', accountKey: 'devin-lane-1',
+      health: 'healthy', meter: 'reactive',
+      models: ['devin/gpt-5-5'],
+      weekly: { used: null, resetsAt: null },
+      fiveHour: { used: null, resetsAt: null },
+      observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+    }],
+  };
+  const rows = [
+    { slug: 'gpt-5-5', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ];
+  const config = { enforce: true, cliproxy: { laneKeySecretRef: SECRET } };
+  const store = new Map();
+  const jobs = new Map();
+  const events = new Map();
+  const key = k => JSON.stringify(k);
+  const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
+  await plugin.setup({
+    config: { get: async () => config },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, NOW, { emitted: { devin: ['gpt-5-5'] } }) }) },
+    agents: { get: async () => null },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (n, fn) => jobs.set(n, fn) },
+    events: { on: (n, fn) => { events.set(n, fn); } },
+    logger: { info() {}, error() {}, warn() {} },
+  });
+  store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
+    { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
+  await plugin.onConfigChanged(config, { companyId: 'acme' });
+  // The run reports the bare id (operator-configured); the lane routes prefixed.
+  await events.get('agent.run.started')({
+    type: 'agent.run.started', companyId: 'acme', entityId: 'run-bare',
+    payload: { run: { agentId: 'agent-9', adapterType: 'claude-code', model: 'gpt-5-5' } },
+    occurredAt: new Date(NOW).toISOString(),
+  });
+  await jobs.get('shadow-tick')({});
+  const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' });
+  const entry = capacity.body.entries.find(e => e.runId === 'run-bare');
+  assert.ok(entry, 'shadow entry recorded');
+  assert.equal(entry.wouldModel, 'devin/gpt-5-5(max)');
+  assert.equal(entry.actualModel, 'gpt-5-5');
+  assert.equal(entry.modelMatch, true);
+});
+
 // Same-family newer models dominate within one account even when the cost is
 // flat: gpt-5-4 must leave the Devin ladder once gpt-5-5 scores at least as
 // well at no higher cost.
