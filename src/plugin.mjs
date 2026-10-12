@@ -1888,6 +1888,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         .map(a => filterBreakerRungs(
           credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg,
         )),
+      // Structural view for the operator-list gate: every lane, health-,
+      // breaker- and readiness-independent, so a lane outage, a cooling
+      // arm or stale evidence never lifts an explicit ban (the role
+      // defers until recovery instead). Built from the unfiltered
+      // ranking (candidates joined to ranking rungs), NOT the
+      // readiness-admitted rungs: all-cooling, expired, zero-serving or
+      // missing evidence is transient lane state, not fleet structure.
+      structuralGroups: ordered
+        .map(a => {
+          const l = ladders[a.accountId];
+          const rungByArm = new Map((l?.rankingRungs ?? []).map(r => [r.armId, r.rung]));
+          if (rungByArm.size === 0) return groupByRung(l?.rungs ?? []);
+          return groupByRung((l?.credentialRanking?.candidates ?? [])
+            .filter(c => rungByArm.has(c.armId))
+            .map(c => ({ ...c, rung: rungByArm.get(c.armId) })));
+        }),
       roleBands,
       trialRoles: config.trials.roles,
     });
