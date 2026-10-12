@@ -27,6 +27,8 @@ import {
   DEFAULT_ACCOUNTS_PATH,
   LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
+  isPlaceholderLaneHost,
+  assertLaneHostPinned,
   buildLaneRequest,
   assertLaneRequest,
   parseLaneBody,
@@ -510,7 +512,11 @@ function windowStartMs(resetsAtMs) {
   return resetsAtMs - WEEKLY_WINDOW_MS;
 }
 
-export function createModelCapacityPlugin({ clock = Date.now } = {}) {
+// `requirePinnedLaneHost` is a test seam: the unit suite drives the lane
+// read against the public placeholder pin with a fake http client. The
+// worker entry never passes it, so every deployed plugin refuses to read
+// the lane key unless the build pinned a real host.
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true } = {}) {
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -605,6 +611,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * code path can fetch anywhere else.
    */
   async function cliproxyLaneGet(companyId, config) {
+    if (requirePinnedLaneHost) assertLaneHostPinned(config.cliproxy.baseUrl);
     const laneKey = await ctx.secrets.resolve(config.cliproxy.laneKeySecretRef, { companyId, configPath: 'cliproxy.laneKeySecretRef' });
     const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
     assertLaneRequest({ method: req.method, url: req.url, body: null },
@@ -1885,6 +1892,22 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         .map(a => filterBreakerRungs(
           credentialGroupsFor(ladders[a.accountId]), breakers, a.accountId, nowMs, breakersCfg,
         )),
+      // Structural view for the operator-list gate: every lane, health-,
+      // breaker- and readiness-independent, so a lane outage, a cooling
+      // arm or stale evidence never lifts an explicit ban (the role
+      // defers until recovery instead). Built from the unfiltered
+      // ranking (candidates joined to ranking rungs), NOT the
+      // readiness-admitted rungs: all-cooling, expired, zero-serving or
+      // missing evidence is transient lane state, not fleet structure.
+      structuralGroups: ordered
+        .map(a => {
+          const l = ladders[a.accountId];
+          const rungByArm = new Map((l?.rankingRungs ?? []).map(r => [r.armId, r.rung]));
+          if (rungByArm.size === 0) return groupByRung(l?.rungs ?? []);
+          return groupByRung((l?.credentialRanking?.candidates ?? [])
+            .filter(c => rungByArm.has(c.armId))
+            .map(c => ({ ...c, rung: rungByArm.get(c.armId) })));
+        }),
       roleBands,
       trialRoles: config.trials.roles,
     });
@@ -3105,12 +3128,16 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
 
     async onHealth() {
       const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
+      // A build that did not pin a real lane host cannot read the feed.
+      const laneHostPinned = !isPlaceholderLaneHost();
       return {
-        status: configured.size === 0 ? 'degraded' : 'ok',
-        message: enforcing > 0
-          ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
-          : 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, manifest: manifest.id },
+        status: configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok',
+        message: !laneHostPinned
+          ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
+          : enforcing > 0
+            ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
+            : 'Shadow only; no runs are changed.',
+        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id },
       };
     },
 

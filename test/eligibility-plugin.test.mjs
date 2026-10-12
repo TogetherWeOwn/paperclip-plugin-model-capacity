@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, validateConfigShape, resolveConfig } from '../src/plugin.mjs';
 import { DEFAULT_MIN_QUALITY, DEFAULT_OUTCOME_GATE } from '../src/eligibility.mjs';
-import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { withSyntheticReadiness, syntheticAvailability } from './synthetic-readiness.mjs';
 
 // Eligibility from data, end to end: the Q minimum and the measured-outcome
 // gate keep Muse off doers WITHOUT a hand-written ban, the emergency
@@ -36,11 +36,16 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, agentModels = {} } = {}) {
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, agentModels = {} } = {}) {
   const claudeLane = spentClaude
     ? lane('claude-1', 'claude', 'a1', 1, 0)
     : lane('claude-1', 'claude', 'a1', 0.95);
   if (unhealthyClaude) claudeLane.health = 'unhealthy';
+  // All-cooling evidence (readyCredentials 0): transient lane state, not a
+  // health flag. The lane stays healthy so placement still sees it; only
+  // credential admission drops its arms. withSyntheticReadiness never
+  // overwrites an own credentialAvailability key.
+  if (coolingClaude) claudeLane.credentialAvailability = syntheticAvailability(claudeLane, TICK, { serving: 1, ready: 0 });
   const store = new Map();
   const jobs = new Map();
   const skey = k => JSON.stringify(k);
@@ -232,6 +237,23 @@ test('emergency override still applies, warns while non-empty, and logs at most 
   d.advance(61 * 60000);
   await d.tick();
   assert.equal(warnings.length, 2, 'standing override is visible again after an hour');
+});
+
+test('an all-cooling lane never lifts the operator ban: the doer defers through the full plugin path', async () => {
+  // Claude credentials all-cooling (readyCredentials 0) is transient lane
+  // state, not fleet structure. The structural view must still see the
+  // Claude arms (unfiltered ranking), so the Meta muse ban for doers holds
+  // and the run defers -- going through the plugin readiness path, not a
+  // hand-built structuralGroups.
+  const cfg = { enforce: true, roles: { ...ROLES_CFG, ...NO_GATES, excludeFamilies: { doer: ['muse'] } } };
+  const d = drive({ config: cfg, coolingClaude: true });
+  await d.setup();
+  await d.tick();
+  const h = await d.hook('run-1', 'eng-doer');
+  assert.equal(h.kind, 'defer', 'doer defers while Claude is all-cooling');
+  const cap = await d.capacity();
+  assert.deepEqual(cap.eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
+  assert.ok(cap.roleExclusionsEffective.doer.includes('muse'));
 });
 
 test('an empty operator list logs nothing', async () => {

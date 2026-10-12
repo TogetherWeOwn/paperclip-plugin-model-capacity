@@ -355,7 +355,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     run: async () => {
       await plugin.setup(fake);
@@ -611,7 +611,7 @@ function driveLive({ nowMs, config = {}, laneAccounts = null, rows = null }) {
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setup: async () => {
       await plugin.setup(fake);
