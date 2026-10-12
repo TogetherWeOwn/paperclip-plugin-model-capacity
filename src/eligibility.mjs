@@ -411,9 +411,13 @@ export function buildEligibility({
     const dataOnly = attempts.find(a => servesHealthy([...manualList, ...tokensFor(a)]));
     // The operator's list lifts only on structural emptiness: when even
     // the fleet-wide arm set holds no non-banned arm fitting the role
-    // window and trial rules. A lane outage, an excluded account or an
-    // open breaker leaves the ban in place and the role defers.
-    const structurallyEmpty = !structurallyAccessible(role, [...manualList, ...tokensFor(attempts[0])]);
+    // window and trial rules. Judged on the operator list alone, never
+    // with the data gates on: when the only non-banned arms fail a data
+    // gate the list does not empty the role (the data gates yield for
+    // that), so a transient lane loss must not lift the ban. A lane
+    // outage, an excluded account or an open breaker leaves the ban in
+    // place and the role defers.
+    const structurallyEmpty = !structurallyAccessible(role, manualList);
     let state;
     if (dataOnly) state = { active: dataOnly, lifted: [] };
     else if (!structurallyEmpty) state = null;

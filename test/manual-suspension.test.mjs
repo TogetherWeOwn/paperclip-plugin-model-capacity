@@ -261,3 +261,20 @@ test('an unhealthy lane never lifts the operator ban: the role defers until the 
   assert.ok(degraded.exclusions.doer.includes('muse'));
   assert.equal(decideFor(META, 'doer', degraded.exclusions.doer).kind, 'defer');
 });
+
+test('structural emptiness ignores the data gates: a quality-gated non-banned arm holds the ban when its lane drops', () => {
+  // The thinker list bans muse; the only non-banned arm (Claude haiku)
+  // sits below the thinker quality floor. The list does not empty the
+  // role -- the data gates yield for that -- so the ban must hold even
+  // when the Claude lane drops out of the healthy set and the role defers.
+  const haiku = arm('claude-haiku-4-5', 'haiku', 0.1, { qFleetThinker: -0.4 });
+  const muse = arm('muse-spark-1.3', 'muse', 0.35, { qFleetThinker: 0.32 });
+  const manual = { doer: [], thinker: ['muse'], other: [] };
+  const structuralGroups = [groupsFor([haiku]), groupsFor([muse])];
+  const healthy = build([haiku, muse], { manual, accountGroups: structuralGroups, structuralGroups });
+  assert.deepEqual(healthy.report.roles.thinker.suspendedManual, [], 'the ban holds; quality yields for haiku');
+  assert.deepEqual(healthy.report.roles.thinker.suspendedGates, ['quality']);
+  const degraded = build([haiku, muse], { manual, accountGroups: [groupsFor([muse])], structuralGroups });
+  assert.deepEqual(degraded.report.roles.thinker.suspendedManual, [], 'the ban still holds; the role defers');
+  assert.ok(degraded.exclusions.thinker.includes('muse'));
+});
