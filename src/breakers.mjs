@@ -41,6 +41,9 @@ export const DEFAULT_BREAKERS = {
   probeTimeoutMs: 2 * 3600 * 1000,
   fatalPatterns: [
     'unknown provider for model',
+    'unknown provider',
+    'unrecognized_model',
+    'unrecognized model',
     'auth_unavailable',
     'no auth available',
     'requested entity was not found',

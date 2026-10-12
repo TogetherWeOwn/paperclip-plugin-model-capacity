@@ -67,6 +67,18 @@
  * `paceGuard.unattributedInFlight` shipped in 0.2.39 and are unchanged.
  * No capability, egress, secret or env-key change.
  *
+ * v0.2.41 = PROVIDER-PREFIXED EMISSION FOR AGGREGATOR LANES: decisions emit
+ * the account's exact served id (`servedIdForArm`: a `devin/<id>` lane emits
+ * `devin/<id>`, never the bare id that 400s as unknown provider or misbills
+ * to the native lane serving the bare id). The servedModels guard compares
+ * canonical ids so prefixed-only arms stay servable, with the same fail-open
+ * on feeds that publish no list. `400 unknown provider` / `unrecognized_model`
+ * classify breaker-fatal, and a new decide `unservable` failure class never
+ * escalates onto the next rung of the same account. Same-family newer-version
+ * dominance runs inside each account ladder (dash minors compare, so
+ * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
+ * prefix. No capability, egress, secret or env-key change.
+ *
  * v0.2.39 = REVIEW-RESERVE REVIEW ROUND: pinned review runs price from
  * their pinned model (hottest arm only when the model matches nothing), so
  * a Haiku-pinned reviewer no longer burns at Opus price; a one-sided
@@ -178,7 +190,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.40';
+export const PLUGIN_VERSION = '0.2.41';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -448,7 +460,7 @@ const CONFIG_SCHEMA = {
         maxCooloffHours: { type: 'number', exclusiveMinimum: 0, default: 48 },
         probeTimeoutMs: { type: 'integer', minimum: 60000, default: 7200000 },
         fatalPatterns: {
-          type: 'array', default: ['unknown provider for model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model', 'model is unavailable', 'no healthy managed'],
+          type: 'array', default: ['unknown provider for model', 'unknown provider', 'unrecognized_model', 'unrecognized model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model', 'model is unavailable', 'no healthy managed'],
           description: 'Case-insensitive substring hits; entries with "+" need every part ("400+model") and are vetoed by transient patterns.',
           items: { type: 'string' },
         },

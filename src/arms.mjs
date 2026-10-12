@@ -76,6 +76,38 @@ export function canonicalModelName(model) {
 }
 
 /**
+ * Exact model id to emit for an arm on one account. The account's feed
+ * `models` list is authoritative: when it holds a provider-prefixed id whose
+ * canonical form matches the arm (`devin/gpt-5-5` for arm `gpt-5-5`), that
+ * exact id is emitted -- CLIProxy serves some lanes ONLY under the prefixed
+ * id, so emitting the bare id 400s (`unknown provider`) or, worse, silently
+ * routes to another provider serving the bare id. Accounts serving the bare
+ * id keep emitting it unchanged. Falls back to the arm id when the account
+ * publishes no list or no match.
+ */
+export function servedIdForArm(accountModels, armModel, provider = null) {
+  if (typeof armModel !== 'string' || armModel.length === 0) return armModel;
+  if (!Array.isArray(accountModels)) return armModel;
+  let bareHit = null;
+  let prefixedHit = null;
+  let providerHit = null;
+  const wantProvider = typeof provider === 'string' ? provider.toLowerCase() : null;
+  for (const raw of accountModels) {
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    if (canonicalModelName(raw) !== armModel) continue;
+    if (!raw.includes('/')) {
+      bareHit ??= raw;
+      continue;
+    }
+    prefixedHit ??= raw;
+    if (wantProvider && raw.slice(0, raw.indexOf('/')).toLowerCase() === wantProvider) {
+      providerHit ??= raw;
+    }
+  }
+  return providerHit ?? prefixedHit ?? bareHit ?? armModel;
+}
+
+/**
  * Infer the arm family from a canonical CLIProxy model id. Ordered rules,
  * first match wins; novel generations without history (claude-4-6) get
  * their own trial family instead of inheriting a proven one. Unknown

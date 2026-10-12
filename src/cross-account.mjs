@@ -107,9 +107,11 @@ export function isFallbackOnlyView(view, nativeModels) {
 /** Numeric version tuple parsed from a model id, e.g. gpt-6.1-sol -> [6, 1]. */
 export function versionTuple(model) {
   if (typeof model !== 'string') return null;
-  const m = /(\d+(?:\.\d+)+|\d+)/.exec(model);
+  // Dash-separated minors count: gpt-5-4 -> [5, 4] so gpt-5-5 reads newer
+  // (the old dot-only pattern read both as [5] and never compared).
+  const m = /(\d+(?:[.-]\d+)+|\d+)/.exec(model);
   if (!m) return null;
-  const parts = m[1].split('.').map(Number);
+  const parts = m[1].split(/[.-]/).map(Number);
   if (parts.some(n => !Number.isFinite(n)) || parts.length === 0) return null;
   return parts;
 }
