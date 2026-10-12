@@ -1869,15 +1869,21 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         meter: v.meter,
         quality: v.quality,
         headroomPct: v.headroomPct,
+        remainingPct: v.remainingPct ?? null,
         models: [...(feedModelsByKey.get(v.accountId) ?? [])],
       }));
       const nativeModels = nativeQualifiedModels(orderingViews, 0.05);
+      // Dominators must be routable this tick: qualified with headroom AND
+      // a known weekly remaining (the candidate loop skips metered accounts
+      // with remainingPct == null, so a 5h-only reading must not dominate).
       const qualifiedHeadroom = new Set(
-        orderingViews.filter(v => hasHeadroom(v, 0.05)).map(v => v.accountId),
+        orderingViews.filter(v => hasHeadroom(v, 0.05) && v.remainingPct != null).map(v => v.accountId),
       );
       const fleetArms = [];
+      const allowedDominatorKeys = new Set();
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         for (const r of ladder?.rungs ?? []) {
+          const breaker = r.breaker ?? 'closed';
           fleetArms.push({
             accountId: key,
             armId: r.armId,
@@ -1885,10 +1891,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
             model: r.model,
             Q: r.qFleet ?? null,
             C: r.costEffective ?? r.C ?? null,
+            breaker,
           });
+          if (breaker === 'closed') allowedDominatorKeys.add(`${key}\u0000${r.armId}`);
         }
       }
-      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom);
+      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys });
       const dominatedKeys = new Set(dominated.map(d => `${d.accountId}\u0000${d.armId}`));
       const dupKeys = new Set();
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
@@ -1899,7 +1907,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           if (k && nativeModels.has(k)) dupKeys.add(`${key}\u0000${r.armId}`);
         }
       }
-      const dropKeys = new Set([...dominatedKeys, ...dupKeys]);
+      // Duplicate aggregator rungs are NOT dropped: deleting them strands
+      // runs when no native can route this tick (reactive cap, open
+      // breaker). They are demoted instead via fallbackOnly band 3 below.
+      // dupKeys stays as the informational duplicate set for the log line.
+      const dropKeys = dominatedKeys;
       if (dropKeys.size > 0) {
         for (const [key, ladder] of Object.entries(ladders ?? {})) {
           const before = (ladder?.rungs ?? []).length;

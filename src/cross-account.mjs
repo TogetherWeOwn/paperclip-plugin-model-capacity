@@ -129,11 +129,17 @@ export function compareVersions(a, b) {
 /**
  * Cross-account dominated arms.
  *
- * arms: [{ accountId, armId, family, model, Q, C }] where Q/C are
+ * arms: [{ accountId, armId, family, model, Q, C, breaker? }] where Q/C are
  * fleet-comparable (fleet Q, effective cost). Null Q/C arms never dominate
  * and are never dropped here (the per-account ladder already reports them).
  * qualifiedWithHeadroom: Set of accountIds that are qualified WITH a
- * metered headroom signal (see hasHeadroom). Only those dominate.
+ * metered headroom signal AND a known weekly remaining (see hasHeadroom;
+ * the tick additionally requires remainingPct != null because the candidate
+ * loop skips metered accounts without one). Only those dominate.
+ * opts.allowedKeys (optional Set of `accountId\0armId`): when present, only
+ * listed arms may dominate. Arms carrying a `breaker` other than 'closed'
+ * never dominate (an open/half-open arm cannot route, so it must not drop
+ * working arms elsewhere); a missing breaker fails open for older callers.
  *
  * An arm is dominated when the SAME family has another arm on a qualified
  * account with (higher Q and cost <=) OR (a newer version with Q >= and
@@ -142,10 +148,11 @@ export function compareVersions(a, b) {
  *
  * Returns [{ accountId, armId, dominatedBy, reason }].
  */
-export function crossAccountDominated(arms, qualifiedWithHeadroom) {
+export function crossAccountDominated(arms, qualifiedWithHeadroom, opts = {}) {
   const qualified = qualifiedWithHeadroom instanceof Set
     ? qualifiedWithHeadroom
     : new Set(qualifiedWithHeadroom ?? []);
+  const allowedKeys = opts?.allowedKeys instanceof Set ? opts.allowedKeys : null;
   const usable = (arms ?? []).filter(a =>
     a != null && a.Q != null && a.C != null && a.family != null && a.armId != null);
   const byFamily = new Map();
@@ -154,9 +161,15 @@ export function crossAccountDominated(arms, qualifiedWithHeadroom) {
     if (!byFamily.has(fam)) byFamily.set(fam, []);
     byFamily.get(fam).push(a);
   }
+  const dominatorUsable = (a) => {
+    if (!qualified.has(a.accountId)) return false;
+    if (a.breaker != null && a.breaker !== 'closed') return false;
+    if (allowedKeys && !allowedKeys.has(`${a.accountId}\u0000${a.armId}`)) return false;
+    return true;
+  };
   const out = [];
   for (const [, group] of byFamily) {
-    const dominators = group.filter(a => qualified.has(a.accountId));
+    const dominators = group.filter(dominatorUsable);
     if (dominators.length === 0) continue;
     for (const m of group) {
       const mVer = versionTuple(m.model ?? m.armId);
