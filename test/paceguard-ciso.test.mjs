@@ -66,7 +66,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
     setup: async () => {
@@ -102,21 +102,30 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
-  // run-2 starts (host order: started fires before the hook resolves) with a
-  // model the tick maps to the claude pool, then the hook defers it at the
-  // cap and marks it waiting.
-  await d.fire(runEvent('run-2', TICK + MIN, 'agent.run.started', 'agent-9', { model: 'claude-opus-5-5' }));
+  // run-2 starts at the tick (host order: started fires before the hook
+  // resolves) with a model the tick maps to the claude pool, then the hook
+  // defers it at the cap and marks it waiting. The event is stamped at the
+  // tick: a future anchor would read as stale and leave the census entirely,
+  // so the exclusion below would prove nothing.
+  await d.fire(runEvent('run-2', TICK, 'agent.run.started', 'agent-9', { model: 'claude-opus-5-5' }));
   const def = await d.hook('run-2');
   assert.equal(def.kind, 'defer');
   assert.match(def.reason, /pace guard/);
   // run-1 finishes; run-2 never resolves and no terminal event ever lands.
   await d.fire(runEvent('run-1', TICK + 2 * MIN, 'agent.run.finished'));
+  // +30 min: inside 12 x 300 s + 60 s = 61 min the fresh mark still excludes
+  // run-2, so the freed slot decides. Without the mark run-2 (in flight
+  // since the tick) would hold the cap and this would defer.
+  d.setNow(TICK + 30 * MIN);
   await d.tick();
-  // Past 12 x 300 s + 60 s slack = 61 min, inside the 2 h ledger horizon.
+  assert.equal((await d.hook('run-3')).kind, 'decide', 'fresh mark excludes the waiting run; the freed slot decides');
+  // +70 min: past the mark lifespan the abandoned run counts as in flight
+  // again (fail closed), inside the 2 h ledger horizon, so the pool is back
+  // at its cap.
   d.setNow(TICK + 70 * MIN);
   await d.tick();
   d.killIo();
-  const again = await d.hook('run-3');
+  const again = await d.hook('run-4');
   assert.equal(again.kind, 'defer', 'stale mark must not hide run-2; the pool is still at its cap');
   assert.match(again.reason, /pace guard/);
 });

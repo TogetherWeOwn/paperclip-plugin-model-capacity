@@ -289,3 +289,12 @@ test('caps: issues denial degrades to a sanitized code, never upstream text', as
   assert.deepEqual(caps.body.agents, []);
   assert.equal(caps.body.capsError, 'issues-unavailable');
 });
+
+test('reviewReserve: rMin above rMax fails validation and normalizes to defaults', async () => {
+  const { normalizeReviewReserve } = await import('../src/reviewreserve.mjs');
+  assert.ok(validateConfigShape({ reviewReserve: { rMin: 0.9, rMax: 0.5 } })
+    .some(e => e.includes('reviewReserve.rMin must be <=')));
+  assert.deepEqual(validateConfigShape({ reviewReserve: { rMin: 0.2, rMax: 0.8 } }), []);
+  const cfg = normalizeReviewReserve({ rMin: 0.9, rMax: 0.5 }, { keepAgentIds: [] });
+  assert.ok(cfg.rMin <= cfg.rMax, 'normalize never leaves a pinning inversion');
+});

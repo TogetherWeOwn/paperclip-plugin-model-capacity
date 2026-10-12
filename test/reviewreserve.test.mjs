@@ -9,7 +9,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_REVIEW_RESERVE,
+  REVIEW_FOLDED_CAP,
   normalizeReviewReserve,
+  priceReviewBurn,
+  priorProviderReserveState,
   reviewEventsFromLedger,
   queuedReviewsByAccount,
   foldReviewEvents,
@@ -72,13 +75,37 @@ test('ledger fold: review runs contribute tier-adjusted burn once, on their attr
   // Tier-adjusted burn map (Haiku 5.5 long sessions at ~5x base): the fold
   // uses the caller's number verbatim, so the #28 tier pricing flows through.
   const burnOf = (arm) => (arm === 'claude-haiku-5-5' ? 0.05 : null);
-  const events = reviewEventsFromLedger(ledger, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H });
-  assert.deepEqual(events, [
+  const first = reviewEventsFromLedger(ledger, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H });
+  assert.deepEqual(first.events, [
     { atMs: T0 - 1000, accountId: 'claude:a', burnPct: 0.05 },
     { atMs: T0 - 2000, accountId: 'claude:b', burnPct: 0.05 },
   ]);
-  // sinceMs bounds the fold: already-folded runs never contribute twice.
-  assert.deepEqual(reviewEventsFromLedger(ledger, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - 500 }), []);
+  assert.deepEqual([...first.runIds].sort(), ['r1', 'r3']);
+  // Folded runIds (not the watermark) bound the fold: passing the first
+  // fold's ids back skips them even with an old sinceMs, so a run
+  // attributed after its tick still folds exactly once.
+  const seen = new Set(first.runIds);
+  assert.deepEqual(
+    reviewEventsFromLedger(ledger, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H, seenRunIds: seen }).events,
+    [],
+  );
+  // A run the first fold skipped for lack of attribution folds once the
+  // attribution lands, however old its start is (late attribution).
+  const late = new Map([
+    ['q1', { runId: 'q1', agentId: 'rev-1', armId: 'claude-haiku-5-5', startedAt: T0 - 10 * H, status: 'running' }],
+  ]);
+  assert.deepEqual(
+    reviewEventsFromLedger(late, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H, seenRunIds: new Set() }).events,
+    [],
+    'no account yet: still skipped, and not marked folded',
+  );
+  late.get('q1').decidedAccount = 'claude:a';
+  const lateFold = reviewEventsFromLedger(late, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H, seenRunIds: new Set() });
+  assert.deepEqual(lateFold.events, [{ atMs: T0 - 10 * H, accountId: 'claude:a', burnPct: 0.05 }]);
+  assert.deepEqual(
+    reviewEventsFromLedger(late, { agentIds: ['rev-1'], burnOf, sinceMs: T0 - H, seenRunIds: new Set(lateFold.runIds) }).events,
+    [],
+  );
 });
 
 test('queued reviews: non-terminal verified review records by account', () => {
@@ -285,4 +312,64 @@ test('computeProviderReserve: weekly-exhausted accounts (>=99%) leave capacity',
   });
   // Only the 50%-used account counts: 50%/10h = 5 %/h.
   assert.equal(out.capacityPctPerH, 5);
+});
+
+test('priceReviewBurn: exact arm wins; null/unknown armId prices the hottest arm', () => {
+  const perArm = { 'claude-haiku-5-5': 0.05, 'claude-opus-5-5': 0.4 };
+  assert.equal(priceReviewBurn(perArm, 'claude-haiku-5-5'), 0.05);
+  // Pinned/keep runs decide before arm selection (armId null): they price
+  // at the hottest arm so review demand is never invisible.
+  assert.equal(priceReviewBurn(perArm, null), 0.4);
+  assert.equal(priceReviewBurn(perArm, 'unknown-arm'), 0.4);
+  assert.equal(priceReviewBurn({}, null), null);
+  assert.equal(priceReviewBurn(null, null), null);
+  assert.equal(priceReviewBurn({ a: 0, b: -1 }, null), null);
+});
+
+test('normalize: rMin above rMax falls back to both defaults (never a pinned reserve)', () => {
+  const cfg = normalizeReviewReserve({ rMin: 0.9, rMax: 0.5 }, { keepAgentIds: [] });
+  assert.equal(cfg.rMin, DEFAULT_REVIEW_RESERVE.rMin);
+  assert.equal(cfg.rMax, DEFAULT_REVIEW_RESERVE.rMax);
+  const ok = normalizeReviewReserve({ rMin: 0.2, rMax: 0.8 }, { keepAgentIds: [] });
+  assert.equal(ok.rMin, 0.2);
+  assert.equal(ok.rMax, 0.8);
+});
+
+test('queued reviews: a stale horizon drops stuck records so they cannot hold R high', () => {
+  const ledger = new Map([
+    ['fresh', { runId: 'fresh', agentId: 'rev-1', decidedAccount: 'claude:a', startedAt: T0 - H, status: 'running' }],
+    ['stuck', { runId: 'stuck', agentId: 'rev-1', decidedAccount: 'claude:a', startedAt: T0 - 10 * H, status: 'running' }],
+    ['timeless', { runId: 'timeless', agentId: 'rev-1', decidedAccount: 'claude:a', status: 'running' }],
+  ]);
+  assert.deepEqual(
+    queuedReviewsByAccount(ledger, { agentIds: ['rev-1'], nowMs: T0, staleHorizonMs: 2 * H }),
+    { byAccount: { 'claude:a': 1 }, unattributed: 0 },
+  );
+  // No horizon: the old behavior (everything counts) is unchanged.
+  assert.deepEqual(
+    queuedReviewsByAccount(ledger, { agentIds: ['rev-1'] }),
+    { byAccount: { 'claude:a': 3 }, unattributed: 0 },
+  );
+});
+
+test('priorProviderReserveState: per-provider state wins; legacy v1 seeds every provider', () => {
+  const legacy = { buckets: [{ atMs: 1, burn: {}, runs: {} }], envelope: null, runsRate: null, lastFoldMs: 7 };
+  assert.equal(priorProviderReserveState(null, 'claude'), null);
+  assert.deepEqual(priorProviderReserveState(legacy, 'claude'), legacy);
+  assert.deepEqual(priorProviderReserveState(legacy, 'gemini'), legacy);
+  const stored = { byProvider: { claude: { buckets: [], envelope: { value: 2, atMs: 9 }, runsRate: null, lastFoldMs: 9, folded: ['r1'] } } };
+  assert.deepEqual(priorProviderReserveState(stored, 'claude'), stored.byProvider.claude);
+  assert.equal(priorProviderReserveState(stored, 'gemini'), null);
+  // Legacy migration restricts shared buckets to the provider's accounts.
+  const mixedLegacy = {
+    buckets: [{ atMs: 1, burn: { 'claude:a': 2, 'gemini:g': 3 }, runs: { 'claude:a': 4, 'gemini:g': 5 } }],
+    envelope: null, runsRate: null, lastFoldMs: 7,
+  };
+  const geminiPrior = priorProviderReserveState(mixedLegacy, 'gemini', { accountIds: ['gemini:g'] });
+  assert.deepEqual(geminiPrior.buckets, [{ atMs: 1, burn: { 'gemini:g': 3 }, runs: { 'gemini:g': 5 } }]);
+});
+
+test('folded-runId cap: REVIEW_FOLDED_CAP dwarfs the ledger cap so a folded id cannot be pruned early', async () => {
+  const { LEDGER_CAP } = await import('../src/ledger.mjs');
+  assert.ok(REVIEW_FOLDED_CAP >= 5 * LEDGER_CAP);
 });

@@ -520,8 +520,7 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   counts again until the hook next defers it (its next retry). A deferred
   mark lives at most 12 x `retryAfterMs` + 60s (the host abandons a run after
   12 deferred attempts): past that the run counts as in flight again, fail
-  closed like a lost terminal event. Every retry re-defers and refreshes the
-  mark.
+  closed like a lost terminal event.
 - Runs with no decided or actual account yet (fresh starts the tick has not
   attributed) are not counted toward any pool's cap: each may belong to any
   pool, or to none, so counting them lets one burst of fresh starts hold

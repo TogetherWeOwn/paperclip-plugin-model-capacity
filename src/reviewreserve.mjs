@@ -31,10 +31,19 @@
  *
  * Pure functions only: same input always yields the same output; no clock
  * (nowMs is a parameter), no network. The plugin owns the persisted state
- * (hour buckets + envelope + runs rate) and supplies ledger-derived events.
+ * (per provider: hour buckets + envelope + runs rate + folded run ids) and
+ * supplies ledger-derived events.
  */
 
 export const REVIEW_RESERVE_STATE_KEY = 'review-reserve-v1';
+
+/**
+ * Bound on folded review-run ids carried per provider. Far above the ledger
+ * cap (1000 records): a folded id is pruned only long after its record left
+ * the ledger, so a pruned id can never refold a live record and double-count
+ * its burn.
+ */
+export const REVIEW_FOLDED_CAP = 5000;
 
 export const DEFAULT_REVIEW_RESERVE = Object.freeze({
   /** Master switch. False restores pre-reserve admission bit-for-bit. */
@@ -98,6 +107,12 @@ export function normalizeReviewReserve(raw, { keepAgentIds = [] } = {}) {
     : null;
   const pos = (v, fb) => (finite(v) && v > 0 ? v : fb);
   const frac = (v, fb) => (finite(v) && v >= 0 && v <= 1 ? v : fb);
+  let rMin = frac(r.rMin, d.rMin);
+  let rMax = frac(r.rMax, d.rMax);
+  // An inverted band would pin the reserve (clamp with lo > hi reads as a
+  // constant): fall back to both defaults, never a silent pin. The config
+  // validator rejects the inversion at load, so this is belt and braces.
+  if (rMin > rMax) { rMin = d.rMin; rMax = d.rMax; }
   return {
     enabled: typeof r.enabled === 'boolean' ? r.enabled : d.enabled,
     providers: providers && providers.length > 0 ? providers : [...d.providers],
@@ -106,8 +121,8 @@ export function normalizeReviewReserve(raw, { keepAgentIds = [] } = {}) {
     envWindowH: Number.isInteger(r.envWindowH) && r.envWindowH >= 1 && r.envWindowH <= 48 ? r.envWindowH : d.envWindowH,
     envHalfLifeH: pos(r.envHalfLifeH, d.envHalfLifeH),
     drainH: pos(r.drainH, d.drainH),
-    rMin: frac(r.rMin, d.rMin),
-    rMax: frac(r.rMax ?? (r.rMin != null && r.rMin > d.rMax ? null : d.rMax), d.rMax),
+    rMin,
+    rMax,
     releaseWeeklyH: pos(r.releaseWeeklyH, d.releaseWeeklyH),
     release5hMin: pos(r.release5hMin, d.release5hMin),
     marginW: frac(r.marginW, d.marginW),
@@ -253,27 +268,81 @@ export function accountHeld({
 }
 
 /**
- * Review-burn events from the run ledger since lastFoldMs. A review-agent
- * record contributes its start (startedAt ?? decidedAt) once, with the
- * caller's burn for its arm on its attributed account -- the tick passes
- * burnPerRunPct, which prices the context-tier multiplier while
- * contextCaps.tierAffectsQuota holds (default true), so Haiku 5.5 long
- * sessions burn at their tier price here too. Terminal records count: their
- * quota burned whether or not they are still running.
+ * Price one review run's quota burn from a per-arm burn map. Pinned/keep
+ * review runs decide before arm selection (armId null): they price at the
+ * hottest arm so review demand is never invisible. With the default config
+ * the review agents ARE the keep agents, so without this fallback the whole
+ * reserve would sit at the floor forever.
  */
-export function reviewEventsFromLedger(ledger, { agentIds = [], burnOf = null, sinceMs = 0 } = {}) {
+export function priceReviewBurn(perArmBurn, armId) {
+  if (perArmBurn == null || typeof perArmBurn !== 'object') return null;
+  if (armId != null && finite(perArmBurn[armId]) && perArmBurn[armId] > 0) return perArmBurn[armId];
+  let best = null;
+  for (const v of Object.values(perArmBurn)) {
+    if (finite(v) && v > 0 && (best == null || v > best)) best = v;
+  }
+  return best;
+}
+
+/**
+ * One provider's prior tick state from the persisted reserve state.
+ * New shape { byProvider: { [provider]: state } }; a legacy v1 state (one
+ * shared { buckets, ... } list) seeds every provider, restricted to that
+ * provider's accounts when known so one provider's burst does not inflate a
+ * newly reserved provider (unknown account set keeps the shared history:
+ * overstating demand is the safe direction).
+ */
+export function priorProviderReserveState(stored, provider, { accountIds = null } = {}) {
+  const byP = stored != null && typeof stored === 'object' && !Array.isArray(stored) ? stored.byProvider : null;
+  const hit = byP != null && typeof byP === 'object' && !Array.isArray(byP) ? byP[provider] : null;
+  if (hit != null && typeof hit === 'object' && !Array.isArray(hit)) return hit;
+  if (stored != null && typeof stored === 'object' && Array.isArray(stored.buckets)) {
+    if (accountIds == null) return stored;
+    const keep = new Set([...accountIds].map(String));
+    const pick = (obj) => Object.fromEntries(Object.entries(obj ?? {}).filter(([k]) => keep.has(k)));
+    return {
+      ...stored,
+      buckets: (stored.buckets ?? []).map(b => ({ ...b, burn: pick(b.burn), runs: pick(b.runs) })),
+    };
+  }
+  return null;
+}
+
+/**
+ * Review-burn events from the run ledger. A review-agent record contributes
+ * its start (startedAt ?? decidedAt) once, with the caller's burn for its
+ * arm on its attributed account -- the tick passes burnPerRunPct (via
+ * priceReviewBurn, so null-armId kept runs price too), which carries the
+ * context-tier multiplier while contextCaps.tierAffectsQuota holds (default
+ * true), so Haiku 5.5 long sessions burn at their tier price here too.
+ * Terminal records count: their quota burned whether or not they are still
+ * running.
+ *
+ * Returns { events, runIds }: runIds folds this call (persist them per
+ * provider and pass back as seenRunIds). Dedupe is by runId, NOT by a
+ * start-time watermark: a run that starts before a tick but is attributed
+ * after it would fall below the watermark and never fold. Records skipped
+ * for lack of attribution (or burn) are NOT reported folded, so they fold
+ * once the attribution lands. sinceMs still bounds the fold when no
+ * seenRunIds set is given.
+ */
+export function reviewEventsFromLedger(ledger, { agentIds = [], burnOf = null, sinceMs = 0, seenRunIds = null } = {}) {
   const set = new Set((agentIds ?? []).filter(s => typeof s === 'string'));
-  if (set.size === 0 || typeof burnOf !== 'function') return [];
-  const out = [];
-  for (const r of (ledger ?? new Map()).values()) {
+  const out = { events: [], runIds: [] };
+  if (set.size === 0 || typeof burnOf !== 'function') return out;
+  const seen = seenRunIds instanceof Set ? seenRunIds : null;
+  for (const [runId, r] of (ledger ?? new Map()).entries()) {
     if (r == null || !set.has(r.agentId)) continue;
+    if (seen != null && seen.has(runId)) continue;
     const atMs = r.startedAt ?? r.decidedAt ?? null;
-    if (!finite(atMs) || !(atMs > sinceMs)) continue;
+    if (!finite(atMs)) continue;
+    if (seen == null && !(atMs > sinceMs)) continue;
     const accountId = r.decidedAccount ?? r.actualAccount ?? null;
     if (typeof accountId !== 'string' || accountId.length === 0) continue;
     const burnPct = burnOf(r.armId, accountId);
     if (!finite(burnPct) || !(burnPct > 0)) continue;
-    out.push({ atMs, accountId, burnPct });
+    out.events.push({ atMs, accountId, burnPct });
+    out.runIds.push(runId);
   }
   return out;
 }
@@ -286,15 +355,26 @@ export function reviewEventsFromLedger(ledger, { agentIds = [], burnOf = null, s
  * a waiting review reclaims the reserve through admission on its next retry.
  * The reserve is lent only when both are empty; executing reviews count as
  * waiting, since more reviews usually follow a burst.
+ *
+ * nowMs + staleHorizonMs bounds the scan: a non-terminal record anchored
+ * (startedAt ?? decidedAt) at or beyond the horizon is stuck -- its demand
+ * signal is stale, and counting it would hold R high until trimLedger
+ * evicts it. Timeless records cannot prove freshness and drop out too.
+ * Without a horizon every record counts (the old behavior).
  */
-export function queuedReviewsByAccount(ledger, { agentIds = [] } = {}) {
+export function queuedReviewsByAccount(ledger, { agentIds = [], nowMs = null, staleHorizonMs = null } = {}) {
   const set = new Set((agentIds ?? []).filter(s => typeof s === 'string'));
   const out = { byAccount: {}, unattributed: 0 };
   if (set.size === 0) return out;
+  const horizon = finite(nowMs) && finite(staleHorizonMs) && staleHorizonMs > 0 ? staleHorizonMs : null;
   for (const r of (ledger ?? new Map()).values()) {
     if (r == null || !set.has(r.agentId)) continue;
     if (r.unverified === true) continue;
     if (r.status === 'finished' || r.status === 'failed' || r.status === 'cancelled') continue;
+    if (horizon != null) {
+      const anchor = r.startedAt ?? r.decidedAt ?? null;
+      if (!finite(anchor) || nowMs - anchor >= horizon) continue;
+    }
     const accountId = r.decidedAccount ?? r.actualAccount ?? null;
     if (typeof accountId !== 'string' || accountId.length === 0) {
       out.unattributed += 1;

@@ -76,8 +76,9 @@ import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { normalizePaceGuard } from './paceguard.mjs';
 import {
-  REVIEW_RESERVE_STATE_KEY, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
-  foldReviewEvents, reviewEventsFromLedger, queuedReviewsByAccount,
+  REVIEW_RESERVE_STATE_KEY, REVIEW_FOLDED_CAP, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
+  priceReviewBurn, priorProviderReserveState,
+  reviewEventsFromLedger, queuedReviewsByAccount,
   computeProviderReserve,
 } from './reviewreserve.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
@@ -213,6 +214,10 @@ export function validateConfigShape(raw) {
       if (k in rr && !(typeof rr[k] === 'number' && rr[k] >= 0 && rr[k] <= 1)) {
         errors.push(`reviewReserve.${k} must be a number in [0, 1]`);
       }
+    }
+    // An inverted band pins the reserve (clamp with lo > hi reads constant).
+    if (typeof rr.rMin === 'number' && typeof rr.rMax === 'number' && rr.rMin > rr.rMax) {
+      errors.push('reviewReserve.rMin must be <= reviewReserve.rMax');
     }
     if ('exhaustedPct' in rr && !(typeof rr.exhaustedPct === 'number' && rr.exhaustedPct > 0 && rr.exhaustedPct <= 1)) {
       errors.push('reviewReserve.exhaustedPct must be a number in (0, 1]');
@@ -575,8 +580,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // attempts (12, hard-coded host-side), so a mark older than that lifespan
   // no longer means waiting. Past it the run counts as in flight again --
   // fail closed, exactly like a lost terminal event whose record stays
-  // running until the in-flight horizon. Every retry re-defers and refreshes
-  // the mark, so a run that is genuinely still waiting keeps its exclusion.
+  // running until the in-flight horizon.
   const DEFERRED_MARK_ATTEMPTS = 12;
   const DEFERRED_MARK_SLACK_MS = 60 * 1000;
   const deferredRuns = new Map();
@@ -1927,12 +1931,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       heldAccountIds: [],
     };
     if (rrCfg.enabled === true) {
-      const rrPrev = (await ctx.state.get(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY))) ?? null;
-      const burnOf = (armId, accountId) => ladders[accountId]?.burnPerRunPct?.[armId] ?? null;
-      const rrEvents = reviewEventsFromLedger(ledger, {
-        agentIds: [...reviewAgentIdSet], burnOf, sinceMs: rrPrev?.lastFoldMs ?? 0,
+      const rrStored = (await ctx.state.get(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY))) ?? null;
+      // Pinned/keep review runs record armId null; price them at the
+      // account's hottest arm so review demand is never invisible.
+      const burnOf = (armId, accountId) => priceReviewBurn(ladders[accountId]?.burnPerRunPct, armId);
+      const rrQueued = queuedReviewsByAccount(ledger, {
+        agentIds: [...reviewAgentIdSet], nowMs, staleHorizonMs,
       });
-      const rrQueued = queuedReviewsByAccount(ledger, { agentIds: [...reviewAgentIdSet] });
       const rrAccounts = accountViews.map(v => ({
         accountId: v.accountId,
         provider: v.provider,
@@ -1945,22 +1950,36 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }));
       const perProvider = {};
       const heldAccountIds = [];
-      let rrNext = null;
+      const rrNext = { byProvider: {} };
       for (const provider of rrCfg.providers ?? []) {
+        const ownIds = rrAccounts
+          .filter(a => String(a.provider ?? '').toLowerCase() === String(provider).toLowerCase())
+          .map(a => a.accountId);
+        const prev = priorProviderReserveState(rrStored, provider, { accountIds: ownIds });
+        const ownIdSet = new Set(ownIds);
+        // Dedupe by folded runId, not by watermark: a run that starts
+        // before a tick but is attributed after it still folds exactly once.
+        const seen = new Set(prev?.folded ?? []);
+        const { events: provEvents, runIds: foldedNow } = reviewEventsFromLedger(ledger, {
+          agentIds: [...reviewAgentIdSet], burnOf, seenRunIds: seen,
+        });
         const verdict = computeProviderReserve({
-          provider, accounts: rrAccounts, state: rrPrev, nowMs, cfg: rrCfg,
-          events: rrEvents, queuedByAccount: rrQueued,
+          provider, accounts: rrAccounts, state: prev, nowMs, cfg: rrCfg,
+          events: provEvents.filter(e => ownIdSet.has(e.accountId)),
+          queuedByAccount: rrQueued,
         });
         // The bucket/envelope/runs-rate state persists; the published
         // verdict carries the numbers, not the carried state.
         const { state: verdictState, ...pub } = verdict;
         perProvider[provider] = pub;
         heldAccountIds.push(...verdict.heldAccountIds);
-        rrNext = verdictState;
+        for (const id of foldedNow) { seen.delete(id); seen.add(id); }
+        rrNext.byProvider[provider] = {
+          ...verdictState,
+          folded: [...seen].slice(-REVIEW_FOLDED_CAP),
+        };
       }
-      await ctx.state.set(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY), rrNext ?? {
-        buckets: [], envelope: null, runsRate: null, lastFoldMs: nowMs,
-      });
+      await ctx.state.set(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY), rrNext);
       reviewReserveView = {
         enabled: true,
         agentIds: [...reviewAgentIdSet],
@@ -3446,14 +3465,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       // When the review reserve holds every account that could serve, the
       // wait is for a review slot (or the hold's release near reset): say so
-      // and keep the plain retry -- review runs reclaim through admission,
-      // never by cancelling.
+      // and retry on the pace-guard scale -- a 60 s retry would burn the
+      // host's 12-attempt budget in ~12 min and abandon the wait long before
+      // the hold lifts. A co-holding pace guard is named too, so operators
+      // see both holds instead of only the reserve.
       if (order.length === 0 && (reserveHeld?.length ?? 0) > 0) {
         const names = reserveHeld.map(h => h.accountId).join(', ');
+        const guard = live.paceGuard ?? {};
+        const held = (paced ?? []).map(p =>
+          `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const also = held.length > 0 ? `; pace guard also holds ${held.join('; ')}` : '';
         return deferred({
           kind: 'defer',
-          retryAfterMs: 60000,
-          reason: `review reserve: ${names} held for review runs`,
+          retryAfterMs: guard.retryAfterMs ?? 300000,
+          reason: `review reserve: ${names} held for review runs${also}`,
         });
       }
       // When the pace guard holds a pool, the wait is for one of its runs to
