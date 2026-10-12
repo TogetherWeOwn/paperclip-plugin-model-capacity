@@ -465,11 +465,11 @@ that share one credential bucket):
 
 A pool that is ahead and already has `cap` runs in flight is **paced**: its
 lanes leave the allocation order, so the run goes to another pool, or, when
-the guard has dropped every pool that could serve it, the hook answers
-`defer` with a `pace guard: ...` reason and `pacing.guard.retryAfterMs`. If
-another pool is left but has nothing to decide (a full trial slot, say), the
-defer is the plain 60s one. A pool that is not ahead is never
-touched. `slots` is the same term as the per-account concurrency target, so
+no other pool decides it, the hook answers `defer` with a `pace guard: ...`
+reason and `pacing.guard.retryAfterMs` -- even when an unpaced pool is left
+but has nothing to decide (a full trial slot, say): the paced pool is a real
+minutes-scale hold, and the reason names both holds. A pool that is not
+ahead is never touched. `slots` is the same term as the per-account concurrency target, so
 the cap follows the plan: it shrinks as an account spends ahead and widens as
 the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
 
@@ -478,9 +478,10 @@ accounts through `orderAccountsWithPacing` with the same plan positions and
 knobs, so they hold and release a pool alike (a run being decided never
 counts against its own pool, and neither do runs the hook deferred). A held run gets no shadow decision;
 `shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
-(`enabled`, `marginPct`, `retryAfterMs`, and one entry per pool with
-`planAhead`, `pacedSlots`, `cap`, `inFlight` and `state`: `paced`, `ahead`,
-`on-plan`, `not-measured`) and each account carries `planAhead`.
+(`enabled`, `marginPct`, `retryAfterMs`, `unattributedInFlight`, and one
+entry per pool with `planAhead`, `pacedSlots`, `cap`, `inFlight` and
+`state`: `paced`, `ahead`, `on-plan`, `not-measured`) and each account
+carries `planAhead`.
 
 Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
 0.02: lead on the plan tolerated before the cap applies), `retryAfterMs`
@@ -516,7 +517,17 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   run the hook deferred (waiting, not running) is not counted, or two waiting
   runs would hold an idle one-slot pool until the host gave up on them. The
   set of deferred runs is memory-only: after a worker restart, a waiting run
-  counts again until the hook next defers it (its next retry).
+  counts again until the hook next defers it (its next retry). A deferred
+  mark lives at most 12 x `retryAfterMs` + 60s (the host abandons a run after
+  12 deferred attempts): past that the run counts as in flight again, fail
+  closed like a lost terminal event. Every retry re-defers and refreshes the
+  mark.
+- Runs with no decided or actual account yet (fresh starts the tick has not
+  attributed) are not counted toward any pool's cap: each may belong to any
+  pool, or to none, so counting them lets one burst of fresh starts hold
+  every pool for all the others and nothing is ever decided. The fail-open is
+  explicit: `/capacity` publishes the unaccounted amount as
+  `paceGuard.unattributedInFlight`.
 - A reset more than one window (plus an hour) away, or already past, is an
   unknown plan position and fails open.
 - A run whose terminal event never arrives (a worker restart can lose one)
