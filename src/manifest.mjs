@@ -61,13 +61,22 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
- * v0.2.27 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
+ * v0.2.33 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
  * dropped when the same family has a newer or better arm (higher fleet Q,
  * cost <=) on any qualified account with headroom, so old Sol on Devin no
- * longer survives next to gpt-6.1-sol on Codex; Devin is fallback-only for
- * models a qualified native also serves (band 3, after every need band)
- * while Devin-unique models (swe-*, etc.) keep band 1. No capability,
- * egress, secret or env-key change.
+ * longer survives next to gpt-6.1-sol on Codex. Devin duplicates of a
+ * qualified native's models are held back from the first routing pass (used
+ * only when the native and unique arms place nothing); Devin-unique models
+ * (swe-*, etc.) keep band 1. No capability, egress, secret or env-key change.
+ *
+ * v0.2.28 = PACE GUARD: a provider pool whose lanes average above the linear
+ * weekly plan (plus `pacing.guard.marginPct`) is held at max(1, ceil(paced
+ * slots)) runs in flight; further runs go to other pools or the hook defers
+ * (`pacing.guard.retryAfterMs`). The hook, the event-time path and the
+ * shadow tick order accounts through the same guard, so they agree.
+ * Unknown plan position or share, and reactive lanes, fail open.
+ * `/capacity` reports `paceGuard`. No capability, egress, secret or env-key
+ * change.
  *
  * v0.2.14 = ARM CIRCUIT BREAKER: per-(account, arm) self-protection that
  * learns from finished-run failed events. Two arm-fatal failures (provider-
@@ -104,7 +113,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.27';
+export const PLUGIN_VERSION = '0.2.33';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -277,6 +286,15 @@ const CONFIG_SCHEMA = {
         rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
         rateWindowMin: { type: 'number', minimum: 10, default: 60 },
         rateMinSpanMin: { type: 'number', minimum: 5, default: 10 },
+        guard: {
+          type: 'object', additionalProperties: false,
+          description: 'Pace guard: a provider pool whose lanes average above the linear weekly plan (plus marginPct) is held at max(1, ceil(paced slots)) runs in flight; further runs go to other pools or are deferred. Applies to the enforcing hook, the event-time path and the shadow tick alike. Unknown plan position, unknown share and reactive lanes fail open.',
+          properties: {
+            enabled: { type: 'boolean', default: true },
+            marginPct: { type: 'number', minimum: 0, maximum: 1, default: 0.02, description: 'Lead on the plan (fraction of the weekly quota) tolerated before the cap applies.' },
+            retryAfterMs: { type: 'integer', minimum: 1000, default: 300000, description: 'Retry hint when the hook defers because every eligible pool is held; longer than the plain no-headroom retry because a slot frees when a run finishes.' },
+          },
+        },
       },
     },
     concurrency: {
