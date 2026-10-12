@@ -31,7 +31,12 @@
  * role where every family reads low, e.g. reviewers who answer in comments,
  * keeps them all), and if the data gates would leave a role with no arm on
  * any account they are suspended for that role (reported, never a defer
- * loop); only the operator's list still applies.
+ * loop). If the operator's list alone would empty a role structurally, the
+ * fewest of its entries are suspended for that role, strongest banned
+ * family first, and the data gates keep as much strength as the role allows
+ * (reported as `manual-suspended`). Structural means the fleet-wide arm set:
+ * a lane outage, an excluded account or an open breaker never lifts the
+ * list; the role defers until the lane recovers and the ban returns.
  */
 
 import { ARM_TOKEN_PREFIX, armToken, normalizeExcludedFamilies, roleLadderAccess } from './decide.mjs';
@@ -258,11 +263,69 @@ function recordFamiliesByRole(records, { nowMs, cfg, roleOf, familyOf }) {
 }
 
 /**
+ * Operator entries in the order their bans lift when they alone would empty
+ * a role: the strongest banned family first (its best quality for the role),
+ * so the role gets the least costly family back. Unscored entries go last;
+ * ties keep the list order.
+ */
+function manualSuspensionOrder(manualList, arms, role) {
+  const bestQ = (token) => {
+    let best = null;
+    for (const a of arms ?? []) {
+      const q = armQuality(a, role);
+      if (q == null) continue;
+      const fam = String(a?.family ?? '').toLowerCase();
+      if (token !== fam && token !== armToken(a.armId)) continue;
+      if (best == null || q > best) best = q;
+    }
+    return best;
+  };
+  return manualList
+    .map((token, i) => ({ token, i, q: bestQ(token) ?? -Infinity }))
+    .sort((x, y) => (x.q === y.q ? x.i - y.i : (x.q > y.q ? -1 : 1)))
+    .map(x => x.token);
+}
+
+/** Every subset of `items` with `size` members, earlier items first. */
+function subsetsOfSize(items, size, from = 0) {
+  if (size === 0) return [[]];
+  const out = [];
+  for (let i = from; i <= items.length - size; i++) {
+    for (const rest of subsetsOfSize(items, size - 1, i + 1)) out.push([items[i], ...rest]);
+  }
+  return out;
+}
+
+/**
+ * The cheapest state that leaves the role an arm: the fewest operator entries
+ * lifted, then the strongest data gates kept, then the strongest banned
+ * families lifted. Null when no arm serves the role at all.
+ */
+function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
+  if (!serves([])) return null;
+  for (let size = 0; size <= order.length; size++) {
+    const subsets = subsetsOfSize(order, size);
+    for (const active of attempts) {
+      for (const lifted of subsets) {
+        const kept = manualList.filter(t => !lifted.includes(t));
+        if (serves([...kept, ...tokensFor(active)])) return { active, lifted };
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * The full picture for one tick.
  *
  * arms: unique arms across the fleet's ladders ({ armId, family, model,
  *   effort, qFleet, qFleetThinker }).
  * accountGroups: per-account grouped rungs (for the empty-role guard).
+ * structuralGroups: every account's grouped rungs, health- and
+ *   breaker-independent (for the structural-emptiness gate on the
+ *   operator's list; within the readiness-admitted fleet, since arms
+ *   without fresh ready evidence never reach the ladders). Defaults to
+ *   accountGroups.
  * manual: the operator's emergency list ({ doer, thinker, other } families).
  *
  * The outcome benchmark skips every family that cannot serve the role:
@@ -275,7 +338,7 @@ function recordFamiliesByRole(records, { nowMs, cfg, roleOf, familyOf }) {
  */
 export function buildEligibility({
   arms, records, nowMs, minQuality, outcomeGate, manual, roleOf, familyOf,
-  accountGroups = [], roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
+  accountGroups = [], structuralGroups = null, roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
 }) {
   const quality = qualityVerdicts(arms, minQuality, { minFleetArms });
   const manualByRole = {};
@@ -308,8 +371,16 @@ export function buildEligibility({
   const roles = {};
   const warnings = [];
   const suspendedByRole = {};
+  const manualSuspendedByRole = {};
   const finalOutcomes = {};
   const accessible = (role, tokens) => (accountGroups ?? []).some(groups => roleLadderAccess(groups, {
+    role, roleBands, excludedFamilies: tokens, trialRoles,
+  }).eligible);
+  // Structural view: every lane, whether healthy or not, breaker-filtered
+  // or not. A non-banned arm fitting the role window and trial rules
+  // anywhere in the fleet means the role is only transiently empty.
+  const structural = structuralGroups ?? accountGroups;
+  const structurallyAccessible = (role, tokens) => (structural ?? []).some(groups => roleLadderAccess(groups, {
     role, roleBands, excludedFamilies: tokens, trialRoles,
   }).eligible);
 
@@ -320,7 +391,7 @@ export function buildEligibility({
     const outcomeBaseTokens = outcomesBase[role].gated;
     // If the data gates would empty the role, give back the least trusted
     // first: the empirical outcome gate (noisy, small samples), then the
-    // benchmark minimum, then both. Only the operator list is never dropped.
+    // benchmark minimum, then both. The operator list yields last.
     const attempts = [
       { quality: true, outcome: true },
       { quality: true, outcome: false },
@@ -334,11 +405,30 @@ export function buildEligibility({
       ...(a.quality ? qualityTokens : []),
       ...(a.outcome ? (a.quality ? outcomeStrictTokens : outcomeBaseTokens) : []),
     ];
-    let active = attempts[0];
-    if ((qualityTokens.length + outcomeStrictTokens.length > 0)
-      && !accessible(role, [...manualList, ...tokensFor(active)]) && accessible(role, manualList)) {
-      active = attempts.find(a => accessible(role, [...manualList, ...tokensFor(a)])) ?? attempts[3];
+    // Data gates yield first with the operator's list intact, so a role
+    // is never emptied into a defer loop by data, on any lane state.
+    const servesHealthy = tokens => accessible(role, tokens);
+    const dataOnly = attempts.find(a => servesHealthy([...manualList, ...tokensFor(a)]));
+    // The operator's list lifts only on structural emptiness: when even
+    // the fleet-wide arm set holds no non-banned arm fitting the role
+    // window and trial rules. A lane outage, an excluded account or an
+    // open breaker leaves the ban in place and the role defers.
+    const structurallyEmpty = !structurallyAccessible(role, [...manualList, ...tokensFor(attempts[0])]);
+    let state;
+    if (dataOnly) state = { active: dataOnly, lifted: [] };
+    else if (!structurallyEmpty) state = null;
+    else {
+      state = firstServingState({
+        attempts,
+        tokensFor,
+        manualList,
+        order: manualSuspensionOrder(manualList, arms, role),
+        serves: servesHealthy,
+      });
     }
+    const active = state?.active ?? attempts[0];
+    const suspendedManual = state?.lifted ?? [];
+    const keptManual = manualList.filter(t => !suspendedManual.includes(t));
     const activeOutcomeTokens = active.quality ? outcomeStrictTokens : outcomeBaseTokens;
     const suspendedGates = [
       ...(!active.quality && qualityTokens.length > 0 ? ['quality'] : []),
@@ -352,15 +442,25 @@ export function buildEligibility({
         message: `the ${suspendedGates.join(' and ')} gate would leave no eligible arm for ${role}; suspended for this role`,
       });
     }
+    if (suspendedManual.length > 0) {
+      warnings.push({
+        code: 'manual-suspended',
+        role,
+        entries: suspendedManual,
+        message: `the operator's ${role} exclusions would leave no eligible arm for ${role}; suspended for this role: ${suspendedManual.join(', ')}`,
+      });
+    }
     suspendedByRole[role] = new Set(suspendedGates);
-    const tokens = [...new Set([...manualList, ...tokensFor(active)])];
+    manualSuspendedByRole[role] = new Set(suspendedManual);
+    const tokens = [...new Set([...keptManual, ...tokensFor(active)])];
     exclusions[role] = tokens;
     finalOutcomes[role] = active.quality ? outcomesStrict[role] : outcomesBase[role];
     roles[role] = {
       excludedFamilies: tokens.filter(t => !t.startsWith(ARM_TOKEN_PREFIX)),
       excludedArms: tokens.filter(t => t.startsWith(ARM_TOKEN_PREFIX)).map(t => t.slice(ARM_TOKEN_PREFIX.length)),
-      suspended: suspendedGates.length > 0,
+      suspended: suspendedGates.length > 0 || suspendedManual.length > 0,
       suspendedGates,
+      suspendedManual,
       outcome: finalOutcomes[role],
     };
   }
@@ -389,9 +489,11 @@ export function buildEligibility({
     for (const role of ELIGIBILITY_ROLES) {
       const reasons = [];
       let ok = true;
-      if (manualByRole[role].includes(String(a.family ?? '').toLowerCase()) || manualByRole[role].includes(armToken(a.armId))) {
-        ok = false;
-        reasons.push(`manual-exclusion: ${a.family}`);
+      const manualHits = [String(a.family ?? '').toLowerCase(), armToken(a.armId)]
+        .filter(t => manualByRole[role].includes(t));
+      if (manualHits.length > 0) {
+        if (manualHits.every(t => manualSuspendedByRole[role].has(t))) reasons.push(`suspended: manual-exclusion: ${a.family}`);
+        else { ok = false; reasons.push(`manual-exclusion: ${a.family}`); }
       }
       const qv = quality[role][a.armId];
       if (qv?.ok === false) {
