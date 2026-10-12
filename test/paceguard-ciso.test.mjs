@@ -66,7 +66,9 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  // Unit suite drives the lane read against the public placeholder pin
+  // with a fake http client (see the requirePinnedLaneHost seam).
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
     setup: async () => {
@@ -104,15 +106,26 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
   assert.equal((await d.hook('run-1')).kind, 'decide');
   // run-2 starts (host order: started fires before the hook resolves) with a
   // model the tick maps to the claude pool, then the hook defers it at the
-  // cap and marks it waiting.
-  await d.fire(runEvent('run-2', TICK + MIN, 'agent.run.started', 'agent-9', { model: 'claude-opus-5-5' }));
+  // cap and marks it waiting. The event is stamped at the tick time: a
+  // future anchor would read as unverified and leave the census through the
+  // read-time prune instead of the TTL, so the TTL assertions below would
+  // pass with the TTL logic removed.
+  await d.fire(runEvent('run-2', TICK, 'agent.run.started', 'agent-9', { model: 'claude-opus-5-5' }));
   const def = await d.hook('run-2');
   assert.equal(def.kind, 'defer');
   assert.match(def.reason, /pace guard/);
   // run-1 finishes; run-2 never resolves and no terminal event ever lands.
   await d.fire(runEvent('run-1', TICK + 2 * MIN, 'agent.run.finished'));
   await d.tick();
-  // Past 12 x 300 s + 60 s slack = 61 min, inside the 2 h ledger horizon.
+  // Inside 12 x 300 s + 60 s slack = 61 min the mark is fresh, so the pool
+  // reads empty and the next run is admitted.
+  d.setNow(TICK + 30 * MIN);
+  await d.tick();
+  assert.equal((await d.hook('run-3')).kind, 'decide', 'fresh mark still hides run-2; the pool has a free slot');
+  // Past the 61 min lifespan, inside the 2 h ledger horizon, the stale mark
+  // drops and run-2 counts as in flight again: the pool is back at its cap.
+  // Same run id as above, so the guard's self-exclusion keeps run-3's own
+  // decided record out of the census and only run-2 can hold the pool.
   d.setNow(TICK + 70 * MIN);
   await d.tick();
   d.killIo();
