@@ -70,7 +70,7 @@
  * `/capacity` reports `paceGuard`. No capability, egress, secret or env-key
  * change.
  *
- * v0.2.28 = LANE HOST PIN: the lane host is no longer written in the public
+ * v0.2.32 = LANE HOST PIN: the lane host is no longer written in the public
  * source. src/lane-host.mjs holds a non-routable placeholder and the package
  * build replaces that one file with the real origin; the manifest enum, the
  * config validator and the config fallback all read it, so the key still
@@ -114,7 +114,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.28';
+export const PLUGIN_VERSION = '0.2.32';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
