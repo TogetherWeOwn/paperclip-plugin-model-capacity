@@ -31,7 +31,9 @@ const CLAUDE = [
 const CODEX = [
   arm('gpt-6-1-sol', 'sol', 0.33, { qFleetThinker: 0.33 }),
   arm('gpt-6-astra', 'astra', 0.2, { qFleetThinker: 0.2 }),
-  arm('gpt-oss-120b', 'oss', -1.75, { qFleetThinker: -1.75 }),
+  // Production marks oss as trial (not in PROVEN_FAMILIES), so thinkers
+  // never run it; the fixture says so too.
+  arm('gpt-oss-120b', 'oss', -1.75, { qFleetThinker: -1.75, trial: true }),
 ];
 
 const build = (arms, overrides = {}) => buildEligibility({
@@ -118,16 +120,31 @@ test('Claude-only fleet: every role decides on Claude, no manual suspension', ()
   assert.deepEqual(e.report.roles.thinker.suspendedManual, []);
 });
 
-test('Codex-only fleet: thinkers decide; the quality gate yields before the operator list (cascade order)', () => {
-  // gpt-oss-120b is not on the thinker list, so the list alone does not empty
-  // the role. The quality gate yields first, so the thinker gets the oss arm.
-  // This is the cascade as specified; it is flagged in the PR for an owner call.
+test('Codex-only fleet: thinkers lift sol with the quality floor suspended (oss is trial-only)', () => {
+  // gpt-oss-120b is trial in production, so thinkers cannot run it. The
+  // thinker list (muse, luna, sol, astra) plus the 0.4 quality floor leave
+  // the role empty, so the minimal lift restores sol and suspends quality.
   const e = build(CODEX);
   const d = decideFor(CODEX, 'thinker', e.exclusions.thinker);
   assert.notEqual(d.kind, 'defer');
-  assert.equal(d.armId, 'gpt-oss-120b');
+  assert.equal(d.armId, 'gpt-6-1-sol');
+  assert.deepEqual(e.report.roles.thinker.suspendedManual, ['sol']);
+  assert.deepEqual(e.report.roles.thinker.suspendedGates, ['quality']);
+});
+
+test('hypothetical non-trial weak arm: the quality gate yields before the operator list (cascade order)', () => {
+  // A serving non-trial arm below the floor is a data-gate problem, not a
+  // list problem: quality yields and the list holds.
+  const arms = [
+    arm('weak-low', 'weak', -1.75, { qFleetThinker: -1.75 }),
+    arm('gpt-6-1-sol', 'sol', 0.33, { qFleetThinker: 0.33 }),
+  ];
+  const e = build(arms, { manual: { doer: [], thinker: ['sol'], other: [] } });
+  const d = decideFor(arms, 'thinker', e.exclusions.thinker);
+  assert.notEqual(d.kind, 'defer');
+  assert.equal(d.armId, 'weak-low');
   assert.deepEqual(e.report.roles.thinker.suspendedManual, []);
-  assert.ok(e.report.warnings.some(w => w.code === 'role-empty-suspended' && w.role === 'thinker'));
+  assert.deepEqual(e.report.roles.thinker.suspendedGates, ['quality']);
 });
 
 test('Codex-only fleet: doers keep the manual oss ban and decide on sol', () => {
@@ -228,14 +245,19 @@ test('an entry outside the role rung window is not lifted', () => {
   assert.equal(d.armId, 'gpt-6-1-sol');
 });
 
-test('a provider with no healthy lane lifts the operator ban for that tick; a healthy lane keeps it', () => {
+test('an unhealthy lane never lifts the operator ban: the role defers until the lane recovers', () => {
+  // Structural emptiness only: the fleet-wide arm set still holds a
+  // non-banned Claude arm fitting the role window and trial rules, so the
+  // ban holds while the lane is down and the role defers (the old behavior).
   const fleet = [...CLAUDE, ...META];
   const manual = { doer: ['muse'], thinker: [], other: [] };
-  const healthy = build(fleet, { manual, accountGroups: [groupsFor(CLAUDE), groupsFor(META)] });
+  const structuralGroups = [groupsFor(CLAUDE), groupsFor(META)];
+  const healthy = build(fleet, { manual, accountGroups: [groupsFor(CLAUDE), groupsFor(META)], structuralGroups });
   assert.deepEqual(healthy.report.roles.doer.suspendedManual, []);
   assert.deepEqual(healthy.exclusions.doer, ['muse']);
   assert.ok(decideFor(CLAUDE, 'doer', healthy.exclusions.doer).armId.startsWith('claude-'));
-  const degraded = build(fleet, { manual, accountGroups: [groupsFor(META)] });
-  assert.deepEqual(degraded.report.roles.doer.suspendedManual, ['muse']);
-  assert.equal(decideFor(META, 'doer', degraded.exclusions.doer).armId, 'muse-spark-1.3');
+  const degraded = build(fleet, { manual, accountGroups: [groupsFor(META)], structuralGroups });
+  assert.deepEqual(degraded.report.roles.doer.suspendedManual, [], 'the ban holds during the outage');
+  assert.ok(degraded.exclusions.doer.includes('muse'));
+  assert.equal(decideFor(META, 'doer', degraded.exclusions.doer).kind, 'defer');
 });

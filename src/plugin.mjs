@@ -1760,6 +1760,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         .map(a => filterBreakerRungs(
           groupByRung(ladders[a.accountId]?.rungs ?? []), breakers, a.accountId, nowMs, breakersCfg,
         )),
+      // Structural view for the operator-list gate: every lane, health-
+      // and breaker-independent, so a lane outage or a cooling arm never
+      // lifts an explicit ban (the role defers until recovery instead).
+      structuralGroups: ordered
+        .map(a => groupByRung(ladders[a.accountId]?.rungs ?? [])),
       roleBands,
       trialRoles: config.trials.roles,
     });
