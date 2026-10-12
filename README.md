@@ -492,11 +492,11 @@ that share one credential bucket):
 
 A pool that is ahead and already has `cap` runs in flight is **paced**: its
 lanes leave the allocation order, so the run goes to another pool, or, when
-the guard has dropped every pool that could serve it, the hook answers
-`defer` with a `pace guard: ...` reason and `pacing.guard.retryAfterMs`. If
-another pool is left but has nothing to decide (a full trial slot, say), the
-defer is the plain 60s one. A pool that is not ahead is never
-touched. `slots` is the same term as the per-account concurrency target, so
+no other pool decides it, the hook answers `defer` with a `pace guard: ...`
+reason and `pacing.guard.retryAfterMs` -- even when an unpaced pool is left
+but has nothing to decide (a full trial slot, say): the paced pool is a real
+minutes-scale hold, and the reason names both holds. A pool that is not
+ahead is never touched. `slots` is the same term as the per-account concurrency target, so
 the cap follows the plan: it shrinks as an account spends ahead and widens as
 the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
 
@@ -505,9 +505,10 @@ accounts through `orderAccountsWithPacing` with the same plan positions and
 knobs, so they hold and release a pool alike (a run being decided never
 counts against its own pool, and neither do runs the hook deferred). A held run gets no shadow decision;
 `shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
-(`enabled`, `marginPct`, `retryAfterMs`, and one entry per pool with
-`planAhead`, `pacedSlots`, `cap`, `inFlight` and `state`: `paced`, `ahead`,
-`on-plan`, `not-measured`) and each account carries `planAhead`.
+(`enabled`, `marginPct`, `retryAfterMs`, `unattributedInFlight`, and one
+entry per pool with `planAhead`, `pacedSlots`, `cap`, `inFlight` and
+`state`: `paced`, `ahead`, `on-plan`, `not-measured`) and each account
+carries `planAhead`.
 
 Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
 0.02: lead on the plan tolerated before the cap applies), `retryAfterMs`
@@ -545,7 +546,16 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   run the hook deferred (waiting, not running) is not counted, or two waiting
   runs would hold an idle one-slot pool until the host gave up on them. The
   set of deferred runs is memory-only: after a worker restart, a waiting run
-  counts again until the hook next defers it (its next retry).
+  counts again until the hook next defers it (its next retry). A deferred
+  mark lives at most 12 x `retryAfterMs` + 60s (the host abandons a run after
+  12 deferred attempts): past that the run counts as in flight again, fail
+  closed like a lost terminal event.
+- Runs with no decided or actual account yet (fresh starts the tick has not
+  attributed) are not counted toward any pool's cap: each may belong to any
+  pool, or to none, so counting them lets one burst of fresh starts hold
+  every pool for all the others and nothing is ever decided. The fail-open is
+  explicit: `/capacity` publishes the unaccounted amount as
+  `paceGuard.unattributedInFlight`.
 - A reset more than one window (plus an hour) away, or already past, is an
   unknown plan position and fails open.
 - A run whose terminal event never arrives (a worker restart can lose one)
@@ -554,6 +564,55 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   1 or 2 that can hold arrivals for up to two hours, longer than the host's
   deferral budget; `/capacity` shows `inFlight` against `cap` so it is
   visible. The guard errs towards spending less, never more.
+
+### Review reserve
+
+The pace guard keeps the fleet on plan, but reviews starve anyway: review
+runs arrive in bursts and compete with bulk work for the same pace. The
+reserve holds a demand-driven share R of each reserved provider's pace
+(default: `claude`) for review runs -- a native port of the host stopgap
+that starved reviews 9 of 47 hours on 72h of fleet data, against 14 for a
+rolling average and 38 for a fixed 50%.
+
+Per reserved provider, each tick:
+
+    burn/h   = closed hourly review burn (quota-% units, priced by
+               burnPerRunPct, so tier-multiplied models burn at tier price;
+               pinned runs price from their pinned model, hottest arm only
+               when the model matches nothing)
+    review   = mean + 1 stdev over the trailing `envWindowH` (3) closed
+               hours; rises apply instantly, falls decay on `envHalfLifeH`
+    backlog  = queued review runs x measured % per review run / `drainH` (8h)
+    need     = review + backlog (all %/h)
+    capacity = sum over the provider's accounts below 99% weekly of
+               remaining% / hours-to-reset
+    R        = clamp(need / capacity, `rMin` 0.10, `rMax` 0.95)
+
+Kueue-style lending: with no review run waiting the reserve is lent to other
+work (R sits at the floor, nothing is held) and is reclaimed through
+admission as soon as one queues. Runs are never cancelled; the reserve only
+gates admission of non-review runs. With measurable demand but no measurable
+capacity the reserve fails closed at the cap, so reviews keep their share
+rather than racing unreserved work to zero.
+
+A reserved-provider account whose weekly OR 5h use sits above its scaled
+allowance, `(elapsed + margin) x (1 - R)` per window (`marginW` 0.10 weekly,
+`margin5h` 0.15, mirroring the feed pace guard), is **held** for non-review
+runs: it leaves the allocation order in the tick, the hook and the
+event-time path, and the hook answers `defer` with a `review reserve: ...`
+reason. The hold releases per window in the last `releaseWeeklyH` (24h)
+before a weekly reset and the last `release5hMin` (45 min) before a 5h
+reset, so unused quota is not wasted. Unknown position on a window never
+holds (fail open). Review runs (`reviewReserve.agentIds`, default
+`roles.keepAgentIds`) see the unheld order, and pinned agents keep their
+model before admission, so neither is ever held.
+
+`/capacity` carries `reviewReserve` (`enabled`, `agentIds`, `providers`, per
+provider `reserve`, `lent`, `needPctPerH`, `reviewRatePctPerH`,
+`backlogRatePctPerH`, `capacityPctPerH`, `queuedReviews`, `reviewRunsPerH`,
+`pctPerReviewRun`, `heldAccountIds` and per-account `held`/`window`, plus
+the top-level `heldAccountIds`). `enabled: false` computes nothing and holds
+nobody: admission is bit-for-bit the pre-reserve behavior.
 
 ## Configuration
 

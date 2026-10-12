@@ -407,17 +407,21 @@ test('an unmeasured lane in the pool makes the whole pool fail open', async () =
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
 });
 
-test('the long retry is for a fleet held entirely by the guard, not for a trial slot another pool lacks', async () => {
+test('a paced pool plus a trial-full unpaced pool defers on the guard retry', async () => {
   const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
   await d.setup();
   await d.tick();
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
-  // Claude is held (one run), gemini's two trial slots are full: gemini is not
-  // paced, so the wait is the plain one.
+  // Claude is held (one run) and gemini's two trial slots are full. The
+  // paced pool is a real minutes-scale hold even though an unpaced pool is
+  // also unselectable, so the wait carries the guard retry, not the 60 s
+  // generic one, and names both holds.
   const fourth = await d.hook('run-4');
   assert.equal(fourth.kind, 'defer');
-  assert.equal(fourth.retryAfterMs, 60000);
-  assert.equal(fourth.reason, 'no account has headroom right now');
+  assert.equal(fourth.retryAfterMs, DEFAULT_PACE_GUARD.retryAfterMs);
+  assert.match(fourth.reason, /pace guard/);
+  assert.match(fourth.reason, /claude/);
+  assert.match(fourth.reason, /unpaced account\(s\) also unselectable/);
 });
 
 test('validateConfigShape tolerates a non-object pacing like before the guard existed', () => {
