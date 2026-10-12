@@ -425,7 +425,13 @@ export function resolveConfig(raw = {}) {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
-    contextCaps: { ...DEFAULT_CONTEXT_CAPS, ...(raw.contextCaps ?? {}) },
+    contextCaps: {
+      ...DEFAULT_CONTEXT_CAPS,
+      ...(raw.contextCaps ?? {}),
+      // Explicit false restores base-cost burn (rollback); anything else
+      // keeps the tier-adjusted quota default.
+      tierAffectsQuota: (raw.contextCaps ?? {}).tierAffectsQuota !== false,
+    },
     // Kill switch for run.model.resolve enforcement. False (default): the
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
@@ -941,7 +947,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           armId: a.armId,
           Q: blendQ(qAa, qEee, alphaDoer),
           // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
-          // below stays on base cost: price cliffs change money, not tokens.
+          // below uses the same effective cost while
+          // contextCaps.tierAffectsQuota holds (default true): on
+          // subscription lanes quota charges the tier price, not base.
           C: tier.costEffective ?? base,
           coverage: scored.get(a.armId)?.coverage ?? 0,
           costBase: base,
@@ -1002,12 +1010,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
       };
       const admitted = credentialLadderFor(credentialRanking, credentialNow, config.credentialReadiness.enforce);
+      // Quota burn prices the tier multiplier while tierAffectsQuota holds:
+      // subscription quota charges Haiku over 100k at ~5x base, so pacing,
+      // headroom (decide burn check), concurrency and target shares all see
+      // the effective cost. False restores base-cost burn.
+      const quotaAffects = config.contextCaps?.tierAffectsQuota !== false;
+      const burnCostOf = (e) => quotaAffects
+        ? (e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null)
+        : (costs.get(e.armId)?.C ?? null);
       ladders[keyOf(account, i)] = {
         ...admitted,
         rankingRungs: ranking.rungs,
         rankingWithinNoise: ranking.withinNoise,
         credentialRanking,
-        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(costs.get(e.armId)?.C ?? null)])),
+        burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(burnCostOf(e))])),
       };
     }
     // Feasibility-gated compact windows per MODEL (most constraining cap
