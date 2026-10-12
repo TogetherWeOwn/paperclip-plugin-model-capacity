@@ -69,6 +69,19 @@
  * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
  * capability, egress, secret or env-key change.
  *
+ * v0.2.35 = OPERATOR LIST YIELDS ON STRUCTURAL EMPTINESS: when the
+ * operator's list alone would leave a role with no arm anywhere in the
+ * fleet-wide arm set, the fewest of its entries are suspended for that
+ * role, strongest banned family first, and the data gates keep as much
+ * strength as the role allows (`manual-suspended` in /capacity). The
+ * structural view is readiness-independent (unfiltered ranking rungs), so
+ * a lane outage, an excluded account, an open breaker, or transient
+ * all-cooling/expired/zero-serving evidence never lifts the list; the
+ * role defers until the lane recovers. Emptiness is judged on the
+ * operator list alone, never with the data gates on. A single-provider
+ * fleet keeps deciding every role. No capability, egress, secret or
+ * env-key change.
+ *
  * v0.2.30 = TIER-AWARE QUOTA BURN: `burnPerRunPct` prices the context-tier
  * multiplier while `contextCaps.tierAffectsQuota` holds (default true), so
  * pacing, the decide burn check, concurrency and target shares see the
@@ -213,7 +226,7 @@ const CONFIG_SCHEMA = {
         keepAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents whose runs always keep their configured model: the hook answers keep and shadow reports the configured model. For gating roles pinned by the operator (e.g. the code reviewer).' },
         excludeFamilies: {
           type: 'object', default: {}, additionalProperties: false,
-          description: 'Emergency override only: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate; a warning is logged while this is non-empty.',
+          description: 'Emergency override: families (or arm:<armId> tokens) removed from a role by hand. Eligibility is decided from data by minQuality and outcomeGate. If this list alone would leave a role with no arm, the fewest entries needed are suspended for that role (manual-suspended in /capacity). A warning is logged while this is non-empty.',
           properties: {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },

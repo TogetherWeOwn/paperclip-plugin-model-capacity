@@ -547,7 +547,8 @@ switch back to pure water-filling.
 ### Eligibility from data
 
 An arm serves a role only if it passes both gates; the operator list
-`roles.excludeFamilies` is applied on top. Each exclusion is a token in the
+`roles.excludeFamilies` is applied on top, yielding only on structural
+emptiness (see Safety). Each exclusion is a token in the
 list the decision code already honors: a family (`muse`) or one arm
 (`arm:<armId>`), so the target, placement, the hook and the event-time path
 all see the same set. `/capacity` shows it (`roleExclusionsEffective`) and
@@ -598,8 +599,16 @@ cannot be placed on a ladder in the first place; it is listed as
 **Safety.** If the gates would leave a role with no arm on any account, the
 outcome gate is given back for that role first, then the quality minimum
 (`role-empty-suspended`, with the `gates` named, in `/capacity`); a role can
-never be emptied into a defer loop by data. The operator list always
-applies.
+never be emptied into a defer loop by data. If the operator list alone would
+leave a role with no arm anywhere in the fleet-wide arm set (a
+single-provider fleet), the fewest of its entries are suspended for that
+role, strongest banned family first, and the data gates keep as much
+strength as the role allows (`manual-suspended`, with the `entries` named,
+in `/capacity`). Otherwise the operator list applies as written. The lift is
+structural only: a lane outage, an excluded account or open arm breakers
+never lift the list; the role defers until the lane recovers. Only healthy,
+non-excluded accounts with arms whose breakers are closed decide and place
+runs.
 
 Defaults (all configurable):
 
