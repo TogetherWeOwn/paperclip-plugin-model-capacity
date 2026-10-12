@@ -61,13 +61,11 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
- * v0.2.40 = PACE-GUARD CISO FOLLOW-UP: deferred-run marks expire after
- * 12 x retryAfterMs + 60s (past the host's retry lifespan a waiting run
- * counts as in flight again, fail closed); a paced pool plus unselectable
- * unpaced accounts defers on the guard retry with both holds named; runs
- * with no account attribution stay out of every pool's cap (fail open) and
- * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
- * capability, egress, secret or env-key change.
+ * v0.2.40 = PACE-GUARD DEFER REASON COUNT: the mixed-hold defer reason
+ * counts distinct unpaced accounts (the duplicate-pass order listed each
+ * account twice). The deferred-mark TTL, the mixed-hold defer and
+ * `paceGuard.unattributedInFlight` shipped in 0.2.39 and are unchanged.
+ * No capability, egress, secret or env-key change.
  *
  * v0.2.39 = REVIEW-RESERVE REVIEW ROUND: pinned review runs price from
  * their pinned model (hottest arm only when the model matches nothing), so
