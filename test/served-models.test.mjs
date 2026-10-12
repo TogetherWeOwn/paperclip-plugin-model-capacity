@@ -62,7 +62,7 @@ async function start(lane, rows) {
   const events = new Map();
   const warnings = [];
   const key = k => JSON.stringify(k);
-  const plugin = createModelCapacityPlugin({ clock: () => NOW });
+  const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
   await plugin.setup({
     config: { get: async () => config },
     state: {

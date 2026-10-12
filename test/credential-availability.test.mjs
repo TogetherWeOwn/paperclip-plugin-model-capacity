@@ -39,7 +39,7 @@ async function start(accounts, rows = null, configure = () => {}) {
     roles: { minQuality: { doer: null, thinker: null, other: null }, outcomeGate: { enabled: false } },
   };
   configure(config);
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup({
     config: { get: async () => config },
     state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
@@ -625,7 +625,7 @@ test('disabling enforcement during a lane fetch holds after the tick lands', asy
   const key = k => JSON.stringify(k);
   let fetchCalls = 0;
   let releaseFetch = null;
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup({
     config: { get: async () => structuredClone(current) },
     state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },

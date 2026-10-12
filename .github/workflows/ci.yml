@@ -20,6 +20,8 @@ jobs:
           node-version: 24
       - name: Run unit tests
         run: node --test test/*.test.mjs
+      - name: Committed lane host pin is the placeholder
+        run: node scripts/check-public-pin.mjs
 
   ci-ok:
     name: ci-ok

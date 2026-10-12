@@ -123,7 +123,9 @@ async function runCase(pluginFactory, repoRoot, name) {
     },
     trials: { roles: ['doer'], adapters: { 'claude-code': ['*'] }, maxInFlightPerAccount: 8 },
   };
-  const plugin = pluginFactory({ clock: () => now });
+  // Test seam from the lane-host pin (main #14): the synthetic lane has no
+  // pinned host. Old baseline factories ignore the unknown option.
+  const plugin = pluginFactory({ clock: () => now, requirePinnedLaneHost: false });
   const ctx = {
     config: { get: async () => config },
     state: {
