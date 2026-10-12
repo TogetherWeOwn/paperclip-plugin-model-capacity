@@ -352,6 +352,24 @@ them and runs haiku at a 200k window): when the arm's AA context window is
 emits `<model>(<effort>)[1m]` instead, which the CLI strips and runs at 1M.
 `decide` returns model/effort first-class and sets nothing else.
 
+### Context-tier quota burn
+
+Ladder order runs on the effective cost (`C_eff = base x E[multiplier]`).
+Quota burn (`burnPerRunPct`) and everything derived from it -- the decide
+headroom check, pacing, concurrency and target shares -- price the same
+effective cost while `contextCaps.tierAffectsQuota` holds (default `true`).
+Measured on subscription lanes, quota charges Haiku over 100k at well above
+base (about 3x on a single-weight fit, 5x within noise), so a Haiku arm with
+`fractionOver = 1` burns about 5x its base quota. Rollback is
+`contextCaps.tierAffectsQuota: false`, or a release revert.
+
+No 100k cap is emitted for Haiku: the compact window is feasibility-gated
+(`p10 < 0.6 x T`), and Haiku sessions start at about 133k at p10, so a 100k
+window cannot keep them under the cliff -- it would only burn context. If
+the baseline prompt is cut below about 60k, a 100k cap becomes feasible;
+measuring what fills the first request of a Haiku run is separate follow-up
+work.
+
 The resolve hook is memory-only: it reads the live view the last tick
 published and performs zero I/O. The host's RPC deadline is 1.5s; local
 synthetic tests do not establish a latency guarantee. Unknown company,
