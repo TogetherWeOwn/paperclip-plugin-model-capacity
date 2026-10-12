@@ -361,9 +361,11 @@ test('runs the hook deferred do not hold the pool: it refills once the real runs
 test('a lane without ready credentials is outside the pool: its position does not move the mean', async () => {
   // Lane a1 is 4 points behind plan and ready; lane a2 is far ahead but has
   // no ready credential, so it can serve nothing. The pool is a1 alone.
+  // Readiness exclusion is opt-in: this pins the flag on (off mode admits
+  // both lanes, covered by the credential-readiness parity corpus).
   const ready = claudeLane(0.6, 48);
   const unready = { ...claudeLane(0.99, 48), accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
-  const d = drive({ config: { enforce: true }, accounts: [ready, unready] });
+  const d = drive({ config: { enforce: true, credentialReadiness: { enforce: true } }, accounts: [ready, unready] });
   await d.setup();
   await d.tick();
   const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');

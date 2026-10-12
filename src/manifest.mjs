@@ -61,13 +61,19 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
- * v0.2.36 = PACE-GUARD CISO FOLLOW-UP: deferred-run marks expire after
+ * v0.2.40 = PACE-GUARD CISO FOLLOW-UP: deferred-run marks expire after
  * 12 x retryAfterMs + 60s (past the host's retry lifespan a waiting run
  * counts as in flight again, fail closed); a paced pool plus unselectable
  * unpaced accounts defers on the guard retry with both holds named; runs
  * with no account attribution stay out of every pool's cap (fail open) and
  * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
  * capability, egress, secret or env-key change.
+ *
+ * v0.2.37 = OPT-IN CREDENTIAL READINESS: `credentialReadiness.enforce`
+ * (default false) gates credential-readiness admission. Off mode admits
+ * evidence-free feeds like the pre-enforcement behavior while still parsing
+ * and reporting readiness in `/capacity`; on mode keeps exact fail-closed
+ * enforcement. No capability, egress, secret or env-key change.
  *
  * v0.2.35 = OPERATOR LIST YIELDS ON STRUCTURAL EMPTINESS: when the
  * operator's list alone would leave a role with no arm anywhere in the
@@ -143,7 +149,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.36';
+export const PLUGIN_VERSION = '0.2.40';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -348,6 +354,13 @@ const CONFIG_SCHEMA = {
     enforce: {
       type: 'boolean', default: false,
       description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
+    },
+    credentialReadiness: {
+      type: 'object', required: ['enforce'], additionalProperties: false,
+      description: 'Credential-readiness admission is opt-in until every lane account publishes a valid envelope. Check /capacity counts before enabling.',
+      properties: {
+        enforce: { type: 'boolean', default: false },
+      },
     },
     trials: {
       type: 'object', additionalProperties: false,
