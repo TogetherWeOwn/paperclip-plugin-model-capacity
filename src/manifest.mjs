@@ -61,6 +61,14 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.30 = TIER-AWARE QUOTA BURN: `burnPerRunPct` prices the context-tier
+ * multiplier while `contextCaps.tierAffectsQuota` holds (default true), so
+ * pacing, the decide burn check, concurrency and target shares see the
+ * effective cost on subscription lanes where quota charges the tier price.
+ * False restores base-cost burn. No cap is emitted for the infeasible 100k
+ * Haiku cliff (sessions start at ~133k p10). No capability, egress, secret
+ * or env-key change.
+ *
  * v0.2.28 = PACE GUARD: a provider pool whose lanes average above the linear
  * weekly plan (plus `pacing.guard.marginPct`) is held at max(1, ceil(paced
  * slots)) runs in flight; further runs go to other pools or the hook defers
@@ -105,7 +113,7 @@
 import { DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.28';
+export const PLUGIN_VERSION = '0.2.30';
 
 /** Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name. */
 export const LANE_BASE_URL_ALLOWLIST = Object.freeze([
@@ -303,6 +311,7 @@ const CONFIG_SCHEMA = {
         solLunaAutoCompactTokens: { type: 'integer', minimum: 1, default: 240000 },
         autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW' },
         haikuMaxOutputTokens: { type: 'integer', minimum: 1, default: 64000 },
+        tierAffectsQuota: { type: 'boolean', default: true, description: 'Apply context-tier multipliers to quota burn and pressure accounting, not only ladder order. True by default (subscription lanes charge tier price); false restores base-cost burn.' },
       },
     },
     enforce: {
