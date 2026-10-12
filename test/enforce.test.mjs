@@ -126,7 +126,7 @@ test('enforce true with fresh state decides from memory with no I/O', async () =
 });
 
 test('unknown company and operator override answer keep; stale ticks defer (fail-closed)', async () => {
-  const d = drive({ nowMs: TICK, config: { enforce: true } });
+  const d = drive({ nowMs: TICK, config: { enforce: true, credentialReadiness: { enforce: true } } });
   await d.setup();
   await d.tick();
   d.killIo();
@@ -139,6 +139,15 @@ test('unknown company and operator override answer keep; stale ticks defer (fail
   assert.equal(stale.kind, 'defer');
   assert.equal(stale.retryAfterMs, 60000);
   assert.match(stale.reason, /stale/);
+});
+
+test('credential readiness off keeps on a stale routing snapshot', async () => {
+  const d = drive({ nowMs: TICK, config: { enforce: true, credentialReadiness: { enforce: false } } });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  d.setNow(TICK + 121000);
+  assert.deepEqual(await d.hook(), { kind: 'keep' });
 });
 
 test('no headroom anywhere defers with a ~60s retry', async () => {

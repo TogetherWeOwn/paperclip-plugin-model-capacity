@@ -31,7 +31,7 @@ async function start(accounts, rows = null, configure = () => {}) {
   const warnings = [];
   const key = k => JSON.stringify(k);
   const config = {
-    enforce: true, cliproxy: { laneKeySecretRef: SECRET },
+    enforce: true, credentialReadiness: { enforce: true }, cliproxy: { laneKeySecretRef: SECRET },
     trials: { maxInFlightPerAccount: 10 },
     armMap: accounts.flatMap(a => a.models.map(model => ({
       aaSlug: model, model, effort: 'max', family: 'sol', providers: [a.provider],
@@ -64,6 +64,10 @@ async function start(accounts, rows = null, configure = () => {}) {
     setFetchStatus: value => { fetchStatus = value; },
     setEnforce: value => {
       config.enforce = value;
+      return plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    setCredentialEnforce: value => {
+      config.credentialReadiness.enforce = value;
       return plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
@@ -557,6 +561,40 @@ test('a dominated backup inherits its unavailable incumbent rung, not a cheaper 
   assert.equal((await d.hook('backup-cannot-enter-rung-zero')).kind, 'defer');
 });
 
+test('readiness off preserves legacy routing and target while reporting all-cooling evidence', async () => {
+  const d = await start([account(MODEL, 'antigravity', 'synthetic', 0)], null, config => {
+    config.credentialReadiness.enforce = false;
+  });
+  await d.tick();
+  const hook = await d.hook('off-mode-all-cooling');
+  assert.equal(hook.kind, 'decide');
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.targetRaw, null);
+  assert.equal(capacity.credentialAvailability.mode, 'off');
+  assert.equal(capacity.credentialAvailability.validEnvelopeAccounts, 1);
+  assert.equal(capacity.credentialAvailability.countsByReason['all-cooling'], 1);
+  assert.equal(capacity.credentialAvailability.totalAccounts, 1);
+  assert.ok(!d.warnings.some(w => String(w.details.code).startsWith('credential-availability-')));
+});
+
+test('credential readiness config flips change hook and event admission immediately', async () => {
+  const d = await start([account()]);
+  await d.tick();
+  assert.equal((await d.hook('flip-on')).kind, 'defer');
+  await d.startRun('event-on');
+  assert.equal((await d.api('shadow')).body.entries.some(row => row.runId === 'event-on'), false);
+
+  await d.setCredentialEnforce(false);
+  await d.startRun('event-off');
+  await d.tick();
+  assert.equal((await d.api('shadow')).body.entries.some(row => row.runId === 'event-off'), true);
+
+  await d.setCredentialEnforce(true);
+  assert.equal((await d.hook('flip-on-pending-tick')).kind, 'decide');
+  await d.tick();
+  assert.equal((await d.hook('flip-on-again')).kind, 'defer');
+});
+
 test('legacy frozen cooldown text and timestamps cannot manufacture fresh readiness', () => {
   const raw = account();
   delete raw.credentialAvailability;
@@ -565,4 +603,72 @@ test('legacy frozen cooldown text and timestamps cannot manufacture fresh readin
   assert.deepEqual(readiness(raw, MODEL, NOW + 2000), { eligible: false, reason: 'missing' });
   const parsed = parseCredentialAvailability(undefined);
   assert.deepEqual(parsed, { status: 'missing', models: [] });
+});
+
+test('disabling enforcement during a lane fetch holds after the tick lands', async () => {
+  // The tick reads its config BEFORE the lane fetch and publishes AFTER it,
+  // so a shared mutated config object cannot show the race: every config
+  // read here returns a per-call snapshot, and the second tick waits on a
+  // gated fetch while the flip lands mid-flight.
+  const current = {
+    enforce: true, credentialReadiness: { enforce: true }, cliproxy: { laneKeySecretRef: SECRET },
+    trials: { maxInFlightPerAccount: 10 },
+    armMap: [MODEL].map(model => ({
+      aaSlug: model, model, effort: 'max', family: 'sol', providers: ['antigravity'],
+    })),
+    roles: { minQuality: { doer: null, thinker: null, other: null }, outcomeGate: { enabled: false } },
+  };
+  const lane = { observedAt: ISO, servedModels: [MODEL], accounts: [account()] };
+  let now = NOW;
+  const store = new Map();
+  const jobs = new Map();
+  const key = k => JSON.stringify(k);
+  let fetchCalls = 0;
+  let releaseFetch = null;
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  await plugin.setup({
+    config: { get: async () => structuredClone(current) },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'synthetic-lane-key' },
+    http: { fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 2) await new Promise(resolve => { releaseFetch = resolve; });
+      return { status: 200, json: async () => lane };
+    } },
+    agents: { get: async () => null }, issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (name, fn) => { jobs.set(name, fn); } },
+    events: { on: () => {} },
+    logger: { info() {}, error() {}, warn() {} },
+  });
+  store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }), {
+    fetchedAt: ISO, duplicateSlugs: [], rows: [{ slug: MODEL, intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 }],
+  });
+  await plugin.onConfigChanged(structuredClone(current), { companyId: 'acme' });
+  const tick = () => jobs.get('shadow-tick')({});
+  const hook = runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 });
+  await tick();
+  assert.equal((await hook('race-on')).kind, 'defer');
+  // Past the 45s lane cache so the next tick really fetches, inside the 120s
+  // evidence and live-view bounds so the feed and the view stay fresh.
+  now = NOW + 46000;
+  const inFlight = tick();
+  while (fetchCalls < 2) await new Promise(resolve => setImmediate(resolve));
+  current.credentialReadiness.enforce = false;
+  await plugin.onConfigChanged(structuredClone(current), { companyId: 'acme' });
+  assert.equal((await hook('race-flipped')).kind, 'decide');
+  releaseFetch();
+  await inFlight;
+  assert.equal((await hook('race-after-tick')).kind, 'decide', 'a stale in-flight tick cannot re-enable enforcement');
+  await tick();
+  assert.equal((await hook('race-next-tick')).kind, 'decide');
+});
+
+test('readiness off keeps the all-cooling arm in the served ladder rungs', async () => {
+  const d = await start([account()], null, config => {
+    config.credentialReadiness.enforce = false;
+  });
+  await d.tick();
+  const rungs = (await d.api('ladder')).body.ladders['antigravity:synthetic'].rungs;
+  assert.ok(rungs.length > 0, 'off mode serves the arm on-mode refuses');
+  assert.equal((await d.hook('off-mode-ladder-hook')).kind, 'decide');
 });
