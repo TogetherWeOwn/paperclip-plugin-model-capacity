@@ -34,6 +34,13 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
    */
   /** Haiku hit the 32k output cap live; raise it to 64k on haiku arms. */
   haikuMaxOutputTokens: 64000,
+  /**
+   * Tier multipliers apply to quota burn and pressure accounting, not only
+   * ladder order. Measured on subscription lanes, quota charges Haiku over
+   * 100k at ~3-5x base, so the default is true. False restores the old
+   * base-cost burn (rollback).
+   */
+  tierAffectsQuota: true,
 });
 
 /**
