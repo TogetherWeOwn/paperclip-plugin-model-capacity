@@ -38,6 +38,7 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
           COMMITS: ${{ toJSON(github.event.commits) }}
           STRICT_INTERNAL_LEVEL: "error" # fail-closed strict public-text gate; "warning" downgrades it
+          INTERNAL_ID_PREFIXES: "TOG|PAP|PAPA" # explicit internal tracker prefixes; never the generic pattern
         shell: python3 {0}
         run: |
           import json, os, re, sys
@@ -58,11 +59,21 @@ jobs:
                   errs.append("ends with a period")
               return errs
 
-          INTERNAL_ID = re.compile(r"\b[A-Z]{2,10}-\d+\b")
+          def build_internal_id():
+              # Explicit internal prefix list, as the sibling gates do with
+              # INTERNAL_ID_PREFIXES. The default stays scoped (never generic):
+              # model names (GPT-5), encodings (UTF-8) and hashes (SHA-256)
+              # must keep passing this gate.
+              raw = (os.environ.get("INTERNAL_ID_PREFIXES") or "").strip()
+              parts = [p.strip() for p in re.split(r"[,\s|]+", raw) if p.strip()] if raw else []
+              if not parts:
+                  parts = ["TOG", "PAP", "PAPA"]
+              return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in parts) + r")-\d+\b")
+          INTERNAL_ID = build_internal_id()
           # Strict public-text subset: tracker ids, instance UI links
           # and the internal host. These always fail a public title/body check unless the
           # strict level is explicitly downgraded to a warning (fail-closed).
-          UI_LINK = re.compile(r"/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
+          UI_LINK = re.compile(r"(?:^|[\s(<\[])/[A-Z]{2,6}/(issues|agents|projects|approvals|runs)/")
           HOST_INTERNAL = re.compile(r"\binfextion\.net\b", re.IGNORECASE)
           STRICT_FIXED = [(UI_LINK, "an instance UI link"), (HOST_INTERNAL, "the internal host")]
 
