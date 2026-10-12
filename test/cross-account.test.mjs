@@ -577,3 +577,150 @@ test('tick: a duplicate model on a mixed Devin lane never routes while a native 
     assert.match(e.wouldModel, /kimi-k3/, `duplicate model routed to Devin: ${e.wouldModel}`);
   }
 });
+
+// ---- Hook + event-time duplicate-pass coverage: the tick, hook and
+// event-time paths share the same two-pass routing (first pass holds Devin
+// duplicates back, second pass admits them), but only the tick had end-to-end
+// tests. These pin the hook and event-time paths with the same fixtures.
+
+const hookParams = (runId) => ({
+  runId, companyId: 'acme', agentId: 'agent-9', issueId: null,
+  adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,
+  agentDefaultModel: null, previous: null, issueOverrideModel: null,
+  deadlineMs: 1500,
+});
+
+function driveLive({ nowMs, config = {}, laneAccounts = null, rows = null }) {
+  const store = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  const skey = k => JSON.stringify(k);
+  let now = nowMs;
+  let lane = { observedAt: new Date(now).toISOString(), accounts: laneAccounts ?? [] };
+  const fake = {
+    config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
+    state: {
+      get: async k => store.get(skey(k)) ?? null,
+      set: async (k, v) => { store.set(skey(k), v); },
+    },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => readyLane(lane, now) }) },
+    agents: { get: async () => null },
+    issues: { get: async () => null },
+    jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+    events: { on: (n, fn) => { handlers.set(n, fn); } },
+    logger: { info() {}, error() {} },
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now });
+  return {
+    setup: async () => {
+      await plugin.setup(fake);
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: rows ?? aaRows(), duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    tick: async () => { await jobs.get('shadow-tick')({}); },
+    hook: (runId) => plugin.onResolveRunModel(hookParams(runId)),
+    fire: (e) => handlers.get(e.type)(e),
+    shadow: () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+    setNow: (ms) => { now = ms; },
+    setLane: (accounts) => { lane = { observedAt: new Date(now).toISOString(), accounts }; },
+  };
+}
+
+const hookLane = (devinModels) => [
+  claudeAcct({ lane: 'claude-1', key: 'r1', meter: 'reactive', quality: 'reactive', weekly: null, reset: null, fiveHour: null, models: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'] }),
+  rawAcct({ lane: 'devin-1', provider: 'devin', key: 'd1', meter: 'reactive', quality: 'reactive', models: devinModels }),
+];
+
+async function hookShadow({ devinModels, hookIds }) {
+  const d = driveLive({ nowMs: TICK, config: { enforce: true }, laneAccounts: hookLane(devinModels) });
+  await d.setup();
+  await d.tick();
+  for (const id of hookIds) {
+    const out = await d.hook(id);
+    assert.equal(out.kind, 'decide', `${id} should decide, got ${out.kind}: ${out.reason ?? ''}`);
+  }
+  d.setNow(TICK + 60000);
+  d.setLane(hookLane(devinModels));
+  await d.tick();
+  return d.shadow();
+}
+
+test('hook: duplicate-only Devin waits behind the native cap', async () => {
+  // Reactive claude (cap 2) plus Devin serving only the same models: the
+  // first two enforced runs pick claude, the next two fall back to Devin.
+  // A single-pass hook would compete duplicates against natives here.
+  const ids = ['hook-dup-0', 'hook-dup-1', 'hook-dup-2', 'hook-dup-3'];
+  const shadow = await hookShadow({
+    devinModels: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'],
+    hookIds: ids,
+  });
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  assert.deepEqual(ids.map(id => byId.get(id)?.accountId), ['claude:r1', 'claude:r1', 'devin:d1', 'devin:d1']);
+  for (const id of ids) assert.equal(byId.get(id)?.enforced, true);
+});
+
+test('hook: mixed Devin lane never routes a duplicate while the native has room', async () => {
+  // Same lanes plus kimi-k3 on Devin (unique): no enforced run may land on
+  // a Devin duplicate while claude still has a free slot. Head order is
+  // Devin unique, Devin unique, claude, claude; a single-pass hook instead
+  // places the second run on Devin's duplicate haiku while claude:r1 still
+  // has a free slot.
+  const ids = ['hook-mix-0', 'hook-mix-1', 'hook-mix-2', 'hook-mix-3'];
+  const shadow = await hookShadow({
+    devinModels: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'kimi-k3'],
+    hookIds: ids,
+  });
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  assert.deepEqual(ids.map(id => byId.get(id)?.accountId), ['devin:d1', 'devin:d1', 'claude:r1', 'claude:r1']);
+  for (const id of ids) {
+    const e = byId.get(id);
+    assert.equal(e?.enforced, true);
+    if (e?.accountId === 'devin:d1') assert.match(e.wouldModel, /kimi-k3/, `duplicate model routed to Devin: ${e.wouldModel}`);
+  }
+  assert.ok([...byId.values()].some(e => e.accountId === 'claude:r1'), 'native still serves');
+});
+
+test('event-time: mixed Devin lane never routes a duplicate while the native has room', async () => {
+  // Event-time equivalent of the hook test: starts landing between ticks go
+  // through the same two passes. A single-pass event-time path places a run
+  // on Devin's duplicate haiku while claude:r1 still has a free slot.
+  const models = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
+  const ids = ['evt-mix-0', 'evt-mix-1', 'evt-mix-2', 'evt-mix-3'];
+  const { run } = drive({
+    nowMs: TICK,
+    config: { enforce: true },
+    laneAccounts: [
+      claudeAcct({ lane: 'claude-1', key: 'r1', meter: 'reactive', quality: 'reactive', weekly: null, reset: null, fiveHour: null, models }),
+      rawAcct({ lane: 'devin-1', provider: 'devin', key: 'd1', meter: 'reactive', quality: 'reactive', models: [...models, 'kimi-k3'] }),
+    ],
+    steps: [
+      { now: TICK },
+      { now: TICK + 60000, fire: ids.map((id, i) => started(id, TICK + 60000 - (40000 - i * 5000), { adapterType: 'claude-code' })) },
+    ],
+  });
+  const { shadow } = await run();
+  const byId = new Map(shadow.body.entries.map(e => [e.runId, e]));
+  for (const id of ids) {
+    const e = byId.get(id);
+    assert.ok(e, `${id} has a shadow entry`);
+    assert.equal(e?.eventTime, true, `${id} should come from the event-time path`);
+    if (e?.accountId === 'devin:d1') assert.match(e.wouldModel, /kimi-k3/, `duplicate model routed to Devin: ${e.wouldModel}`);
+  }
+});
+
+test('explicit fallbackOnly boolean wins over the derived model check', () => {
+  // The live view carries a precomputed fallbackOnly boolean; ordering
+  // honors it over the models-list derivation. Forcing it false in the live
+  // view must not silently promote a duplicate lane back into band 1.
+  const ids = (views) => orderAccountsForRun(views).map(v => v.accountId);
+  const native = view('claude:r1', { provider: 'claude', meter: 'reactive', headroomPct: null, models: ['claude-haiku-5-5'] });
+  const uniqueFlagged = view('devin:d1', { provider: 'devin', meter: 'reactive', headroomPct: null, models: ['kimi-k3'], fallbackOnly: true });
+  const duplicateUnflagged = view('devin:d2', { provider: 'devin', meter: 'reactive', headroomPct: null, models: ['claude-haiku-5-5'], fallbackOnly: false });
+  assert.deepEqual(ids([native, uniqueFlagged]), ['claude:r1', 'devin:d1'], 'explicit true sorts last even with a unique model');
+  assert.deepEqual(
+    ids([native, duplicateUnflagged, uniqueFlagged]),
+    ['claude:r1', 'devin:d2', 'devin:d1'],
+    'explicit false stays in band 1 even with only duplicate models',
+  );
+});
