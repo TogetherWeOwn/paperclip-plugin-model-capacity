@@ -287,6 +287,23 @@ test('hook: a reserve defer retries on the pace-guard scale and names a co-holdi
   assert.match(both.reason, /pace guard/, 'the co-holding guard is named, not hidden behind the reserve');
 });
 
+test('report: a reserve-held pool stays listed in paceGuard.pools', async () => {
+  // The tick's pace report must see the complete pool set (applyReserve
+  // false), not the reserve-filtered order. Pre-fix the merged
+  // allocationOrder signature bound { applyReserve: false } to the new
+  // `duplicates` parameter, so a held claude pool vanished from /capacity
+  // paceGuard.pools while the suite stayed green.
+  const d = drive({ config: REVIEW_CFG, accounts: [lane(0.5, 40)] });
+  await d.setup();
+  d.seed(RR_STATE_KEY, burnedState(2.0));
+  await d.fire(runEvent('rev-waiting', TICK - 60000, 'reviewer-2'));
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.ok((cap.reviewReserve.heldAccountIds ?? []).includes('claude:a1'), 'claude is reserve-held');
+  const pool = (cap.paceGuard.pools ?? []).find(p => p.pool === 'claude');
+  assert.ok(pool != null, 'a held pool is still listed in the pace-guard report');
+});
+
 test('hook: a lone reserve hold still defers on the guard retry scale', async () => {
   const d = drive({
     config: { ...REVIEW_CFG, pacing: { guard: { retryAfterMs: 600000 } } },

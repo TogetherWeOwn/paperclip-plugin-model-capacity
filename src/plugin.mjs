@@ -2814,7 +2814,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const agentRunning = Object.fromEntries(agentRunningById);
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
-    const paceReport = allocationOrder('doer', null, { applyReserve: false }).pools;
+    const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
