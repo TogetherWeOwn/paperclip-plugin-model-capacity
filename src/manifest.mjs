@@ -69,6 +69,12 @@
  * only when the native and unique arms place nothing); Devin-unique models
  * (swe-*, etc.) keep band 1. No capability, egress, secret or env-key change.
  *
+ * v0.2.37 = OPT-IN CREDENTIAL READINESS: `credentialReadiness.enforce`
+ * (default false) gates credential-readiness admission. Off mode admits
+ * evidence-free feeds like the pre-enforcement behavior while still parsing
+ * and reporting readiness in `/capacity`; on mode keeps exact fail-closed
+ * enforcement. No capability, egress, secret or env-key change.
+ *
  * v0.2.35 = OPERATOR LIST YIELDS ON STRUCTURAL EMPTINESS: when the
  * operator's list alone would leave a role with no arm anywhere in the
  * fleet-wide arm set, the fewest of its entries are suspended for that
@@ -348,6 +354,13 @@ const CONFIG_SCHEMA = {
     enforce: {
       type: 'boolean', default: false,
       description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
+    },
+    credentialReadiness: {
+      type: 'object', required: ['enforce'], additionalProperties: false,
+      description: 'Credential-readiness admission is opt-in until every lane account publishes a valid envelope. Check /capacity counts before enabling.',
+      properties: {
+        enforce: { type: 'boolean', default: false },
+      },
     },
     trials: {
       type: 'object', additionalProperties: false,

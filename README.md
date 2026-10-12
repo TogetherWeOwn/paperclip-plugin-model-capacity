@@ -22,8 +22,9 @@ it answers `keep` and nothing changes.
 ## Credential readiness admission
 
 A served model ID and healthy account do **not** prove that a credential can
-serve a run. The lane producer must publish this counts-only contract inside
-each account; otherwise its affected arms are ineligible:
+serve a run. To use opt-in credential-readiness admission, the lane producer
+must publish this counts-only contract inside each account; while the flag is
+off, missing evidence is reported but does not filter routing:
 
 ```json
 {
@@ -59,7 +60,8 @@ each account; otherwise its affected arms are ineligible:
   with currently ready credentials, not a provider-wide total.
 - Both counts are nonnegative safe integers; ready cannot exceed serving.
   Zero serving or zero ready closes the arm. One ready keeps it admissible;
-  existing quota, role, context, trial and breaker gates still apply.
+  existing quota, role, context, trial and breaker gates still apply whenever
+  `credentialReadiness.enforce` is enabled.
 - Times must be real UTC calendar timestamps ending in `Z`, with optional
   1–3 fractional digits. They describe the underlying credential observation,
   not the HTTP fetch/cache/publication time. Expiry must follow observation;
@@ -76,40 +78,55 @@ each account; otherwise its affected arms are ineligible:
   tokens, error messages, or credential management payloads.
 
 All served arms are scored first; their Pareto survivors receive benchmark
-rungs. Admission then narrows ready candidates before the existing Pareto
-survivor selection and account placement, without changing fleet
-scoring/calibration or the tier-price baseline. Benchmark incumbency, rung numbers and the durable pacing range survive
-readiness flaps; empty benchmark rung slots remain in the decision ladder so
-pointers and role floors/ceilings cannot silently shift to another model.
-The cached candidates include dominated alternatives: when an incumbent expires,
-the existing ranking algorithm can expose a still-ready backup at the lowest
-benchmark rung whose incumbent strictly dominates it, including trial families
-with the same bounded budgets. The existing coverage-derived `maxRung` field is
-retained as metadata; the current decision engine does not enforce it.
-Tick shadow, event-time shadow and enforced resolve use the same evidence and recheck expiry between
-ticks. Existing awaits complete before selection/probe claims/recording; evidence
-is parsed against the post-fetch clock. Tick attribution reads occur before
-selection, including for candidates ultimately deferred (per-tick caches bound
-repeated reads). A ready alternative may serve; if none remains, enforced resolve returns
-`defer` (60-second retry) and logs
-`credential-availability-all-unavailable`. Explicit operator overrides and
-`roles.keepAgentIds` remain operator-owned exemptions, not proof of readiness.
-`GET /capacity.credentialAvailability` reports the tick's counts-only model
-admission records, reasons and `alarm`; inspect the report's `atMs`, each row's
-`evaluatedAtMs` and observation/expiry, rather than treating a persisted report
-as a live probe. Partial refusal logs `credential-availability-excluded`.
-Enforced stale/invalid routing snapshots defer and log the separate
-`credential-availability-stale-snapshot` code. These warnings retain the existing
-per-company/per-code hourly throttle; persisted tick diagnostics remain available.
-Setting `enforce: false` immediately restores `keep`, even during feed failures
-or a pending ledger load; it does not mark stale credential evidence healthy.
-Re-enabling requires an enforcing live view and still applies freshness checks.
+rungs. With credential readiness enabled, admission narrows ready candidates
+before account placement without changing fleet scoring/calibration or the
+tier-price baseline. Benchmark incumbency, rung numbers and the durable pacing
+range survive readiness flaps; empty benchmark rung slots remain in the
+admission ladder so pointers and role floors/ceilings cannot shift silently.
+The cached candidates include dominated alternatives: when an incumbent
+expires, ranking can expose a still-ready backup at the lowest benchmark rung
+whose incumbent strictly dominates it, including trial families with the same
+bounded budgets. `maxRung` remains metadata; the decision engine does not
+enforce it.
 
-**Rollout is fail-closed.** Feeds predating this contract no longer admit arms,
-even if `servedModels` is present. Ship and verify the producer contract first,
-then authorize installation/enforcement and compare before/after acceptance.
-A source PR or passing synthetic tests is not evidence of deployment. No new
-endpoint, credential access, egress grant, or model-config mutation is added.
+Credential-readiness admission is **opt-in** through
+`credentialReadiness.enforce` (default `false`). Off mode still parses and
+reports the counts-only evidence but does not filter allocation or emit
+`credential-availability-*` enforcement warnings. This preserves legacy
+routing for existing feeds. Before enabling, verify `/capacity` in off mode:
+**every account** must report a valid envelope, and each served exact model ID
+must have a matching row. `validEnvelopeAccounts` must equal `totalAccounts`;
+check the per-model reasons and observation/expiry too. Readiness evidence is
+not a readiness probe and does not guarantee a credential will remain usable.
+
+When enabled, tick shadow, event-time shadow and enforced resolve recheck the
+same evidence and expiry between ticks. A ready alternative may serve; if none
+remains, event/hook admission defers for 60 seconds, while tick shadow records
+no pick. The host stops an issue after **12 deferred attempts**, requiring a
+human to move it back to todo. If every usable arm is excluded, the
+concurrency target can become **zero** and `/caps` returns no allocations.
+These are expected fail-closed consequences, not a signal to keep retrying.
+Explicit operator overrides and `roles.keepAgentIds` remain operator-owned
+exemptions, not proof of readiness. A fresh view is needed for changed evidence;
+expired evidence alone never declares recovery.
+
+`GET /capacity.credentialAvailability` reports `mode`, counts by reason, the
+number of valid-envelope accounts and all accounts, plus counts-only model
+admission rows and `alarm`. Inspect `atMs`, each row's `evaluatedAtMs` and
+observation/expiry; persisted diagnostics are not a live probe. When enabled,
+partial refusal logs `credential-availability-excluded`, total refusal logs
+`credential-availability-all-unavailable`, and stale/invalid snapshots log
+`credential-availability-stale-snapshot`. Warnings retain the per-company,
+per-code hourly throttle.
+
+Switching from **on to off** takes effect on the next hook or event call,
+even during feed failures or a pending ledger load; a stale view answers
+`keep`, matching the legacy behavior. Switching **off to on** takes effect
+when the next tick publishes a fresh live view; until then, calls use that
+existing view. To roll back, set `credentialReadiness.enforce` to `false`.
+This only restores legacy admission; it does not repair the producer or mark
+stale evidence as ready. No new endpoint, credential access, egress grant, or
+model-config mutation is added.
 
 **Bounded race:** readiness can change immediately after the producer observes
 it or after the consumer admits a run. The 120-second maximum evidence age
@@ -501,8 +518,10 @@ gives up on a run after a fixed number of deferrals.
 Fails open (the existing caps apply): a pool with ANY lane of unknown reset,
 weekly reading or target share (leaving that lane out would size the cap from
 the others alone), a pool that includes a reactive (unmetered) lane, or no
-run duration. A lane without ready credentials, or whose every arm is
-breaker-open, is not part of the pool in any of the three paths.
+run duration. A lane whose every arm is breaker-open is not part of the
+pool in any of the three paths; a lane without ready credentials is
+likewise excluded only when `credentialReadiness.enforce` is on (off
+mode admits it, matching legacy behavior).
 
 Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
 
