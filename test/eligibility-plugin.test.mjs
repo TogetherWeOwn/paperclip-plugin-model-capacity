@@ -36,7 +36,9 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, agentModels = {} } = {}) {
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, coolingMeta = false, metaOnly = false, agentModels = {} } = {}) {
+  const metaLane = lane('meta-1', 'meta', 'm1', 0.05, 0.05);
+  if (coolingMeta) metaLane.credentialAvailability = syntheticAvailability(metaLane, TICK, { serving: 1, ready: 0 });
   const claudeLane = spentClaude
     ? lane('claude-1', 'claude', 'a1', 1, 0)
     : lane('claude-1', 'claude', 'a1', 0.95);
@@ -65,7 +67,7 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
           servedModels: ['muse-spark-1.3-contributor', 'claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
           // Meta holds the biggest deficit, so without a gate the doer goes
           // to Muse; claude stays decidable on five-hour headroom.
-          accounts: [lane('meta-1', 'meta', 'm1', 0.05, 0.05), claudeLane],
+          accounts: metaOnly ? [metaLane] : [metaLane, claudeLane],
         }, nowMs),
       }),
     },
@@ -255,6 +257,29 @@ test('an all-cooling lane never lifts the operator ban: the doer defers through 
   const cap = await d.capacity();
   assert.deepEqual(cap.eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
   assert.ok(cap.roleExclusionsEffective.doer.includes('muse'));
+});
+
+test('off mode still lifts the operator ban onto an all-cooling lane: the doer decides through the full plugin path', async () => {
+  // Same fixture as the on-mode test above, but a Meta-only fleet whose
+  // single lane is all-cooling, with the flag off. The tick's eligibility
+  // accountGroups are what let servesHealthy see the admitted cooling lane,
+  // so the empty-role guard lifts the muse ban (legacy parity) instead of
+  // deferring every doer run into the single-provider defer loop the
+  // operator-list suspension exists to prevent. Forcing the flag on at that
+  // call site must fail this test (verified by mutation).
+  const base = { enforce: true, roles: { ...ROLES_CFG, ...NO_GATES, excludeFamilies: { doer: ['muse'] } } };
+  const off = drive({ config: { ...base, credentialReadiness: { enforce: false } }, metaOnly: true, coolingMeta: true });
+  await off.setup();
+  await off.tick();
+  const h = await off.hook('run-1', 'eng-doer');
+  assert.equal(h.kind, 'decide', 'off mode admits the cooling lane like legacy');
+  assert.match(h.model, /muse-spark/);
+  assert.deepEqual((await off.capacity()).eligibility.roles.doer.suspendedManual, ['muse'], 'the ban lifts: legacy parity');
+  const on = drive({ config: { ...base, credentialReadiness: { enforce: true } }, metaOnly: true, coolingMeta: true });
+  await on.setup();
+  await on.tick();
+  assert.equal((await on.hook('run-1', 'eng-doer')).kind, 'defer', 'on mode refuses the all-cooling lane');
+  assert.deepEqual((await on.capacity()).eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
 });
 
 test('an empty operator list logs nothing', async () => {
