@@ -68,6 +68,11 @@ const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// These fixtures hold several concurrent runs on lanes that read 30% spent at
+// the start of the week (ahead of plan). Their subject is how the actual model is resolved, not the
+// pace guard (see paceguard*.test.mjs), so the guard is off here.
+const NO_GUARD = { pacing: { guard: { enabled: false } } };
+
 function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, failIssueGet = null, failAgentGet = null }) {
   const store = new Map();
   const jobs = new Map();
@@ -263,6 +268,7 @@ test('issue override beats agent config; the event model beats both', async () =
   const at = TICK - 5 * 60000;
   const { run } = drive({
     nowMs: TICK,
+    config: NO_GUARD,
     steps: [{
       now: TICK,
       fire: [

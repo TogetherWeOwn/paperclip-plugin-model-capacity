@@ -292,6 +292,9 @@ frozen clock can never double-count.
    only breaks ties while no rate is measured yet. At most one rung per
    10 min. The 5h guard overrides everything: above 80% the account floors
    and sheds load, rejoining below 50%.
+   The **pace guard** (below) is the hard brake behind this ordering: a
+   pool that has spent ahead of its weekly plan stops taking runs at its
+   cap instead of merely sorting last.
 6. **Per-run signals only**: role floor/ceiling, +1 rung per retry,
    test-fail +1, rate-limit reroutes, context-window filter. Trial arms
    (families without fleet success: gemini, kimi, grok, claude-4-6, ...)
@@ -300,7 +303,8 @@ frozen clock can never double-count.
    unlisted adapters get no trial arms), a free per-family in-flight slot
    (`trials.maxInFlightPerFamily`, default 2), and bypass the burn check
    (their burn is unmeasured by definition; the in-flight cap bounds the
-   blast radius). `defer` happens only when no account has headroom.
+   blast radius). `defer` happens when no account has headroom, or when
+   the pace guard holds every pool that could serve the run.
    Run events rarely carry `adapterType`, so the tick resolves it from the
    agent record (`agents.read`, already declared; 10-min TTL, 500-entry
    cap, failures never cached) and stamps it onto the runs; the live view
@@ -344,7 +348,10 @@ synthetic tests do not establish a latency guarantee. Unknown company,
 `enforce: false`, and a human operator
 override (`issueOverrideModel`) answer `keep`. Enforced tick staleness over
 120s, no fresh ready credentials, or no account with headroom answer `defer`
-(`retryAfterMs` 60000). Every enforced decision is recorded in the ledger
+(`retryAfterMs` 60000); when every pool that could serve the run is held by
+the pace guard the hook answers `defer` with `retryAfterMs` from
+`pacing.guard` (300000 by default; the reason starts `pace guard:`). Every
+enforced decision is recorded in the ledger
 with `enforced:true` (memory-only; the next tick persists it).
 
 Eligibility: health must read exactly `healthy` (unknown/unavailable/
@@ -425,6 +432,81 @@ servable arm is breaker-open (fleet-wide cooling) floors suspend and floored
 caps hold at running, so failed runs on cooled models cannot rise. Cost: past
 target the fleet can run over it by at most the floors' new slots (8 for the
 example entry); no agent loses a running slot.
+
+### Pace guard
+
+Ordering alone never stops spend: an account ahead of plan sorts into the
+last need band, but when every account that can serve a run is ahead, one is
+still picked, and a fleet ahead of plan keeps burning (a Claude lane went 78%
+to 90% in two hours). The guard adds the brake. Per provider pool (lanes
+that share one credential bucket):
+
+    ahead  = mean(weeklyUsed - elapsedFraction) over the pool's lanes > marginPct
+    slots  = sum over lanes of targetShare x meanRunDurationHours
+    cap    = max(1, ceil(slots))
+
+A pool that is ahead and already has `cap` runs in flight is **paced**: its
+lanes leave the allocation order, so the run goes to another pool, or, when
+the guard has dropped every pool that could serve it, the hook answers
+`defer` with a `pace guard: ...` reason and `pacing.guard.retryAfterMs`. If
+another pool is left but has nothing to decide (a full trial slot, say), the
+defer is the plain 60s one. A pool that is not ahead is never
+touched. `slots` is the same term as the per-account concurrency target, so
+the cap follows the plan: it shrinks as an account spends ahead and widens as
+the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
+
+The enforcing hook, the event-time shadow path and the shadow tick all order
+accounts through `orderAccountsWithPacing` with the same plan positions and
+knobs, so they hold and release a pool alike (a run being decided never
+counts against its own pool, and neither do runs the hook deferred). A held run gets no shadow decision;
+`shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
+(`enabled`, `marginPct`, `retryAfterMs`, and one entry per pool with
+`planAhead`, `pacedSlots`, `cap`, `inFlight` and `state`: `paced`, `ahead`,
+`on-plan`, `not-measured`) and each account carries `planAhead`.
+
+Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
+0.02: lead on the plan tolerated before the cap applies), `retryAfterMs`
+(default 300000). The retry hint is longer than the plain no-headroom
+defer (60s) on purpose: a slot frees when a run finishes, and the host
+gives up on a run after a fixed number of deferrals.
+
+Fails open (the existing caps apply): a pool with ANY lane of unknown reset,
+weekly reading or target share (leaving that lane out would size the cap from
+the others alone), a pool that includes a reactive (unmetered) lane, or no
+run duration. A lane without ready credentials, or whose every arm is
+breaker-open, is not part of the pool in any of the three paths.
+
+Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
+
+- The guard acts only above plan plus margin. A pool behind plan is bounded
+  by the concurrency caps, not by the guard; with caps held at the paced
+  target the guard changes nothing, and with caps at 3x the target it is what
+  keeps a fleet from running dry days early (out of quota at hour 98-110 of
+  168 unguarded; 163 guarded, finishing at 99% with a lead on plan of at
+  most 9 points).
+- The floor of 1 in flight can overspend an account whose single run burns
+  faster than the plan: one run in flight burns `E / D` of a lane's week per
+  hour (E = weekly share one run costs, D = mean run hours), against a plan
+  rate of 0.6%/h for a week. At E = 0.5% / D = 0.5h (1%/h) a lone lane is out
+  of quota at hour 99, at E = 1% at hour 50, at E = 2% at hour 25. Pacing
+  those needs a rate gate (fractional slots as a duty cycle); the guard
+  does not have one.
+- A pool is judged on the mean of its lanes. A pool of one lane far ahead and
+  one far behind reads on plan; steering by lane needs the lane feed.
+- The cap counts runs that are executing, read from the run ledger at the time
+  of the decision: a finished run frees its slot at its terminal event, and a
+  run the hook deferred (waiting, not running) is not counted, or two waiting
+  runs would hold an idle one-slot pool until the host gave up on them. The
+  set of deferred runs is memory-only: after a worker restart, a waiting run
+  counts again until the hook next defers it (its next retry).
+- A reset more than one window (plus an hour) away, or already past, is an
+  unknown plan position and fails open.
+- A run whose terminal event never arrives (a worker restart can lose one)
+  keeps its slot until the in-flight horizon, `max(3 x mean run duration,
+  2h)`, the same horizon every in-flight count uses. On a pool with a cap of
+  1 or 2 that can hold arrivals for up to two hours, longer than the host's
+  deferral budget; `/capacity` shows `inFlight` against `cap` so it is
+  visible. The guard errs towards spending less, never more.
 
 ## Configuration
 
@@ -584,6 +666,7 @@ otherwise, never a silent zero.
 - `src/arms.mjs`, `src/quality.mjs`, `src/ladder.mjs` -- ladder math
 - `src/pacing.mjs`, `src/decide.mjs`, `src/concurrency.mjs` -- control
 - `src/pools.mjs` -- calibration groups and pooled burn per run
+- `src/select.mjs`, `src/paceguard.mjs` -- account ordering and the pace guard
 - `src/smoothing.mjs` -- EWMA and per-agent cap hysteresis
 - `src/outcomes.mjs` -- run outcome classification and per-family report
 - `src/shadow.mjs` -- bounded shadow ring (unit-tested legacy helper)
