@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { DEFAULT_PACE_GUARD } from '../src/paceguard.mjs';
-import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { withSyntheticReadiness, syntheticAvailability } from './synthetic-readiness.mjs';
 
 // Regression tests for the CISO re-review on the v0.2.28 pace-guard merge
 // (adverse findings, fixed here). Each test fails on the pre-fix code. The
@@ -140,31 +140,41 @@ test('hook: a deferred run abandoned past the retry budget counts as in-flight a
 // never execute), so counting them lets one burst of fresh starts hold every
 // pool for all the others and nothing is ever decided (trial-budget and
 // shadow-agreement tests pin the deciding behavior). The fail-open is
-// explicit instead: /capacity publishes the unaccounted amount. Here a
-// thinker whose families are all excluded can never be decided, so its
-// started run stays unattributed; the hook still serves the pool minimum
-// while the report shows the 1 unaccounted run.
+// explicit instead: /capacity publishes the unaccounted amount. Here the
+// claude lane is all-cooling (no ready credentials, transient lane state)
+// while the thinker is banned from the healthy gemini family: the ban holds
+// (claude still serves the role structurally, so no suspension lifts it)
+// but nothing anywhere can decide the thinker's run, so its started record
+// stays running and unattributed; the hook still decides for the doer on
+// gemini while the report shows the 1 unaccounted run and no claude pool
+// usage (unmeasured while all-cooling).
 test('hook: an unattributed waiting run fails open and is exposed in /capacity', async () => {
+  const coolingClaude = claudeLane(0.9);
+  coolingClaude.credentialAvailability = syntheticAvailability(coolingClaude, TICK, { serving: 1, ready: 0 });
   const d = drive({
     config: {
       enforce: true,
       roles: {
         thinkerAgentIds: ['agent-thinker'],
-        excludeFamilies: { thinker: ['opus', 'sonnet', 'haiku'] },
+        excludeFamilies: { thinker: ['gemini'] },
       },
     },
-    accounts: [claudeLane(0.9)],
+    accounts: [coolingClaude, geminiLane()],
   });
   await d.setup();
   await d.tick();
-  // The thinker starts a run nobody can decide for it (every family is
-  // excluded for its role) and no model info ever resolves, so the record
-  // stays running and unattributed. The event is stamped at the tick time:
-  // a future anchor would read as stale and leave the census entirely.
+  // The thinker starts a run nobody can decide for it (claude all-cooling,
+  // gemini banned for its role) and no model info ever resolves, so the
+  // record stays running and unattributed. The event is stamped at the tick
+  // time: a future anchor would read as stale and leave the census entirely.
   await d.fire(runEvent('run-X', TICK, 'agent.run.started', 'agent-thinker'));
   await d.tick();
   const cap = (await d.api('capacity')).body;
   assert.equal(cap.paceGuard.unattributedInFlight, 1, 'the unaccounted run is visible to operators');
+  assert.equal(
+    cap.paceGuard.pools.find(p => p.pool === 'claude')?.inFlight ?? 0, 0,
+    'the unattributed run consumes none of the claude pool cap (unmeasured while all-cooling)',
+  );
   d.killIo();
   const h = await d.hook('run-Y');
   assert.equal(h.kind, 'decide', 'fail open: an unknown run alone never holds the pool');
