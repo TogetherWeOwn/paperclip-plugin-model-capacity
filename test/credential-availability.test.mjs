@@ -39,7 +39,7 @@ async function start(accounts, rows = null, configure = () => {}) {
     roles: { minQuality: { doer: null, thinker: null, other: null }, outcomeGate: { enabled: false } },
   };
   configure(config);
-  const plugin = createModelCapacityPlugin({ clock: () => now });
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup({
     config: { get: async () => config },
     state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },

@@ -12,7 +12,9 @@ import {
   isReactiveAccount,
   resetAtMsOf,
   CliproxyCache,
+  isPlaceholderLaneHost,
 } from '../src/cliproxy.mjs';
+import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 
 const LANE = { baseUrl: DEFAULT_BASE_URL, accountsPath: DEFAULT_ACCOUNTS_PATH };
 const LANE_URL = `${DEFAULT_BASE_URL}${DEFAULT_ACCOUNTS_PATH}`;
@@ -20,7 +22,7 @@ const LANE_URL = `${DEFAULT_BASE_URL}${DEFAULT_ACCOUNTS_PATH}`;
 // --- HARD RULE: exactly one outbound read ---
 
 test('lane request is the single GET with defaults', () => {
-  assert.equal(DEFAULT_BASE_URL, 'https://router.infextion.net');
+  assert.equal(DEFAULT_BASE_URL, LANE_BASE_URLS[0]);
   assert.equal(DEFAULT_ACCOUNTS_PATH, '/telemetry/cliproxy/live/accounts.json');
   assert.equal(LANE_KEY_HEADER, 'X-Api-Key');
   assert.deepEqual(buildLaneRequest(), { method: 'GET', url: LANE_URL });
