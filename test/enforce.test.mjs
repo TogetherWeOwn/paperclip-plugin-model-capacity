@@ -298,3 +298,25 @@ test('caps: issues denial degrades to a sanitized code, never upstream text', as
   assert.deepEqual(caps.body.agents, []);
   assert.equal(caps.body.capsError, 'issues-unavailable');
 });
+
+test('reviewReserve: rMin above rMax fails validation and normalizes to defaults', async () => {
+  const { normalizeReviewReserve } = await import('../src/reviewreserve.mjs');
+  assert.ok(validateConfigShape({ reviewReserve: { rMin: 0.9, rMax: 0.5 } })
+    .some(e => e.includes('reviewReserve.rMin must be <=')));
+  assert.deepEqual(validateConfigShape({ reviewReserve: { rMin: 0.2, rMax: 0.8 } }), []);
+  const cfg = normalizeReviewReserve({ rMin: 0.9, rMax: 0.5 }, { keepAgentIds: [] });
+  assert.ok(cfg.rMin <= cfg.rMax, 'normalize never leaves a pinning inversion');
+});
+
+test('reviewReserve: a one-sided rMin/rMax inversion against the other default fails validation', async () => {
+  // {rMax: 0.05} reads against the 0.10 default floor; {rMin: 0.97} against
+  // the 0.95 default cap. Both used to validate clean and then silently
+  // reset both bounds to 0.10/0.95, so an operator capping the reserve at
+  // 5% got up to 95%.
+  assert.ok(validateConfigShape({ reviewReserve: { rMax: 0.05 } })
+    .some(e => e.includes('reviewReserve.rMin must be <=')));
+  assert.ok(validateConfigShape({ reviewReserve: { rMin: 0.97 } })
+    .some(e => e.includes('reviewReserve.rMin must be <=')));
+  assert.deepEqual(validateConfigShape({ reviewReserve: { rMax: 0.5 } }), []);
+  assert.deepEqual(validateConfigShape({ reviewReserve: { rMin: 0.05 } }), []);
+});

@@ -75,6 +75,12 @@ import {
 import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { normalizePaceGuard } from './paceguard.mjs';
+import {
+  REVIEW_RESERVE_STATE_KEY, REVIEW_FOLDED_CAP, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
+  priceReviewBurn, priorProviderReserveState,
+  reviewEventsFromLedger, queuedReviewsByAccount,
+  computeProviderReserve,
+} from './reviewreserve.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
@@ -185,6 +191,43 @@ export function validateConfigShape(raw) {
     }
   }
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
+  // Review reserve: every knob is validated so a typo fails closed at config
+  // load, never as a silent full-hold or a dead reserve in the tick.
+  const rr = raw.reviewReserve;
+  if (rr != null && (typeof rr !== 'object' || Array.isArray(rr))) {
+    errors.push('reviewReserve must be an object');
+  } else if (rr) {
+    if ('enabled' in rr && typeof rr.enabled !== 'boolean') errors.push('reviewReserve.enabled must be a boolean');
+    if ('providers' in rr && (!Array.isArray(rr.providers) || rr.providers.some(p => typeof p !== 'string'))) {
+      errors.push('reviewReserve.providers must be an array of strings');
+    }
+    if ('agentIds' in rr && rr.agentIds != null && (!Array.isArray(rr.agentIds) || rr.agentIds.some(a => typeof a !== 'string'))) {
+      errors.push('reviewReserve.agentIds must be an array of strings or null');
+    }
+    for (const k of ['windowH', 'envWindowH']) {
+      if (k in rr && !(Number.isInteger(rr[k]) && rr[k] >= 1)) errors.push(`reviewReserve.${k} must be an integer >= 1`);
+    }
+    for (const k of ['envHalfLifeH', 'drainH', 'releaseWeeklyH', 'release5hMin', 'minRunsPerH', 'runsHalfLifeH']) {
+      if (k in rr && !(typeof rr[k] === 'number' && rr[k] > 0)) errors.push(`reviewReserve.${k} must be a number > 0`);
+    }
+    for (const k of ['rMin', 'rMax', 'marginW', 'margin5h']) {
+      if (k in rr && !(typeof rr[k] === 'number' && rr[k] >= 0 && rr[k] <= 1)) {
+        errors.push(`reviewReserve.${k} must be a number in [0, 1]`);
+      }
+    }
+    // An inverted band pins the reserve (clamp with lo > hi reads constant).
+    // Compare the effective band: an unset bound reads as its default, so a
+    // one-sided inversion against the other bound's default ({rMax: 0.05},
+    // {rMin: 0.97}) fails closed instead of silently resetting both bounds.
+    const effRMin = typeof rr.rMin === 'number' ? rr.rMin : DEFAULT_REVIEW_RESERVE.rMin;
+    const effRMax = typeof rr.rMax === 'number' ? rr.rMax : DEFAULT_REVIEW_RESERVE.rMax;
+    if (effRMin > effRMax) {
+      errors.push('reviewReserve.rMin must be <= reviewReserve.rMax');
+    }
+    if ('exhaustedPct' in rr && !(typeof rr.exhaustedPct === 'number' && rr.exhaustedPct > 0 && rr.exhaustedPct <= 1)) {
+      errors.push('reviewReserve.exhaustedPct must be a number in (0, 1]');
+    }
+  }
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
       errors.push('armMap entries need aaSlug, model, effort, family, providers');
@@ -373,6 +416,7 @@ export function extractRunErrorText(event) {
 }
 
 export function resolveConfig(raw = {}) {
+  const keepAgentIds = (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string');
   return {
     cliproxy: {
       // Belt and braces behind the validator: a non-allowlisted baseUrl
@@ -390,7 +434,7 @@ export function resolveConfig(raw = {}) {
     roles: {
       thinkerAgentIds: raw.roles?.thinkerAgentIds ?? [],
       doerAgentIds: (Array.isArray(raw.roles?.doerAgentIds) ? raw.roles.doerAgentIds : []).filter(id => typeof id === 'string'),
-      keepAgentIds: (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string'),
+      keepAgentIds,
       excludeFamilies: {
         doer: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.doer),
         thinker: normalizeExcludedFamilies(raw.roles?.excludeFamilies?.thinker),
@@ -423,6 +467,11 @@ export function resolveConfig(raw = {}) {
       // path and the shadow tick.
       guard: normalizePaceGuard(raw.pacing?.guard),
     },
+    // Demand-driven review reserve (see reviewreserve.mjs): the share of a
+    // reserved provider's pace held back for review runs. Enabled by
+    // default; enabled:false restores pre-reserve admission bit-for-bit.
+    // agentIds null/empty resolves to roles.keepAgentIds.
+    reviewReserve: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }),
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
@@ -516,6 +565,8 @@ function sanitizeReservedFloors(raw) {
 // Weekly window length for schedule-error math (the lane reports `used`
 // fractions plus reset timestamps; the host owns staleness/live-pull).
 const WEEKLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
+// Rolling 5h meter window for the review reserve's five-hour allowance.
+const FIVE_HOUR_WINDOW_MS = 5 * 3600 * 1000;
 // A reset reported this far past one window still reads as a window that has
 // just rolled over (feed and host clocks differ by minutes, not hours).
 const PLAN_WINDOW_SLACK_MS = 3600 * 1000;
@@ -538,23 +589,37 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
   const breakerLoads = new Map(); // companyId -> in-flight first-load promise (single-flight)
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
-  // Runs the enforcing hook deferred, per company: runId -> deferredAt. The
-  // host claims a run (agent.run.started) before the hook answers, so a
+  // Runs the enforcing hook deferred, per company: runId -> { atMs, ttlMs }.
+  // The host claims a run (agent.run.started) before the hook answers, so a
   // deferred run sits in the ledger as running and the tick attributes it
   // to the pool its model serves; it is waiting, not executing, so the pace
   // guard leaves it out of its in-flight count. Memory-only (a restart
   // re-adds a run the next time the hook defers it); cleared when the hook
   // decides the run or it reaches a terminal state.
+  //
+  // A mark is a claim about the present ("this run is waiting on a retry"),
+  // not a fact: the host abandons a run after a bounded number of deferred
+  // attempts (12, hard-coded host-side), so a mark older than that lifespan
+  // no longer means waiting. Past it the run counts as in flight again --
+  // fail closed, exactly like a lost terminal event whose record stays
+  // running until the in-flight horizon.
+  const DEFERRED_MARK_ATTEMPTS = 12;
+  const DEFERRED_MARK_SLACK_MS = 60 * 1000;
   const deferredRuns = new Map();
-  const markDeferred = (companyId, runId, atMs, horizonMs) => {
+  const deferredMarkTtlMs = (retryAfterMs, horizonMs) => {
+    if (!Number.isInteger(retryAfterMs) || retryAfterMs <= 0) return horizonMs;
+    return Math.min(horizonMs, DEFERRED_MARK_ATTEMPTS * retryAfterMs + DEFERRED_MARK_SLACK_MS);
+  };
+  const markDeferred = (companyId, runId, atMs, horizonMs, retryAfterMs) => {
     if (runId == null) return;
     let m = deferredRuns.get(companyId);
     if (!m) { m = new Map(); deferredRuns.set(companyId, m); }
     m.delete(String(runId));
-    m.set(String(runId), atMs);
+    m.set(String(runId), { atMs, ttlMs: deferredMarkTtlMs(retryAfterMs, horizonMs) });
     // Bounded: entries older than the in-flight horizon no longer count
     // anywhere, and the oldest go first past the ledger's own cap.
-    for (const [id, at] of m) {
+    for (const [id, mark] of m) {
+      const at = typeof mark === 'object' ? mark.atMs : mark;
       if (atMs - at < horizonMs && m.size <= LEDGER_CAP) break;
       m.delete(id);
     }
@@ -567,9 +632,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * executing, i.e. non-terminal, verified and inside the horizon, minus
    * runs the hook deferred (waiting, not running) and minus the run being
    * decided (it must not hold its own pool at the cap).
+   *
+   * Deferred marks older than their retry lifespan, or whose ledger record
+   * is gone, terminal, unverified or stale, are dropped on read: pruning
+   * only on the next defer would let one stale mark hide an executing run
+   * until another run happens to defer. Fresh starts with no decided or
+   * actual account yet are reported as `unattributed` but deliberately NOT
+   * counted toward any pool's cap: each may belong to any pool, or to none
+   * (an undecided run may never execute), so counting them lets one burst of
+   * fresh starts hold every pool for all the others and nothing is ever
+   * decided. The unaccounted amount is published on the /capacity report
+   * instead (see paceGuard.unattributedInFlight), so the fail-open is
+   * explicit and visible.
    */
   const paceInFlightByPool = (companyId, ledger, { nowMs, horizonMs, selfRunId = null, poolOf }) => {
     const waiting = deferredRuns.get(companyId);
+    if (waiting?.size > 0) {
+      for (const [id, mark] of waiting) {
+        const atMs = typeof mark === 'object' ? mark.atMs : mark;
+        const ttlMs = typeof mark === 'object' ? mark.ttlMs : horizonMs;
+        if (nowMs - atMs < ttlMs && isInflight(ledger?.get(id), nowMs, horizonMs)) continue;
+        waiting.delete(id);
+      }
+    }
     const self = selfRunId != null ? String(selfRunId) : null;
     const census = inflightByAccount(ledger, {
       nowMs, horizonMs,
@@ -580,7 +665,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const p = poolOf(id);
       pools[p] = (pools[p] ?? 0) + n;
     }
-    return pools;
+    return { pools, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
@@ -1475,6 +1560,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // points ahead; the guard treats that as unknown and stays out of the way.
       const onWindow = resetAtMs != null && resetAtMs >= nowMs && startMs - nowMs <= PLAN_WINDOW_SLACK_MS;
       const planAhead = weeklyUsed != null && onWindow ? positionError : null;
+      // Window elapsed fractions for the review reserve (per-window allowance
+      // (elapsed + margin) x (1 - R); unknown position never holds -- fail
+      // open, the unknown-headroom rule already excludes unreadable meters).
+      const weeklyElapsed = onWindow && startMs != null && resetAtMs > startMs
+        ? Math.min(1, Math.max(0, (nowMs - startMs) / (resetAtMs - startMs)))
+        : null;
+      const reset5Ms = account.fiveHour?.resetsAtMs ?? null;
+      const start5Ms = reset5Ms != null && !Number.isNaN(reset5Ms) ? reset5Ms - FIVE_HOUR_WINDOW_MS : null;
+      const onWindow5 = reset5Ms != null && reset5Ms >= nowMs && start5Ms - nowMs <= PLAN_WINDOW_SLACK_MS;
+      const fiveHourElapsed = onWindow5 && start5Ms != null && reset5Ms > start5Ms
+        ? Math.min(1, Math.max(0, (nowMs - start5Ms) / (reset5Ms - start5Ms)))
+        : null;
+      const hoursTo5hReset = reset5Ms != null ? Math.max((reset5Ms - nowMs) / 3600000, 0) : null;
       // Availability narrows selections, never the durable pacing range.
       const ceiling = (ladders[key]?.rankingRungs.length ?? ladders[key]?.rungs.length ?? 1) - 1;
       let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
@@ -1575,6 +1673,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         rateHistoryPoints: history.length,
         requiredRatePerHour: required,
         planAhead,
+        weeklyElapsed,
+        fiveHourElapsed,
+        hoursTo5hReset,
       });
     }
     const ordered = orderAccounts(accountViews.map(a => ({ ...a, remainingPct: a.remainingPct ?? 0 })));
@@ -1853,6 +1954,92 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
 
+    // Review reserve: the demand-driven share of each reserved provider's
+    // pace held back for review runs (see reviewreserve.mjs; native port of
+    // the host stopgap). Computed once per tick, AFTER E-calibration so
+    // review burn prices burnPerRunPct -- tier-adjusted while
+    // contextCaps.tierAffectsQuota holds, so Haiku 5.5 long sessions burn at
+    // their tier price here too. The tick's allocation order, the live view
+    // (hook and event-time path) and /capacity all read this one verdict.
+    // Disabled (enabled:false) computes nothing and holds nobody.
+    const rrCfg = config.reviewReserve ?? normalizeReviewReserve(null, {});
+    const reviewAgentIdSet = new Set(rrCfg.agentIds ?? []);
+    const isReviewAgent = (agentId) => typeof agentId === 'string' && reviewAgentIdSet.has(agentId);
+    let reviewReserveView = {
+      enabled: rrCfg.enabled === true,
+      agentIds: [...reviewAgentIdSet],
+      providers: [...(rrCfg.providers ?? [])],
+      perProvider: {},
+      heldAccountIds: [],
+    };
+    if (rrCfg.enabled === true) {
+      const rrStored = (await ctx.state.get(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY))) ?? null;
+      // Pinned/keep review runs record armId null; price them from the
+      // pinned model on the kept record (wouldModel), so a Haiku-pinned
+      // reviewer burns at Haiku price. Unmatched models fall back to the
+      // account's hottest arm so review demand is never invisible.
+      const burnOf = (armId, accountId, model = null) => {
+        const ladder = ladders[accountId];
+        const armModels = {};
+        for (const r of [...(ladder?.rungs ?? []), ...(ladder?.credentialRanking?.candidates ?? [])]) {
+          if (r?.armId != null && typeof r?.model === 'string') armModels[r.armId] = r.model;
+        }
+        return priceReviewBurn(ladder?.burnPerRunPct, armId, { model, armModels });
+      };
+      const rrQueued = queuedReviewsByAccount(ledger, {
+        agentIds: [...reviewAgentIdSet], nowMs, staleHorizonMs,
+      });
+      const rrAccounts = accountViews.map(v => ({
+        accountId: v.accountId,
+        provider: v.provider,
+        weeklyUsed: v.weeklyUsedPct,
+        weeklyElapsed: v.weeklyElapsed ?? null,
+        hoursToWeeklyReset: v.hoursToReset,
+        fiveHourUsed: v.fiveHourUsedPct,
+        fiveHourElapsed: v.fiveHourElapsed ?? null,
+        hoursTo5hReset: v.hoursTo5hReset ?? null,
+      }));
+      const perProvider = {};
+      const heldAccountIds = [];
+      const rrNext = { byProvider: {} };
+      for (const provider of rrCfg.providers ?? []) {
+        const ownIds = rrAccounts
+          .filter(a => String(a.provider ?? '').toLowerCase() === String(provider).toLowerCase())
+          .map(a => a.accountId);
+        const prev = priorProviderReserveState(rrStored, provider, { accountIds: ownIds });
+        const ownIdSet = new Set(ownIds);
+        // Dedupe by folded runId, not by watermark: a run that starts
+        // before a tick but is attributed after it still folds exactly once.
+        const seen = new Set(prev?.folded ?? []);
+        const { events: provEvents, runIds: foldedNow } = reviewEventsFromLedger(ledger, {
+          agentIds: [...reviewAgentIdSet], burnOf, seenRunIds: seen,
+        });
+        const verdict = computeProviderReserve({
+          provider, accounts: rrAccounts, state: prev, nowMs, cfg: rrCfg,
+          events: provEvents.filter(e => ownIdSet.has(e.accountId)),
+          queuedByAccount: rrQueued,
+        });
+        // The bucket/envelope/runs-rate state persists; the published
+        // verdict carries the numbers, not the carried state.
+        const { state: verdictState, ...pub } = verdict;
+        perProvider[provider] = pub;
+        heldAccountIds.push(...verdict.heldAccountIds);
+        for (const id of foldedNow) { seen.delete(id); seen.add(id); }
+        rrNext.byProvider[provider] = {
+          ...verdictState,
+          folded: [...seen].slice(-REVIEW_FOLDED_CAP),
+        };
+      }
+      await ctx.state.set(scopeKey(companyId, REVIEW_RESERVE_STATE_KEY), rrNext);
+      reviewReserveView = {
+        enabled: true,
+        agentIds: [...reviewAgentIdSet],
+        providers: [...(rrCfg.providers ?? [])],
+        perProvider,
+        heldAccountIds,
+      };
+    }
+
     // Trial promotion: terminal runs with a resolved model feed per-family
     // finished/failed counters (each run counted once, via seenTerminal).
     // A non-proven family graduates at trials.minRuns runs with
@@ -2073,9 +2260,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
     };
-    const allocationOrder = (role, selfRunId = null) => {
+    // opts.forReview: review runs see the unheld order (the reserve holds
+    // quota FOR them). opts.applyReserve false keeps the pace-guard pools
+    // report complete (held pools are not candidates, but they are still
+    // pools the report narrates).
+    const allocationOrder = (role, selfRunId = null, opts = {}) => {
       const { pools, byAccount } = freshPressure();
-      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
+      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey }).pools;
+      const applyReserve = opts.applyReserve !== false && reviewReserveView.enabled === true;
       return orderAccountsWithPacing(
         accountViews.filter(v => rungsHaveEligibleArms(filterBreakerRungs(
           credentialGroupsFor(ladders[v.accountId], nowMs, config.credentialReadiness.enforce), breakers, v.accountId, nowMs, breakersCfg))).map(v => ({
@@ -2095,7 +2287,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           placementQ: placementQualityFor(v.accountId, v.pointer, role),
           planAhead: v.planAhead,
         })),
-        { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts },
+        {
+          reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts,
+          reviewReserve: applyReserve
+            ? { heldAccountIds: reviewReserveView.heldAccountIds, forReview: opts.forReview === true }
+            : null,
+        },
       );
     };
     // Fresh trial budgets per candidate: decisions write through to the
@@ -2189,7 +2386,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // straight into the ledger, so earlier decisions in this tick already
       // narrow the winner's shortfall and consume budget structurally --
       // the next run spreads elsewhere without any pending-side state.
-      const allocation = allocationOrder(role, run.runId);
+      const allocation = allocationOrder(role, run.runId, { forReview: isReviewAgent(run.agentId) });
       for (const sel of allocation.order) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
@@ -2385,6 +2582,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
       paceGuard: paceOpts,
+      // Tick's review-reserve verdict: held accounts plus the agent ids
+      // that run past the hold. The hook and event-time path read this.
+      reviewReserve: reviewReserveView,
       staleHorizonMs,
     });
     // Event-time decisions that landed since the previous tick (memory-only
@@ -2479,7 +2679,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const agentRunning = Object.fromEntries(agentRunningById);
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
-    const paceReport = allocationOrder('doer').pools;
+    const paceReport = allocationOrder('doer', null, { applyReserve: false }).pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
@@ -2555,7 +2755,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
+        // Fresh starts with no decided or actual account yet are
+        // deliberately outside every pool's cap (see paceInFlightByPool):
+        // the count is published here so the fail-open stays visible.
+        unattributedInFlight: paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, poolOf: poolOfKey }).unattributed,
       },
+      // Review reserve: R, need, capacity, lent and inputs per reserved
+      // provider, plus the accounts held for non-review runs.
+      reviewReserve: reviewReserveView,
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
@@ -2693,11 +2900,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * mutate the view. The pooled value drives ORDERING and the pace guard;
    * the reactive per-account cap is checked separately against per-account
    * counts (see the hook and event-time loops).
-   * Returns { order, paced, pools } (see orderAccountsWithPacing): the pace
-   * guard reads the same knobs and plan positions the tick used, so the
-   * hook, the event-time path and the tick hold and release a pool alike.
+   * Returns { order, paced, pools, reserveHeld } (see
+   * orderAccountsWithPacing): the pace guard reads the same knobs and plan
+   * positions the tick used, so the hook, the event-time path and the tick
+   * hold and release a pool alike; the review reserve holds the tick's held
+   * accounts for non-review runs (forReview true runs past the hold).
    */
-  function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = []) {
+  function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = [], forReview = false) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
       [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
     const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
@@ -2716,7 +2925,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const pacePools = live.paceGuard?.enabled === true && ledgers.has(companyId)
       ? paceInFlightByPool(companyId, ledgers.get(companyId), {
         nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
-      })
+      }).pools
       : {};
     return orderAccountsWithPacing(
       (live.accounts ?? []).map(a => ({
@@ -2738,8 +2947,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           })?.quality ?? null,
         };
       }),
-      { reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null, pacing: live.paceGuard ?? null },
+      {
+        reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null, pacing: live.paceGuard ?? null,
+        reviewReserve: live.reviewReserve?.enabled === true
+          ? { heldAccountIds: live.reviewReserve.heldAccountIds ?? [], forReview }
+          : null,
+      },
     );
+  }
+
+  /** True when the run's agent serves reviews past the reserve hold. */
+  function liveIsReviewAgent(live, agentId) {
+    return Array.isArray(live?.reviewReserve?.agentIds) && live.reviewReserve.agentIds.includes(agentId);
   }
 
   /**
@@ -2813,7 +3032,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const ledger = await getOrLoadLedger(companyId);
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
-    const { order } = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
+    const { order } = allocationOrderFromLive(live, companyId, null, role, roleExcluded, liveIsReviewAgent(live, run.agentId));
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
     // views drives ordering only -- comparing the pool total against the
@@ -3200,9 +3419,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       const credentialEnforced = credentialReadinessEnforced(params.companyId);
       // Every defer below leaves the run waiting, not executing: the pace
-      // guard stops counting it as in flight until the hook decides it.
+      // guard stops counting it as in flight while its mark is fresh (see
+      // the retry-lifespan bound on deferredRuns).
       const deferred = (out) => {
-        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000);
+        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, out?.retryAfterMs);
         return out;
       };
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
@@ -3234,7 +3454,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // this hook resolves, so a queued shadow entry for THIS runId must not
       // count against it in ordering, caps, or budgets.
       const selfId = params?.runId != null ? String(params.runId) : null;
-      const { order, paced } = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
+      // Review runs admit past the reserve hold (the reserve holds quota FOR
+      // them); other work defers while its only account is held, and the
+      // reason says so -- not a generic no-headroom.
+      const forReview = liveIsReviewAgent(live, params.agentId);
+      const { order, paced, reserveHeld } = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded, forReview);
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
@@ -3325,18 +3549,38 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         && !(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a, clock(), true)))) {
         return deferred(credentialDefer(params.companyId));
       }
-      // When the pace guard dropped EVERY pool that could serve, the wait is
-      // for one of their runs to finish (minutes), not for headroom: say so
-      // and retry on that scale so the host does not burn its retry budget.
-      // A pool left in the order that merely had nothing to decide (a trial
-      // slot, say) keeps the plain retry.
-      if (paced.length > 0 && order.length === 0) {
+      // When the review reserve holds every account that could serve, the
+      // wait is for a review slot (or the hold's release near reset): say so
+      // and retry on the pace-guard scale -- a 60 s retry would burn the
+      // host's 12-attempt budget in ~12 min and abandon the wait long before
+      // the hold lifts. A co-holding pace guard is named too, so operators
+      // see both holds instead of only the reserve.
+      if (order.length === 0 && (reserveHeld?.length ?? 0) > 0) {
+        const names = reserveHeld.map(h => h.accountId).join(', ');
         const guard = live.paceGuard ?? {};
-        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const held = (paced ?? []).map(p =>
+          `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const also = held.length > 0 ? `; pace guard also holds ${held.join('; ')}` : '';
         return deferred({
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,
-          reason: `pace guard: ${held.join('; ')}`,
+          reason: `review reserve: ${names} held for review runs${also}`,
+        });
+      }
+      // When the pace guard holds a pool, the wait is for one of its runs to
+      // finish (minutes), not for headroom: say so and retry on that scale
+      // so the host does not burn its retry budget. Reaching here means the
+      // loop decided nothing, so any pool left in the order was skipped for
+      // another hold (trial, breaker, readiness); the paced pool is still a
+      // real minutes-scale hold, and it is named first.
+      if (paced.length > 0) {
+        const guard = live.paceGuard ?? {};
+        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const also = order.length > 0 ? `; ${order.length} unpaced account(s) also unselectable this call` : '';
+        return deferred({
+          kind: 'defer',
+          retryAfterMs: guard.retryAfterMs ?? 300000,
+          reason: `pace guard: ${held.join('; ')}${also}`,
         });
       }
       return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
