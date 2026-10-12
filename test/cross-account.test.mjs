@@ -278,6 +278,37 @@ const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// Admission is fail-closed on credential readiness (main #24): a lane feed
+// with no version-1 credentialAvailability row for the exact emitted model
+// id admits nothing. These fixtures exercise OTHER features (dominance,
+// fallback), so the drive() lane states, explicitly and in plain data, that
+// every discovered model is ready (observed at the fixture clock). Same wire
+// shape a feed carries (cf. test/synthetic-readiness.mjs on main); kept
+// inline so this branch stands alone without main's helper. On trees that
+// predate the readiness gate the extra key is ignored.
+const readyLane = (lane, nowMs) => ({
+  ...lane,
+  accounts: (lane.accounts ?? []).map(entry => {
+    if (!entry || typeof entry !== 'object' || Object.hasOwn(entry, 'credentialAvailability')) return entry;
+    const provider = entry.provider;
+    const accountId = `${provider}:${entry.accountKey ?? entry.lane ?? 'x'}`;
+    const discovered = (Array.isArray(entry.models) ? entry.models : [])
+      .filter(m => typeof m === 'string' && !/[\/()\[\]]/.test(m));
+    return {
+      ...entry,
+      credentialAvailability: {
+        version: 1,
+        models: discovered.map(model => ({
+          model, provider, accountId,
+          servingCredentials: 1, readyCredentials: 1,
+          observedAt: new Date(nowMs).toISOString(),
+          expiresAt: new Date(nowMs + 120000).toISOString(),
+        })),
+      },
+    };
+  }),
+});
+
 function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, rows = null }) {
   const store = new Map();
   const jobs = new Map();
@@ -300,7 +331,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
       },
     },
     secrets: { resolve: async () => 'lane-key' },
-    http: { fetch: async () => ({ status: 200, json: async () => lane }) },
+    http: { fetch: async () => ({ status: 200, json: async () => readyLane(lane, now) }) },
     agents: {
       get: async (agentId, companyId) => {
         if (typeof agentId !== 'string' || typeof companyId !== 'string') {
