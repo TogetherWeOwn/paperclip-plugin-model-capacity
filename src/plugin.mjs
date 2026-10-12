@@ -2552,10 +2552,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
-        // Fresh starts with no decided or actual account yet still burn
-        // provider capacity: the guard reads them as pressure on every ahead
-        // pool (see paceInFlightByPool), and the count is published here so
-        // operators can see how much of a cap hold is unaccounted demand.
+        // Fresh starts with no decided or actual account yet are
+        // deliberately outside every pool's cap (see paceInFlightByPool):
+        // the count is published here so the fail-open stays visible.
         unattributedInFlight: paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, poolOf: poolOfKey }).unattributed,
       },
       unmappedRuns,
