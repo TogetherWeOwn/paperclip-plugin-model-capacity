@@ -61,6 +61,14 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.36 = PACE-GUARD CISO FOLLOW-UP: deferred-run marks expire after
+ * 12 x retryAfterMs + 60s (past the host's retry lifespan a waiting run
+ * counts as in flight again, fail closed); a paced pool plus unselectable
+ * unpaced accounts defers on the guard retry with both holds named; runs
+ * with no account attribution stay out of every pool's cap (fail open) and
+ * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
+ * capability, egress, secret or env-key change.
+ *
  * v0.2.30 = TIER-AWARE QUOTA BURN: `burnPerRunPct` prices the context-tier
  * multiplier while `contextCaps.tierAffectsQuota` holds (default true), so
  * pacing, the decide burn check, concurrency and target shares see the
@@ -77,14 +85,6 @@
  * Unknown plan position or share, and reactive lanes, fail open.
  * `/capacity` reports `paceGuard`. No capability, egress, secret or env-key
  * change.
- *
- * v0.2.36 = PACE-GUARD CISO FOLLOW-UP: deferred-run marks expire after
- * 12 x retryAfterMs + 60s (past the host's retry lifespan a waiting run
- * counts as in flight again, fail closed); a paced pool plus unselectable
- * unpaced accounts defers on the guard retry with both holds named; runs
- * with no account attribution stay out of every pool's cap (fail open) and
- * `/capacity` exposes them as `paceGuard.unattributedInFlight`. No
- * capability, egress, secret or env-key change.
  *
  * v0.2.32 = LANE HOST PIN: the lane host is no longer written in the public
  * source. src/lane-host.mjs holds a non-routable placeholder and the package
