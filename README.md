@@ -319,7 +319,7 @@ frozen clock can never double-count.
    measured the result is `calibration: weak` with no target and no caps.
    Guard-capped accounts contribute zero; a 75 hard ceiling binds the
    total. Slots count only for roles that can use the account (v0.2.19).
-8. **Allocation (water-filling, v0.2.3; v0.2.33 adds fallback band)**:
+8. **Allocation (water-filling, v0.2.3; v0.2.38 adds fallback band)**:
    each decision goes to the largest `(targetShare_a - inFlight_a)` inside
    the need band (metered-behind, then reactive, then metered-ahead/
    over-burning, then aggregator fallback-only last). A Devin lane serving

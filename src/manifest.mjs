@@ -61,6 +61,14 @@
  * the quality suspension, so a suspended quality gate lets its families
  * benchmark again. No capability, egress, secret or env-key change.
  *
+ * v0.2.38 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
+ * dropped when the same family has a newer or better arm (higher fleet Q,
+ * cost <=) on any qualified account with headroom, so old Sol on Devin no
+ * longer survives next to gpt-6.1-sol on Codex. Devin duplicates of a
+ * qualified native's models are held back from the first routing pass (used
+ * only when the native and unique arms place nothing); Devin-unique models
+ * (swe-*, etc.) keep band 1. No capability, egress, secret or env-key change.
+ *
  * v0.2.35 = OPERATOR LIST YIELDS ON STRUCTURAL EMPTINESS: when the
  * operator's list alone would leave a role with no arm anywhere in the
  * fleet-wide arm set, the fewest of its entries are suspended for that
@@ -73,14 +81,6 @@
  * operator list alone, never with the data gates on. A single-provider
  * fleet keeps deciding every role. No capability, egress, secret or
  * env-key change.
- *
- * v0.2.33 = CROSS-ACCOUNT DOMINANCE + AGGREGATOR FALLBACK-ONLY: a rung is
- * dropped when the same family has a newer or better arm (higher fleet Q,
- * cost <=) on any qualified account with headroom, so old Sol on Devin no
- * longer survives next to gpt-6.1-sol on Codex. Devin duplicates of a
- * qualified native's models are held back from the first routing pass (used
- * only when the native and unique arms place nothing); Devin-unique models
- * (swe-*, etc.) keep band 1. No capability, egress, secret or env-key change.
  *
  * v0.2.30 = TIER-AWARE QUOTA BURN: `burnPerRunPct` prices the context-tier
  * multiplier while `contextCaps.tierAffectsQuota` holds (default true), so
@@ -143,7 +143,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.35';
+export const PLUGIN_VERSION = '0.2.38';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
