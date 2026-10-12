@@ -36,6 +36,7 @@
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+import { isFallbackOnlyView, nativeQualifiedModels } from './cross-account.mjs';
 import { paceGuardPools } from './paceguard.mjs';
 
 /** Normalized burn deficit; 0 when either rate is unknown or required <= 0. */
@@ -102,7 +103,13 @@ export function allowanceOf(shortfall, poolShare) {
  *   pool (optional: lanes that share one credential pool),
  *   laneInFlight (optional: this lane's own count, spreads decisions across
  *   a pool), placementQ (optional: fleet quality of the arm this account
- *   would run for the run's role) }]
+ *   would run for the run's role),
+ *   provider (optional: aggregator detection, e.g. 'devin'),
+ *   models (optional: canonical-or-raw model ids served, for the
+ *   aggregator fallback rule), fallbackOnly (optional precomputed
+ *   aggregator fallback flag -- when absent and `models` is present it is
+ *   derived: an aggregator serving only models a qualified native also
+ *   serves) }]
  * Unhealthy accounts and metered accounts without headroom are dropped;
  * healthy reactive accounts qualify without headroom.
  *
@@ -114,9 +121,14 @@ export function allowanceOf(shortfall, poolShare) {
  *
  * Sort: need band, then the placement blend (when quality is known), then
  * water-filling shortfall (largest first), then the lane with the fewest
- * in-flight, then deficit, then earliest reset, then accountId. Re-sorting
- * with updated in-flight after every decision is what spreads load: a
- * static order re-used across runs herds every decision onto the same winner.
+ * in-flight, then deficit, then earliest reset, then accountId. Bands are
+ * metered-behind (0), reactive (1), metered-ahead/over-burning (2), and
+ * aggregator fallback-only (3, last). A fallback-only aggregator (Devin
+ * serving only models a qualified native also serves; owner rule
+ * 2026-09-17) loses to every need band; a Devin lane with a unique model
+ * (swe-*, etc.) keeps band 1. Re-sorting with updated in-flight after every
+ * decision is what spreads load: a static order re-used across runs herds
+ * every decision onto the same winner.
  */
 export function orderAccountsForRun(views, opts = {}) {
   return orderAccountsWithPacing(views, opts).order;
@@ -131,7 +143,9 @@ export function orderAccountsForRun(views, opts = {}) {
  *   pools  every qualified pool's verdict (for reporting)
  * opts.pacing = { enabled, marginPct, meanRunDurationHours } turns the guard
  * on; absent (null) it is off and `order` is exactly the old ordering. Views
- * may carry `planAhead` (weekly used minus the linear plan; null unknown).
+ * may carry `planAhead` (weekly used minus the linear plan; null unknown) and
+ * `held` (true: the lane may not route this pass; it still counts toward its
+ * pool's verdict, so every pass sees the same pool membership).
  * Callers re-evaluate per run with fresh in-flight counts, so the cap
  * releases the moment a run finishes and the next call sees the lower count.
  */
@@ -146,8 +160,18 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // placement scores and shortfalls below see only the pools that can serve.
   const verdicts = paceGuardPools(eligible, { pacing, poolKeyOf });
   const pacedKeys = new Set(verdicts.filter(p => p.paced).map(p => p.key));
-  const qualified = pacedKeys.size > 0 ? eligible.filter(v => !pacedKeys.has(poolKeyOf(v))) : eligible;
+  const routable = eligible.filter(v => !v.held);
+  const qualified = pacedKeys.size > 0 ? routable.filter(v => !pacedKeys.has(poolKeyOf(v))) : routable;
+  // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
+  // only models a qualified native also serves sorts after every need band.
+  // Views without a `models` list fail open (never fallback-only), so older
+  // callers keep bit-identical behavior. An explicit boolean `fallbackOnly`
+  // on the view wins over the derived check. Qualification is the gate alone,
+  // matching the tick's duplicate set: the pace guard does not remove a native.
+  const nativeModels = nativeQualifiedModels(eligible, reservePct);
+  const fallbackOf = (v) => isFallbackOnlyView(v, nativeModels);
   const bandOf = (v) => {
+    if (fallbackOf(v)) return 3;
     if (isReactiveAccount(v)) return 1;
     // Ahead-of-plan metered accounts sort with the over-burning: burning
     // quota against the plan loses to a reactive lane of unknown size.

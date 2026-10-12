@@ -189,3 +189,23 @@ test('paceGuardPools reports state per pool and is pure over its input', () => {
   assert.equal(pools[0].paced, true);
   assert.equal(JSON.stringify(views), frozen);
 });
+
+test('a held lane never enters the order, but still counts toward its pool verdict', () => {
+  const r = run([
+    lane('devin:a', { pool: 'devin', planAhead: 0, targetShare: 0.5, inFlight: 0 }),
+    lane('devin:b', { pool: 'devin', planAhead: 0, targetShare: 0.5, inFlight: 0, held: true }),
+  ]);
+  assert.deepEqual(ids(r), ['devin:a']);
+});
+
+test('a held lane is a pool member: its plan position paces the lanes that route', () => {
+  // Pool mean (0 + 0.1) / 2 = 0.05 is ahead of the 0.02 margin; the cap is
+  // ceil(0.5 + 0.5) = 1 and one run is in flight. Without the held lane the
+  // pool reads on-plan and the routable lane keeps serving.
+  const r = run([
+    lane('devin:a', { pool: 'devin', planAhead: 0, targetShare: 0.5, inFlight: 1 }),
+    lane('devin:b', { pool: 'devin', planAhead: 0.1, targetShare: 0.5, inFlight: 1, held: true }),
+  ], { ...PACING, meanRunDurationHours: 1 });
+  assert.deepEqual(ids(r), []);
+  assert.deepEqual(r.paced.map(p => p.pool), ['devin']);
+});
