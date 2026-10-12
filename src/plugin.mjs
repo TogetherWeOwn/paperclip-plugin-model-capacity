@@ -1933,29 +1933,34 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         const probe = orderingViews.find(v => v.accountId === key);
         if (!probe || !isAggregatorAccount(probe)) continue;
-        for (const r of ladder?.rungs ?? []) {
+        const duplicateArmIds = [];
+        // Candidates, not survivors: a duplicate shadowed on the Pareto front
+        // today is revived by admission once its unique sibling loses readiness.
+        for (const r of ladder?.credentialRanking?.candidates ?? ladder?.rungs ?? []) {
           const k = canonicalKey(r.model);
-          if (k && nativeModels.has(k)) dupKeys.add(`${key}\u0000${r.armId}`);
+          if (k && nativeModels.has(k)) {
+            dupKeys.add(`${key}\u0000${r.armId}`);
+            duplicateArmIds.push(r.armId);
+          }
         }
+        if (ladder?.credentialRanking) ladder.credentialRanking.duplicateArmIds = duplicateArmIds;
       }
       // Duplicate aggregator rungs are NOT dropped: deleting them strands
       // runs when no native can route this tick (reactive cap, open
-      // breaker). They are demoted instead via fallbackOnly band 3 below.
-      // dupKeys stays as the informational duplicate set for the log line.
+      // breaker). Routing holds them back in its first pass instead (see
+      // withDuplicatePass); dupKeys stays as the informational log set.
       const dropKeys = dominatedKeys;
       if (dropKeys.size > 0) {
         for (const [key, ladder] of Object.entries(ladders ?? {})) {
-          // Routing reads the admitted ladder rebuilt from
-          // credentialRanking, not ladder.rungs: dominated candidates must
-          // go too, or credentialLadderFor revives them and the drop only
-          // hides them from the capacity view. rankingRungs stays the
-          // pacing range.
+          // Routing rebuilds the admitted ladder from credentialRanking, so
+          // the dominated ids are excluded there after buildLadder. Removing
+          // the candidates instead would let the per-account Pareto revive
+          // arms that only the dominated arm had pushed off the ladder.
           const ranking = ladder?.credentialRanking;
-          if (Array.isArray(ranking?.candidates)) {
-            const keptCandidates = ranking.candidates.filter(c => !dropKeys.has(`${key}\u0000${c.armId}`));
-            if (keptCandidates.length !== ranking.candidates.length) {
-              ranking.candidates = keptCandidates;
-            }
+          if (ranking) {
+            ranking.excludedArmIds = [...dropKeys]
+              .filter(k => k.startsWith(`${key}\u0000`))
+              .map(k => k.split('\u0000')[1]);
           }
           const before = (ladder?.rungs ?? []).length;
           if (before === 0) continue;
@@ -2030,17 +2035,17 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // account with the most room regardless of what runs there.
     // Readiness can expire between candidate awaits: never memoize the
     // quality of an arm that is no longer admitted.
-    const placementQualityFor = (accountId, pointer, role) => {
-      const groups = filterBreakerRungs(credentialGroupsFor(ladders[accountId]), breakers, accountId, nowMs, breakersCfg);
+    const placementQualityFor = (accountId, pointer, role, duplicates = true) => {
+      const groups = filterBreakerRungs(routableGroupsFor(ladders[accountId], duplicates), breakers, accountId, nowMs, breakersCfg);
       return placementArm(groups, {
         role, roleBands, excludedFamilies: roleExclusions[role],
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
     };
-    const allocationOrder = (role) => {
+    const allocationOrder = (role, duplicates) => {
       const { pools, byAccount } = freshPressure();
       return orderAccountsForRun(
-        accountViews.filter(v => rungsHaveEligibleArms(credentialGroupsFor(ladders[v.accountId]))).map(v => ({
+        accountViews.filter(v => rungsHaveEligibleArms(routableGroupsFor(ladders[v.accountId], duplicates))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -2056,7 +2061,8 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           inFlight: pools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
-          placementQ: placementQualityFor(v.accountId, v.pointer, role),
+          duplicates,
+          placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
         })),
         { reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement },
       );
@@ -2151,7 +2157,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // straight into the ledger, so earlier decisions in this tick already
       // narrow the winner's shortfall and consume budget structurally --
       // the next run spreads elsewhere without any pending-side state.
-      for (const sel of allocationOrder(role)) {
+      for (const sel of withDuplicatePass(duplicates => allocationOrder(role, duplicates))) {
         const view = viewById.get(sel.accountId);
         const ladder = ladders[sel.accountId];
         if (!view || !ladder) continue;
@@ -2166,7 +2172,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
         const roleRungs = filterRungsByExcludedFamilies(
-          credentialGroupsFor(ladder), roleExclusions[role]);
+          routableGroupsFor(ladder, sel.duplicates), roleExclusions[role]);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
@@ -2530,10 +2536,12 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
     const benchmark = ranking.rankingRungs;
     const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
+    const excluded = new Set(ranking.excludedArmIds ?? []);
     // Admission may revive dominated backups, but must not move the pacing
     // pointer or role bands into another benchmark rung. A revived backup
     // occupies the lowest benchmark rung whose incumbent strictly dominates it.
     const rungs = admitted.rungs.flatMap(r => {
+      if (excluded.has(r.armId)) return [];
       const rung = rungByArm.get(r.armId) ?? benchmark.find(b =>
         b.Q >= r.Q && b.C <= r.C && (b.Q > r.Q || b.C < r.C))?.rung;
       if (rung == null) return [];
@@ -2553,6 +2561,19 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // decide and placement use group count as topRung; retain empty shells
     // just like the breaker and family-exclusion filters.
     return ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
+  }
+
+  // Per-arm aggregator fallback (owner rule 2026-09-17): duplicate arms of a
+  // Devin lane are held back from the first routing pass.
+  function routableGroupsFor(ladder, duplicates = true) {
+    const groups = credentialGroupsFor(ladder);
+    const held = duplicates ? null : new Set(ladder?.credentialRanking?.duplicateArmIds ?? []);
+    if (!held || held.size === 0) return groups;
+    return groups.map(g => ({ ...g, arms: (g.arms ?? []).filter(a => !held.has(a.armId)) }));
+  }
+
+  function withDuplicatePass(orderFor) {
+    return [...orderFor(false), ...orderFor(true)];
   }
 
   function decisionCredentialReady(decision, groups) {
@@ -2621,7 +2642,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * per-account cap is checked separately against per-account counts
    * (see the hook and event-time loops).
    */
-  function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = []) {
+  function allocationOrderFromLive(live, companyId, excludeRunId = null, role = 'doer', roleExcluded = [], duplicates = true) {
     const providerOf = new Map((live.accounts ?? []).map(a =>
       [a.accountId, String(a.pool ?? a.provider ?? String(a.accountId).split(':')[0]).toLowerCase()]));
     const poolOf = (id) => providerOf.get(id) ?? String(id).split(':')[0].toLowerCase();
@@ -2635,7 +2656,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     }
     return orderAccountsForRun(
       (live.accounts ?? []).map(a => ({
-        ...a, ladderRungs: filterBreakerRungs(credentialGroupsFor(a),
+        ...a, ladderRungs: filterBreakerRungs(routableGroupsFor(a, duplicates),
           breakerStores.get(companyId) ?? createBreakerStore(), a.accountId, clock(),
           lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS),
       })).filter(a => rungsHaveEligibleArms(a.ladderRungs)).map(a => {
@@ -2725,7 +2746,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const ledger = await getOrLoadLedger(companyId);
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
-    const order = allocationOrderFromLive(live, companyId, null, role, roleExcluded);
+    const order = withDuplicatePass(duplicates => allocationOrderFromLive(live, companyId, null, role, roleExcluded, duplicates));
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
     // views drives ordering only -- comparing the pool total against the
@@ -3119,7 +3140,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       // this hook resolves, so a queued shadow entry for THIS runId must not
       // count against it in ordering, caps, or budgets.
       const selfId = params?.runId != null ? String(params.runId) : null;
-      const order = allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded);
+      const order = withDuplicatePass(duplicates => allocationOrderFromLive(live, params.companyId, selfId, role, roleExcluded, duplicates));
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
       const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;

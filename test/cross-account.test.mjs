@@ -527,3 +527,53 @@ test('tick: open breaker on the dominator keeps Devin serving end to end', async
   assert.equal(shadow.body.entries[0].accountId, 'devin:devin-lane-1');
   assert.match(shadow.body.entries[0].wouldModel, /gpt-6-sol/);
 });
+
+test('tick: a Devin sibling dominated on Devin stays out when dominance drops old Sol', async () => {
+  // Review finding: dropping old Sol from the candidates let kimi-k3 back in.
+  // kimi-k3 (Q50, cost 25) is dominated on Devin by old Sol (Q60, cost 20)
+  // alone, so the per-account Pareto must still exclude it after the drop.
+  const rows = aaRows().map(r => (r.slug === 'kimi-k3'
+    ? { ...r, intelligenceIndex: 50, intelligenceIndexCostPerTask: 25 }
+    : r));
+  const laneAt = (weekly, now) => [
+    codexSol({ weekly, observedAt: new Date(now).toISOString() }),
+    devinOldSol({ models: ['gpt-6-sol', 'kimi-k3'], observedAt: new Date(now).toISOString() }),
+  ];
+  const at = TICK + 30 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    rows,
+    laneAccounts: (tickNo, now) => laneAt(now <= TICK ? 0.02 : 0.09, now),
+    steps: [
+      { now: TICK },
+      { now: at, fire: [started('run-sib-1', at - 60000, { adapterType: 'claude-code' })] },
+    ],
+  });
+  const { shadow } = await run();
+  assert.equal(shadow.body.entries.length, 1);
+  assert.equal(shadow.body.entries[0].accountId, 'codex:codex-lane-1');
+  assert.match(shadow.body.entries[0].wouldModel, /gpt-6\.1-sol/);
+});
+
+test('tick: a duplicate model on a mixed Devin lane never routes while a native serves it', async () => {
+  // Review finding: Devin serves the claude models (duplicates of the native)
+  // plus kimi-k3 (unique). Duplicates must wait behind the native and unique
+  // arms; the second run may go to Devin only on kimi-k3.
+  const models = ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
+  const { run } = drive({
+    nowMs: TICK,
+    laneAccounts: [
+      claudeAcct({ lane: 'claude-1', key: 'r1', meter: 'reactive', quality: 'reactive', weekly: null, reset: null, fiveHour: null, models }),
+      rawAcct({ lane: 'devin-1', provider: 'devin', key: 'd1', meter: 'reactive', quality: 'reactive', models: [...models, 'kimi-k3'] }),
+    ],
+    steps: [{
+      now: TICK,
+      fire: [started('run-mix-0', TICK - 60000), started('run-mix-1', TICK - 60000)],
+    }],
+  });
+  const { shadow } = await run();
+  assert.equal(shadow.body.entries.length, 2);
+  for (const e of shadow.body.entries.filter(e => e.accountId === 'devin:d1')) {
+    assert.match(e.wouldModel, /kimi-k3/, `duplicate model routed to Devin: ${e.wouldModel}`);
+  }
+});

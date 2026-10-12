@@ -320,7 +320,10 @@ frozen clock can never double-count.
    the need band (metered-behind, then reactive, then metered-ahead/
    over-burning, then aggregator fallback-only last). A Devin lane serving
    only models a qualified native also serves is fallback-only (owner rule
-   2026-09-17); Devin-unique models (swe-*, etc.) keep the reactive band.
+   2026-09-17). On a mixed Devin lane, the duplicated models are held back
+   from the first routing pass and route only when the native and
+   Devin-unique arms place nothing; Devin-unique models (swe-*, etc.) keep
+   the reactive band.
    A rung is also dropped fleet-wide when the same family has a newer or
    better arm (higher fleet Q, cost <=) on a qualified account with
    headroom, so old Sol on Devin never survives next to gpt-6.1-sol on
