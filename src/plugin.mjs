@@ -509,23 +509,38 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
   const breakerReady = new Set(); // companyIds whose breaker store absorbed persisted state
   const breakerLoads = new Map(); // companyId -> in-flight first-load promise (single-flight)
   const lastTickAtMs = new Map(); // companyId -> ms of the last successful tick (memory-only reporting stat)
-  // Runs the enforcing hook deferred, per company: runId -> deferredAt. The
-  // host claims a run (agent.run.started) before the hook answers, so a
+  // Runs the enforcing hook deferred, per company: runId -> { atMs, ttlMs }.
+  // The host claims a run (agent.run.started) before the hook answers, so a
   // deferred run sits in the ledger as running and the tick attributes it
   // to the pool its model serves; it is waiting, not executing, so the pace
   // guard leaves it out of its in-flight count. Memory-only (a restart
   // re-adds a run the next time the hook defers it); cleared when the hook
   // decides the run or it reaches a terminal state.
+  //
+  // A mark is a claim about the present ("this run is waiting on a retry"),
+  // not a fact: the host abandons a run after a bounded number of deferred
+  // attempts (12, hard-coded host-side), so a mark older than that lifespan
+  // no longer means waiting. Past it the run counts as in flight again --
+  // fail closed, exactly like a lost terminal event whose record stays
+  // running until the in-flight horizon. Every retry re-defers and refreshes
+  // the mark, so a run that is genuinely still waiting keeps its exclusion.
+  const DEFERRED_MARK_ATTEMPTS = 12;
+  const DEFERRED_MARK_SLACK_MS = 60 * 1000;
   const deferredRuns = new Map();
-  const markDeferred = (companyId, runId, atMs, horizonMs) => {
+  const deferredMarkTtlMs = (retryAfterMs, horizonMs) => {
+    if (!Number.isInteger(retryAfterMs) || retryAfterMs <= 0) return horizonMs;
+    return Math.min(horizonMs, DEFERRED_MARK_ATTEMPTS * retryAfterMs + DEFERRED_MARK_SLACK_MS);
+  };
+  const markDeferred = (companyId, runId, atMs, horizonMs, retryAfterMs) => {
     if (runId == null) return;
     let m = deferredRuns.get(companyId);
     if (!m) { m = new Map(); deferredRuns.set(companyId, m); }
     m.delete(String(runId));
-    m.set(String(runId), atMs);
+    m.set(String(runId), { atMs, ttlMs: deferredMarkTtlMs(retryAfterMs, horizonMs) });
     // Bounded: entries older than the in-flight horizon no longer count
     // anywhere, and the oldest go first past the ledger's own cap.
-    for (const [id, at] of m) {
+    for (const [id, mark] of m) {
+      const at = typeof mark === 'object' ? mark.atMs : mark;
       if (atMs - at < horizonMs && m.size <= LEDGER_CAP) break;
       m.delete(id);
     }
@@ -538,9 +553,29 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
    * executing, i.e. non-terminal, verified and inside the horizon, minus
    * runs the hook deferred (waiting, not running) and minus the run being
    * decided (it must not hold its own pool at the cap).
+   *
+   * Deferred marks older than their retry lifespan, or whose ledger record
+   * is gone, terminal, unverified or stale, are dropped on read: pruning
+   * only on the next defer would let one stale mark hide an executing run
+   * until another run happens to defer. Fresh starts with no decided or
+   * actual account yet are reported as `unattributed` but deliberately NOT
+   * counted toward any pool's cap: each may belong to any pool, or to none
+   * (an undecided run may never execute), so counting them lets one burst of
+   * fresh starts hold every pool for all the others and nothing is ever
+   * decided. The unaccounted amount is published on the /capacity report
+   * instead (see paceGuard.unattributedInFlight), so the fail-open is
+   * explicit and visible.
    */
   const paceInFlightByPool = (companyId, ledger, { nowMs, horizonMs, selfRunId = null, poolOf }) => {
     const waiting = deferredRuns.get(companyId);
+    if (waiting?.size > 0) {
+      for (const [id, mark] of waiting) {
+        const atMs = typeof mark === 'object' ? mark.atMs : mark;
+        const ttlMs = typeof mark === 'object' ? mark.ttlMs : horizonMs;
+        if (nowMs - atMs < ttlMs && isInflight(ledger?.get(id), nowMs, horizonMs)) continue;
+        waiting.delete(id);
+      }
+    }
     const self = selfRunId != null ? String(selfRunId) : null;
     const census = inflightByAccount(ledger, {
       nowMs, horizonMs,
@@ -551,7 +586,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       const p = poolOf(id);
       pools[p] = (pools[p] ?? 0) + n;
     }
-    return pools;
+    return { pools, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   const caches = new Map(); // companyId -> CliproxyCache
@@ -1999,7 +2034,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     };
     const allocationOrder = (role, selfRunId = null) => {
       const { pools, byAccount } = freshPressure();
-      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
+      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey }).pools;
       return orderAccountsWithPacing(
         accountViews.filter(v => rungsHaveEligibleArms(filterBreakerRungs(
           credentialGroupsFor(ladders[v.accountId]), breakers, v.accountId, nowMs, breakersCfg))).map(v => ({
@@ -2478,6 +2513,11 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
+        // Fresh starts with no decided or actual account yet still burn
+        // provider capacity: the guard reads them as pressure on every ahead
+        // pool (see paceInFlightByPool), and the count is published here so
+        // operators can see how much of a cap hold is unaccounted demand.
+        unattributedInFlight: paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, poolOf: poolOfKey }).unattributed,
       },
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
@@ -2617,7 +2657,7 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     const pacePools = live.paceGuard?.enabled === true && ledgers.has(companyId)
       ? paceInFlightByPool(companyId, ledgers.get(companyId), {
         nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
-      })
+      }).pools
       : {};
     return orderAccountsWithPacing(
       (live.accounts ?? []).map(a => ({
@@ -3089,9 +3129,10 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
         return keep();
       }
       // Every defer below leaves the run waiting, not executing: the pace
-      // guard stops counting it as in flight until the hook decides it.
+      // guard stops counting it as in flight while its mark is fresh (see
+      // the retry-lifespan bound on deferredRuns).
       const deferred = (out) => {
-        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000);
+        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, out?.retryAfterMs);
         return out;
       };
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
@@ -3210,18 +3251,20 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
       if (!(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a)))) {
         return deferred(credentialDefer(params.companyId));
       }
-      // When the pace guard dropped EVERY pool that could serve, the wait is
-      // for one of their runs to finish (minutes), not for headroom: say so
-      // and retry on that scale so the host does not burn its retry budget.
-      // A pool left in the order that merely had nothing to decide (a trial
-      // slot, say) keeps the plain retry.
-      if (paced.length > 0 && order.length === 0) {
+      // When the pace guard holds a pool, the wait is for one of its runs to
+      // finish (minutes), not for headroom: say so and retry on that scale
+      // so the host does not burn its retry budget. Reaching here means the
+      // loop decided nothing, so any pool left in the order was skipped for
+      // another hold (trial, breaker, readiness); the paced pool is still a
+      // real minutes-scale hold, and it is named first.
+      if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const also = order.length > 0 ? `; ${order.length} unpaced account(s) also unselectable this call` : '';
         return deferred({
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,
-          reason: `pace guard: ${held.join('; ')}`,
+          reason: `pace guard: ${held.join('; ')}${also}`,
         });
       }
       return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
