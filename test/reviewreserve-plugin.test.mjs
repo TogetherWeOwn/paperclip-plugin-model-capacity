@@ -208,7 +208,9 @@ test('hook: a pinned review run (armId null) still prices review burn into the r
   // Default config reviews ARE the pinned keep agents: their ledger records
   // carry armId null (the hook keeps before arm selection). Pre-fix the
   // fold priced burnOf(null) = null and skipped them, so R sat at the floor
-  // forever with the default config; post-fix they price at the hottest arm.
+  // forever with the default config; post-fix they price from the pinned
+  // model on the kept record, falling back to the hottest arm only when the
+  // model matches nothing.
   // The pinned reviewer resolves its configured model to the claude lane,
   // so the keep decision lands in the ledger (armId null, decidedAccount
   // claude:a1) for the fold to price.
@@ -226,6 +228,35 @@ test('hook: a pinned review run (armId null) still prices review burn into the r
   await d.tick();
   const claude = (await d.api('capacity')).body.reviewReserve.perProvider.claude;
   assert.ok(claude.reviewRatePctPerH > 0, `kept review burn must price, got ${claude.reviewRatePctPerH}`);
+});
+
+test('hook: pinned review burn prices from the pinned model end to end', async () => {
+  // Plugin-level cover for the pinned-pricing wiring: the hook's kept record
+  // (armId null, wouldModel = pinned model), burnOf's model argument, and the
+  // ladder arm-model map must all work, or Haiku and Opus reviewers price the
+  // same (the hottest arm). Ten kept runs each, past the hour: Haiku must run
+  // below half the Opus rate.
+  const rateFor = async (pinnedModel, prefix) => {
+    const d = drive({
+      config: REVIEW_CFG,
+      accounts: [lane(0.5, 40)],
+      agentGets: { 'reviewer-1': { adapterConfig: { model: pinnedModel } } },
+    });
+    await d.setup();
+    await d.tick();
+    for (let i = 0; i < 10; i++) {
+      const kept = await d.hook(`${prefix}-${i}`, { agentId: 'reviewer-1' });
+      assert.equal(kept.kind, 'keep');
+    }
+    d.setNow(TICK + HOUR + 60000);
+    await d.tick();
+    return (await d.api('capacity')).body.reviewReserve.perProvider.claude.reviewRatePctPerH;
+  };
+  const haiku = await rateFor('claude-haiku-5-5', 'run-haiku');
+  const opus = await rateFor('claude-opus-5-5', 'run-opus');
+  assert.ok(haiku > 0, `Haiku-pinned review burn must price, got ${haiku}`);
+  assert.ok(opus > 0, `Opus-pinned review burn must price, got ${opus}`);
+  assert.ok(haiku < opus / 2, `Haiku-pinned (${haiku}) must run below half the Opus-pinned rate (${opus})`);
 });
 
 test('hook: a reserve defer retries on the pace-guard scale and names a co-holding guard', async () => {
