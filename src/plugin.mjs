@@ -72,6 +72,10 @@ import {
 } from './outcomes.mjs';
 import { normalizeMinQuality, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
 import { orderAccountsForRun, DEFAULT_PLACEMENT } from './select.mjs';
+import {
+  isAggregatorAccount, isFallbackOnlyView, nativeQualifiedModels,
+  hasHeadroom, crossAccountDominated, canonicalKey,
+} from './cross-account.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
   createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
@@ -1871,6 +1875,107 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
     // the stale horizon -- never the 60-min rate window, which would drop
     // still-running runs across restarts.
     const viewById = new Map(accountViews.map(v => [v.accountId, v]));
+    // TOG-21579: cross-account dominance + aggregator fallback-only.
+    // Served models come from the lane feed (authoritative); ladders may
+    // already exclude unserved ids. Views without a feed models list fail
+    // open (never fallback-only). Dominance uses fleet Q + effective cost;
+    // only qualified-with-headroom accounts dominate.
+    {
+      const feedModelsByKey = new Map();
+      for (let i = 0; i < snapshot.accounts.length; i++) {
+        const raw = snapshot.accounts[i]?.models;
+        const set = new Set();
+        if (Array.isArray(raw)) {
+          for (const m of raw) {
+            const k = canonicalKey(m);
+            if (k) set.add(k);
+          }
+        }
+        feedModelsByKey.set(stateKeys[i], set);
+      }
+      const orderingViews = accountViews.map(v => ({
+        accountId: v.accountId,
+        provider: v.provider,
+        health: v.health,
+        meter: v.meter,
+        quality: v.quality,
+        headroomPct: v.headroomPct,
+        remainingPct: v.remainingPct ?? null,
+        models: [...(feedModelsByKey.get(v.accountId) ?? [])],
+      }));
+      const nativeModels = nativeQualifiedModels(orderingViews, 0.05);
+      // Dominators must be routable this tick: qualified with headroom AND
+      // a known weekly remaining (the candidate loop skips metered accounts
+      // with remainingPct == null, so a 5h-only reading must not dominate).
+      const qualifiedHeadroom = new Set(
+        orderingViews.filter(v => hasHeadroom(v, 0.05) && v.remainingPct != null).map(v => v.accountId),
+      );
+      const fleetArms = [];
+      const allowedDominatorKeys = new Set();
+      for (const [key, ladder] of Object.entries(ladders ?? {})) {
+        for (const r of ladder?.rungs ?? []) {
+          const breaker = r.breaker ?? 'closed';
+          fleetArms.push({
+            accountId: key,
+            armId: r.armId,
+            family: r.family,
+            model: r.model,
+            Q: r.qFleet ?? null,
+            C: r.costEffective ?? r.C ?? null,
+            breaker,
+          });
+          if (breaker === 'closed') allowedDominatorKeys.add(`${key}\u0000${r.armId}`);
+        }
+      }
+      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys });
+      const dominatedKeys = new Set(dominated.map(d => `${d.accountId}\u0000${d.armId}`));
+      const dupKeys = new Set();
+      for (const [key, ladder] of Object.entries(ladders ?? {})) {
+        const probe = orderingViews.find(v => v.accountId === key);
+        if (!probe || !isAggregatorAccount(probe)) continue;
+        for (const r of ladder?.rungs ?? []) {
+          const k = canonicalKey(r.model);
+          if (k && nativeModels.has(k)) dupKeys.add(`${key}\u0000${r.armId}`);
+        }
+      }
+      // Duplicate aggregator rungs are NOT dropped: deleting them strands
+      // runs when no native can route this tick (reactive cap, open
+      // breaker). They are demoted instead via fallbackOnly band 3 below.
+      // dupKeys stays as the informational duplicate set for the log line.
+      const dropKeys = dominatedKeys;
+      if (dropKeys.size > 0) {
+        for (const [key, ladder] of Object.entries(ladders ?? {})) {
+          const before = (ladder?.rungs ?? []).length;
+          if (before === 0) continue;
+          const kept = (ladder.rungs ?? []).filter(r => !dropKeys.has(`${key}\u0000${r.armId}`));
+          if (kept.length !== before) {
+            ladder.rungs = kept.map((r, rung) => ({ ...r, rung }));
+            ladder.crossAccountDominated = [
+              ...(ladder.crossAccountDominated ?? []),
+              ...[...dropKeys].filter(k => k.startsWith(`${key}\u0000`)).map(k => k.split('\u0000')[1]),
+            ];
+          }
+        }
+        for (const v of accountViews) {
+          if (!Array.isArray(v.arms)) continue;
+          const key = v.accountId;
+          v.arms = v.arms.filter(a => !dropKeys.has(`${key}\u0000${a.armId}`));
+        }
+      }
+      for (const v of accountViews) {
+        const probe = orderingViews.find(o => o.accountId === v.accountId);
+        v.models = probe ? probe.models : [];
+        v.fallbackOnly = probe ? isFallbackOnlyView(probe, nativeModels) : false;
+      }
+      if (dominated.length > 0 || dupKeys.size > 0) {
+        ctx.logger.info('model-capacity: cross-account filter', {
+          companyId,
+          dominated: dominated.map(d => `${d.accountId}:${d.armId} by ${d.dominatedBy}`),
+          aggregatorDuplicates: [...dupKeys].map(k => k.replace('\u0000', ':')),
+          nativeModels: [...nativeModels],
+        });
+      }
+    }
     const reconciledUnverified = reconcileLedger(ledger, { nowMs, verifyWindowMs: staleHorizonMs });
     // Trial budgets are read fresh from the ledger per candidate and for
     // the live view below (decisions write through, so no carried copy).
@@ -1933,6 +2038,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           health: v.health,
           meter: v.meter,
           quality: v.quality,
+          provider: v.provider,
+          models: v.models,
+          fallbackOnly: v.fallbackOnly,
           inFlight: pools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
@@ -2200,6 +2308,9 @@ export function createModelCapacityPlugin({ clock = Date.now } = {}) {
           accountId: a.accountId,
           provider: view?.pool ?? poolOfKey(a.accountId),
           pool: view?.pool ?? poolOfKey(a.accountId),
+          laneProvider: view?.provider ?? null,
+          models: view?.models ?? [],
+          fallbackOnly: view?.fallbackOnly === true,
           pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
           headroomPct: view?.headroomPct ?? null,
           headroomSource: view?.headroomSource ?? null,
