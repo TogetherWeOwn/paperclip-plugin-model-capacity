@@ -495,3 +495,96 @@ test('fleet baseline clamps into the unmeasured tier own range', () => {
   closeTo(cost.costMultiplier, 1.5);
   closeTo(cost.costEffective, 4.5);
 });
+
+test('tier multiplier applies to quota burn: Haiku fractionOver=1 burns ~5x base', async () => {
+  // Quota burn and pressure accounting price Haiku over 100k at its tier
+  // price, not base cost. fractionOver=1 -> E=5.0, so burn is 5x. Sessions
+  // start at ~133k (p10), so the 100k cliff is infeasible: no cap.
+  const store = new Map();
+  const jobs = new Map();
+  const skey = k => JSON.stringify(k);
+  const laneAccount = (models) => ({
+    lane: 'l1', provider: 'claude', accountKey: 'a1',
+    health: 'healthy', meter: 'metered', pool: null, models,
+    weekly: { used: 0.1, resetsAt: null }, fiveHour: { used: 0.1, resetsAt: null },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  });
+  const fullHaikuStats = haikuStats({
+    promptTokens: { p10: 133000, p50: 210000, p90: 380000, p99: 500000 },
+    fractionOver: { '100000': 1.0 },
+  });
+  const book = { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 };
+  const laneBody = {
+    observedAt: new Date(TICK).toISOString(),
+    accounts: [laneAccount(['claude-haiku-5-5', 'ref-model'])],
+    modelStats: {
+      schemaVersion: 1, observedAt: new Date(TICK).toISOString(), windowHours: 24,
+      thresholds: [100000],
+      models: { 'claude-haiku-5-5': fullHaikuStats },
+    },
+    pricingTiers: [{
+      family: 'haiku', match: ['haiku'], vendor: 'anthropic',
+      tiers: [haikuTier({ pricesPerMTok: book })],
+      base: book, contextWindow: 200000,
+      status: 'verified', source: 't', verifiedAt: '2026-10-09T00:00:00Z',
+    }],
+  };
+  const aaRow = (slug, cost, index) => ({
+    slug, intelligenceIndex: index, intelligenceIndexCostPerTask: cost,
+    price1mInputTokens: 1, price1mOutputTokens: 5,
+  });
+  const armMap = [
+    { aaSlug: 'claude-haiku-5-5', model: 'claude-haiku-5-5', effort: 'max', family: 'haiku', providers: ['claude'] },
+    { aaSlug: 'ref-model', model: 'ref-model', effort: 'max', family: 'ref', providers: ['claude'] },
+  ];
+  const runTick = async (contextCaps) => {
+    store.clear();
+    jobs.clear();
+    const rawConfig = {
+      enforce: true,
+      cliproxy: { laneKeySecretRef: SECRET },
+      armMap,
+      calibration: { referenceArmId: 'ref-model', referenceBurnPerRunPct: 0.0005 },
+      ...(contextCaps ? { contextCaps } : {}),
+    };
+    const io = {
+      config: { get: async () => rawConfig },
+      state: {
+        get: async k => store.get(skey(k)) ?? null,
+        set: async (k, v) => { store.set(skey(k), v); },
+      },
+      secrets: { resolve: async () => 'lane-key' },
+      http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(laneBody, TICK) }) },
+      agents: { get: async () => null },
+      issues: { get: async () => null, list: async () => [] },
+      jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+      events: { on() {} },
+      logger: { info() {}, error() {} },
+    };
+    const plugin = createModelCapacityPlugin({ clock: () => TICK, requirePinnedLaneHost: false });
+    await plugin.setup(io);
+    await plugin.onConfigChanged(rawConfig, { companyId: 'acme' });
+    store.set(skey(AA_STATE_KEY), {
+      fetchedAt: new Date(TICK).toISOString(),
+      rows: [aaRow('claude-haiku-5-5', 1.0, 55), aaRow('ref-model', 1.0, 50)],
+      duplicateSlugs: [],
+    });
+    await jobs.get('shadow-tick')({});
+    const ladder = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' });
+    const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
+    return { ladder: ladder.body, capacity: capacity.body };
+  };
+  // Default (flag absent): tier affects quota. Base burn for Haiku at equal
+  // cost to the reference is 0.0005; tiered burn is 5x: 0.0025.
+  const tiered = await runTick();
+  const burns = tiered.ladder.ladders['claude:a1'].burnPerRunPct;
+  assert.ok(burns, 'ladder carries burnPerRunPct');
+  closeTo(burns['claude-haiku-5-5'], 0.0005 * 5.0, 1e-9);
+  closeTo(burns['ref-model'], 0.0005, 1e-9);
+  // Rollback: tierAffectsQuota false restores base-cost burn.
+  const flat = await runTick({ tierAffectsQuota: false });
+  const flatBurns = flat.ladder.ladders['claude:a1'].burnPerRunPct;
+  closeTo(flatBurns['claude-haiku-5-5'], 0.0005, 1e-9);
+  // No cap: p10 133k against the 100k cliff is infeasible (0.6xT gate).
+  assert.deepEqual(tiered.capacity.contextTiers.caps['claude-haiku-5-5'] ?? null, null);
+});
