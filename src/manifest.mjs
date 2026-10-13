@@ -82,6 +82,17 @@
  * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
  * prefix. No capability, egress, secret or env-key change.
  *
+ * v0.2.42 = BURN HORIZON FOR PROVIDER FREE RESETS: accounts pace to
+ * min(regular reset, H) with H = lastFreeReset + Q_q(residual gaps) from the
+ * feed's `freeResets` section (Codex seeded from codex-reset.com, every
+ * provider from the host restore ledger; backtest q=0.5 default). The horizon
+ * feeds the required rate, the plan position and the C* concurrency need
+ * (one pace term throughout: targetShare and C* stay the same ratio); 5h
+ * guard, exhaustion floor and review reserve are untouched. No data, or an
+ * unknown regular reset, reads as today's linear pace bit-for-bit;
+ * `burnHorizon.enabled:false` is the kill switch. No capability, egress,
+ * secret or env-key change.
+ *
  * v0.2.39 = REVIEW-RESERVE REVIEW ROUND: pinned review runs price from
  * their pinned model (hottest arm only when the model matches nothing), so
  * a Haiku-pinned reviewer no longer burns at Opus price; a one-sided
@@ -193,7 +204,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.41';
+export const PLUGIN_VERSION = '0.2.42';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -375,6 +386,20 @@ const CONFIG_SCHEMA = {
             marginPct: { type: 'number', minimum: 0, maximum: 1, default: 0.02, description: 'Lead on the plan (fraction of the weekly quota) tolerated before the cap applies.' },
             retryAfterMs: { type: 'integer', minimum: 1000, default: 300000, description: 'Retry hint when the hook defers because every eligible pool is held; longer than the plain no-headroom retry because a slot frees when a run finishes.' },
           },
+        },
+      },
+    },
+    burnHorizon: {
+      type: 'object', additionalProperties: false,
+      description: 'Burn horizon: pace each account to min(regular reset, H) with H = lastFreeReset + Q_q(residual inter-arrival gaps) from the feed freeResets section, so quota is spent when a provider free reset lands. Applies to the required rate and plan position only. No data, or enabled:false, reads as linear-to-regular-reset pacing.',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        quantile: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1, default: 0.5, description: 'Quantile of the residual time-to-next-free-reset (backtest default 0.5).' },
+        maxBurnFactor: { type: 'number', minimum: 1, default: 3, description: 'The burn rate never exceeds this multiple of the linear rate.' },
+        minHistory: { type: 'integer', minimum: 1, default: 3, description: 'Minimum past gaps before a horizon is trusted.' },
+        providerQuantiles: {
+          type: 'object', additionalProperties: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1 },
+          description: 'Per-provider quantile overrides, e.g. { codex: 0.25 }.',
         },
       },
     },

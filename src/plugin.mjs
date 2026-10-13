@@ -58,6 +58,7 @@ import {
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
+import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
@@ -194,6 +195,31 @@ export function validateConfigShape(raw) {
       }
       if ('retryAfterMs' in g && !(Number.isInteger(g.retryAfterMs) && g.retryAfterMs >= 1000)) {
         errors.push('pacing.guard.retryAfterMs must be an integer >= 1000');
+      }
+    }
+  }
+  // Burn horizon: every knob validated so a typo fails closed at config load,
+  // never as a silent full-burn or a dead horizon in the tick.
+  const bh = raw.burnHorizon;
+  if (bh != null && (typeof bh !== 'object' || Array.isArray(bh))) {
+    errors.push('burnHorizon must be an object');
+  } else if (bh) {
+    if ('enabled' in bh && typeof bh.enabled !== 'boolean') errors.push('burnHorizon.enabled must be a boolean');
+    if ('quantile' in bh && !(typeof bh.quantile === 'number' && bh.quantile > 0 && bh.quantile < 1)) {
+      errors.push('burnHorizon.quantile must be a number in (0, 1)');
+    }
+    if ('maxBurnFactor' in bh && !(typeof bh.maxBurnFactor === 'number' && bh.maxBurnFactor >= 1)) {
+      errors.push('burnHorizon.maxBurnFactor must be a number >= 1');
+    }
+    if ('minHistory' in bh && !(Number.isInteger(bh.minHistory) && bh.minHistory >= 1)) {
+      errors.push('burnHorizon.minHistory must be an integer >= 1');
+    }
+    if ('providerQuantiles' in bh) {
+      const pq = bh.providerQuantiles;
+      if (pq == null || typeof pq !== 'object' || Array.isArray(pq) ||
+        Object.entries(pq).some(([k, v]) => typeof k !== 'string' || !k ||
+          !(typeof v === 'number' && v > 0 && v < 1))) {
+        errors.push('burnHorizon.providerQuantiles must map provider names to numbers in (0, 1)');
       }
     }
   }
@@ -479,6 +505,10 @@ export function resolveConfig(raw = {}) {
     // default; enabled:false restores pre-reserve admission bit-for-bit.
     // agentIds null/empty resolves to roles.keepAgentIds.
     reviewReserve: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }),
+    // Burn horizon (see burnhorizon.mjs): pace to min(regular reset, expected
+    // free reset) so quota is spent when a provider restore lands. Enabled by
+    // default; enabled:false restores linear-to-regular-reset pacing bit-for-bit.
+    burnHorizon: normalizeBurnHorizon(raw.burnHorizon),
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
@@ -742,7 +772,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
-      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null };
+      return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null, freeResets: null };
     }
     const body = await cliproxyLaneGet(companyId, config);
     // Validate observation time after the fetch, never against tick start.
@@ -756,6 +786,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs,
       modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers, eeeSnapshot: eee,
       servedModels: parsed.servedModels,
+      freeResets: parsed.freeResets ?? null,
     };
     cache.set('accounts', snapshot, nowMs);
     return snapshot;
@@ -1552,6 +1583,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const hoursToReset = resetAtMs != null
         ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
         : null;
+      // Burn horizon (see burnhorizon.mjs): pace to min(regular reset, H) so
+      // the account is allowed to run ahead of linear pace when a provider
+      // free reset is expected. Null reads as the regular reset (fail open).
+      // hoursToReset above stays truthful; only the pace math uses the burn end.
+      const burn = burnHorizon({
+        nowMs, resetAtMs,
+        feed: snapshot.freeResets?.[account.provider] ?? null,
+        cfg: config.burnHorizon,
+      });
+      const paceResetAtMs = burn?.horizonMs ?? resetAtMs;
+      const hoursToPaceReset = paceResetAtMs != null
+        ? Math.max((paceResetAtMs - nowMs) / 3600000, 0.25)
+        : null;
       // Rate inputs: append this reading, then measure over the trailing
       // window. The reading is stamped with the ACCOUNT's own observedAt
       // (each account's series carries its own time, then the body stamp,
@@ -1573,12 +1617,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // remaining fraction and the reset are both known it is a number.
       // Null (unknown) only when an input is missing -- never a 0 that
       // would read as "burn nothing".
-      const required = remaining != null && hoursToReset != null
-        ? requiredRatePerHour({ remainingPct: remaining, hoursToReset })
+      const required = remaining != null && hoursToPaceReset != null
+        ? requiredRatePerHour({ remainingPct: remaining, hoursToReset: hoursToPaceReset })
         : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
-      const positionError = weeklyUsed != null && startMs != null && resetAtMs != null
-        ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: resetAtMs })
+      const positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
+        ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
         : 0;
       // Plan position for the pace guard: the same error, but only while the
       // reading sits on a weekly window (reset ahead of now and no further
@@ -1689,6 +1733,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         resetAtMs,
         remainingPct: remaining,
         hoursToReset,
+        burnHorizonMs: burn?.horizonMs ?? null,
+        burnHorizonSource: burn ? 'free-reset' : null,
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,
@@ -2194,7 +2240,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           accountId: a.accountId,
           calibrationGroup: gid,
           remainingPct: a.remainingPct ?? 0,
-          hoursToReset: a.resetAtMs != null ? Math.max((a.resetAtMs - nowMs) / 3600000, 0.25) : 168,
+          // The C* need is the same term as targetShare (requiredRate / E):
+          // both pace to the burn end, so the fleet target moves with the
+          // allowance the horizon grants. burnHorizonMs is set only when a
+          // finite regular reset binds after it, so the fallback is exact.
+          hoursToReset: (() => {
+            const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
+            return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
+          })(),
           burnPerRunPct: burnOf(a.accountId),
           measuredBurnPerRunPct: groupE.get(gid) ?? null,
           runsInWindow: runsInGroupSpan(gid, rateWindowMs),
