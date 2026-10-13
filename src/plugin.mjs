@@ -2240,7 +2240,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           accountId: a.accountId,
           calibrationGroup: gid,
           remainingPct: a.remainingPct ?? 0,
-          hoursToReset: a.resetAtMs != null ? Math.max((a.resetAtMs - nowMs) / 3600000, 0.25) : 168,
+          // The C* need is the same term as targetShare (requiredRate / E):
+          // both pace to the burn end, so the fleet target moves with the
+          // allowance the horizon grants. burnHorizonMs is set only when a
+          // finite regular reset binds after it, so the fallback is exact.
+          hoursToReset: (() => {
+            const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
+            return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
+          })(),
           burnPerRunPct: burnOf(a.accountId),
           measuredBurnPerRunPct: groupE.get(gid) ?? null,
           runsInWindow: runsInGroupSpan(gid, rateWindowMs),

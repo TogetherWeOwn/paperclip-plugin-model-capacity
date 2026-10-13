@@ -29,7 +29,9 @@
  * Generic across providers: {provider: {lastAtMs, gapsMs[]}} comes from the
  * feed (Codex seeded from codex-reset.com, every provider from the host's own
  * restore ledger). A provider with no data reads as "no horizon": bit-for-bit
- * today's linear behavior. enabled:false is the kill switch.
+ * today's linear behavior. An unknown regular reset reads as no horizon too
+ * (no linear baseline to clamp a burn rate against). enabled:false is the
+ * kill switch.
  */
 
 export const DEFAULT_BURN_HORIZON = Object.freeze({
@@ -94,6 +96,9 @@ export function residualQuantileMs(gapsMs, sinceMs, q) {
  * (caller keeps the regular reset: fail open, today's behavior).
  *
  * feed: { lastAtMs, gapsMs[] } | null (this account's provider entry).
+ * resetAtMs must be a positive finite timestamp: with no regular reset
+ * there is no linear baseline to clamp against, so an unknown reset reads
+ * as an unknown horizon (null) and the caller keeps its nulls.
  * Returns { horizonMs, horizonHours, quantile, gaps } with horizonMs clamped
  * so the implied burn rate stays within maxBurnFactor x linear.
  */
@@ -102,6 +107,7 @@ export function burnHorizon({ nowMs, resetAtMs = null, feed = null, cfg = null }
     cfg?.maxBurnFactor !== undefined || cfg?.minHistory !== undefined ||
     cfg?.providerQuantiles !== undefined ? cfg : (cfg ?? {}));
   if (c.enabled !== true) return null;
+  if (!finite(resetAtMs) || !(resetAtMs > 0)) return null;
   const gaps = Array.isArray(feed?.gapsMs) ? feed.gapsMs.filter((g) => finite(g) && g > 0) : [];
   const lastAt = finite(feed?.lastAtMs) ? feed.lastAtMs : null;
   if (lastAt == null || gaps.length < c.minHistory) return null;
@@ -112,15 +118,13 @@ export function burnHorizon({ nowMs, resetAtMs = null, feed = null, cfg = null }
   const residual = residualQuantileMs(gaps, since, q);
   if (residual == null) return null;
   let horizon = lastAt + since + residual;
-  if (finite(resetAtMs) && resetAtMs > 0) {
-    if (horizon >= resetAtMs) return null; // regular reset binds first: no-op
-    // Clamp to maxBurnFactor x linear: never burn faster than
-    // remaining / (regularHours / maxBurnFactor).
-    const regularHours = Math.max((resetAtMs - (nowMs ?? Date.now())) / 3600000, 0);
-    if (regularHours > 0) {
-      horizon = Math.max(horizon, (nowMs ?? Date.now()) + (regularHours / c.maxBurnFactor) * 3600000);
-      if (horizon >= resetAtMs) return null;
-    }
+  if (horizon >= resetAtMs) return null; // regular reset binds first: no-op
+  // Clamp to maxBurnFactor x linear: never burn faster than
+  // remaining / (regularHours / maxBurnFactor).
+  const regularHours = Math.max((resetAtMs - (nowMs ?? Date.now())) / 3600000, 0);
+  if (regularHours > 0) {
+    horizon = Math.max(horizon, (nowMs ?? Date.now()) + (regularHours / c.maxBurnFactor) * 3600000);
+    if (horizon >= resetAtMs) return null;
   }
   if (!(horizon > (nowMs ?? Date.now()))) return null;
   return {

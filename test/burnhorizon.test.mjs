@@ -49,6 +49,11 @@ test('burnHorizon fails open without data or when disabled', () => {
   const resetAtMs = T0 + 7 * D;
   assert.equal(burnHorizon({ nowMs: T0, resetAtMs, feed: null, cfg: {} }), null);
   assert.equal(burnHorizon({ nowMs: T0, resetAtMs, feed: { provider: 'x', lastAtMs: null, gapsMs: [] }, cfg: {} }), null);
+  // Unknown regular reset reads as no horizon: there is no linear baseline
+  // to clamp a burn rate against, so the caller keeps its nulls.
+  assert.equal(burnHorizon({ nowMs: T0, resetAtMs: null, feed, cfg: {} }), null);
+  assert.equal(burnHorizon({ nowMs: T0, feed, cfg: {} }), null);
+  assert.equal(burnHorizon({ nowMs: T0, resetAtMs: feed, feed, cfg: {} }), null);
   assert.equal(burnHorizon({ nowMs: T0, resetAtMs, feed, cfg: { enabled: false } }), null);
   // Fewer gaps than minHistory: untrusted.
   assert.equal(burnHorizon({ nowMs: T0, resetAtMs, feed: { ...feed, gapsMs: [2 * D] }, cfg: {} }), null);
@@ -172,7 +177,9 @@ const CODEX_FEED = {
   },
 };
 
-async function capacityBody({ config = {}, feedExtra = {} }) {
+const SMOOTH_SKEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'smoothing-v1' };
+
+async function capacityBody({ config = {}, feedExtra = {}, lane = null, smoothE = null }) {
   const store = new Map();
   const jobs = new Map();
   const skey = (k) => JSON.stringify(k);
@@ -185,7 +192,7 @@ async function capacityBody({ config = {}, feedExtra = {} }) {
       fetch: async () => ({
         status: 200,
         json: async () => withSyntheticReadiness(
-          { observedAt: new Date(T0).toISOString(), accounts: [codexLane()], ...feedExtra }, T0),
+          { observedAt: new Date(T0).toISOString(), accounts: [lane ?? codexLane()], ...feedExtra }, T0),
       }),
     },
     agents: { get: async () => null },
@@ -196,6 +203,9 @@ async function capacityBody({ config = {}, feedExtra = {} }) {
   };
   await plugin.setup(io);
   store.set(skey(AA_KEY), { fetchedAt: new Date(T0).toISOString(), rows: AA_ROWS, duplicateSlugs: [] });
+  // A carried smoothed burn-per-run puts the lane in the calibrated regime
+  // (C* defined) without a multi-tick history.
+  if (smoothE) store.set(skey(SMOOTH_SKEY), { E: smoothE });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
   await jobs.get('shadow-tick')({ companyId: 'acme' });
   return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
@@ -222,4 +232,32 @@ test('engaged horizon quickens the required pace, within the clamp', async () =>
     `burn ${b.requiredRatePerHour} should stay within 3x linear ${l.requiredRatePerHour}`);
   // The plan position moves with the pace end too.
   assert.notEqual(b.planAhead, l.planAhead);
+});
+
+test('unknown weekly reset invents no pace even with feed data', async () => {
+  const noReset = { ...codexLane(), weekly: { used: 0.5, resetsAt: null } };
+  const body = await capacityBody({ config: {}, feedExtra: { freeResets: CODEX_FEED }, lane: noReset });
+  const a = body.accounts.find((x) => x.accountId === 'codex:codex-lane-1');
+  assert.ok(a, 'expected the codex account in the capacity body');
+  assert.equal(a.requiredRatePerHour, null);
+  assert.equal(a.targetShare, null);
+  assert.equal(a.planAhead, null);
+});
+
+test('C* need paces to the burn end too (same term as targetShare)', async () => {
+  const E = { 'codex:codex-lane-1': { value: 0.01, atMs: T0 } };
+  const linear = await capacityBody({
+    config: { burnHorizon: { enabled: false } }, feedExtra: { freeResets: CODEX_FEED }, smoothE: E,
+  });
+  const burned = await capacityBody({ config: {}, feedExtra: { freeResets: CODEX_FEED }, smoothE: E });
+  assert.ok(linear.target > 0 && burned.target > 0,
+    `calibrated C* expected, got linear=${linear.target} burned=${burned.target}`);
+  assert.ok(burned.target > linear.target,
+    `burn C* ${burned.target} should exceed linear C* ${linear.target}`);
+  // Same term: the C* ratio tracks the required-rate ratio.
+  const la = linear.accounts.find((x) => x.accountId === 'codex:codex-lane-1');
+  const ba = burned.accounts.find((x) => x.accountId === 'codex:codex-lane-1');
+  const rTarget = burned.target / linear.target;
+  const rRate = ba.requiredRatePerHour / la.requiredRatePerHour;
+  assert.ok(Math.abs(rTarget - rRate) < 0.05, `C* x${rTarget} should track rate x${rRate}`);
 });

@@ -86,9 +86,10 @@
  * min(regular reset, H) with H = lastFreeReset + Q_q(residual gaps) from the
  * feed's `freeResets` section (Codex seeded from codex-reset.com, every
  * provider from the host restore ledger; backtest q=0.5 default). The horizon
- * feeds only the required rate and the plan position (rate controller +
- * pace guard allowances); 5h guard, exhaustion floor and review reserve are
- * untouched. No data reads as today's linear pace bit-for-bit;
+ * feeds the required rate, the plan position and the C* concurrency need
+ * (one pace term throughout: targetShare and C* stay the same ratio); 5h
+ * guard, exhaustion floor and review reserve are untouched. No data, or an
+ * unknown regular reset, reads as today's linear pace bit-for-bit;
  * `burnHorizon.enabled:false` is the kill switch. No capability, egress,
  * secret or env-key change.
  *
