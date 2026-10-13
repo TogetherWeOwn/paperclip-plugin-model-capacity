@@ -156,6 +156,111 @@ test('alias-only claude account decorates the bare id at 1M, devin keeps its pre
   assert.equal(devin.model, 'devin/claude-sonnet-5-5(max)[1m]');
 });
 
+// Native alias-only accounts emit the listed alias end to end when the bare
+// id is unserved: a codex account listing only `openai/gpt-6.1-sol` with
+// servedModels holding only that alias must decide the alias (not the bare id
+// that 400s, not a defer). Pins both servedIds call sites in plugin.mjs: the
+// ladder site (emits the alias) and the guard site (keeps the account
+// servable). Dropping the argument at either site must fail this test.
+test('native alias-only account decides the listed alias when the bare id is unserved', async () => {
+  const lane = {
+    observedAt: new Date(NOW).toISOString(),
+    servedModels: ['openai/gpt-6.1-sol'],
+    accounts: [{
+      lane: 'codex-lane-1', provider: 'codex', accountKey: 'codex-lane-1',
+      health: 'healthy', meter: 'reactive',
+      models: ['openai/gpt-6.1-sol'],
+      weekly: { used: null, resetsAt: null },
+      fiveHour: { used: null, resetsAt: null },
+      observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+    }],
+  };
+  const rows = [
+    { slug: 'gpt-6-1-sol', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ];
+  const config = { enforce: true, cliproxy: { laneKeySecretRef: SECRET } };
+  const store = new Map();
+  const jobs = new Map();
+  const key = k => JSON.stringify(k);
+  const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
+  await plugin.setup({
+    config: { get: async () => config },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, NOW, { emitted: { codex: ['gpt-6.1-sol'] } }) }) },
+    agents: { get: async () => null },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (n, fn) => jobs.set(n, fn) },
+    events: { on: () => {} },
+    logger: { info() {}, error() {}, warn() {} },
+  });
+  store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
+    { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
+  await plugin.onConfigChanged(config, { companyId: 'acme' });
+  await jobs.get('shadow-tick')({});
+  const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
+  assert.equal((capacity.body.unservable ?? []).length, 0);
+  const ladder = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' });
+  const rungs = (ladder.body.ladders['codex:codex-lane-1']?.rungs ?? []);
+  assert.ok(rungs.some(r => r.model === 'openai/gpt-6.1-sol'), 'alias missing from ladder');
+  assert.ok(!rungs.some(r => r.model === 'gpt-6.1-sol'), 'unserved bare id reached the ladder');
+  const hook = await plugin.onResolveRunModel({
+    runId: 'run-alias-only', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
+    issueId: null, deadlineMs: 1500,
+  });
+  assert.equal(hook.kind, 'decide');
+  assert.equal(hook.model, 'openai/gpt-6.1-sol');
+});
+
+// Same bare-unserved route through the 1M decoration: a claude account
+// listing only `claude/claude-sonnet-5-5` with only the alias served must
+// decide the prefixed 1M id (not the bare decoration, not a defer). Native
+// prefixed `[1m]` ids therefore exist beyond the devin lane whenever the bare
+// id is unserved.
+test('native alias-only claude account decides the prefixed 1M id when the bare id is unserved', async () => {
+  const lane = {
+    observedAt: new Date(NOW).toISOString(),
+    servedModels: ['claude/claude-sonnet-5-5'],
+    accounts: [{
+      lane: 'claude-lane-1', provider: 'claude', accountKey: 'claude-lane-1',
+      health: 'healthy', meter: 'reactive',
+      models: ['claude/claude-sonnet-5-5'],
+      weekly: { used: null, resetsAt: null },
+      fiveHour: { used: null, resetsAt: null },
+      observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+    }],
+  };
+  const rows = [
+    { slug: 'claude-sonnet-5-5', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4, contextWindowTokens: 1000000 },
+  ];
+  const config = { enforce: true, cliproxy: { laneKeySecretRef: SECRET } };
+  const store = new Map();
+  const jobs = new Map();
+  const key = k => JSON.stringify(k);
+  const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
+  await plugin.setup({
+    config: { get: async () => config },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, NOW, { emitted: { claude: ['claude-sonnet-5-5'] } }) }) },
+    agents: { get: async () => null },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (n, fn) => jobs.set(n, fn) },
+    events: { on: () => {} },
+    logger: { info() {}, error() {}, warn() {} },
+  });
+  store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
+    { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
+  await plugin.onConfigChanged(config, { companyId: 'acme' });
+  await jobs.get('shadow-tick')({});
+  const hook = await plugin.onResolveRunModel({
+    runId: 'run-alias-1m', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
+    issueId: null, deadlineMs: 1500,
+  });
+  assert.equal(hook.kind, 'decide');
+  assert.equal(hook.model, 'claude/claude-sonnet-5-5(max)[1m]');
+});
+
 // Unknown-provider failures are unservable for that (account, model): the
 // error classifies breaker-fatal, and the decision never escalates onto the
 // next rung of the same account the way test-fail retries do.
