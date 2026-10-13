@@ -129,6 +129,33 @@ function msOrNull(iso) {
 }
 
 /**
+ * Burn-horizon feed (see burnhorizon.mjs): per-provider { provider, lastAtMs,
+ * gapsMs } from the host's `freeResets` section. Tolerant: a missing section
+ * reads as null and malformed entries degrade to absent (linear pace), never
+ * a crash. Gaps derive from the history stamps so the plugin needs no clock
+ * of its own beyond nowMs.
+ */
+export function parseFreeResets(body, nowMs = Date.now()) {
+  const section = body?.freeResets;
+  if (!section || typeof section !== 'object' || Array.isArray(section)) return null;
+  const out = {};
+  for (const [provider, v] of Object.entries(section)) {
+    if (typeof provider !== 'string' || !provider || v == null || typeof v !== 'object' || Array.isArray(v)) continue;
+    const stamps = (Array.isArray(v.history) ? v.history : [])
+      .map(msOrNull).filter((n) => n != null).sort((a, b) => a - b);
+    const lastAtMs = msOrNull(v.lastAt) ?? (stamps.length ? stamps[stamps.length - 1] : null);
+    const gapsMs = [];
+    for (let i = 1; i < stamps.length; i++) {
+      const g = stamps[i] - stamps[i - 1];
+      if (g > 0) gapsMs.push(g);
+    }
+    if (lastAtMs == null && gapsMs.length === 0) continue;
+    out[provider] = { provider, lastAtMs, gapsMs };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
  * Normalize one lane account entry. Unhealthy or unparseable entries are
  * kept with null windows (the pacer treats unknown as hold, never as
  * headroom) rather than dropped, so the shadow log can show the gap.
@@ -205,6 +232,7 @@ export function parseLaneBody(body, nowMs = Date.now()) {
     // never a crash; tiers.mjs validates per entry).
     modelStats: body?.modelStats && typeof body.modelStats === 'object' ? body.modelStats : null,
     pricingTiers: Array.isArray(body?.pricingTiers) ? body.pricingTiers : [],
+    freeResets: parseFreeResets(body, nowMs),
     atMs: nowMs,
     source: 'cliproxy-lane',
   };

@@ -138,6 +138,7 @@ const PUBLIC_HOSTS = new Set([
   'artificialanalysis.ai',
   'cliproxy', // docker service name used as a negative-test input
   'z.ai', // model provider named in an error-path fixture, not a lane host
+  'codex-reset.com', // public Codex free-reset timeline feeding burnHorizon history, not a lane host
 ]);
 
 // Reserved names: never routable to a real deployment.
