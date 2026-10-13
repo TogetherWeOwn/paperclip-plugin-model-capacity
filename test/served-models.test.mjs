@@ -102,6 +102,15 @@ test('served-id snapshot excludes unservable arms before tick, event, and hook d
   for (const model of missing) assert.ok(!SERVED.includes(model), `${model} unexpectedly served`);
   for (const model of kept) assert.ok(SERVED.includes(model), `${model} unexpectedly absent`);
 
+  // Lanes serving an arm ONLY under a provider-prefixed id (every Devin id
+  // is `devin/*`) are servable: the guard checks the account's exact emitted
+  // id against the served list. A bare id no route serves stays unservable
+  // even when another lane serves the same model prefixed (negatives indices
+  // 5-9, including kimi-k3 on a kimi account listing only the bare id); the
+  // rest of the negatives ride their ladders under the prefixed emission.
+  const unservedIdx = [5, 6, 7, 8, 9];
+  const prefixedIdx = [0, 1, 2, 3, 4];
+
   const candidates = [...negatives, ...positives];
   const lane = {
     observedAt: new Date(NOW).toISOString(), servedModels: SERVED,
@@ -112,17 +121,36 @@ test('served-id snapshot excludes unservable arms before tick, event, and hook d
   await d.tick();
   const capacity = (await d.api('capacity')).body;
   const refused = capacity.unservable;
-  assert.equal(refused.length, missing.length);
-  for (let i = 0; i < negatives.length; i++) {
+  assert.equal(refused.length, unservedIdx.length);
+  for (let j = 0; j < unservedIdx.length; j++) {
+    const i = unservedIdx[j];
     const [raw, provider] = negatives[i];
-    assert.deepEqual(refused[i], {
+    assert.deepEqual(refused[j], {
       model: raw, accountId: `${provider}:lane-${i}`, emitted: canonicalModelName(raw),
     });
   }
   const ladder = (await d.api('ladder')).body.ladders;
   const rungs = Object.values(ladder).flatMap(l => l.rungs);
-  for (const model of missing) assert.ok(!rungs.some(r => r.model === model), `${model} reached a ladder`);
-  for (const model of kept) assert.ok(rungs.some(r => r.model === model), `${model} lost from ladders`);
+  for (const i of unservedIdx) {
+    const model = canonicalModelName(negatives[i][0]);
+    assert.ok(!rungs.some(r => canonicalModelName(r.model) === model), `${model} reached a ladder`);
+  }
+  for (const model of kept) assert.ok(rungs.some(r => canonicalModelName(r.model) === model), `${model} lost from ladders`);
+  // Native lanes never take a prefixed alias: an account listing the bare id
+  // emits it, and an account listing only a prefixed alias still emits the
+  // bare id whenever it is served (base emitted bare for every native
+  // account). The bare id, not just its canonical form, must ride a ladder.
+  for (const [raw] of positives) {
+    const expected = canonicalModelName(raw);
+    assert.ok(rungs.some(r => r.model === expected), `${raw} lost its bare emission (want ${expected})`);
+  }
+  // Prefixed-only arms ride their own account's ladder under the exact served id.
+  for (const i of prefixedIdx) {
+    const [raw, provider] = negatives[i];
+    const accountId = `${provider}:lane-${i}`;
+    assert.ok(rungs.some(r => r.model === raw), `${raw} lost its prefixed emission`);
+    assert.ok((ladder[accountId]?.rungs ?? []).some(r => r.model === raw), `${raw} missing on ${accountId}`);
+  }
   for (const entry of (await d.api('shadow')).body.entries) {
     assert.ok(kept.includes(canonicalModelName(entry.wouldModel)), entry.wouldModel);
   }

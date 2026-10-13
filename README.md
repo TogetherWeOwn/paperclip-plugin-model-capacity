@@ -147,7 +147,14 @@ effort) plus a small `MODEL_AA_OVERRIDES` table for verified mismatches
 no arm and are reported `unscored` on `/capacity` (with the serving
 accounts), never silently dropped and never invented. When the feed carries
 top-level `servedModels` (exact CLIProxy `/v1/models` ids), only an arm whose
-emitted model id occurs in that list reaches a ladder. `/capacity.unservable`
+exact emitted id occurs in that list reaches a ladder: lanes serving an arm
+solely under a provider-prefixed id (`devin/<id>`) stay servable, and the
+decision emits the account's exact served id (a listed bare id is always
+emitted unchanged, and an account listing only a prefixed alias still emits
+the bare id whenever it is served -- so native lanes never take a prefixed
+alias; the alias is emitted only when the bare id is unserved or the
+provider is prefixed-only `devin`/`opencode-go`).
+`/capacity.unservable`
 reports refused `{ model, accountId, emitted }` entries; an absent or invalid
 list leaves old routing unchanged and logs one warning. An empty valid list
 refuses all arms. Families without fleet success history route as capped trials (doer and other roles by default;

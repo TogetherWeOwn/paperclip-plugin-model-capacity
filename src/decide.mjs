@@ -262,7 +262,13 @@ export function decide({
   }
   const band = roleBands[role] ?? roleBands.doer;
   const { floor, ceiling } = roleRungWindow(band, ladderRungs?.length);
-  const escalation = Math.max(0, retryCount) + (failureClass === 'test-fail' ? 1 : 0);
+  // An unservable failure (400 unknown provider / unrecognized model: the
+  // emitted id names no route on this account) must never escalate onto the
+  // next rung of the SAME account -- the arm is broken, not too weak. The
+  // arm breaker excludes it and routing moves to the next account instead.
+  const escalation = failureClass === 'unservable'
+    ? 0
+    : Math.max(0, retryCount) + (failureClass === 'test-fail' ? 1 : 0);
   const target = clamp((pointer ?? floor) + escalation, floor, ceiling);
   const excludedFamilySet = new Set(normalizeExcludedFamilies(excludedFamilies));
   const requiredWindow = contextTokens != null ? contextTokens * 2 : 0;

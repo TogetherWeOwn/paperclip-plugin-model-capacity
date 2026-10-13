@@ -38,7 +38,7 @@ import {
 import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
-  canonicalModelName, inferFamily, familyOfModelName, PROVEN_FAMILIES,
+  canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES,
 } from './arms.mjs';
 import { computeComposite, DEFAULT_WEIGHTS } from './quality.mjs';
 import {
@@ -139,7 +139,10 @@ const ONE_M_CONTEXT_TOKENS = 1000000;
  */
 function decoratedModelFor(decision, adapterType) {
   const model = decision?.model;
-  if (typeof model !== 'string' || !model.startsWith('claude-')) return null;
+  if (typeof model !== 'string') return null;
+  // Provider-prefixed emissions (devin/claude-...) decorate on the canonical
+  // id but keep the prefix, so the route stays on the deciding account.
+  if (canonicalModelName(model)?.startsWith('claude-') !== true) return null;
   if (!CLAUDE_CLI_ADAPTERS.has(adapterType)) return null;
   const window = decision?.contextWindow;
   if (!Number.isFinite(window) || window < ONE_M_CONTEXT_TOKENS) return null;
@@ -922,8 +925,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         .filter(a => (a?.models ?? []).map(canonicalModelName).includes(u.model))
         .map(a => accountKey(a));
     }
-    // Account models establish coverage, but only the exact id emitted by
-    // the resolver proves CLIProxy can serve an arm. Keep old feeds unchanged.
+    // Account models establish coverage, but only the exact id the decision
+    // will emit proves CLIProxy can route an arm. Lanes serve some models
+    // ONLY under a provider-prefixed id (every Devin id is `devin/*`), so the
+    // guard checks the account's exact served id (see servedIdForArm): an arm
+    // is servable only when that emitted id occurs in the served list. A bare
+    // id no route serves stays unservable even when another lane serves the
+    // same model prefixed. Keep old feeds unchanged (no list = fail open).
     const servedIds = Array.isArray(servedModels) ? new Set(servedModels) : null;
     const unservable = [];
     const credentialAdmission = [];
@@ -931,7 +939,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const eligible = [];
       const refused = new Set();
       for (const arm of armsForAccount(arms, account)) {
-        if (!servedIds || servedIds.has(arm.model)) {
+        const emittedId = servedIdForArm(account?.models, arm.model, account?.provider, servedIds);
+        if (!servedIds || servedIds.has(emittedId)) {
           const evidence = credentialEvidenceFor(account, arm.model);
           const readiness = credentialReadiness(evidence, credentialNow);
           if (!refused.has(arm.model)) {
@@ -946,7 +955,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           refused.add(arm.model);
           unservable.push({
             model: account?.models?.find(m => canonicalModelName(m) === arm.model) ?? arm.model,
-            accountId: keyOf(account, i), emitted: arm.model,
+            accountId: keyOf(account, i),
+            emitted: emittedId,
           });
         }
       }
@@ -1051,6 +1061,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         });
         return {
           armId: a.armId,
+          // Family + model ride along for same-family newer-version dominance
+          // (see ladder.mjs): entries without them keep strict-only behavior.
+          family: a.family ?? null,
+          model: a.model ?? null,
           Q: blendQ(qAa, qEee, alphaDoer),
           // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
           // below uses the same effective cost while
@@ -1088,7 +1102,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const eq = eeeByArm.get(r.armId) ?? {};
           return {
             ...r,
-            model: arm.model,
+            // Emit the account's exact served id (provider-prefixed only when
+            // the bare id is unserved or the provider is prefixed-only;
+            // native alias-only accounts keep the bare emission). Readiness
+            // below still keys on the canonical bare id: credential rows
+            // name the bare proxy id, never the prefixed alias.
+            model: servedIdForArm(account?.models, arm.model, account?.provider, servedIds),
             credentialEvidence: credentialEvidenceFor(account, arm.model),
             effort: arm.effort,
             family: arm.family,
@@ -1786,7 +1805,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (mapped != null) r.actualAccount = mapped;
       }
       if (r.actualModel != null && r.actualModel !== 'unknown' && r.wouldModel != null && r.modelMatch == null) {
-        r.modelMatch = r.actualModel === String(r.wouldModel).split('(')[0] || r.actualModel === r.wouldModel;
+        // Canonical compare: a prefixed emission (`devin/<id>`) matches a
+        // bare actual of the same id (account attribution stays exact).
+        r.modelMatch = canonicalModelName(r.actualModel) === canonicalModelName(r.wouldModel);
       }
       if (r.actualPending === true && r.actualModel != null && r.actualModel !== 'unknown') r.actualPending = false;
     }
@@ -2574,7 +2595,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (decision) {
         // 1M claude runs render decorated so the CLI takes the 1M window;
         // the terminal modelDecision echoes the same string, keeping
-        // modelMatch exact.
+        // modelMatch canonical.
         const wouldModel = decoratedModelFor(decision, run.adapterType ?? null)
           ?? `${decision.model}(${decision.effort ?? 'default'})`;
         const actualModel = actual.model ?? run.actualModel ?? 'unknown';
@@ -2601,8 +2622,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             rec.actualAccount = accountOfModel(actual.model);
           }
           // Did shadow agree with reality? Null while the actual model is
-          // still unknown; true/false once known.
-          rec.modelMatch = actual.model == null ? null : (actual.model === decision.model || actual.model === wouldModel);
+          // still unknown; true/false once known. Canonical: a prefixed
+          // emission matches a bare actual of the same id.
+          rec.modelMatch = actual.model == null ? null
+            : canonicalModelName(actual.model) === canonicalModelName(wouldModel);
         }
         observed += 1;
       } else {

@@ -16,6 +16,7 @@ export const LOW_COVERAGE_THRESHOLD = 0.6;
 export const LOW_COVERAGE_MAX_RUNG = 1;
 
 import { ciGateAllowsReorder } from './eee.mjs';
+import { versionTuple, compareVersions } from './cross-account.mjs';
 
 /**
  * Pareto filter + rung assignment. Input entries: [{ armId, Q, C,
@@ -62,7 +63,7 @@ export function paretoFilter(entries, opts = {}) {
   }
   const noisyBlocks = [];
   const dominatesForDrop = (o, m) => {
-    if (!strictlyDominates(o, m)) return false;
+    if (!strictlyDominates(o, m) && !sameFamilyNewerDominates(o, m)) return false;
     const newcomer = incumbents && !incumbents.has(o.armId);
     const heldAgainst = incumbents && held.has(heldPairKey(o.armId, m.armId));
     if (incumbents && gateByArm && incumbents.has(m.armId) && (newcomer || heldAgainst)) {
@@ -103,6 +104,24 @@ export function paretoFilter(entries, opts = {}) {
 
 function strictlyDominates(a, b) {
   return a.Q >= b.Q && a.C <= b.C && (a.Q > b.Q || a.C < b.C);
+}
+
+/**
+ * Same-family newer-version dominance: within one account, an older model
+ * must leave the ladder once a newer model of the same family scores at
+ * least as well at no higher cost -- even when the cost is flat (equal C,
+ * equal Q: strict dominance never fires on a tie) . Entries without a family
+ * or a parseable version never dominate this way, so callers that pass only
+ * { armId, Q, C } keep bit-identical behavior.
+ */
+function sameFamilyNewerDominates(o, m) {
+  const famO = typeof o?.family === 'string' ? o.family.toLowerCase() : null;
+  const famM = typeof m?.family === 'string' ? m.family.toLowerCase() : null;
+  if (!famO || famO !== famM) return false;
+  const oVer = versionTuple(o?.model ?? o?.armId);
+  const mVer = versionTuple(m?.model ?? m?.armId);
+  if (!oVer || !mVer || compareVersions(oVer, mVer) <= 0) return false;
+  return o.Q >= m.Q && o.C <= m.C;
 }
 
 /**
