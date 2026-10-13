@@ -81,9 +81,10 @@ export function canonicalModelName(model) {
  * canonical form matches the arm (`devin/gpt-5-5` for arm `gpt-5-5`), that
  * exact id is emitted -- CLIProxy serves some lanes ONLY under the prefixed
  * id, so emitting the bare id 400s (`unknown provider`) or, worse, silently
- * routes to another provider serving the bare id. Accounts serving the bare
- * id keep emitting it unchanged. Falls back to the arm id when the account
- * publishes no list or no match.
+ * routes to another provider serving the bare id. When the account lists the
+ * bare id, it is emitted unchanged (bare lanes never take a prefixed alias,
+ * so a native account listing both forms stays on its own route). Falls back
+ * to the arm id when the account publishes no list or no match.
  */
 export function servedIdForArm(accountModels, armModel, provider = null) {
   if (typeof armModel !== 'string' || armModel.length === 0) return armModel;
@@ -104,7 +105,7 @@ export function servedIdForArm(accountModels, armModel, provider = null) {
       providerHit ??= raw;
     }
   }
-  return providerHit ?? prefixedHit ?? bareHit ?? armModel;
+  return bareHit ?? providerHit ?? prefixedHit ?? armModel;
 }
 
 /**

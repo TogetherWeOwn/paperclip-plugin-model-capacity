@@ -146,11 +146,11 @@ effort) plus a small `MODEL_AA_OVERRIDES` table for verified mismatches
 (operator-extendable via `modelAaOverrides`). Models with no AA match build
 no arm and are reported `unscored` on `/capacity` (with the serving
 accounts), never silently dropped and never invented. When the feed carries
-top-level `servedModels` (exact CLIProxy `/v1/models` ids), only an arm with
-a canonical match in that list reaches a ladder: lanes serving an arm solely
-under a provider-prefixed id (`devin/<id>`) stay servable, and the decision
-emits the account's exact served id (bare lanes keep emitting the bare id,
-so bare emissions can never misbill to another provider's route).
+top-level `servedModels` (exact CLIProxy `/v1/models` ids), only an arm whose
+exact emitted id occurs in that list reaches a ladder: lanes serving an arm
+solely under a provider-prefixed id (`devin/<id>`) stay servable, and the
+decision emits the account's exact served id (an account listing the bare id
+keeps emitting it unchanged, so native lanes never take a prefixed alias).
 `/capacity.unservable`
 reports refused `{ model, accountId, emitted }` entries; an absent or invalid
 list leaves old routing unchanged and logs one warning. An empty valid list

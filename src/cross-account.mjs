@@ -108,8 +108,11 @@ export function isFallbackOnlyView(view, nativeModels) {
 export function versionTuple(model) {
   if (typeof model !== 'string') return null;
   // Dash-separated minors count: gpt-5-4 -> [5, 4] so gpt-5-5 reads newer
-  // (the old dot-only pattern read both as [5] and never compared).
-  const m = /(\d+(?:[.-]\d+)+|\d+)/.exec(model);
+  // (the old dot-only pattern read both as [5] and never compared). Each
+  // minor is at most 2 digits and must not run into a letter or another
+  // digit: size (`-1m`, `-256k`) and date (`-20250514`) suffixes stop the
+  // match instead of comparing as versions.
+  const m = /(\d+(?:[.-]\d{1,2}(?![0-9A-Za-z]))*)/.exec(model);
   if (!m) return null;
   const parts = m[1].split(/[.-]/).map(Number);
   if (parts.some(n => !Number.isFinite(n)) || parts.length === 0) return null;

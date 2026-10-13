@@ -4,6 +4,7 @@ import { decide } from '../src/decide.mjs';
 import { servedIdForArm, canonicalModelName } from '../src/arms.mjs';
 import { classifyArmError, DEFAULT_BREAKERS } from '../src/breakers.mjs';
 import { buildLadder } from '../src/ladder.mjs';
+import { versionTuple } from '../src/cross-account.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -60,13 +61,16 @@ test('devin account emits the exact provider-prefixed served id', async () => {
 });
 
 // A bare id the account serves only prefixed must still resolve to the
-// prefixed emission at the helper level (codex accounts serving the bare id
-// keep emitting it unchanged).
+// prefixed emission at the helper level. When the account lists the bare id
+// it keeps emitting it unchanged -- even alongside a prefixed alias, and
+// even a foreign prefix never beats the account's own bare id.
 test('servedIdForArm maps bare arms to the account exact served id', () => {
   assert.equal(servedIdForArm(['devin/gpt-5-5', 'devin/gpt-5-4'], 'gpt-5-5', 'devin'), 'devin/gpt-5-5');
   assert.equal(servedIdForArm(['gpt-6-luna'], 'gpt-6-luna', 'codex'), 'gpt-6-luna');
   assert.equal(servedIdForArm(null, 'gpt-5-5', 'devin'), 'gpt-5-5');
   assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-6-luna', 'devin'), 'gpt-6-luna');
+  assert.equal(servedIdForArm(['gpt-6.1-sol', 'openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex'), 'gpt-6.1-sol');
+  assert.equal(servedIdForArm(['claude-sonnet-5-5', 'devin/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude'), 'claude-sonnet-5-5');
 });
 
 // Unknown-provider failures are unservable for that (account, model): the
@@ -158,4 +162,24 @@ test('same-family newer arm dominates on flat cost within one account', () => {
   assert.ok(!rungs.some(r => r.armId === 'gpt-5-4'), 'gpt-5-4 leaves the ladder');
   assert.ok(rungs.some(r => r.armId === 'gpt-5-5'), 'gpt-5-5 stays');
   assert.ok(dominated.includes('gpt-5-4'));
+});
+
+// Context-size (`-1m`, `-256k`) and date (`-20250514`) suffixes are not
+// versions: the long-context twin must not displace the standard variant on
+// flat cost, and dated ids must not outrank dotted minors.
+test('versionTuple ignores size and date suffixes', () => {
+  assert.deepEqual(versionTuple('gpt-5-5'), [5, 5]);
+  assert.deepEqual(versionTuple('claude-opus-4-6'), [4, 6]);
+  assert.deepEqual(versionTuple('claude-opus-4-6-1m'), [4, 6]);
+  assert.deepEqual(versionTuple('kimi-k3'), [3]);
+  assert.deepEqual(versionTuple('kimi-k3-256k'), [3]);
+  assert.deepEqual(versionTuple('claude-sonnet-4-20250514'), [4]);
+  assert.deepEqual(versionTuple('claude-sonnet-4-5-20250929'), [4, 5]);
+  const entries = [
+    { armId: 'claude-opus-4-6', model: 'claude-opus-4-6', family: 'claude-4-6', Q: 1, C: 10, coverage: 1 },
+    { armId: 'claude-opus-4-6-1m', model: 'claude-opus-4-6-1m', family: 'claude-4-6', Q: 1, C: 10, coverage: 1 },
+  ];
+  const { rungs } = buildLadder(entries);
+  assert.ok(rungs.some(r => r.armId === 'claude-opus-4-6'), 'standard variant stays');
+  assert.ok(rungs.some(r => r.armId === 'claude-opus-4-6-1m'), 'long-context twin stays');
 });

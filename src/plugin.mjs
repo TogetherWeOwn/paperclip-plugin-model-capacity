@@ -925,23 +925,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         .filter(a => (a?.models ?? []).map(canonicalModelName).includes(u.model))
         .map(a => accountKey(a));
     }
-    // Account models establish coverage, but only an id the feed serves
-    // proves CLIProxy can route an arm. Lanes serve some models ONLY under a
-    // provider-prefixed id (every Devin id is `devin/*`), so the guard compares
-    // canonical ids: an arm is servable when ANY served id canonical-matches
-    // it, and the decision emits the account's exact served id (see
-    // servedIdForArm). Keep old feeds unchanged (no list = fail open).
+    // Account models establish coverage, but only the exact id the decision
+    // will emit proves CLIProxy can route an arm. Lanes serve some models
+    // ONLY under a provider-prefixed id (every Devin id is `devin/*`), so the
+    // guard checks the account's exact served id (see servedIdForArm): an arm
+    // is servable only when that emitted id occurs in the served list. A bare
+    // id no route serves stays unservable even when another lane serves the
+    // same model prefixed. Keep old feeds unchanged (no list = fail open).
     const servedIds = Array.isArray(servedModels) ? new Set(servedModels) : null;
-    const servedCanonical = servedIds
-      ? new Set([...servedIds].map(canonicalModelName).filter(m => typeof m === 'string'))
-      : null;
     const unservable = [];
     const credentialAdmission = [];
     const accountArms = (accounts ?? []).map((account, i) => {
       const eligible = [];
       const refused = new Set();
       for (const arm of armsForAccount(arms, account)) {
-        if (!servedCanonical || servedCanonical.has(arm.model)) {
+        const emittedId = servedIdForArm(account?.models, arm.model, account?.provider);
+        if (!servedIds || servedIds.has(emittedId)) {
           const evidence = credentialEvidenceFor(account, arm.model);
           const readiness = credentialReadiness(evidence, credentialNow);
           if (!refused.has(arm.model)) {
@@ -957,7 +956,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           unservable.push({
             model: account?.models?.find(m => canonicalModelName(m) === arm.model) ?? arm.model,
             accountId: keyOf(account, i),
-            emitted: servedIdForArm(account?.models, arm.model, account?.provider),
+            emitted: emittedId,
           });
         }
       }

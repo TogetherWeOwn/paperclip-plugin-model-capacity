@@ -103,12 +103,13 @@ test('served-id snapshot excludes unservable arms before tick, event, and hook d
   for (const model of kept) assert.ok(SERVED.includes(model), `${model} unexpectedly absent`);
 
   // Lanes serving an arm ONLY under a provider-prefixed id (every Devin id
-  // is `devin/*`) are servable: the guard compares canonical ids and the
-  // decision emits the account's exact served id. Only arms with no served
-  // entry at all stay unservable (negatives indices 5, 6, 8, 9); the rest of
-  // the negatives ride their ladders under the prefixed emission.
-  const unservedIdx = [5, 6, 8, 9];
-  const prefixedIdx = [0, 1, 2, 3, 4, 7];
+  // is `devin/*`) are servable: the guard checks the account's exact emitted
+  // id against the served list. A bare id no route serves stays unservable
+  // even when another lane serves the same model prefixed (negatives indices
+  // 5-9, including kimi-k3 on a kimi account listing only the bare id); the
+  // rest of the negatives ride their ladders under the prefixed emission.
+  const unservedIdx = [5, 6, 7, 8, 9];
+  const prefixedIdx = [0, 1, 2, 3, 4];
 
   const candidates = [...negatives, ...positives];
   const lane = {
@@ -135,6 +136,10 @@ test('served-id snapshot excludes unservable arms before tick, event, and hook d
     assert.ok(!rungs.some(r => canonicalModelName(r.model) === model), `${model} reached a ladder`);
   }
   for (const model of kept) assert.ok(rungs.some(r => canonicalModelName(r.model) === model), `${model} lost from ladders`);
+  // Native lanes keep their exact listed emission (bare stays bare, single
+  // prefixed alias stays prefixed): the exact id, not just its canonical
+  // form, must ride a ladder.
+  for (const [raw] of positives) assert.ok(rungs.some(r => r.model === raw), `${raw} lost its exact emission`);
   // Prefixed-only arms ride their own account's ladder under the exact served id.
   for (const i of prefixedIdx) {
     const [raw, provider] = negatives[i];
