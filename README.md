@@ -149,8 +149,11 @@ accounts), never silently dropped and never invented. When the feed carries
 top-level `servedModels` (exact CLIProxy `/v1/models` ids), only an arm whose
 exact emitted id occurs in that list reaches a ladder: lanes serving an arm
 solely under a provider-prefixed id (`devin/<id>`) stay servable, and the
-decision emits the account's exact served id (an account listing the bare id
-keeps emitting it unchanged, so native lanes never take a prefixed alias).
+decision emits the account's exact served id (a listed bare id is always
+emitted unchanged, and an account listing only a prefixed alias still emits
+the bare id whenever it is served -- so native lanes never take a prefixed
+alias; the alias is emitted only when the bare id is unserved or the
+provider is prefixed-only `devin`/`opencode-go`).
 `/capacity.unservable`
 reports refused `{ model, accountId, emitted }` entries; an absent or invalid
 list leaves old routing unchanged and logs one warning. An empty valid list

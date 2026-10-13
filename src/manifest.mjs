@@ -70,9 +70,12 @@
  * v0.2.41 = PROVIDER-PREFIXED EMISSION FOR AGGREGATOR LANES: decisions emit
  * the account's exact served id (`servedIdForArm`: a `devin/<id>` lane emits
  * `devin/<id>`, never the bare id that 400s as unknown provider or misbills
- * to the native lane serving the bare id). The servedModels guard compares
- * canonical ids so prefixed-only arms stay servable, with the same fail-open
- * on feeds that publish no list. `400 unknown provider` / `unrecognized_model`
+ * to the native lane serving the bare id; native alias-only accounts keep
+ * the bare emission). The servedModels guard requires the account's exact
+ * emitted id (`servedIdForArm`) to occur in the served list, so
+ * prefixed-only arms stay servable and a bare id no route serves stays
+ * refused, with the same fail-open on feeds that publish no list.
+ * `400 unknown provider` / `unrecognized_model`
  * classify breaker-fatal, and a new decide `unservable` failure class never
  * escalates onto the next rung of the same account. Same-family newer-version
  * dominance runs inside each account ladder (dash minors compare, so

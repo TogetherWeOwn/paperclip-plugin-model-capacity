@@ -939,7 +939,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const eligible = [];
       const refused = new Set();
       for (const arm of armsForAccount(arms, account)) {
-        const emittedId = servedIdForArm(account?.models, arm.model, account?.provider);
+        const emittedId = servedIdForArm(account?.models, arm.model, account?.provider, servedIds);
         if (!servedIds || servedIds.has(emittedId)) {
           const evidence = credentialEvidenceFor(account, arm.model);
           const readiness = credentialReadiness(evidence, credentialNow);
@@ -1102,11 +1102,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const eq = eeeByArm.get(r.armId) ?? {};
           return {
             ...r,
-            // Emit the account's exact served id (provider-prefixed when the
-            // lane serves the arm only that way). Readiness below still keys
-            // on the canonical bare id: credential rows name the bare proxy
-            // id, never the prefixed alias.
-            model: servedIdForArm(account?.models, arm.model, account?.provider),
+            // Emit the account's exact served id (provider-prefixed only when
+            // the bare id is unserved or the provider is prefixed-only;
+            // native alias-only accounts keep the bare emission). Readiness
+            // below still keys on the canonical bare id: credential rows
+            // name the bare proxy id, never the prefixed alias.
+            model: servedIdForArm(account?.models, arm.model, account?.provider, servedIds),
             credentialEvidence: credentialEvidenceFor(account, arm.model),
             effort: arm.effort,
             family: arm.family,

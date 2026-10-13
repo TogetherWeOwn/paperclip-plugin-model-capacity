@@ -63,7 +63,10 @@ test('devin account emits the exact provider-prefixed served id', async () => {
 // A bare id the account serves only prefixed must still resolve to the
 // prefixed emission at the helper level. When the account lists the bare id
 // it keeps emitting it unchanged -- even alongside a prefixed alias, and
-// even a foreign prefix never beats the account's own bare id.
+// even a foreign prefix never beats the account's own bare id. An account
+// listing ONLY a prefixed alias still emits the bare id whenever it is
+// served (native lanes never take a prefixed alias); the alias is emitted
+// only when the bare id is unserved or the provider is prefixed-only.
 test('servedIdForArm maps bare arms to the account exact served id', () => {
   assert.equal(servedIdForArm(['devin/gpt-5-5', 'devin/gpt-5-4'], 'gpt-5-5', 'devin'), 'devin/gpt-5-5');
   assert.equal(servedIdForArm(['gpt-6-luna'], 'gpt-6-luna', 'codex'), 'gpt-6-luna');
@@ -71,6 +74,86 @@ test('servedIdForArm maps bare arms to the account exact served id', () => {
   assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-6-luna', 'devin'), 'gpt-6-luna');
   assert.equal(servedIdForArm(['gpt-6.1-sol', 'openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex'), 'gpt-6.1-sol');
   assert.equal(servedIdForArm(['claude-sonnet-5-5', 'devin/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude'), 'claude-sonnet-5-5');
+});
+
+// Alias-only native accounts keep the base bare emission whenever the bare
+// id is served: base emitted bare for every native account, readiness keys
+// on the bare id, and the host route serves it. Prefixed emission is for
+// unserved bare ids and prefixed-only providers (devin, opencode-go).
+test('servedIdForArm keeps native alias-only accounts on the bare emission', () => {
+  const both = new Set(['gpt-6.1-sol', 'openai/gpt-6.1-sol', 'claude-sonnet-5-5', 'claude/claude-sonnet-5-5']);
+  assert.equal(servedIdForArm(['openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex', both), 'gpt-6.1-sol');
+  assert.equal(servedIdForArm(['claude/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude', both), 'claude-sonnet-5-5');
+  assert.equal(servedIdForArm(['claude/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude', [...both]), 'claude-sonnet-5-5');
+  // Bare unserved: the listed alias is the only route.
+  assert.equal(servedIdForArm(['openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex', new Set(['openai/gpt-6.1-sol'])), 'openai/gpt-6.1-sol');
+  // Prefixed-only providers emit the alias even fail-open (no served list).
+  assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-5-5', 'devin', null), 'devin/gpt-5-5');
+  assert.equal(servedIdForArm(['opencode-go/hy3-preview'], 'hy3-preview', 'opencode-go', null), 'opencode-go/hy3-preview');
+  // Native fail-open (no served list) stays byte-identical to base: bare.
+  assert.equal(servedIdForArm(['openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex', null), 'gpt-6.1-sol');
+  assert.equal(servedIdForArm(['claude/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude', null), 'claude-sonnet-5-5');
+  // Devin keeps the prefixed emission when the bare id is unserved.
+  assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-5-5', 'devin', new Set(['devin/gpt-5-5'])), 'devin/gpt-5-5');
+});
+
+// Alias-only native accounts keep the bare 1M decoration: a claude account
+// listing only `claude/claude-sonnet-5-5` (bare served) decides the bare id,
+// so a 1M run decorates `claude-sonnet-5-5(max)[1m]` exactly as base did --
+// never `claude/...[1m]`. A devin account serving only the prefixed id keeps
+// the prefix through the decoration (`devin/...[1m]`).
+test('alias-only claude account decorates the bare id at 1M, devin keeps its prefix', async () => {
+  async function hookFor({ provider, models, servedModels, slug }) {
+    const lane = {
+      observedAt: new Date(NOW).toISOString(), servedModels,
+      accounts: [{
+        lane: `${provider}-lane-1`, provider, accountKey: `${provider}-lane-1`,
+        health: 'healthy', meter: 'reactive', models,
+        weekly: { used: null, resetsAt: null },
+        fiveHour: { used: null, resetsAt: null },
+        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+      }],
+    };
+    const rows = [
+      { slug, intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4, contextWindowTokens: 1000000 },
+    ];
+    const config = { enforce: true, cliproxy: { laneKeySecretRef: SECRET } };
+    const store = new Map();
+    const jobs = new Map();
+    const key = k => JSON.stringify(k);
+    const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
+    await plugin.setup({
+      config: { get: async () => config },
+      state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+      secrets: { resolve: async () => 'lane-key' },
+      http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, NOW, { emitted: { [provider]: [canonicalModelName(models[0])] } }) }) },
+      agents: { get: async () => null },
+      issues: { get: async () => null, list: async () => [] },
+      jobs: { register: (n, fn) => jobs.set(n, fn) },
+      events: { on: () => {} },
+      logger: { info() {}, error() {}, warn() {} },
+    });
+    store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
+      { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
+    await plugin.onConfigChanged(config, { companyId: 'acme' });
+    await jobs.get('shadow-tick')({});
+    return plugin.onResolveRunModel({
+      runId: 'run-1m', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
+      issueId: null, deadlineMs: 1500,
+    });
+  }
+  const native = await hookFor({
+    provider: 'claude', models: ['claude/claude-sonnet-5-5'],
+    servedModels: ['claude-sonnet-5-5', 'claude/claude-sonnet-5-5'], slug: 'claude-sonnet-5-5',
+  });
+  assert.equal(native.kind, 'decide');
+  assert.equal(native.model, 'claude-sonnet-5-5(max)[1m]');
+  const devin = await hookFor({
+    provider: 'devin', models: ['devin/claude-sonnet-5-5'],
+    servedModels: ['devin/claude-sonnet-5-5'], slug: 'claude-sonnet-5-5',
+  });
+  assert.equal(devin.kind, 'decide');
+  assert.equal(devin.model, 'devin/claude-sonnet-5-5(max)[1m]');
 });
 
 // Unknown-provider failures are unservable for that (account, model): the

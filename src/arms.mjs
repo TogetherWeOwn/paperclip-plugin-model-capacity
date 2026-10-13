@@ -76,17 +76,33 @@ export function canonicalModelName(model) {
 }
 
 /**
- * Exact model id to emit for an arm on one account. The account's feed
- * `models` list is authoritative: when it holds a provider-prefixed id whose
- * canonical form matches the arm (`devin/gpt-5-5` for arm `gpt-5-5`), that
- * exact id is emitted -- CLIProxy serves some lanes ONLY under the prefixed
- * id, so emitting the bare id 400s (`unknown provider`) or, worse, silently
- * routes to another provider serving the bare id. When the account lists the
- * bare id, it is emitted unchanged (bare lanes never take a prefixed alias,
- * so a native account listing both forms stays on its own route). Falls back
- * to the arm id when the account publishes no list or no match.
+ * Providers whose lanes serve ONLY under the provider-prefixed id (never the
+ * bare id). A `devin/<id>` lane 400s the bare id as unknown provider, so the
+ * prefixed emission is required even when the served list is absent
+ * (fail-open old feeds). Native lanes keep byte-identical bare emission.
  */
-export function servedIdForArm(accountModels, armModel, provider = null) {
+export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go']);
+
+/**
+ * Exact model id to emit for an arm on one account. The account's feed
+ * `models` list is authoritative, with one native-emission guard: when the
+ * account lists the bare id, it is emitted unchanged (bare lanes never take
+ * a prefixed alias, so a native account listing both forms stays on its own
+ * route). When the account lists ONLY a prefixed alias, the bare id is still
+ * emitted whenever it is served (or the served list is unknown and the
+ * provider is not prefixed-only) -- base emitted bare for every native
+ * account, and credential readiness stays keyed on the bare id. The listed
+ * prefixed id is emitted only when the bare id is unserved or the provider
+ * is prefixed-only (`devin`, `opencode-go`: every Devin id is `devin/*`, so
+ * emitting the bare id 400s as unknown provider or misbills to the native
+ * lane serving the bare id). Falls back to the arm id when the account
+ * publishes no list or no match.
+ *
+ * servedIds is the feed's global served list (Set or Array of exact ids) or
+ * null when the feed publishes none (fail-open): with no list, native
+ * providers emit bare and prefixed-only providers emit their listed alias.
+ */
+export function servedIdForArm(accountModels, armModel, provider = null, servedIds = null) {
   if (typeof armModel !== 'string' || armModel.length === 0) return armModel;
   if (!Array.isArray(accountModels)) return armModel;
   let bareHit = null;
@@ -105,7 +121,19 @@ export function servedIdForArm(accountModels, armModel, provider = null) {
       providerHit ??= raw;
     }
   }
-  return bareHit ?? providerHit ?? prefixedHit ?? armModel;
+  if (bareHit) return bareHit;
+  if (!prefixedHit && !providerHit) return armModel;
+  if (wantProvider && PREFIXED_ONLY_PROVIDERS.includes(wantProvider)) {
+    return providerHit ?? prefixedHit ?? armModel;
+  }
+  if (servedIds != null) {
+    const hasBare = typeof servedIds.has === 'function'
+      ? servedIds.has(armModel)
+      : Array.isArray(servedIds) ? servedIds.includes(armModel) : false;
+    if (hasBare) return armModel;
+    return providerHit ?? prefixedHit ?? armModel;
+  }
+  return armModel;
 }
 
 /**

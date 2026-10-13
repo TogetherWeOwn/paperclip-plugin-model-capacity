@@ -136,10 +136,14 @@ test('served-id snapshot excludes unservable arms before tick, event, and hook d
     assert.ok(!rungs.some(r => canonicalModelName(r.model) === model), `${model} reached a ladder`);
   }
   for (const model of kept) assert.ok(rungs.some(r => canonicalModelName(r.model) === model), `${model} lost from ladders`);
-  // Native lanes keep their exact listed emission (bare stays bare, single
-  // prefixed alias stays prefixed): the exact id, not just its canonical
-  // form, must ride a ladder.
-  for (const [raw] of positives) assert.ok(rungs.some(r => r.model === raw), `${raw} lost its exact emission`);
+  // Native lanes never take a prefixed alias: an account listing the bare id
+  // emits it, and an account listing only a prefixed alias still emits the
+  // bare id whenever it is served (base emitted bare for every native
+  // account). The bare id, not just its canonical form, must ride a ladder.
+  for (const [raw] of positives) {
+    const expected = canonicalModelName(raw);
+    assert.ok(rungs.some(r => r.model === expected), `${raw} lost its bare emission (want ${expected})`);
+  }
   // Prefixed-only arms ride their own account's ladder under the exact served id.
   for (const i of prefixedIdx) {
     const [raw, provider] = negatives[i];
