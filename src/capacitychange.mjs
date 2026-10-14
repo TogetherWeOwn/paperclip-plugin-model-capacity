@@ -24,6 +24,24 @@ export function isWarmupSpan(spanMs) {
   return spanMs < WARMUP_MIN_SPAN_MS;
 }
 
+/**
+ * Pre-step guard prediction: the post-step guard flag cannot be diffed before
+ * the step that sets it, so predict from this tick's 5h reading against the
+ * previous guard state. Mirrors the controller exactly (trip at guardHigh,
+ * hold at >= guardRejoin, release below it -- including release on a missing
+ * reading while guarded, which the controller treats as rejoin).
+ */
+export function predictGuard(prevGuardActive, fiveHourUsed, { guardHigh = 0.8, guardRejoin = 0.5 } = {}) {
+  const hi = finite(guardHigh) ? guardHigh : 0.8;
+  const rejoin = finite(guardRejoin) ? guardRejoin : 0.5;
+  if (prevGuardActive === true) {
+    if (fiveHourUsed == null) return false;
+    return fiveHourUsed >= rejoin;
+  }
+  if (fiveHourUsed == null) return false;
+  return fiveHourUsed >= hi;
+}
+
 const idOf = (a) => (a != null && typeof a.accountId === 'string' ? a.accountId : null);
 
 function isHealthy(a) {
@@ -88,10 +106,13 @@ export function diffCapacityFeed(prev, curr, { nowMs = Date.now(), firstTick = f
     const pr = p.resetAtMs;
     const cr = c.resetAtMs;
     const resetForward = finite(pr) && finite(cr) && cr > pr + 3600000;
-    const bigDrop = finite(pu) && finite(cu) && cu + 0.3 < pu;
+    // Collapse toward zero on the same window reads as an early provider
+    // restart (a deliberate bet: extreme same-window restatements are rarer
+    // than early restarts). A reset with real burn behind it drops well over
+    // 5 points, so the 5pt-with-shift arm covers every genuine reset.
     const collapseToZero = finite(pu) && finite(cu) && pu >= 0.4 && cu <= 0.1;
-    const epsilonWithShift = finite(pu) && finite(cu) && resetForward && cu + 0.05 < pu;
-    if ((bigDrop && resetForward) || collapseToZero || epsilonWithShift) upwardIds.add(id);
+    const dropWithShift = finite(pu) && finite(cu) && resetForward && cu + 0.05 < pu;
+    if (collapseToZero || dropWithShift) upwardIds.add(id);
     // Free-reset arrival surfaces as a fresh burn horizon upstream; the feed
     // carries it as burnHorizonMs appearing on the account row.
     if (p.burnHorizonMs == null && c.burnHorizonMs != null) upwardIds.add(id);

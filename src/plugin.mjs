@@ -96,7 +96,7 @@ import {
 } from './ledger.mjs';
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
-import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan } from './capacitychange.mjs';
+import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal } from './reviewer.mjs';
 
 const NS = 'model-capacity';
@@ -1597,18 +1597,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // transitions keep today's debounce (no bypass).
     const prevChange = (await ctx.state.get(scopeKey(companyId, CAPACITY_CHANGE_KEY))) ?? null;
     const prevSummaries = Array.isArray(prevChange?.accounts) ? prevChange.accounts : [];
-    // Pre-step guard prediction: the post-step guard flag cannot be diffed
-    // before the step that sets it, so predict from this tick's 5h reading
-    // against the previous guard state (trip at guardHigh, release below
-    // guardRejoin). Unknown 5h readings hold the previous state.
+    // Pre-step guard prediction (see predictGuard): the post-step guard flag
+    // cannot be diffed before the step that sets it, so predict from this
+    // tick's 5h reading against the previous guard state.
     const guardHigh = config.pacing.guardHigh;
     const guardRejoin = config.pacing.guardRejoin;
     const currSummaries = snapshot.accounts.map((a, idx) => {
       const prevGuard = (pacingState?.[stateKeys[idx]]?.guardActive) === true;
-      const fiveHour = a.fiveHour?.utilization;
-      const predictedGuard = fiveHour != null
-        ? (prevGuard ? fiveHour >= guardRejoin : fiveHour >= guardHigh)
-        : prevGuard;
+      const predictedGuard = predictGuard(prevGuard, a.fiveHour?.utilization, { guardHigh, guardRejoin });
       const resetAt = a.weekly?.resetsAtMs ?? null;
       const burnPre = burnHorizon({
         nowMs,

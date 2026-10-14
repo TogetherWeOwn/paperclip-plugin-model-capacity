@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan } from '../src/capacitychange.mjs';
+import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from '../src/capacitychange.mjs';
 
 // capacity-change events own the upward fast path. New accounts,
 // resets/free resets and cooldown ends must bypass the rung cooldown; downward
@@ -104,6 +104,16 @@ test('first tick seeds without waking the fleet', () => {
   assert.equal(d.upwardIds.size, 0);
   assert.equal(d.shouldBypassCooldown('b'), false);
   assert.equal(d.changed, false);
+});
+
+test('predictGuard mirrors the controller: trip, hold, release, release-on-null', () => {
+  const cfg = { guardHigh: 0.8, guardRejoin: 0.5 };
+  assert.equal(predictGuard(false, 0.85, cfg), true);
+  assert.equal(predictGuard(false, 0.5, cfg), false);
+  assert.equal(predictGuard(true, 0.7, cfg), true);
+  assert.equal(predictGuard(true, 0.4, cfg), false);
+  assert.equal(predictGuard(true, null, cfg), false);
+  assert.equal(predictGuard(false, null, cfg), false);
 });
 
 test('warmup span: histories under 60 min are not trusted', () => {
