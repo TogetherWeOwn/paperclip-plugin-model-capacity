@@ -95,6 +95,31 @@ test('override table holds only verified mismatches', () => {
   assert.equal(MODEL_AA_OVERRIDES['gpt-oss-120b-medium'], 'gpt-oss-120b');
   assert.equal(MODEL_AA_OVERRIDES['kimi-k3-256k'], 'kimi-k3');
   assert.equal(MODEL_AA_OVERRIDES['claude-opus-4-6-thinking'], 'claude-opus-4-6');
+  // AA has no muse-wonder-1-0 / -xhigh slug: the only Wonder row is the
+  // base `muse-wonder` slug (verified against the live AA snapshot).
+  assert.deepEqual(MODEL_AA_OVERRIDES['muse-wonder-1.0-contributor'], { slug: 'muse-wonder', effort: 'xhigh' });
+});
+
+test('default Meta arm is Muse Wonder 1.0 contributor, not Spark', () => {
+  const meta = DEFAULT_ARM_MAP.filter(a => a.providers?.includes('meta'));
+  assert.deepEqual(meta, [
+    { aaSlug: 'muse-wonder', model: 'muse-wonder-1.0-contributor', effort: 'xhigh', family: 'muse', providers: ['meta'] },
+  ]);
+  assert.ok(!DEFAULT_ARM_MAP.some(a => a.model === 'muse-spark-1.3-contributor'));
+  const { arms, skipped } = resolveArms(rows(['muse-wonder', 'muse-spark-1-3-xhigh']));
+  const wonder = arms.find(a => a.armId === 'muse-wonder');
+  assert.deepEqual([wonder.model, wonder.effort, wonder.family], ['muse-wonder-1.0-contributor', 'xhigh', 'muse']);
+  assert.ok(!skipped.some(s => s.aaSlug === 'muse-wonder'));
+});
+
+test('wonder contributor dynamic binding reaches the muse-wonder AA row', () => {
+  assert.deepEqual(slugCandidates('muse-wonder-1.0-contributor'),
+    ['muse-wonder-1.0-contributor', 'muse-wonder-1-0-contributor', 'muse-wonder-1-0-xhigh']);
+  const { bindings } = buildDynamicBindings(['muse-wonder-1.0-contributor'], {});
+  assert.deepEqual([bindings[0].aaSlug, bindings[0].effort, bindings[0].family], ['muse-wonder', 'xhigh', 'muse']);
+  const { arms, unscored } = resolveDynamicArms(rows(['muse-wonder']), bindings);
+  assert.deepEqual(arms.map(a => a.armId), ['muse-wonder-1.0-contributor']);
+  assert.deepEqual(unscored, []);
 });
 
 test('dynamic bindings: covered models skipped, overrides bypass candidates, non-chat unscored', () => {

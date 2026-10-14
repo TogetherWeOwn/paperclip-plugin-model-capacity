@@ -53,6 +53,12 @@ export const MODEL_AA_OVERRIDES = Object.freeze({
   'grok-4-20-0309-reasoning': 'grok-4-20-0309',
   'grok-3-mini': 'grok-3-mini-reasoning',
   'muse-spark-1.2-contributor': { slug: 'muse-spark-1-2', effort: 'xhigh' },
+  // AA publishes Wonder only as the base slug `muse-wonder` ("Muse Wonder
+  // (Max)", intelligence index 52.4 in the 2026-10-14 live snapshot, above
+  // Spark 1.3's 48.1 max / 45.1 xhigh rows): there is no
+  // `muse-wonder-1-0` or `muse-wonder-*-xhigh` row normalization could
+  // reach, and the contributor id runs at the muse xhigh cap.
+  'muse-wonder-1.0-contributor': { slug: 'muse-wonder', effort: 'xhigh' },
 });
 
 /** Model ids that can never carry an agent run: media, test, and private ids. */
@@ -332,7 +338,12 @@ export const DEFAULT_ARM_MAP = Object.freeze([
   { aaSlug: 'gpt-6-astra-high', model: 'gpt-6-astra', effort: 'high', family: 'astra', providers: ['codex'] },
   { aaSlug: 'gpt-6-astra-medium', model: 'gpt-6-astra', effort: 'medium', family: 'astra', providers: ['codex'] },
   { aaSlug: 'gpt-6-astra-low', model: 'gpt-6-astra', effort: 'low', family: 'astra', providers: ['codex'] },
-  { aaSlug: 'muse-spark-1-3-xhigh', model: 'muse-spark-1.3-contributor', effort: 'xhigh', family: 'muse', providers: ['meta'] },
+  // The Meta arm is Muse Wonder 1.0 contributor (official id, no alias).
+  // AA slug `muse-wonder` is the only Wonder row in the live snapshot
+  // (see MODEL_AA_OVERRIDES note); effort stays at the muse xhigh cap.
+  // Spark 1.3 contributor is no longer a default arm: it stays callable
+  // directly by its exact model id.
+  { aaSlug: 'muse-wonder', model: 'muse-wonder-1.0-contributor', effort: 'xhigh', family: 'muse', providers: ['meta'] },
 ]);
 
 /** Effort suffix parsing: trailing `-<effort>` else the base slug = max. */
