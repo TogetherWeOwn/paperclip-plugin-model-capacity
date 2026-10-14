@@ -96,6 +96,8 @@ import {
 } from './ledger.mjs';
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
+import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan } from './capacitychange.mjs';
+import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal } from './reviewer.mjs';
 
 const NS = 'model-capacity';
 // Weekly remainder at or below this floor: the account cannot serve runs
@@ -108,6 +110,8 @@ const CAPACITY_KEY = 'capacity-v1';
 const LADDER_KEY = 'ladder-v1';
 const RATE_KEY = 'rate-history-v1';
 const RUNEVT_KEY = 'run-events-v1';
+/** Previous-tick account summary for capacity-change diffing (auto-heal). */
+const CAPACITY_CHANGE_KEY = 'capacity-change-v1';
 /** EWMA state for the pooled burn per run and the fleet target (tick-owned). */
 const SMOOTH_KEY = 'smoothing-v1';
 /** Per-agent cap hysteresis state (written by GET /caps). */
@@ -259,6 +263,22 @@ export function validateConfigShape(raw) {
     }
     if ('exhaustedPct' in rr && !(typeof rr.exhaustedPct === 'number' && rr.exhaustedPct > 0 && rr.exhaustedPct <= 1)) {
       errors.push('reviewReserve.exhaustedPct must be a number in (0, 1]');
+    }
+  }
+  const rv = raw.reviewer;
+  if (rv != null && (typeof rv !== 'object' || Array.isArray(rv))) {
+    errors.push('reviewer must be an object');
+  } else if (rv) {
+    if ('providers' in rv && (!Array.isArray(rv.providers) || rv.providers.some((p) => typeof p !== 'string'))) {
+      errors.push('reviewer.providers must be an array of strings');
+    }
+    for (const k of ['supplyHeadroomPct']) {
+      if (k in rv && !(typeof rv[k] === 'number' && rv[k] > 0 && rv[k] <= 1)) {
+        errors.push(`reviewer.${k} must be a number in (0, 1]`);
+      }
+    }
+    if ('supplyHoursToReset' in rv && !(typeof rv.supplyHoursToReset === 'number' && rv.supplyHoursToReset > 0)) {
+      errors.push('reviewer.supplyHoursToReset must be a number > 0');
     }
   }
   for (const b of armMap ?? []) {
@@ -505,6 +525,10 @@ export function resolveConfig(raw = {}) {
     // default; enabled:false restores pre-reserve admission bit-for-bit.
     // agentIds null/empty resolves to roles.keepAgentIds.
     reviewReserve: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }),
+    // Reviewer as a first-class role (see reviewer.mjs): runnable review
+    // capacity from qualified providers (Claude today; others only when the
+    // operator opts in) plus the hold/resume signal the review gate reads.
+    reviewer: normalizeReviewer(raw.reviewer),
     // Burn horizon (see burnhorizon.mjs): pace to min(regular reset, expected
     // free reset) so quota is spent when a provider restore lands. Enabled by
     // default; enabled:false restores linear-to-regular-reset pacing bit-for-bit.
@@ -1567,6 +1591,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
     const nextPacing = { ...pacingState };
     const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
+    // Capacity-change diff (auto-heal): compare this feed against
+    // the previous tick's summary so UPWARD transitions (new account, reset,
+    // guard end, recovery) bypass the rung cooldown below. Downward
+    // transitions keep today's debounce (no bypass).
+    const prevChange = (await ctx.state.get(scopeKey(companyId, CAPACITY_CHANGE_KEY))) ?? null;
+    const prevSummaries = Array.isArray(prevChange?.accounts) ? prevChange.accounts : [];
+    const currSummaries = snapshot.accounts.map((a, idx) => ({
+      accountId: stateKeys[idx],
+      weeklyUsed: a.weekly?.utilization ?? null,
+      resetAtMs: a.weekly?.resetsAtMs ?? null,
+      guardActive: (pacingState?.[stateKeys[idx]]?.guardActive) === true,
+      health: a.health ?? null,
+      burnHorizonMs: null,
+    }));
+    const capacityDiff = diffCapacityFeed(prevSummaries, currSummaries, { nowMs });
     const accountViews = [];
     for (let i = 0; i < snapshot.accounts.length; i++) {
       const account = snapshot.accounts[i];
@@ -1613,6 +1652,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const measured = weeklyUsed != null
         ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
         : null;
+      // New-account warmup : the CONTROLLER does not act on rate
+      // estimates from < 60 min of data (live: a brand-new Claude account
+      // measured 4.65%/h from minutes of data and throttled). Reporting keeps
+      // the measured value; control falls back to burnHorizon/linear position
+      // pacing until the history spans the warmup floor. Never a hold on thin
+      // data: warmup only ever replaces a descend with position logic, and a
+      // bypass (upward transition) still climbs at once.
+      let warmingUp = false;
+      if (weeklyUsed != null) {
+        const spanMs = measured?.spanMs
+          ?? (history.length >= 2 ? history[history.length - 1].atMs - history[0].atMs : 0);
+        warmingUp = isWarmupSpan(spanMs);
+      }
+      const controlMeasured = warmingUp ? null : measured;
       // Required rate needs no history and no calibration: whenever the
       // remaining fraction and the reset are both known it is a number.
       // Null (unknown) only when an input is missing -- never a 0 that
@@ -1646,13 +1699,28 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const hoursTo5hReset = reset5Ms != null ? Math.max((reset5Ms - nowMs) / 3600000, 0) : null;
       // Availability narrows selections, never the durable pacing range.
       const ceiling = (ladders[key]?.rankingRungs.length ?? ladders[key]?.rungs.length ?? 1) - 1;
-      let step = stepRateController(nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false },
+      // Auto-heal fast path: upward capacity transitions recompute at once
+      // (no cooldown rung delay) so a new account ramps instead of holding.
+      const bypassCooldown = capacityDiff.shouldBypassCooldown(key);
+      const pacingInput = nextPacing[key] ?? { pointer: 0, lastMoveAtMs: 0, guardActive: false };
+      const pacingForStep = bypassCooldown ? { ...pacingInput, lastMoveAtMs: 0 } : pacingInput;
+      let step = stepRateController(pacingForStep,
         {
-          measuredRatePerHour: measured?.ratePerHour ?? null,
+          measuredRatePerHour: controlMeasured?.ratePerHour ?? null,
           requiredRatePerHour: required ?? 0,
           positionError,
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
+      if (warmingUp && (step.action === 'descend' || step.action === 'hold-cooldown')) {
+        // Warmup never throttles on thin data: a thin-data descend becomes a
+        // position hold, and a thin-data cooldown hold keeps the pointer but
+        // says warmup so ops can see why the rate was not acted on.
+        step = {
+          ...step,
+          action: 'hold',
+          reason: `warming up (${Math.round((measured?.spanMs ?? 0) / 60000)} min of rate history < 60 min): position pacing until enough points`,
+        };
+      }
       // Unhealthy accounts allocate nothing (the order filter drops them),
       // so the controller must not narrate them as holding a bound: freeze
       // the pointer and report excluded, resuming from the frozen pointer
@@ -1744,6 +1812,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         rateSpanMs: measured?.spanMs ?? null,
         ratePoints: measured?.points ?? 0,
         rateHistoryPoints: history.length,
+        warmingUp,
+        bypassedCooldown: bypassCooldown,
         requiredRatePerHour: required,
         planAhead,
         weeklyElapsed,
@@ -2270,7 +2340,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     let nextSmoothTarget = null;
     if (rawTarget != null && rawTarget > 0) {
       const prevT = Object.hasOwn(smoothState, 'target') ? smoothState.target : null;
-      nextSmoothTarget = smoothValue(prevT, rawTarget, nowMs, targetSmoothOpts);
+      // Auto-heal fast path: upward capacity transitions serve the raw target
+      // at once (no EWMA rise lag) so new/reset capacity raises caps now.
+      const upwardFastPath = capacityDiff.upwardIds.size > 0;
+      nextSmoothTarget = upwardFastPath
+        ? { value: rawTarget, atMs: nowMs }
+        : smoothValue(prevT, rawTarget, nowMs, targetSmoothOpts);
       concurrency.target = Math.min(nextSmoothTarget.value, config.concurrency.maxTotal);
       // Demand bound (current queues, applied after smoothing so a surge is
       // not lagged): never serve more concurrency than the queued work can
@@ -2892,6 +2967,54 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
+    // Reviewer as a first-class role : runnable review capacity
+    // from qualified providers plus the hold/resume signal the review gate
+    // reads. Reviewer-eligible = a non-trial arm the role can reach (thinker
+    // access first, doer as fallback); trial-only accounts never serve reviews.
+    const reviewerView = computeReviewerCapacity({
+      accounts: accountViews.map((v) => {
+        const access = roleAccess?.[v.accountId];
+        const thinker = access?.thinker;
+        const doer = access?.doer;
+        const eligible = (thinker?.eligible === true && thinker?.trialOnly !== true)
+          || (doer?.eligible === true && doer?.trialOnly !== true);
+        return {
+          accountId: v.accountId,
+          provider: v.provider,
+          health: v.health,
+          headroomPct: v.headroomPct,
+          remainingPct: v.remainingPct,
+          hoursToReset: v.hoursToReset,
+          reactive: v.reactive === true,
+          reviewerEligible: eligible,
+        };
+      }),
+      cfg: config.reviewer,
+      nowMs,
+    });
+    // Demand-aware supply signal: large unused headroom near reset while doers
+    // idle means supply should scale up instead of idling.
+    const doerIdle = (demand?.byRole?.doer ?? 0) <= 0 && (roleRunning?.doer ?? 0) <= 0;
+    const supplySignal = computeSupplySignal({
+      accounts: accountViews.map((v) => ({
+        provider: v.provider,
+        remainingPct: v.remainingPct,
+        hoursToReset: v.hoursToReset,
+      })),
+      doerIdle,
+      cfg: config.reviewer,
+    });
+    // Capacity-change event : upward transitions wake held/idle
+    // work via the capacity view + persisted state key; downward debounces.
+    const capacityChange = {
+      version: 1,
+      atMs: nowMs,
+      added: capacityDiff.added,
+      removed: capacityDiff.removed,
+      upwardAccountIds: [...capacityDiff.upwardIds].sort(),
+      downwardAccountIds: [...capacityDiff.downwardIds].sort(),
+      wake: capacityDiff.upwardIds.size > 0,
+    };
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
     const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
@@ -2978,6 +3101,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Review reserve: R, need, capacity, lent and inputs per reserved
       // provider, plus the accounts held for non-review runs.
       reviewReserve: reviewReserveView,
+      // Reviewer as a first-class role : runnable capacity from
+      // qualified providers plus the hold/resume signal the review gate
+      // reads (supersedes the host reviewer_failover/review-hold scripts).
+      reviewer: reviewerView,
+      // Capacity-change event: upward transitions (new account, reset, guard
+      // end, recovery) set wake:true so host + Paperclip wake held/idle work.
+      capacityChange,
+      // Demand-aware supply signal: large unused headroom near reset while
+      // doers idle. Wake supply (work generator / PR-finishing cards).
+      supplySignal,
       unmappedRuns,
       runEventsSeen: mergedEvt.seen,
       lastRunEventAtMs: mergedEvt.lastAtMs,
@@ -2990,6 +3123,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       },
     });
     await ctx.state.set(scopeKey(companyId, LADDER_KEY), { atMs: nowMs, ladders });
+    await ctx.state.set(scopeKey(companyId, CAPACITY_CHANGE_KEY), {
+      atMs: nowMs,
+      accounts: accountViews.map((v) => ({
+        accountId: v.accountId,
+        weeklyUsed: v.weeklyUsedPct ?? null,
+        resetAtMs: v.resetAtMs ?? null,
+        guardActive: v.guardActive === true,
+        health: v.health ?? null,
+        burnHorizonMs: v.burnHorizonMs ?? null,
+      })),
+      lastChange: capacityChange,
+    });
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,
       calibration: concurrency.calibration, observed, runs: ledger.size, runsSource: 'events',
