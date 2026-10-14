@@ -97,7 +97,7 @@ import {
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
-import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal } from './reviewer.mjs';
+import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 
 const NS = 'model-capacity';
 // Weekly remainder at or below this floor: the account cannot serve runs
@@ -279,6 +279,12 @@ export function validateConfigShape(raw) {
     }
     if ('supplyHoursToReset' in rv && !(typeof rv.supplyHoursToReset === 'number' && rv.supplyHoursToReset > 0)) {
       errors.push('reviewer.supplyHoursToReset must be a number > 0');
+    }
+    if ('doerStarvationMarginRuns' in rv && !(typeof rv.doerStarvationMarginRuns === 'number' && rv.doerStarvationMarginRuns > 0)) {
+      errors.push('reviewer.doerStarvationMarginRuns must be a number > 0');
+    }
+    if ('doerStarvationSustainMs' in rv && !(typeof rv.doerStarvationSustainMs === 'number' && rv.doerStarvationSustainMs > 0)) {
+      errors.push('reviewer.doerStarvationSustainMs must be a number > 0');
     }
   }
   for (const b of armMap ?? []) {
@@ -3022,19 +3028,42 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       nowMs,
     });
     // Demand-aware supply signal: large unused headroom near reset while doers
-    // idle means supply should scale up instead of idling.
+    // idle means supply should scale up instead of idling. Per-provider live
+    // runs keep one provider's reviewer traffic from masking another
+    // provider's doer starvation (host 2026-10-14: Meta sat on large headroom
+    // with almost no runs while fleet runs/h looked healthy).
     const doerIdle = (demand?.byRole?.doer ?? 0) <= 0 && (roleRunning?.doer ?? 0) <= 0;
-    const supplySignal = computeSupplySignal({
+    const supplyBase = computeSupplySignal({
       accounts: accountViews.map((v) => ({
         provider: v.provider,
         health: v.health,
         action: v.action ?? null,
+        guardActive: v.guardActive === true,
         remainingPct: v.remainingPct,
         hoursToReset: v.hoursToReset,
+        inFlight: liveCensus.byAccount[v.accountId] ?? 0,
       })),
       doerIdle,
       cfg: config.reviewer,
     });
+    // Doer-starvation wake: the served target C* exceeds live doer runs by a
+    // margin sustained across ticks, so idle in_progress/todo cards on
+    // healthy-provider agents get woken. The since-timestamp persists in the
+    // capacity-change state key below so a slow poller sees the sustained
+    // wake, not a one-tick pulse.
+    const doerStarvation = computeDoerStarvation({
+      target: concurrency.target,
+      liveDoerRuns: roleRunning.doer,
+      doerDemand: demand?.byRole?.doer ?? 0,
+      sinceMs: prevChange?.doerStarvationSinceMs ?? null,
+      cfg: config.reviewer,
+      nowMs,
+    });
+    const supplySignal = {
+      ...supplyBase,
+      doerStarvation,
+      wake: supplyBase.wake || doerStarvation.wake,
+    };
     // Capacity-change event : upward transitions wake held/idle
     // work via the capacity view + persisted state key; downward debounces.
     // wake pulses on the transition tick only, but seq and lastWakeAtMs
@@ -3187,6 +3216,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       })),
       lastChange,
       lastWakeAtMs,
+      // Durable doer-starvation start so the sustain window survives slow
+      // pollers and restarts (a gap that closes resets to null).
+      doerStarvationSinceMs: doerStarvation.sinceMs,
     });
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,

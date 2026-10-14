@@ -79,7 +79,9 @@
   "reviewer": {
     "providers": ["claude"],
     "supplyHeadroomPct": 0.3,
-    "supplyHoursToReset": 120
+    "supplyHoursToReset": 120,
+    "doerStarvationMarginRuns": 4,
+    "doerStarvationSustainMs": 600000
   },
   "concurrency": {
     "maxTotal": 75,

@@ -202,3 +202,25 @@ test('bypass tick with no move preserves the rung cooldown stamp', async () => {
   assert.equal((await view()).pointer, 1, 'cooldown survives the bypass tick');
   assert.match((await view()).action, /hold-cooldown/);
 });
+
+test('supply signal reports per-provider idleness and the doer-starvation shape on /capacity', async () => {
+  // Host 2026-10-14: Meta held large unused headroom with almost no runs
+  // while fleet runs/h looked healthy. The tick must publish each
+  // provider's own live runs (not a fleet average) plus the C*-vs-live-doer
+  // starvation object. Fresh install here: no measured runs, so C* is
+  // unmeasurable and starvation stays unknown instead of waking.
+  const soon = new Date(TICK + 60 * 3600000).toISOString();
+  const meta = lane('meta', 'm1', { models: ['muse-spark-1.3-contributor'], used: 0.4 });
+  meta.weekly = { ...meta.weekly, resetsAt: soon };
+  const d = drive({ lanes: [lane('claude', 'a1', { models: ['claude-haiku-5-5'], used: 0.9 }), meta] });
+  await d.setup();
+  await d.tick();
+  const body = (await d.api('capacity')).body;
+  const entry = body.supplySignal.providers.find((p) => p.provider === 'meta');
+  assert.ok(entry, 'meta qualifies with large headroom near reset');
+  assert.equal(entry.liveRuns, 0);
+  assert.equal(entry.idle, true);
+  assert.equal(entry.qualifyingAccounts, 1);
+  assert.equal(body.supplySignal.doerStarvation.unknown, true);
+  assert.equal(body.supplySignal.doerStarvation.wake, false);
+});

@@ -645,7 +645,16 @@ compares them against what it last handled instead of racing the pulse.
 `supplySignal` fires when at least one account clears both bars on its own
 (headroom at/above `supplyHeadroomPct` with reset inside
 `supplyHoursToReset`) while doers are idle -- one account's headroom is
-never paired with another account's reset.
+never paired with another account's reset. Each provider entry also
+carries its own `liveRuns`, `qualifyingAccounts` and `idle` flag, and wakes
+when it qualifies and has zero live runs even while the fleet is busy --
+fleet runs/h (e.g. reviewer traffic on one provider) must not mask another
+provider's doer starvation. `supplySignal.doerStarvation` tracks the served
+target C* against live doer runs and wakes when the gap (default >= 4 runs)
+persists (default 10 minutes) while queued doer demand waits, so idle
+in_progress/todo cards on healthy-provider agents get woken; a gap with
+nothing queued (thinker-absorbed target, issues outage) never wakes, and an
+unmeasurable target stays `unknown` and never wakes.
 
 Two tick behaviors to know. New-account warmup: measured rates from under
 60 minutes of retained history are not trusted (the span comes from the
@@ -659,7 +668,9 @@ that moves nothing writes the account's original last-move stamp back, so
 the rung cooldown survives the event.
 
 Config (`reviewer`): `providers` (default `["claude"]`), `supplyHeadroomPct`
-(default 0.30), `supplyHoursToReset` (default 120). Every knob is validated
+(default 0.30), `supplyHoursToReset` (default 120),
+`doerStarvationMarginRuns` (default 4), `doerStarvationSustainMs`
+(default 600000). Every knob is validated
 so a typo fails closed at config load. Each account row also reports
 `warmingUp`, `bypassedCooldown`, `rateBasis` (measurement availability;
 `warmingUp` tells when control still falls back to position), `action` and

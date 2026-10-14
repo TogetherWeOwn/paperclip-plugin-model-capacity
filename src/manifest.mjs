@@ -82,6 +82,14 @@
  * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
  * prefix. No capability, egress, secret or env-key change.
  *
+ * v0.2.45 = DOER-STARVATION SCOPE: per-provider liveRuns/idle on the supply
+ * signal (one provider's reviewer traffic no longer masks another provider's
+ * idle headroom) plus a C*-vs-live-doer starvation wake sustained across
+ * ticks (default gap >= 4 runs for 10 minutes, persisted start, unknown
+ * target never wakes). Review-response fixes ride along (history-span
+ * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
+ * wake seq). No capability, egress, secret or env-key change.
+ *
  * v0.2.44 = REVIEWER ROUTING + CAPACITY AUTO-HEAL: reviewer is a first-class
  * role (runnable capacity from qualified providers, default Claude only, plus
  * the hold/resume signal the review gate reads); feed diffs bypass the rung
@@ -215,7 +223,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.44';
+export const PLUGIN_VERSION = '0.2.45';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

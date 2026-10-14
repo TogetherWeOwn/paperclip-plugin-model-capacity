@@ -5,6 +5,7 @@ import {
   normalizeReviewer,
   computeReviewerCapacity,
   computeSupplySignal,
+  computeDoerStarvation,
 } from '../src/reviewer.mjs';
 
 // reviewer is a first-class role. Claude qualifies today; Meta only
@@ -143,4 +144,88 @@ test('supply signal pairs each account headroom with its own reset', () => {
     doerIdle: true,
   });
   assert.equal(sick.wake, false);
+});
+
+test('supply signal reports per-provider live runs; an idle healthy provider wakes even when the fleet is busy', () => {
+  // Host 2026-10-14: Meta held large unused headroom with almost no runs
+  // while fleet runs/h (Claude reviewer traffic) looked healthy. Fleet
+  // doerIdle=false must not mask the idle provider.
+  const accounts = [
+    acct('claude:r1', 'claude', { remainingPct: 0.1, hoursToReset: 100, inFlight: 3 }),
+    acct('meta:m1', 'meta', { remainingPct: 0.6, hoursToReset: 60, inFlight: 0 }),
+  ];
+  const out = computeSupplySignal({ accounts, doerIdle: false });
+  const meta = out.providers.find((p) => p.provider === 'meta');
+  assert.ok(meta);
+  assert.equal(meta.liveRuns, 0);
+  assert.equal(meta.idle, true);
+  assert.equal(meta.qualifyingAccounts, 1);
+  assert.equal(meta.wake, true);
+  assert.equal(out.wake, true);
+  assert.equal(out.providers.find((p) => p.provider === 'claude'), undefined);
+});
+
+test('supply liveRuns count every provider run, not just qualifying accounts', () => {
+  // A non-qualifying account on the same provider still burns quota: its
+  // runs must show in the provider entry, or an idle flag lies.
+  const accounts = [
+    acct('meta:m1', 'meta', { remainingPct: 0.6, hoursToReset: 60, inFlight: 0 }),
+    acct('meta:m2', 'meta', { remainingPct: 0.6, hoursToReset: 60, action: 'excluded', inFlight: 5 }),
+  ];
+  const out = computeSupplySignal({ accounts, doerIdle: false });
+  const meta = out.providers.find((p) => p.provider === 'meta');
+  assert.ok(meta);
+  assert.equal(meta.liveRuns, 5);
+  assert.equal(meta.idle, false);
+  assert.equal(meta.wake, false);
+  assert.equal(out.wake, false);
+});
+
+test('supply signal without liveness falls back to the fleet doer flag', () => {
+  const accounts = [acct('meta:m1', 'meta', { remainingPct: 0.6, hoursToReset: 60 })];
+  const out = computeSupplySignal({ accounts, doerIdle: false });
+  assert.equal(out.providers[0].liveRuns, null);
+  assert.equal(out.providers[0].idle, null);
+  assert.equal(out.wake, false);
+});
+
+test('doer starvation wakes only after the C* gap persists past the sustain window', () => {
+  const t0 = 1000000;
+  const first = computeDoerStarvation({ target: 22, liveDoerRuns: 8, doerDemand: 37, sinceMs: null, nowMs: t0 });
+  assert.equal(first.starving, true);
+  assert.equal(first.gap, 14);
+  assert.equal(first.waiting, true);
+  assert.equal(first.wake, false);
+  assert.equal(first.sinceMs, t0);
+  const early = computeDoerStarvation({ target: 22, liveDoerRuns: 8, doerDemand: 37, sinceMs: first.sinceMs, nowMs: t0 + 5 * 60000 });
+  assert.equal(early.wake, false);
+  assert.equal(early.sinceMs, t0);
+  const late = computeDoerStarvation({ target: 22, liveDoerRuns: 8, doerDemand: 37, sinceMs: first.sinceMs, nowMs: t0 + 10 * 60000 });
+  assert.equal(late.wake, true);
+  const closed = computeDoerStarvation({ target: 22, liveDoerRuns: 21, doerDemand: 37, sinceMs: late.sinceMs, nowMs: t0 + 11 * 60000 });
+  assert.equal(closed.starving, false);
+  assert.equal(closed.sinceMs, null);
+  assert.equal(closed.wake, false);
+});
+
+test('doer starvation never wakes without waiting doer demand', () => {
+  // C* absorbed by thinker runs, or an issues outage zeroing demand: a gap
+  // with nothing queued is not starvation, however long it persists.
+  const t0 = 1000000;
+  const out = computeDoerStarvation({ target: 22, liveDoerRuns: 0, doerDemand: 0, sinceMs: t0, nowMs: t0 + 30 * 60000 });
+  assert.equal(out.starving, true);
+  assert.equal(out.waiting, false);
+  assert.equal(out.wake, false);
+  assert.equal(out.sinceMs, t0);
+});
+
+test('a doer gap inside the margin never starves; an unmeasurable target stays unknown', () => {
+  const inside = computeDoerStarvation({ target: 22, liveDoerRuns: 20, sinceMs: null, nowMs: 1000 });
+  assert.equal(inside.starving, false);
+  assert.equal(inside.wake, false);
+  assert.equal(inside.sinceMs, null);
+  const unknown = computeDoerStarvation({ target: null, liveDoerRuns: 0, sinceMs: null, nowMs: 1000 });
+  assert.equal(unknown.wake, false);
+  assert.equal(unknown.starving, false);
+  assert.equal(unknown.unknown, true);
 });
