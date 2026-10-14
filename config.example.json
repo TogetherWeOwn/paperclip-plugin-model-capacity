@@ -76,6 +76,13 @@
     "minRunsPerH": 0.1,
     "runsHalfLifeH": 6
   },
+  "reviewer": {
+    "providers": ["claude"],
+    "supplyHeadroomPct": 0.3,
+    "supplyHoursToReset": 120,
+    "doerStarvationMarginRuns": 4,
+    "doerStarvationSustainMs": 600000
+  },
   "concurrency": {
     "maxTotal": 75,
     "meanRunDurationHours": 0.186

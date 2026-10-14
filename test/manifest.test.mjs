@@ -2,13 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
 import { validateConfigShape } from '../src/plugin.mjs';
+import { DEFAULT_REVIEWER, normalizeReviewer } from '../src/reviewer.mjs';
 import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.42');
-  assert.equal(PLUGIN_VERSION, '0.2.42');
+  assert.equal(manifest.version, '0.2.45');
+  assert.equal(PLUGIN_VERSION, '0.2.45');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -102,4 +103,26 @@ test('package.json version tracks PLUGIN_VERSION (no release drift)', async () =
   const { readFile } = await import('node:fs/promises');
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
   assert.equal(pkg.version, PLUGIN_VERSION);
+});
+
+test('reviewer schema declares every normalized knob (manifest/validator/example parity)', async () => {
+  // Paperclip Review probe: the host validates instance config against the
+  // manifest schema at the API boundary, so a knob missing here rejects the
+  // documented config even though normalizeReviewer and validateConfigShape
+  // accept it.
+  const schema = manifest.instanceConfigSchema.properties.reviewer;
+  assert.equal(schema.additionalProperties, false);
+  for (const key of Object.keys(normalizeReviewer(null))) {
+    assert.ok(key in schema.properties, `reviewer schema missing ${key}`);
+  }
+  assert.equal(schema.properties.doerStarvationMarginRuns.type, 'number');
+  assert.equal(schema.properties.doerStarvationMarginRuns.default, DEFAULT_REVIEWER.doerStarvationMarginRuns);
+  assert.equal(schema.properties.doerStarvationSustainMs.type, 'number');
+  assert.equal(schema.properties.doerStarvationSustainMs.default, DEFAULT_REVIEWER.doerStarvationSustainMs);
+  const { readFile } = await import('node:fs/promises');
+  const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url)));
+  for (const key of Object.keys(example.reviewer ?? {})) {
+    assert.ok(key in schema.properties, `config.example.json reviewer key ${key} rejected by the schema`);
+  }
+  assert.deepEqual(validateConfigShape({ reviewer: example.reviewer }), []);
 });

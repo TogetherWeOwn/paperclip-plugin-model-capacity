@@ -320,3 +320,30 @@ test('reviewReserve: a one-sided rMin/rMax inversion against the other default f
   assert.deepEqual(validateConfigShape({ reviewReserve: { rMax: 0.5 } }), []);
   assert.deepEqual(validateConfigShape({ reviewReserve: { rMin: 0.05 } }), []);
 });
+
+test('reviewer: a non-object block and mistyped knobs fail validation', async () => {
+  // Mirrors the reviewReserve fail-closed tests: a typo in the reviewer
+  // block must fail at config load, never as a silent dead reviewer.
+  assert.ok(validateConfigShape({ reviewer: 'claude' })
+    .some(e => e.includes('reviewer must be an object')));
+  assert.ok(validateConfigShape({ reviewer: { providers: 'claude' } })
+    .some(e => e.includes('reviewer.providers must be an array of strings')));
+  assert.ok(validateConfigShape({ reviewer: { providers: ['claude', 7] } })
+    .some(e => e.includes('reviewer.providers must be an array of strings')));
+  assert.ok(validateConfigShape({ reviewer: { supplyHeadroomPct: 0 } })
+    .some(e => e.includes('reviewer.supplyHeadroomPct must be a number in (0, 1]')));
+  assert.ok(validateConfigShape({ reviewer: { supplyHeadroomPct: 1.5 } })
+    .some(e => e.includes('reviewer.supplyHeadroomPct must be a number in (0, 1]')));
+  assert.ok(validateConfigShape({ reviewer: { supplyHoursToReset: -1 } })
+    .some(e => e.includes('reviewer.supplyHoursToReset must be a number > 0')));
+  assert.deepEqual(validateConfigShape({
+    reviewer: { providers: ['claude'], supplyHeadroomPct: 0.3, supplyHoursToReset: 120 },
+  }), []);
+  assert.ok(validateConfigShape({ reviewer: { doerStarvationMarginRuns: 0 } })
+    .some(e => e.includes('reviewer.doerStarvationMarginRuns must be a number > 0')));
+  assert.ok(validateConfigShape({ reviewer: { doerStarvationSustainMs: -5 } })
+    .some(e => e.includes('reviewer.doerStarvationSustainMs must be a number > 0')));
+  assert.deepEqual(validateConfigShape({
+    reviewer: { providers: ['claude'], doerStarvationMarginRuns: 4, doerStarvationSustainMs: 600000 },
+  }), []);
+});

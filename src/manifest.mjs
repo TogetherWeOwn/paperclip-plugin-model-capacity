@@ -82,6 +82,25 @@
  * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
  * prefix. No capability, egress, secret or env-key change.
  *
+ * v0.2.45 = DOER-STARVATION SCOPE: per-provider liveRuns/idle on the supply
+ * signal (one provider's reviewer traffic no longer masks another provider's
+ * idle headroom) plus a C*-vs-live-doer starvation wake sustained across
+ * ticks (default gap >= 4 runs for 10 minutes, persisted start, unknown
+ * target never wakes). Review-response fixes ride along (history-span
+ * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
+ * wake seq). No capability, egress, secret or env-key change.
+ *
+ * v0.2.44 = REVIEWER ROUTING + CAPACITY AUTO-HEAL: reviewer is a first-class
+ * role (runnable capacity from qualified providers, default Claude only, plus
+ * the hold/resume signal the review gate reads); feed diffs bypass the rung
+ * cooldown and target smoothing on upward transitions (new account, reset,
+ * guard end, recovery) and persist a capacityChange wake event; new-account
+ * warmup ignores measured rates from < 60 min of history (linear/burn-horizon
+ * position pacing until then); /capacity gains reviewer, capacityChange and a
+ * demand-aware supplySignal for idle fleets with headroom near reset.
+ * 0.2.43 is claimed by an open PR, so this takes 0.2.44. No capability,
+ * egress, secret or env-key change.
+ *
  * v0.2.42 = BURN HORIZON FOR PROVIDER FREE RESETS: accounts pace to
  * min(regular reset, H) with H = lastFreeReset + Q_q(residual gaps) from the
  * feed's `freeResets` section (Codex seeded from codex-reset.com, every
@@ -204,7 +223,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.42';
+export const PLUGIN_VERSION = '0.2.45';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -423,6 +442,17 @@ const CONFIG_SCHEMA = {
         exhaustedPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.99, description: 'Weekly used fraction at/above which an account leaves reserve capacity.' },
         minRunsPerH: { type: 'number', exclusiveMinimum: 0, default: 0.1, description: 'Minimum runs/h before a measured % per review run is trusted.' },
         runsHalfLifeH: { type: 'number', exclusiveMinimum: 0, default: 6, description: 'Runs-rate EWMA half-life (hours) for the measured % per review run.' },
+      },
+    },
+    reviewer: {
+      type: 'object', additionalProperties: false,
+      description: 'Reviewer as a first-class role: runnable review capacity from qualified providers plus the hold/resume signal the review gate reads. Claude qualifies today; other providers only after the operator opts them in.',
+      properties: {
+        providers: { type: 'array', items: { type: 'string' }, default: ['claude'], description: 'Providers whose accounts may serve review runs.' },
+        supplyHeadroomPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.30, description: 'Headroom fraction that counts as large unused supply.' },
+        supplyHoursToReset: { type: 'number', exclusiveMinimum: 0, default: 120, description: 'Hours-to-reset under which unused headroom counts as close to reset.' },
+        doerStarvationMarginRuns: { type: 'number', exclusiveMinimum: 0, default: 4, description: 'C*-vs-live-doer gap (runs) that counts as doer starvation.' },
+        doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
       },
     },
     concurrency: {
