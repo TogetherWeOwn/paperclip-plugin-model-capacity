@@ -1676,11 +1676,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // pacing until the history spans the warmup floor. Never a hold on thin
       // data: warmup only ever replaces a descend with position logic, and a
       // bypass (upward transition) still climbs at once.
+      // Warmup span comes from the full retained history (90 min), never the
+      // trailing rate window: windowed points are capped at rateWindowMin and
+      // real feed stamps sit seconds behind the tick clock, so the windowed
+      // span hovers just under the 60-min floor forever and rate control
+      // would stay dead for every account.
       let warmingUp = false;
       if (weeklyUsed != null) {
-        const spanMs = measured?.spanMs
-          ?? (history.length >= 2 ? history[history.length - 1].atMs - history[0].atMs : 0);
-        warmingUp = isWarmupSpan(spanMs);
+        const historySpanMs = history.length >= 2 ? history[history.length - 1].atMs - history[0].atMs : 0;
+        warmingUp = isWarmupSpan(historySpanMs);
       }
       const controlMeasured = warmingUp ? null : measured;
       // Required rate needs no history and no calibration: whenever the
@@ -1728,16 +1732,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           positionError,
           fiveHourUsedPct: fiveHourUsed,
         }, nowMs, config.pacing, ceiling);
-      if (warmingUp && (step.action === 'descend' || step.action === 'hold-cooldown')) {
-        // Warmup never throttles on thin data: a thin-data descend becomes a
-        // position hold, and a thin-data cooldown hold keeps the pointer but
-        // says warmup so ops can see why the rate was not acted on.
-        step = {
-          ...step,
-          action: 'hold',
-          reason: `warming up (${Math.round((measured?.spanMs ?? 0) / 60000)} min of rate history < 60 min): position pacing until enough points`,
-        };
-      }
+      // No warmup relabel: controlMeasured=null already falls back to
+      // position pacing, so a thin-data descend is a real position move and
+      // must execute (and read as one). Relabeling it 'hold' kept the moved
+      // pointer and the new move stamp under a hold label.
       // Unhealthy accounts allocate nothing (the order filter drops them),
       // so the controller must not narrate them as holding a bound: freeze
       // the pointer and report excluded, resuming from the frozen pointer
@@ -1753,7 +1751,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           reason: `excluded: health is ${account.health ?? 'unknown'} -- only healthy accounts allocate`,
         };
       }
-      nextPacing[key] = { pointer: step.pointer, lastMoveAtMs: step.lastMoveAtMs, guardActive: step.guardActive, rateBasis: step.rateBasis ?? null };
+      // The bypass zeroes the stamp for the step only: when the step moves
+      // nothing, the account's real last-move time survives. Otherwise every
+      // upward event erases the cooldown until the account's next move (the
+      // zeroed stamp echoes back through keepStamp and persists as 0).
+      const moved = step.pointer !== pacingInput.pointer;
+      nextPacing[key] = {
+        pointer: step.pointer,
+        lastMoveAtMs: moved ? step.lastMoveAtMs : (pacingInput.lastMoveAtMs ?? step.lastMoveAtMs),
+        guardActive: step.guardActive,
+        rateBasis: step.rateBasis ?? null,
+      };
       // Effective headroom: the 5h meter when present, else the weekly
       // remaining as a fallback pool guard -- but ONLY for accounts whose
       // feed entry carries a `models` list (the auto-discovery feed). A
@@ -3004,6 +3012,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           hoursToReset: v.hoursToReset,
           reactive: v.reactive === true,
           reviewerEligible: eligible,
+          // Allocator parity: the reviewer must not resume on accounts the
+          // allocator refuses (weekly-exhausted 'excluded', floor-guard).
+          action: v.action ?? null,
+          guardActive: v.guardActive === true,
         };
       }),
       cfg: config.reviewer,
@@ -3015,6 +3027,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const supplySignal = computeSupplySignal({
       accounts: accountViews.map((v) => ({
         provider: v.provider,
+        health: v.health,
+        action: v.action ?? null,
         remainingPct: v.remainingPct,
         hoursToReset: v.hoursToReset,
       })),
@@ -3023,7 +3037,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     // Capacity-change event : upward transitions wake held/idle
     // work via the capacity view + persisted state key; downward debounces.
-    const capacityChange = {
+    // wake pulses on the transition tick only, but seq and lastWakeAtMs
+    // survive idle ticks (and restarts): a consumer polling slower than the
+    // 60s tick compares them against what it last handled instead of racing
+    // the pulse. lastChange keeps the last non-empty diff for the same
+    // reason -- it is the last change, not the current tick's diff.
+    const prevLastChange = (prevChange != null && typeof prevChange.lastChange === 'object' && prevChange.lastChange !== null)
+      ? prevChange.lastChange
+      : null;
+    const prevSeq = Number.isFinite(prevLastChange?.seq) ? prevLastChange.seq : 0;
+    const prevWakeAtMs = Number.isFinite(prevChange?.lastWakeAtMs)
+      ? prevChange.lastWakeAtMs
+      : (prevLastChange?.wake === true && Number.isFinite(prevLastChange?.atMs) ? prevLastChange.atMs : null);
+    const tickChange = {
       version: 1,
       atMs: nowMs,
       added: capacityDiff.added,
@@ -3031,6 +3057,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       upwardAccountIds: [...capacityDiff.upwardIds].sort(),
       downwardAccountIds: [...capacityDiff.downwardIds].sort(),
       wake: capacityDiff.upwardIds.size > 0,
+    };
+    const lastChange = capacityDiff.changed
+      ? { ...tickChange, seq: prevSeq + 1, eventAtMs: nowMs }
+      : (prevLastChange ?? { ...tickChange, seq: 0, eventAtMs: null });
+    const lastWakeAtMs = tickChange.wake ? nowMs : prevWakeAtMs;
+    const capacityChange = {
+      ...tickChange,
+      seq: lastChange.seq,
+      lastWakeAtMs,
     };
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
@@ -3150,7 +3185,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         health: v.health ?? null,
         burnHorizonMs: v.burnHorizonMs ?? null,
       })),
-      lastChange: capacityChange,
+      lastChange,
+      lastWakeAtMs,
     });
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,

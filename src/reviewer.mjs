@@ -22,6 +22,8 @@
  * instead of idling. Pure and advisory; the tick publishes it on /capacity.
  */
 
+import { hasHeadroom } from './cross-account.mjs';
+
 export const DEFAULT_REVIEWER = Object.freeze({
   /** Providers whose accounts may serve review runs. */
   providers: Object.freeze(['claude']),
@@ -52,7 +54,12 @@ export function normalizeReviewer(raw) {
 /**
  * Reviewer runnable capacity from tick account views.
  * accounts: [{ accountId, provider, health, headroomPct, remainingPct,
- *   hoursToReset, reactive, reviewerEligible }].
+ *   hoursToReset, reactive, reviewerEligible, action, guardActive }].
+ * Only accounts the allocator itself would serve count: excluded (e.g.
+ * weekly-exhausted) and guard-pinned accounts never resume reviews, and
+ * metered headroom must clear the allocator's reserve (select.mjs
+ * reservePct). Reactive lanes carry no meter and qualify on health alone,
+ * matching the allocator.
  * Returns { providers, qualifiedAccountIds, slots, hold, resume, reason }.
  */
 export function computeReviewerCapacity({ accounts, cfg = null, nowMs = Date.now() } = {}) {
@@ -65,9 +72,14 @@ export function computeReviewerCapacity({ accounts, cfg = null, nowMs = Date.now
     if (a == null || typeof a.accountId !== 'string') continue;
     if (!qualified.has(String(a.provider ?? '').toLowerCase())) continue;
     if (a.health !== 'healthy') continue;
+    if (a.action === 'excluded' || a.guardActive === true) continue;
     if (a.reviewerEligible === false) continue;
     const headroom = finite(a.headroomPct) ? a.headroomPct : (a.reactive === true ? 0.5 : null);
-    if (!(headroom > 0)) continue;
+    if (a.reactive === true && !finite(a.headroomPct)) {
+      // No meter to clear the reserve with: health alone decides.
+    } else if (!hasHeadroom({ health: a.health, headroomPct: a.headroomPct })) {
+      continue;
+    }
     ids.push(a.accountId);
     slots += headroom;
   }
@@ -95,17 +107,24 @@ export function computeReviewerCapacity({ accounts, cfg = null, nowMs = Date.now
 
 /**
  * Demand-aware supply signal.
- * accounts: [{ provider, remainingPct, hoursToReset }]; doerIdle: bool.
+ * accounts: [{ provider, health, action, remainingPct, hoursToReset }];
+ * doerIdle: bool.
  * Returns { providers: [{ provider, headroomPct, hoursToReset }], wake }.
- * Wake when at least one provider is above the headroom floor, inside the
- * reset window, and doers are idle.
+ * Each account clears both bars on its own (healthy, not excluded, headroom
+ * at/above the floor, reset inside the window) before it counts: one
+ * account's headroom is never paired with another account's reset. Wake when
+ * at least one provider has a passing account and doers are idle.
  */
 export function computeSupplySignal({ accounts, doerIdle = false, cfg = null } = {}) {
   const c = normalizeReviewer(cfg);
   const byProvider = new Map();
   for (const a of accounts ?? []) {
     if (a == null || typeof a.provider !== 'string' || !a.provider) continue;
+    if (a.health != null && a.health !== 'healthy') continue;
+    if (a.action === 'excluded') continue;
     if (!(finite(a.remainingPct) && finite(a.hoursToReset))) continue;
+    if (!(a.remainingPct >= c.supplyHeadroomPct)) continue;
+    if (!(a.hoursToReset < c.supplyHoursToReset)) continue;
     const key = a.provider.toLowerCase();
     let e = byProvider.get(key);
     if (!e) { e = { provider: key, remaining: 0, n: 0, minHours: Infinity }; byProvider.set(key, e); }

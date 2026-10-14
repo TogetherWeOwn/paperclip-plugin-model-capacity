@@ -623,6 +623,48 @@ provider `reserve`, `lent`, `needPctPerH`, `reviewRatePctPerH`,
 the top-level `heldAccountIds`). `enabled: false` computes nothing and holds
 nobody: admission is bit-for-bit the pre-reserve behavior.
 
+## Reviewer routing and capacity auto-heal
+
+The reviewer is a first-class role: the tick derives runnable review
+capacity from qualified providers (default Claude only; other providers
+only after the operator opts them in via `reviewer.providers`) and the
+review gate reads `capacity.reviewer` (`hold`, `resume`,
+`qualifiedAccountIds`, `slots`). Only accounts the allocator itself would
+serve count -- healthy, reviewer-eligible (a non-trial arm the role can
+reach), not `excluded` (e.g. weekly-exhausted), not floor-guard pinned,
+with metered headroom above the allocator's 0.05 reserve. Reactive lanes
+carry no meter and qualify on health alone. When nobody qualifies the
+signal holds reviews until a qualified provider recovers.
+
+`/capacity` also carries `capacityChange` (per-tick `added`, `removed`,
+`upwardAccountIds`, `downwardAccountIds`, `wake`) and `supplySignal`
+(`providers` with `headroomPct`/`hoursToReset`, `wake`). `wake` pulses on
+the transition tick only; `seq` and `lastWakeAtMs` persist across idle
+ticks (and restarts), so a consumer polling slower than the 60s tick
+compares them against what it last handled instead of racing the pulse.
+`supplySignal` fires when at least one account clears both bars on its own
+(headroom at/above `supplyHeadroomPct` with reset inside
+`supplyHoursToReset`) while doers are idle -- one account's headroom is
+never paired with another account's reset.
+
+Two tick behaviors to know. New-account warmup: measured rates from under
+60 minutes of retained history are not trusted (the span comes from the
+full 90-minute history, not the trailing rate window), so control falls
+back to burn-horizon/linear position pacing until the span clears -- thin
+data never throttles, and a thin-data descend is a real position move that
+executes. Auto-heal bypass: upward capacity transitions (new account,
+weekly reset, guard end, health recovery) recompute at once with no rung
+cooldown, while downward transitions keep today's debounce; a bypass tick
+that moves nothing writes the account's original last-move stamp back, so
+the rung cooldown survives the event.
+
+Config (`reviewer`): `providers` (default `["claude"]`), `supplyHeadroomPct`
+(default 0.30), `supplyHoursToReset` (default 120). Every knob is validated
+so a typo fails closed at config load. Each account row also reports
+`warmingUp`, `bypassedCooldown`, `rateBasis` (measurement availability;
+`warmingUp` tells when control still falls back to position), `action` and
+`reason`.
+
 ## Configuration
 
 `placement.qualityWeight` (default 1) and `placement.allowanceWeight`
