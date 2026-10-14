@@ -219,6 +219,54 @@ test('doer starvation never wakes without waiting doer demand', () => {
   assert.equal(out.sinceMs, t0);
 });
 
+test('reviewer excludes guard-pinned and weekly-exhausted accounts even with headroom above the reserve', () => {
+  // Mutation pin: headroom 0.06/0.10 clears the allocator's 0.05 reserve, so
+  // hasHeadroom alone would count these -- only the excluded/guardActive
+  // parity line holds the signal.
+  const cfg = normalizeReviewer({ providers: ['claude'] });
+  const guarded = computeReviewerCapacity({
+    accounts: [acct('claude:a1', 'claude', { headroomPct: 0.06, remainingPct: 0.5, guardActive: true })],
+    cfg,
+    nowMs: 1000,
+  });
+  assert.equal(guarded.hold, true);
+  assert.equal(guarded.resume, false);
+  assert.deepEqual(guarded.qualifiedAccountIds, []);
+  const excluded = computeReviewerCapacity({
+    accounts: [acct('claude:a1', 'claude', { headroomPct: 0.10, remainingPct: 0.5, action: 'excluded' })],
+    cfg,
+    nowMs: 1000,
+  });
+  assert.equal(excluded.hold, true);
+  assert.equal(excluded.resume, false);
+  assert.deepEqual(excluded.qualifiedAccountIds, []);
+});
+
+test('supply signal ignores excluded and guard-pinned accounts with qualifying headroom and reset', () => {
+  // Mutation pin: remaining 0.6 with reset in 60h clears both supply bars on
+  // its own, so only the excluded/guardActive parity line keeps it out.
+  const guarded = computeSupplySignal({
+    accounts: [acct('claude:a1', 'claude', { remainingPct: 0.6, hoursToReset: 60, guardActive: true })],
+    doerIdle: true,
+  });
+  assert.deepEqual(guarded.providers, []);
+  assert.equal(guarded.wake, false);
+  const excluded = computeSupplySignal({
+    accounts: [acct('claude:a1', 'claude', { remainingPct: 0.6, hoursToReset: 60, action: 'excluded' })],
+    doerIdle: true,
+  });
+  assert.deepEqual(excluded.providers, []);
+  assert.equal(excluded.wake, false);
+});
+
+test('doer starvation treats a gap exactly at the margin as starving', () => {
+  // Boundary pin: the margin comparison is >=, not >.
+  const at = computeDoerStarvation({ target: 22, liveDoerRuns: 18, doerDemand: 37, sinceMs: null, nowMs: 1000 });
+  assert.equal(at.gap, 4);
+  assert.equal(at.starving, true);
+  assert.equal(at.sinceMs, 1000);
+});
+
 test('a doer gap inside the margin never starves; an unmeasurable target stays unknown', () => {
   const inside = computeDoerStarvation({ target: 22, liveDoerRuns: 20, sinceMs: null, nowMs: 1000 });
   assert.equal(inside.starving, false);

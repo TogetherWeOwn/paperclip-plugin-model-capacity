@@ -451,6 +451,8 @@ const CONFIG_SCHEMA = {
         providers: { type: 'array', items: { type: 'string' }, default: ['claude'], description: 'Providers whose accounts may serve review runs.' },
         supplyHeadroomPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.30, description: 'Headroom fraction that counts as large unused supply.' },
         supplyHoursToReset: { type: 'number', exclusiveMinimum: 0, default: 120, description: 'Hours-to-reset under which unused headroom counts as close to reset.' },
+        doerStarvationMarginRuns: { type: 'number', exclusiveMinimum: 0, default: 4, description: 'C*-vs-live-doer gap (runs) that counts as doer starvation.' },
+        doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
       },
     },
     concurrency: {
