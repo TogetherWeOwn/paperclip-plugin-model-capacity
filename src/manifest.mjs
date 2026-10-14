@@ -82,6 +82,14 @@
  * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
  * prefix. No capability, egress, secret or env-key change.
  *
+ * v0.2.43 = MUSE WONDER IS THE META ARM: the default Meta arm is
+ * `muse-wonder-1.0-contributor` (official id, effort xhigh, family muse)
+ * bound to the AA `muse-wonder` row (the only Wonder slug in the live AA
+ * snapshot; index 52.4 vs Spark 1.3's 48.1) via a verified
+ * MODEL_AA_OVERRIDES entry, replacing the Spark 1.3 contributor default
+ * (Spark stays callable directly by exact id). No capability, egress,
+ * secret or env-key change.
+ *
  * v0.2.42 = BURN HORIZON FOR PROVIDER FREE RESETS: accounts pace to
  * min(regular reset, H) with H = lastFreeReset + Q_q(residual gaps) from the
  * feed's `freeResets` section (Codex seeded from codex-reset.com, every
@@ -204,7 +212,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.42';
+export const PLUGIN_VERSION = '0.2.43';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

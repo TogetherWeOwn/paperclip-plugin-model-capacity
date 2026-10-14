@@ -78,7 +78,7 @@ const TICK = Date.parse('2026-10-08T23:00:00Z');
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
 const AA_SKEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
 const aaRows = () => ([
-  { slug: 'muse-spark-1-3-xhigh', intelligenceIndex: 70, intelligenceIndexCostPerTask: 40, price1mInputTokens: 2, price1mOutputTokens: 8 },
+  { slug: 'muse-wonder', intelligenceIndex: 70, intelligenceIndexCostPerTask: 40, price1mInputTokens: 2, price1mOutputTokens: 8 },
   { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
 ]);
 const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
@@ -162,7 +162,7 @@ test('other agents still get muse; thinkers skip it too', async () => {
   await d.tick();
   const h = await d.hook('run-other-1', 'helper');
   assert.equal(h.kind, 'decide');
-  assert.match(h.model, /muse-spark/);
+  assert.match(h.model, /muse-wonder/);
   const t = await d.hook('run-thinker-1', 'planner');
   assert.equal(t.kind, 'decide');
   assert.match(t.model, /haiku/);
@@ -174,7 +174,7 @@ test('absent roles config keeps legacy behavior: non-thinker is a doer, muse win
   await d.tick();
   const h = await d.hook('run-legacy-1', 'eng-doer');
   assert.equal(h.kind, 'decide');
-  assert.match(h.model, /muse-spark/);
+  assert.match(h.model, /muse-wonder/);
 });
 
 test('/capacity exposes the per-role effective exclusions', async () => {

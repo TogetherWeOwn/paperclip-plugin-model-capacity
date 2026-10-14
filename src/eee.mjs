@@ -147,8 +147,8 @@ export function eeeKeyToArm(key) {
  * harness emits dotted ids (opus-5.5) while the AA mirror emits dashed,
  * prefixed ids (claude-opus-5-5) for the same model. Lowercase, dots->dashes,
  * leading claude- stripped, trailing -contributor stripped (the Muse effort
- * decoration: the real arm model is muse-spark-1.3-contributor while the
- * benchmark key is muse-spark-1.3(xhigh) -- cf slugCandidates/dynamicEffort
+ * decoration: the real arm model is muse-wonder-1.0-contributor while the
+ * benchmark key is muse-wonder-1.0(xhigh) -- cf slugCandidates/dynamicEffort
  * in arms.mjs). Distinct models stay distinct (opus-5 vs opus-5-5);
  * same-model spellings merge. */
 function aliasBare(bare) {
