@@ -52,6 +52,60 @@ test('removed and newly unhealthy accounts are downward only', () => {
   assert.equal(d.upwardIds.size, 0);
 });
 
+test('unknown health never counts as recovery or loss', () => {
+  const rec = diffCapacityFeed(
+    [{ accountId: 'a', health: null }],
+    [{ accountId: 'a', health: 'healthy' }],
+    { nowMs: 1000 },
+  );
+  assert.ok(!rec.upwardIds.has('a'));
+  const loss = diffCapacityFeed(
+    [{ accountId: 'a', health: 'healthy' }],
+    [{ accountId: 'a', health: null }],
+    { nowMs: 1000 },
+  );
+  assert.ok(!loss.downwardIds.has('a'));
+  const real = diffCapacityFeed(
+    [{ accountId: 'a', health: 'unavailable' }],
+    [{ accountId: 'a', health: 'healthy' }],
+    { nowMs: 1000 },
+  );
+  assert.ok(real.upwardIds.has('a'));
+});
+
+test('meter restatement without a reset is not a reset; epsilon drops are not resets', () => {
+  const restated = diffCapacityFeed(
+    [{ accountId: 'm', weeklyUsed: 0.9, resetAtMs: 1000 }],
+    [{ accountId: 'm', weeklyUsed: 0.5, resetAtMs: 1000 }],
+    { nowMs: 2000 },
+  );
+  assert.ok(!restated.upwardIds.has('m'));
+  const epsilon = diffCapacityFeed(
+    [{ accountId: 'm', weeklyUsed: 0.9, resetAtMs: 1000 }],
+    [{ accountId: 'm', weeklyUsed: 0.899, resetAtMs: 1000 + 2 * 3600 * 1000 }],
+    { nowMs: 2000 },
+  );
+  assert.ok(!epsilon.upwardIds.has('m'));
+  const collapse = diffCapacityFeed(
+    [{ accountId: 'm', weeklyUsed: 0.9, resetAtMs: 1000 }],
+    [{ accountId: 'm', weeklyUsed: 0.05, resetAtMs: 1000 }],
+    { nowMs: 2000 },
+  );
+  assert.ok(collapse.upwardIds.has('m'));
+});
+
+test('first tick seeds without waking the fleet', () => {
+  const d = diffCapacityFeed(
+    [{ accountId: 'a' }],
+    [{ accountId: 'a' }, { accountId: 'b' }],
+    { nowMs: 1000, firstTick: true },
+  );
+  assert.deepEqual(d.added, ['b']);
+  assert.equal(d.upwardIds.size, 0);
+  assert.equal(d.shouldBypassCooldown('b'), false);
+  assert.equal(d.changed, false);
+});
+
 test('warmup span: histories under 60 min are not trusted', () => {
   assert.equal(WARMUP_MIN_SPAN_MS, 60 * 60 * 1000);
   assert.equal(isWarmupSpan(5 * 60 * 1000), true);

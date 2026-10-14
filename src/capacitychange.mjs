@@ -36,7 +36,7 @@ function isHealthy(a) {
  * Returns { added, removed, upwardIds:Set, downwardIds:Set,
  *   shouldBypassCooldown(id), changed }.
  */
-export function diffCapacityFeed(prev, curr, { nowMs = Date.now() } = {}) {
+export function diffCapacityFeed(prev, curr, { nowMs = Date.now(), firstTick = false } = {}) {
   void nowMs;
   const prevById = new Map();
   for (const a of prev ?? []) {
@@ -56,7 +56,9 @@ export function diffCapacityFeed(prev, curr, { nowMs = Date.now() } = {}) {
   for (const id of currById.keys()) {
     if (!prevById.has(id)) {
       added.push(id);
-      upwardIds.add(id);
+      // First tick seeds the key without waking the fleet: every id is new
+      // to an empty store, so none of them is a real upward transition.
+      if (!firstTick) upwardIds.add(id);
     }
   }
   for (const id of prevById.keys()) {
@@ -71,25 +73,42 @@ export function diffCapacityFeed(prev, curr, { nowMs = Date.now() } = {}) {
     // Guard end is upward; guard start is downward (debounced).
     if (p.guardActive === true && c.guardActive !== true) upwardIds.add(id);
     if (p.guardActive !== true && c.guardActive === true) downwardIds.add(id);
-    // Health recovery is upward; newly unhealthy is downward.
-    if (!isHealthy(p) && isHealthy(c)) upwardIds.add(id);
-    if (isHealthy(p) && !isHealthy(c)) downwardIds.add(id);
-    // Weekly reset: used drops a lot while the reset moves forward, or used
-    // collapses toward zero on the same window (provider restarts early).
+    // Health recovery is upward; newly unhealthy is downward. Unknown health
+    // (null/absent reading) is neither: only an explicitly non-healthy
+    // previous state recovers, and only an explicitly non-healthy current
+    // state is a loss.
+    if (p.health != null && !isHealthy(p) && isHealthy(c)) upwardIds.add(id);
+    if (isHealthy(p) && c.health != null && !isHealthy(c)) downwardIds.add(id);
+    // Weekly reset: a large drop WITH a forward reset, or a collapse toward
+    // zero on the same window (provider restarts early). A mid-window
+    // restatement (large drop, same reset, still well above zero) is meter
+    // noise, not a reset; an epsilon drop with a reset shift is a re-parse.
     const pu = p.weeklyUsed;
     const cu = c.weeklyUsed;
-    if (finite(pu) && finite(cu) && cu + 0.3 < pu) upwardIds.add(id);
     const pr = p.resetAtMs;
     const cr = c.resetAtMs;
-    if (finite(pr) && finite(cr) && cr > pr + 3600000 && finite(pu) && finite(cu) && cu < pu) {
-      upwardIds.add(id);
-    }
+    const resetForward = finite(pr) && finite(cr) && cr > pr + 3600000;
+    const bigDrop = finite(pu) && finite(cu) && cu + 0.3 < pu;
+    const collapseToZero = finite(pu) && finite(cu) && pu >= 0.4 && cu <= 0.1;
+    const epsilonWithShift = finite(pu) && finite(cu) && resetForward && cu + 0.05 < pu;
+    if ((bigDrop && resetForward) || collapseToZero || epsilonWithShift) upwardIds.add(id);
     // Free-reset arrival surfaces as a fresh burn horizon upstream; the feed
     // carries it as burnHorizonMs appearing on the account row.
     if (p.burnHorizonMs == null && c.burnHorizonMs != null) upwardIds.add(id);
   }
 
   const shouldBypassCooldown = (id) => upwardIds.has(id);
+  // First tick only seeds: report the ids but raise no wake and no bypass.
+  if (firstTick) {
+    return {
+      added: added.sort(),
+      removed: removed.sort(),
+      upwardIds: new Set(),
+      downwardIds: new Set(),
+      shouldBypassCooldown: () => false,
+      changed: false,
+    };
+  }
   return {
     added: added.sort(),
     removed: removed.sort(),

@@ -1597,15 +1597,36 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // transitions keep today's debounce (no bypass).
     const prevChange = (await ctx.state.get(scopeKey(companyId, CAPACITY_CHANGE_KEY))) ?? null;
     const prevSummaries = Array.isArray(prevChange?.accounts) ? prevChange.accounts : [];
-    const currSummaries = snapshot.accounts.map((a, idx) => ({
-      accountId: stateKeys[idx],
-      weeklyUsed: a.weekly?.utilization ?? null,
-      resetAtMs: a.weekly?.resetsAtMs ?? null,
-      guardActive: (pacingState?.[stateKeys[idx]]?.guardActive) === true,
-      health: a.health ?? null,
-      burnHorizonMs: null,
-    }));
-    const capacityDiff = diffCapacityFeed(prevSummaries, currSummaries, { nowMs });
+    // Pre-step guard prediction: the post-step guard flag cannot be diffed
+    // before the step that sets it, so predict from this tick's 5h reading
+    // against the previous guard state (trip at guardHigh, release below
+    // guardRejoin). Unknown 5h readings hold the previous state.
+    const guardHigh = config.pacing.guardHigh;
+    const guardRejoin = config.pacing.guardRejoin;
+    const currSummaries = snapshot.accounts.map((a, idx) => {
+      const prevGuard = (pacingState?.[stateKeys[idx]]?.guardActive) === true;
+      const fiveHour = a.fiveHour?.utilization;
+      const predictedGuard = fiveHour != null
+        ? (prevGuard ? fiveHour >= guardRejoin : fiveHour >= guardHigh)
+        : prevGuard;
+      const resetAt = a.weekly?.resetsAtMs ?? null;
+      const burnPre = burnHorizon({
+        nowMs,
+        resetAtMs: resetAt,
+        feed: snapshot.freeResets?.[a.provider] ?? null,
+        cfg: config.burnHorizon,
+      });
+      return {
+        accountId: stateKeys[idx],
+        weeklyUsed: a.weekly?.utilization ?? null,
+        resetAtMs: resetAt,
+        guardActive: predictedGuard,
+        health: a.health ?? null,
+        burnHorizonMs: burnPre?.horizonMs ?? null,
+      };
+    });
+    // First tick with the new key only seeds (no fleet-wide wake on deploy).
+    const capacityDiff = diffCapacityFeed(prevSummaries, currSummaries, { nowMs, firstTick: prevChange == null });
     const accountViews = [];
     for (let i = 0; i < snapshot.accounts.length; i++) {
       const account = snapshot.accounts[i];
