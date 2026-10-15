@@ -15,6 +15,9 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
   let now = T0;
   let step = 0;
   let includeLarge = true;
+  let epochOverride = null;
+  let timeOffsetMs = 0;
+  const fieldOverrides = {};
   const accounts = () => ['a', 'b', 'c', ...(includeLarge ? ['large'] : [])].map(k => ({
     lane: k, provider, accountKey: k, health: 'healthy', models: [model],
     // Same remaining quota at the final tick isolates the plan multiplier
@@ -22,7 +25,8 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
     weekly: { used: (k === 'large' ? 0.28 : 0.1) + step * (k === 'large' ? 0.01 : 0.04), resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
     fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
     observedAt: new Date(now).toISOString(), quality: 'live',
-    ...(usage ? { usage: { observedAt: new Date(now).toISOString(), epoch: 'keeper-1', requests: 100 + step * 100 } } : {}),
+    ...(usage ? { usage: { observedAt: new Date(now).toISOString(), epoch: epochOverride ?? 'keeper-1', requests: 100 + step * 100 } } : {}),
+    ...(fieldOverrides[k] ?? {}),
   }));
   const config = { cliproxy: { laneKeySecretRef: SECRET }, smoothing, reviewReserve: { enabled: false } };
   const io = {
@@ -45,7 +49,7 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: async i => {
-      now = T0 + i * 5 * MIN;
+      now = T0 + i * 5 * MIN + timeOffsetMs;
       step = i;
       if (i > 0) for (let n = 0; n < 10; n++) {
         await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `run-${i}-${n}`,
@@ -55,6 +59,9 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
     addLarge: flag => { includeLarge = flag; },
+    setEpoch: e => { epochOverride = e; },
+    addTime: ms => { timeOffsetMs += ms; },
+    setAccount: (k, patch) => { fieldOverrides[k] = { ...(fieldOverrides[k] ?? {}), ...patch }; },
     state,
   };
 }
@@ -97,4 +104,101 @@ test('legacy feed has no invented account evidence or weight and custom smoothin
   assert.ok(cap.accounts.every(a => a.capacityWeight === 1 && a.calibrationSource === 'group-prior'));
   assert.equal(cap.smoothing.halfLifeMin, 12);
   assert.equal(cap.smoothing.targetDownHalfLifeMin, 4);
+});
+
+// Review #38 finding 4: a first individual estimate with no discovered
+// capacity (weight 1) is not verified headroom -- no fast ramp fires.
+test('uniform pool individualizes to weight 1 with no fast ramp', async () => {
+  const d = drive({});
+  d.addLarge(false);
+  await d.setup();
+  await d.tick(0);
+  await d.tick(1);
+  const cap = await d.tick(2);
+  for (const id of ['meta:a', 'meta:b', 'meta:c']) {
+    const view = cap.accounts.find(a => a.accountId === id);
+    assert.equal(view.calibrationSource, 'account-weekly');
+    assert.equal(view.capacityWeight, 1);
+  }
+  assert.ok(cap.smoothing.fastUntilMs <= cap.atMs, 'no verified ramp for equal accounts');
+});
+
+// Review #38 finding 6: a counter epoch change discards the retained
+// individual estimate instead of bridging it.
+test('epoch change drops the retained estimate back to the group prior', async () => {
+  const d = drive({});
+  await d.setup();
+  await d.tick(0);
+  const first = await d.tick(1);
+  assert.equal(first.accounts.find(a => a.accountId === 'meta:large').calibrationSource, 'account-weekly');
+  d.setEpoch('keeper-2');
+  const cap = await d.tick(2);
+  const large = cap.accounts.find(a => a.accountId === 'meta:large');
+  assert.equal(large.calibrationSource, 'group-prior');
+  assert.equal(large.capacityWeight, 1);
+});
+
+// Review #38 finding 6: a stale (>6h) retained estimate is discarded.
+test('stale retained estimate is discarded after the horizon', async () => {
+  const d = drive({});
+  await d.setup();
+  await d.tick(0);
+  const first = await d.tick(1);
+  assert.ok(first.accounts.find(a => a.accountId === 'meta:large').capacityWeight > 1.9);
+  d.addTime(7 * 3600000);
+  const cap = await d.tick(2);
+  const large = cap.accounts.find(a => a.accountId === 'meta:large');
+  assert.equal(large.calibrationSource, 'group-prior');
+  assert.equal(large.capacityWeight, 1);
+});
+
+// Review #38 finding 6: the health/guard gate on the fast ramp -- a guarded
+// or unhealthy account with a real weight jump still gets no ramp.
+for (const [name, patch] of [
+  ['guarded', { fiveHour: { used: 0.9, resetsAt: new Date(T0 + 5 * 3600000).toISOString() } }],
+  ['unhealthy', { health: 'degraded' }],
+]) {
+  test(`no fast ramp for a ${name} account with a weight jump`, async () => {
+    const d = drive({});
+    d.setAccount('large', patch);
+    await d.setup();
+    await d.tick(0);
+    const cap = await d.tick(1);
+    const large = cap.accounts.find(a => a.accountId === 'meta:large');
+    assert.equal(large.calibrationSource, 'account-weekly');
+    assert.ok(large.capacityWeight >= 1.25, `would-ramp weight, got ${large.capacityWeight}`);
+    assert.ok(cap.smoothing.fastUntilMs <= cap.atMs, `no verified ramp while ${name}`);
+  });
+}
+
+// Review #38 finding 5: the retired instant bypass stays retired -- a health
+// recovery serves the smoothed target (below raw) while the wake still fires.
+test('recovery tick serves the smoothed target, not the raw jump', async () => {
+  const d = drive({});
+  d.addLarge(false);
+  await d.setup();
+  await d.tick(0);
+  d.setAccount('a', { health: 'degraded' });
+  const down = await d.tick(1);
+  d.setAccount('a', { health: 'healthy' });
+  const cap = await d.tick(2);
+  assert.ok(cap.capacityChange.wake, 'recovery still pulses the wake');
+  assert.ok(cap.targetRaw > down.target, `raw target recovers, raw ${cap.targetRaw} vs down ${down.target}`);
+  assert.ok(cap.target < cap.targetRaw, `served ${cap.target} stays smoothed below raw ${cap.targetRaw}`);
+  assert.ok(cap.target > down.target, 'served target still moves up');
+});
+
+// Review #38 finding 5: an uncalibrated feed addition keeps full damping.
+test('new uncalibrated account joins with no fast ramp', async () => {
+  const d = drive({});
+  d.addLarge(false);
+  await d.setup();
+  await d.tick(0);
+  await d.tick(1);
+  await d.tick(2);
+  d.addLarge(true);
+  const cap = await d.tick(3);
+  const large = cap.accounts.find(a => a.accountId === 'meta:large');
+  assert.equal(large.calibrationSource, 'group-prior');
+  assert.ok(cap.smoothing.fastUntilMs <= cap.atMs, 'joining account gets no verified ramp');
 });

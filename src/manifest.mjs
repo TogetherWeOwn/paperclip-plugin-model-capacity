@@ -90,6 +90,19 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.46 = PER-ACCOUNT PLAN CALIBRATION + CREDIT POOLS + VERIFIED RAMP:
+ * meter-aligned per-account burn individualizes E within a calibration
+ * group (pooled E stays the cold-start prior; a missing or reset peer
+ * counter leaves the whole group on the prior); weekly-spent accounts with
+ * a spendable free-credit balance stay available, paced to drain the credit
+ * pool over the credit horizon. Upward capacity events (new account, reset,
+ * guard end, recovery) no longer serve the raw target at once: the v0.2.44
+ * instant bypass is retired and verified additional capacity ramps on a
+ * 5-minute half-life over a bounded 30-minute window, only for
+ * already-calibrated accounts (an uncalibrated feed addition keeps full
+ * damping); the rung-cooldown bypass on upward transitions is unchanged.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.44 = REVIEWER ROUTING + CAPACITY AUTO-HEAL: reviewer is a first-class
  * role (runnable capacity from qualified providers, default Claude only, plus
  * the hold/resume signal the review gate reads); feed diffs bypass the rung

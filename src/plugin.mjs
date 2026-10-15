@@ -1702,7 +1702,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
       }
       rateHistories[key] = history;
-      const measured = weeklyUsed != null
+      // Credit lanes pace the CREDIT drain, not the flat weekly meter (which
+      // sits at 100% while credits are spent and would read as rate 0
+      // forever): track the credit fraction as its own utilization series
+      // (1 - fraction) so the controller measures the real drain rate. An
+      // unquantified fraction has no measurable rate, so control falls back
+      // to position pacing below instead of climbing to the ceiling.
+      let creditHistory = null;
+      if (credit != null) {
+        const cFractionNow = credit.entry.fraction;
+        creditHistory = rateHistories[`credit:${key}`] ?? [];
+        if (cFractionNow != null) {
+          const cReadingAtMs = account.signalsAtMs ?? snapshot.observedAtMs ?? nowMs;
+          const cUsed = 1 - cFractionNow;
+          const cDup = creditHistory.some(p => p.atMs === cReadingAtMs && p.usedPct === cUsed);
+          if (!cDup) creditHistory = appendUtilReading(creditHistory, { atMs: cReadingAtMs, usedPct: cUsed }, nowMs);
+        }
+        rateHistories[`credit:${key}`] = creditHistory;
+      }
+      let measured = weeklyUsed != null
         ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
         : null;
       // New-account warmup : the CONTROLLER does not act on rate
@@ -1721,6 +1739,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (weeklyUsed != null) {
         const historySpanMs = history.length >= 2 ? history[history.length - 1].atMs - history[0].atMs : 0;
         warmingUp = isWarmupSpan(historySpanMs);
+      }
+      if (credit != null) {
+        // The weekly series is flat at 100% on a credit lane, so its rate
+        // (0) and span (old) are both lies: measure the credit drain, and
+        // hold position pacing until the credit series spans the floor.
+        if ((creditHistory?.length ?? 0) >= 2) {
+          measured = measuredRatePerHour(creditHistory, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin);
+          warmingUp = isWarmupSpan(creditHistory[creditHistory.length - 1].atMs - creditHistory[0].atMs);
+        } else {
+          measured = null;
+          warmingUp = true;
+        }
       }
       const controlMeasured = warmingUp ? null : measured;
       // Required rate needs no history and no calibration: whenever the
@@ -1830,9 +1860,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       let headroomPct = null;
       let headroomSource = null;
       if (credit != null) {
-        // Backup capacity: report only the quantified credit fraction (else
-        // zero) so healthier accounts are preferred while the credits last.
-        headroomPct = credit.entry.fraction ?? 0;
+        // Backup capacity: the quantified fraction is the headroom. An
+        // unquantified fraction (balance asserted positive) reads as a full
+        // window so the lane stays routable; the balance guard cuts it off
+        // at zero on the next feed poll.
+        headroomPct = credit.entry.fraction ?? 1;
         headroomSource = 'credits';
       } else if (weeklySpent) {
         headroomPct = weeklyRemaining;
@@ -1882,6 +1914,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         creditFree: credit?.creditFree ?? null,
         creditBalance: credit?.entry.balance ?? null,
         creditFraction: credit?.entry.fraction ?? null,
+        creditResetAtMs: credit?.entry.resetsAtMs ?? null,
         resetAtMs,
         remainingPct: remaining,
         hoursToReset,
@@ -2175,7 +2208,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (entry.source !== 'group-prior') nextAccountE.set(key, entry);
         const view = viewByKey.get(key);
         if (fresh && view?.health === 'healthy' && view.action !== 'excluded' && !view.guardActive
-          && (!previous || entry.capacityWeight >= previous.capacityWeight * 1.25)) verifiedPlanHeadroom = true;
+          && entry.capacityWeight >= (previous?.capacityWeight ?? 1) * 1.25) verifiedPlanHeadroom = true;
       }
     }
 
@@ -2425,12 +2458,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return {
           accountId: a.accountId,
           calibrationGroup: gid,
-          remainingPct: a.remainingPct ?? 0,
+          // Credit lanes pace the credit pool, not the spent weekly window:
+          // the C* need uses the credit fraction (else a full window) over
+          // the credit reset horizon, so the fleet target counts the credits.
+          remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.remainingPct ?? 0),
           // The C* need is the same term as targetShare (requiredRate / E):
           // both pace to the burn end, so the fleet target moves with the
           // allowance the horizon grants. burnHorizonMs is set only when a
           // finite regular reset binds after it, so the fallback is exact.
           hoursToReset: (() => {
+            if (a.creditType != null && a.creditResetAtMs != null) {
+              return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
+            }
             const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
             return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
           })(),

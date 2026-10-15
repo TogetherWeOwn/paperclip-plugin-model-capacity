@@ -78,10 +78,14 @@ per account (nothing provider-specific on the plugin side):
 drain over the credit (else weekly) horizon; `fraction` (0..1 remaining, when
 the feed can normalize it) quantifies the pace, otherwise the account drains
 like a fresh window and the balance guard cuts it off at zero. Headroom
-reports the quantified fraction only, so healthier accounts are preferred
-while the credits last. Only types listed under `credits.freeTypes` (default
-`["codex-credits"]`) or `credits.paidTypes` (default `[]`) count; unknown
-types, a missing flag, and a zero/unknown balance are never capacity.
+reports the quantified fraction, or a full window when the fraction is
+unquantified, so the lane stays routable; the fleet concurrency target counts
+the credit fraction over the credit reset horizon, and the rung controller
+measures the credit-fraction drain (not the flat weekly meter), holding
+position pacing until the credit series spans the warmup floor. Only types
+listed under `credits.freeTypes` (default `["codex-credits"]`) or
+`credits.paidTypes` (default `[]`) count; unknown types, a missing flag, and
+a zero/unknown balance are never capacity.
 
 Feed note: `live_accounts.py` does not emit `credits` yet; it should map the
 CLIProxy auth-file quota signals (e.g. `X-Codex-Credits-Has-Credits` and
