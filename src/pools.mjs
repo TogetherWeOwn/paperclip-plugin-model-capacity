@@ -34,12 +34,14 @@ import { canonicalModelName } from './arms.mjs';
  *
  * Each member's own meter still reveals its own burn: E_raw(member) is the
  * member's weekly-used delta over its own span divided by the even share of
- * the group's runs in the span (group runs / width). CLIProxy round-robins a
+ * the group's runs in the span (group runs / live width: only lanes that can
+ * receive traffic -- healthy with an unspent weekly window -- split the
+ * round-robin; lanes out of rotation get no share). CLIProxy round-robins a
  * calibration group's shared model across its lanes and the enforced hook
  * returns only model/effort/env, so a pick does not choose the credential
- * that burns -- each lane's meter moves for about N/width runs whatever the
- * picks are, and normalizing by the even share recovers each lane's own burn
- * while weighted spreading skews the picks. A lane
+ * that burns -- each live lane's meter moves for about N/W_active runs
+ * whatever the picks are, and normalizing by the even share recovers each
+ * lane's own burn while weighted spreading skews the picks. A lane
  * individualizes only on a minimal sample
  * (>= minRunsForIndiv lane runs over >= minSpanMs of history); until then it
  * inherits the group E with weight 1. Burns driving shares are bounded to
@@ -92,8 +94,9 @@ export function memberDelta(history, spanMs, nowMs) {
  *   historyOf(key): [{ atMs, usedPct }] weekly-used readings, oldest first
  *   spanMsOf(key): measured-rate span for the key (null: no measured rate yet)
  *   runsInSpanFor(key, spanMs): even share of the group's runs in the span
- *     (group runs / width -- never the lane's pick count, which skews once
- *     weighted spreading works while the meter still moves N/width per lane).
+ *     (group runs / live width -- never the lane's pick count, which skews
+ *     once weighted spreading works while the meter still moves N/W_active
+ *     per live lane).
  * Returns Map(key -> rawBurnPerRunPct) for members with a minimal sample:
  * a measured span of at least minSpanMs, a positive delta, and at least
  * minRunsForIndiv lane runs in that span. Members without a sample are

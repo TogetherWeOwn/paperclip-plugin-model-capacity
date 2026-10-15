@@ -10,7 +10,7 @@ import {
 } from '../src/pools.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { computeConcurrencyTarget } from '../src/concurrency.mjs';
-import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { createModelCapacityPlugin, orderCapacityWeight } from '../src/plugin.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // A $200 Meta plan (~4x a standard plan) shares a calibration group with
@@ -254,7 +254,7 @@ const paaRows = () => ([
   { slug: 'gpt-oss-120b', intelligenceIndex: 33, intelligenceIndexCostPerTask: 4, price1mInputTokens: 0.1, price1mOutputTokens: 0.4 },
 ]);
 const planLane = (o, now) => ({
-  lane: o.lane, provider: o.provider, accountKey: o.key, health: 'healthy', models: o.models,
+  lane: o.lane, provider: o.provider, accountKey: o.key, health: o.health ?? 'healthy', models: o.models,
   weekly: { used: o.weekly, resetsAt: new Date(PT0 + 4 * 24 * 60 * MIN).toISOString() },
   fiveHour: { used: o.fiveHour ?? 0.1, resetsAt: new Date(now + 4 * 60 * MIN).toISOString() },
   observedAt: new Date(now).toISOString(), quality: 'live',
@@ -316,6 +316,7 @@ function planDrive({ config = {} } = {}) {
     },
     hook: (runId) => plugin.onResolveRunModel(pHookParams(runId)),
     capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+    shadow: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow', query: { limit: 500 } })).body,
     setNow: (t) => { now = t; },
   };
 }
@@ -426,4 +427,132 @@ test('plan-size shadow tick: even-split individualization drives shares, slots, 
   // even split holds (samples equal prev, so smoothing holds exact).
   assert.ok(Math.abs(small3.effectiveBurnPerRunPct - 0.001) / 0.001 < 0.02, `skewed picks keep small burn ${small3.effectiveBurnPerRunPct}`);
   assert.ok(Math.abs(big3.effectiveBurnPerRunPct - 0.00025) / 0.00025 < 0.02, `skewed picks keep big burn ${big3.effectiveBurnPerRunPct}`);
+  // Hook decisions land on the Meta pair (solos guarded). The weighted ~4x
+  // spread itself is pinned by the demand-free test below, where need ties
+  // and the weight is the decider (here demand bands dominate, so the split
+  // is not weight-sensitive).
+  const shadow = await d.shadow();
+  const byRun = new Map((shadow.entries ?? []).map((e) => [e.runId, e]));
+  const picks = skewRuns.map((id) => byRun.get(id)?.accountId);
+  assert.equal(
+    picks.filter((a) => a === 'meta:meta-big' || a === 'meta:meta-small').length,
+    skewRuns.length,
+    `all skew picks land on the meta pair: ${picks.join(',')}`,
+  );
+});
+
+test('unhealthy lane out of rotation does not inflate live lanes burn', async () => {
+  // 3 uniform Meta lanes, true burn 0.001/run, 30 runs over 24 min, meta-c
+  // unhealthy with a flat meter. Live lanes each burn N/W_active = 15 runs
+  // (deltas 0.015); dividing by N/W = 10 reads 0.0015 (1.5x), dividing by
+  // the live width restores 0.001.
+  const trioFleet = ({ now, a, b, c, cHealth = 'unhealthy' }) => ([
+    planLane({ lane: 'meta-a', provider: 'meta', key: 'meta-a', models: ['muse-spark-1.3-contributor'], weekly: a }, now),
+    planLane({ lane: 'meta-b', provider: 'meta', key: 'meta-b', models: ['muse-spark-1.3-contributor'], weekly: b }, now),
+    planLane({ lane: 'meta-c', provider: 'meta', key: 'meta-c', health: cHealth, models: ['muse-spark-1.3-contributor'], weekly: c }, now),
+  ]);
+  const d = planDrive({ config: { enforce: true } });
+  await d.setup();
+  const runs = Array.from({ length: 30 }, (_, i) => `tu-${i}`);
+  await d.step({ at: PT0, fleet: trioFleet({ now: PT0, a: 0.29, b: 0.29, c: 0.29 }) });
+  await d.step({
+    at: PT0 + 12 * MIN,
+    fleet: trioFleet({ now: PT0 + 12 * MIN, a: 0.29, b: 0.29, c: 0.29 }),
+    fire: runs.map((id, i) => pStarted(id, PT0 + 1 * MIN + i * 20 * 1000, 'eng', 'muse-spark-1.3-contributor')),
+  });
+  await d.step({
+    at: PT0 + 24 * MIN,
+    fleet: trioFleet({ now: PT0 + 24 * MIN, a: 0.305, b: 0.305, c: 0.29 }),
+    fire: runs.map((id) => pFinished(id, PT0 + 24 * MIN)),
+  });
+  const cap = await d.capacity();
+  const byId = new Map(cap.accounts.map((a) => [a.accountId, a]));
+  const a = byId.get('meta:meta-a');
+  const b = byId.get('meta:meta-b');
+  const c = byId.get('meta:meta-c');
+  assert.ok(a && b && c, 'all three lanes present');
+  assert.equal(a.calibrationGroup, b.calibrationGroup, 'trio shares one group');
+  assert.equal(c.calibrationGroup, a.calibrationGroup, 'down lane in same group');
+  assert.ok(a.burnIndividualized === true && b.burnIndividualized === true, 'live lanes individualized');
+  assert.ok(Math.abs(a.effectiveBurnPerRunPct - 0.001) < 1e-9, `live lane a burn ${a.effectiveBurnPerRunPct} (bug reads 0.0015)`);
+  assert.ok(Math.abs(b.effectiveBurnPerRunPct - 0.001) < 1e-9, `live lane b burn ${b.effectiveBurnPerRunPct} (bug reads 0.0015)`);
+  // Down lane has no delta: inherits the pooled group figure, never an
+  // inflated per-lane figure.
+  assert.ok(c.burnIndividualized !== true, 'flat down lane does not individualize');
+});
+
+test('orderCapacityWeight passes the lane weight through (call-site pin)', async () => {
+  // Both orderAccountsWithPacing call sites in plugin.mjs (the tick shadow
+  // path and the hook live view) must pass the lane's capacityWeight through
+  // -- forcing either input to `capacityWeight: 1` spreads picks evenly
+  // instead of ~4x to a 4x plan. The helper is the single place the default
+  // lives; mutating it to return 1 fails the assertions below, and bypassing
+  // it at either call site fails the source pin.
+  assert.equal(orderCapacityWeight({ capacityWeight: 2.5 }), 2.5);
+  assert.equal(orderCapacityWeight({ capacityWeight: 0.625 }), 0.625);
+  assert.equal(orderCapacityWeight({}), 1, 'absent reads as 1');
+  assert.equal(orderCapacityWeight(null), 1, 'null reads as 1');
+  assert.equal(orderCapacityWeight({ capacityWeight: null }), 1, 'null weight reads as 1');
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('../src/plugin.mjs', import.meta.url), 'utf8');
+  assert.ok(src.includes('capacityWeight: orderCapacityWeight(v)'), 'tick shadow path uses the helper');
+  assert.ok(src.includes('capacityWeight: orderCapacityWeight(view)'), 'hook live view uses the helper');
+});
+
+test('plugin weights spread lane selection ~4x when need ties', async () => {
+  // End-to-end contract for the call-site wiring: calibrate the Meta pair
+  // (small 0.001, big 0.00025, weights ~0.625/~2.5), then feed those REAL
+  // plugin weights into orderAccountsForRun with tied need (same band,
+  // same pool, null rates) so the weight-normalized lane load decides. With
+  // the plugin weights the picks spread ~8/2; with the call-site mutant
+  // (`capacityWeight: 1`) they spread ~evenly -- so this fails the mutant
+  // while the unit test above pins the helper itself.
+  const d = planDrive({ config: { enforce: true } });
+  await d.setup();
+  const metaRuns = Array.from({ length: 20 }, (_, i) => `pw-${i}`);
+  await d.step({
+    at: PT0, fleet: planFleet({ now: PT0, small: 0.29, big: 0.2975, claude: 0.20, codex: 0.10 }),
+  });
+  await d.step({
+    at: PT0 + 12 * MIN,
+    fleet: planFleet({ now: PT0 + 12 * MIN, small: 0.29, big: 0.2975, claude: 0.20, codex: 0.10 }),
+    fire: metaRuns.map((id, i) => pStarted(id, PT0 + 1 * MIN + i * 30 * 1000, 'eng', 'muse-spark-1.3-contributor')),
+  });
+  await d.step({
+    at: PT0 + 24 * MIN,
+    fleet: planFleet({ now: PT0 + 24 * MIN, small: 0.30, big: 0.30, claude: 0.20, codex: 0.10 }),
+    fire: metaRuns.map((id) => pFinished(id, PT0 + 24 * MIN)),
+  });
+  const cap = await d.capacity();
+  const byId = new Map(cap.accounts.map((a) => [a.accountId, a]));
+  const small = byId.get('meta:meta-small');
+  const big = byId.get('meta:meta-big');
+  assert.ok(small && big, 'meta pair present');
+  const wSmall = orderCapacityWeight(small);
+  const wBig = orderCapacityWeight(big);
+  assert.ok(Math.abs(wSmall - 0.625) < 0.15, `small weight ${wSmall}`);
+  assert.ok(Math.abs(wBig - 2.5) < 0.5, `big weight ${wBig}`);
+  // Tied need: same pool, null rates (band 0, deficit 0), high headroom, so
+  // only the weight-normalized lane load orders the pair.
+  const tiedView = (id, weight, laneInFlight) => ({
+    accountId: id, pool: 'meta', targetShare: 10, inFlight: 0, laneInFlight,
+    capacityWeight: weight, health: 'healthy', headroomPct: 0.9,
+    measuredRatePerHour: null, requiredRatePerHour: null,
+  });
+  const spread = (wS, wB) => {
+    const load = { small: 0, big: 0 };
+    for (let i = 0; i < 10; i++) {
+      const [w] = orderAccountsForRun([
+        tiedView('meta:meta-small', wS, load.small),
+        tiedView('meta:meta-big', wB, load.big),
+      ], {});
+      if (w.accountId === 'meta:meta-big') load.big += 1; else load.small += 1;
+    }
+    return load;
+  };
+  const weighted = spread(wSmall, wBig);
+  assert.ok(weighted.big >= 7 && weighted.small <= 3, `plugin weights spread ~4x: ${JSON.stringify(weighted)}`);
+  const unweighted = spread(1, 1);
+  assert.ok(Math.abs(unweighted.big - unweighted.small) <= 2, `forced 1 spreads evenly: ${JSON.stringify(unweighted)}`);
+  assert.ok(weighted.big - weighted.small >= 4, 'weight is the decider, not a tie-break');
 });

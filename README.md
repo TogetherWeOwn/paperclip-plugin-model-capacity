@@ -207,7 +207,8 @@ install ran live:
    (`calibrationGroups` on `/capacity`). Lanes with different plan sizes
    individualize: once a lane has 3 of its own runs over 10 min of history,
    its burn is its own delta over the even share of the group's runs
-   (group runs / width -- picks never route credentials under round-robin),
+   (group runs / live width: only healthy lanes with an unspent weekly window
+   split the round-robin -- picks never route credentials under round-robin),
    smoothed, bounded to [group-median/8, group-median*4], and weighed at
    median-burn/lane-burn (clamped [0.25, 8]) -- a 4x plan burns ~1/4 per run
    and serves ~4x the share through targetShare, C* slots, the pace-guard

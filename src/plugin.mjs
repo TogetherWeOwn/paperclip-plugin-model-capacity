@@ -103,6 +103,17 @@ const NS = 'model-capacity';
 // Weekly remainder at or below this floor: the account cannot serve runs
 // until its weekly window resets, whatever its 5h meter reads.
 const WEEKLY_EXHAUSTED_PCT = 0.01;
+/**
+ * Order-input capacity weight: the plan-size weight driving
+ * weight-normalized in-pool spreading (see select.mjs laneLoad). Absent
+ * reads as 1 (bit-identical to the old order). Both the tick shadow path
+ * (allocationOrder) and the hook live view must pass the lane's weight
+ * through this helper -- forcing either input to 1 spreads picks evenly
+ * instead of ~4x to a 4x plan.
+ */
+export function orderCapacityWeight(view) {
+  return view?.capacityWeight ?? 1;
+}
 const AA_KEY = 'aa-snapshot-v1';
 const TRIAL_KEY = 'trial-families-v1';
 const PACING_KEY = 'pacing-v1';
@@ -2107,13 +2118,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // smoothed burn drives its share. The first sample jumps at once (fast
     // outlier path: a 4x plan is detected as soon as its meter history spans
     // the floor); later samples smooth normally. Lane runs are the even share
-    // of the group's runs in the span (group runs / width): CLIProxy
+    // of the group's runs in the span (group runs / live width): CLIProxy
     // round-robins a calibration group's shared model across its lanes and
     // the hook returns only model/effort/env, so a pick never chooses the
-    // credential that burns -- each lane's meter moves for about N/width runs
-    // whatever the picks are, and normalizing by the pick count feeds back
-    // through weighted spreading into the clamps. Runs never mapped to the
-    // group stay out entirely.
+    // credential that burns -- each live lane's meter moves for about
+    // N/W_active runs whatever the picks are, and normalizing by the pick
+    // count feeds back through weighted spreading into the clamps. Lanes out
+    // of rotation (unhealthy, or a spent weekly window) get no share, so the
+    // divisor counts only lanes that can receive traffic. Runs never mapped
+    // to the group stay out entirely.
     // Share-driving burns are bounded to the group median (see pools.mjs),
     // so one thin sample cannot mint capacity. Single-member groups are
     // never clamped against other providers: a solo lane's burn is its own
@@ -2123,12 +2136,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const nextIndivE = new Map();
     const indivE = new Map(); // accountId -> smoothed per-lane burn per run
     for (const [gid, memberKeys] of calibMembers) {
-      const width = memberKeys.length;
+      // Live width: only lanes that can receive traffic split the round-robin
+      // share. Unhealthy lanes are dropped from allocation and a spent weekly
+      // window serves nothing, so they get no runs; dividing by every member
+      // inflates the live lanes' burn by W/W_active. Falls back to the full
+      // width when no member qualifies (avoids a zero divisor).
+      const liveWidth = memberKeys.filter((k) => {
+        const v = viewByKey.get(k);
+        if (!v || v.health !== 'healthy') return false;
+        const used = v.weeklyUsedPct;
+        if (used != null && (1 - used) <= WEEKLY_EXHAUSTED_PCT) return false;
+        return true;
+      }).length || memberKeys.length;
       const rawByMember = perAccountRawBurn({
         memberKeys,
         historyOf: (k) => rateHistories[k] ?? [],
         spanMsOf: (k) => viewByKey.get(k)?.rateSpanMs ?? null,
-        runsInSpanFor: (k, spanMs) => runsInGroupSpan(gid, spanMs) / width,
+        runsInSpanFor: (k, spanMs) => runsInGroupSpan(gid, spanMs) / liveWidth,
         nowMs,
       });
       for (const k of memberKeys) {
@@ -2676,7 +2700,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
-          capacityWeight: v.capacityWeight ?? 1,
+          capacityWeight: orderCapacityWeight(v),
           duplicates,
           held: !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
@@ -2965,7 +2989,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           headroomSource: view?.headroomSource ?? null,
           remainingKnown: view?.remainingPct != null,
           targetShare: view?.targetShare ?? null,
-          capacityWeight: view?.capacityWeight ?? 1,
+          capacityWeight: orderCapacityWeight(view),
           effectiveBurnPerRunPct: view?.effectiveBurnPerRunPct ?? null,
           reactive: view?.reactive === true,
           health: view?.health ?? 'unknown',
