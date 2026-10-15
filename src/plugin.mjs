@@ -1706,8 +1706,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // sits at 100% while credits are spent and would read as rate 0
       // forever): track the credit fraction as its own utilization series
       // (1 - fraction) so the controller measures the real drain rate. An
-      // unquantified fraction has no measurable rate, so control falls back
-      // to position pacing below instead of climbing to the ceiling.
+      // unquantified fraction has no measurable rate and gets no position
+      // signal either (positionError 0 below), so the pointer holds instead
+      // of climbing to the ceiling on fiction.
       let creditHistory = null;
       if (credit != null) {
         const cFractionNow = credit.entry.fraction;
@@ -1765,17 +1766,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
         : 0;
       if (credit != null) {
-        // Drain pace: the unquantified fraction reads as a full window (a
-        // free grant drains steadily like a fresh week); the positive-balance
-        // guard above cuts the account off at zero on the next feed poll.
+        // Drain pace: the fraction (else a full window) paces the required
+        // rate over the credit (else weekly) horizon. There is deliberately
+        // NO position signal: windowStartMs assumes a 7-day weekly window,
+        // but the credit window's start is unknowable from a reset timestamp
+        // alone, so any scheduleError is fiction (a 48h credit reset reads
+        // ~43% behind and climbs to the ceiling on tick 0). Rate-only pacing
+        // holds through warmup and follows the measured credit drain after;
+        // the positive-balance guard above cuts the account off at zero on
+        // the next feed poll.
         const cFraction = credit.entry.fraction ?? 1;
         const cResetMs = credit.entry.resetsAtMs ?? resetAtMs;
         const cHours = cResetMs != null ? Math.max((cResetMs - nowMs) / 3600000, 0.25) : null;
         if (cHours != null) required = requiredRatePerHour({ remainingPct: cFraction, hoursToReset: cHours });
-        const cStart = cResetMs != null && !Number.isNaN(cResetMs) ? windowStartMs(cResetMs) : null;
-        positionError = cStart != null && cResetMs > cStart
-          ? scheduleError({ usedPct: 1 - cFraction, nowMs, periodStartMs: cStart, periodEndMs: cResetMs })
-          : 0;
+        positionError = 0;
       }
       // Plan position for the pace guard: the same error, but only while the
       // reading sits on a weekly window (reset ahead of now and no further

@@ -81,8 +81,11 @@ like a fresh window and the balance guard cuts it off at zero. Headroom
 reports the quantified fraction, or a full window when the fraction is
 unquantified, so the lane stays routable; the fleet concurrency target counts
 the credit fraction over the credit reset horizon, and the rung controller
-measures the credit-fraction drain (not the flat weekly meter), holding
-position pacing until the credit series spans the warmup floor. Only types
+measures the credit-fraction drain (not the flat weekly meter). Credit lanes
+carry no position signal — the credit window's start is unknowable from a
+reset timestamp alone, so any schedule error would be fiction — and the
+pointer holds at its rung until the measured drain rate takes over after the
+warmup floor. Only types
 listed under `credits.freeTypes` (default `["codex-credits"]`) or
 `credits.paidTypes` (default `[]`) count; unknown types, a missing flag, and
 a zero/unknown balance are never capacity.

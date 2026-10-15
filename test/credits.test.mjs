@@ -220,20 +220,145 @@ test('credit capacity counts in C* slots over the credit horizon', async () => {
 
 const MIN = 60000;
 
-function driveDrain(fractions) {
+// Multi-rung drain drive: the lane serves three models so the ladder has
+// three arms (a climb is possible), and the credit reset (48h) differs from
+// the weekly reset (96h) so the credit horizon is pinned, not assumed.
+const DRAIN_MODELS = ['gpt-6.1-sol', 'gpt-6.1-sol-lite', 'gpt-6.1-sol-micro'];
+const DRAIN_SLUGS = ['gpt-6-1-sol', 'gpt-6-1-sol-lite', 'gpt-6-1-sol-micro'];
+
+function driveDrain({ fractions, creditResetsAtH = 48 }) {
   const state = new Map();
   const jobs = new Map();
   const handlers = new Map();
   let now = T0;
   let step = 0;
   const accounts = () => [{
-    lane: 'cr', provider: 'codex', accountKey: 'cr', health: 'healthy', models: ['gpt-6.1-sol'],
+    lane: 'cr', provider: 'codex', accountKey: 'cr', health: 'healthy', models: DRAIN_MODELS,
     weekly: { used: 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
     fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
     observedAt: new Date(now).toISOString(), quality: 'live',
-    credits: [{ type: 'codex-credits', hasCredits: true, balance: 10, fraction: fractions[step],
-      resetsAt: new Date(T0 + 96 * 3600000).toISOString() }],
+    credits: [{ type: 'codex-credits', hasCredits: true, balance: 10,
+      ...(fractions[step] == null ? {} : { fraction: fractions[step] }),
+      resetsAt: new Date(T0 + creditResetsAtH * 3600000).toISOString() }],
   }];
+  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
+  const io = {
+    config: { get: async () => config },
+    state: { get: async k => state.get(JSON.stringify(k)) ?? null, set: async (k, v) => state.set(JSON.stringify(k), v) },
+    secrets: { resolve: async () => 'fixture' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: accounts() }, now) }) },
+    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (k, fn) => jobs.set(k, fn) },
+    events: { on: (k, fn) => handlers.set(k, fn) },
+    logger: { info() {}, error() {} },
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  return {
+    setup: async () => {
+      await plugin.setup(io);
+      state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows: DRAIN_SLUGS.map(slug => ({ slug,
+        intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 })) ,
+        duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    tick: async i => {
+      now = T0 + i * 5 * MIN;
+      step = i;
+      await jobs.get('shadow-tick')({});
+      return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
+    },
+  };
+}
+
+// Review #38 finding 3: the controller paces the measured credit drain, so a
+// lane draining ~10x above pace holds the floor instead of climbing to the
+// ceiling on the flat weekly meter. The required rate pins the credit
+// horizon (fraction / credit hours), not the weekly reset.
+test('falling credit fraction paces the drain without climbing', async () => {
+  const fractions = Array.from({ length: 14 }, (_, i) => 0.6 - i * 0.01);
+  const d = driveDrain({ fractions });
+  await d.setup();
+  let cap;
+  for (let i = 0; i < fractions.length; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.ok(view.arms.length >= 3, `multi-rung ladder, got ${view.arms.length} arms`);
+    assert.equal(view.pointer, 0, `tick ${i}: pointer holds the floor while credits drain above pace`);
+  }
+  const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+  assert.equal(view.rateBasis, 'measured');
+  assert.ok(view.measuredRatePerHour > view.requiredRatePerHour,
+    `measured ${view.measuredRatePerHour} tracks the credit drain above required ${view.requiredRatePerHour}`);
+  const lastHours = 48 - (fractions.length - 1) * 5 / 60;
+  assert.ok(Math.abs(view.requiredRatePerHour - (0.6 - 0.13) / lastHours) < 1e-9,
+    `required paces the credit horizon: ${view.requiredRatePerHour}`);
+});
+
+// Review round 2 finding 1: a fraction-less credit entry (the live feed
+// shape) carries no position signal, so the pointer holds on a multi-rung
+// ladder instead of climbing to the ceiling on a synthetic deficit.
+test('fraction-less credit lane holds the pointer on a multi-rung ladder', async () => {
+  const d = driveDrain({ fractions: Array(14).fill(null) });
+  await d.setup();
+  let cap;
+  for (let i = 0; i < 14; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.ok(view.arms.length >= 3, `multi-rung ladder, got ${view.arms.length} arms`);
+    assert.equal(view.headroomPct, 1);
+    assert.notEqual(view.action, 'excluded');
+    assert.equal(view.pointer, 0, `tick ${i}: pointer holds with no fraction signal`);
+  }
+});
+
+// A below-pace quantified drain inside the warmup span stays on position
+// pacing (hold), which kills replacing the credit warmup span with false:
+// with rate control the 0.24%/h drain would read behind the ~1%/h required
+// rate and climb.
+test('slow quantified drain inside warmup holds instead of climbing', async () => {
+  const fractions = [0.5, 0.4998, 0.4996, 0.4994, 0.4992];
+  const d = driveDrain({ fractions });
+  await d.setup();
+  for (let i = 0; i < fractions.length; i++) {
+    const cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.ok(view.arms.length >= 3, `multi-rung ladder, got ${view.arms.length} arms`);
+    assert.equal(view.pointer, 0, `tick ${i}: warmup holds on position pacing`);
+  }
+});
+
+// Review round 2 finding 2: C* slots scale with the credit horizon. Two
+// lanes with the same fraction and the same burn but different credit resets
+// earn slots in inverse-horizon ratio; the fraction-less lane earns slots
+// from the full-window assumption.
+function driveCreditHorizons() {
+  const state = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  let now = T0;
+  let step = 0;
+  const creditLane = (lane, extra) => ({
+    lane, provider: 'codex', accountKey: lane, health: 'healthy', models: ['gpt-6.1-sol'],
+    weekly: { used: 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+    fiveHour: { used: 0.1 + step * 0.04, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+    observedAt: new Date(now).toISOString(), quality: 'live',
+    usage: { observedAt: new Date(now).toISOString(), epoch: 'keeper-1', requests: 100 + step * 100 },
+    ...extra,
+  });
+  const accounts = () => [
+    { lane: 'ok', provider: 'codex', accountKey: 'ok', health: 'healthy', models: ['gpt-6.1-sol'],
+      weekly: { used: 0.2 + step * 0.01, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+      fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+      observedAt: new Date(now).toISOString(), quality: 'live',
+      usage: { observedAt: new Date(now).toISOString(), epoch: 'keeper-1', requests: 100 + step * 100 } },
+    creditLane('cr48', { credits: [{ type: 'codex-credits', hasCredits: true, balance: 9, fraction: 0.5,
+      resetsAt: new Date(T0 + 48 * 3600000).toISOString() }] }),
+    creditLane('cr96', { credits: [{ type: 'codex-credits', hasCredits: true, balance: 9, fraction: 0.5,
+      resetsAt: new Date(T0 + 96 * 3600000).toISOString() }] }),
+    creditLane('crnofrac', { credits: [{ type: 'codex-credits', hasCredits: true, balance: 9,
+      resetsAt: new Date(T0 + 48 * 3600000).toISOString() }] }),
+  ];
   const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
   const io = {
     config: { get: async () => config },
@@ -257,27 +382,28 @@ function driveDrain(fractions) {
     tick: async i => {
       now = T0 + i * 5 * MIN;
       step = i;
+      if (i > 0) for (let n = 0; n < 10; n++) {
+        await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `hz-run-${i}-${n}`,
+          payload: { run: { agentId: 'eng', model: 'gpt-6.1-sol' } }, occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
+      }
       await jobs.get('shadow-tick')({});
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
   };
 }
 
-// Review #38 finding 3: the controller paces the measured credit drain, so a
-// lane draining ~20x above pace holds the floor instead of climbing to the
-// ceiling on the flat weekly meter.
-test('falling credit fraction paces the drain without climbing', async () => {
-  const fractions = Array.from({ length: 14 }, (_, i) => 0.6 - i * 0.01);
-  const d = driveDrain(fractions);
+test('C* slots scale with the credit horizon', async () => {
+  const d = driveCreditHorizons();
   await d.setup();
   let cap;
-  for (let i = 0; i < fractions.length; i++) {
-    cap = await d.tick(i);
-    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
-    assert.equal(view.pointer, 0, `tick ${i}: pointer holds the floor while credits drain above pace`);
+  for (let i = 0; i <= 6; i++) cap = await d.tick(i);
+  for (const id of ['codex:cr48', 'codex:cr96', 'codex:crnofrac']) {
+    assert.equal(cap.accounts.find(a => a.accountId === id).calibrationSource, 'account-five-hour');
   }
-  const view = cap.accounts.find(a => a.accountId === 'codex:cr');
-  assert.equal(view.rateBasis, 'measured');
-  assert.ok(view.measuredRatePerHour > view.requiredRatePerHour,
-    `measured ${view.measuredRatePerHour} tracks the credit drain above required ${view.requiredRatePerHour}`);
+  const slots = id => cap.perAccount.find(a => a.accountId === id).slots;
+  assert.ok(slots('codex:cr48') > 0 && slots('codex:cr96') > 0 && slots('codex:crnofrac') > 0);
+  const ratio = slots('codex:cr48') / slots('codex:cr96');
+  assert.ok(Math.abs(ratio - 2) < 0.02, `slots scale with the horizon, ratio ${ratio}`);
+  const req48 = cap.accounts.find(a => a.accountId === 'codex:cr48').requiredRatePerHour;
+  assert.ok(Math.abs(req48 - 0.5 / 47.5) < 1e-9, `required paces the 48h credit horizon: ${req48}`);
 });
