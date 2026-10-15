@@ -28,31 +28,35 @@ import { canonicalModelName } from './arms.mjs';
  * Plan-size aware calibration.
  *
  * Pooled E (above) is the group's average burn, which is exactly right for a
- * pool of equal plans under an even traffic spread -- but a $200 plan (~4x a
- * standard plan) burns ~1/4 per run, so sharing one E gives it the same share
- * as every 1x lane and it idles at ~1/4 of its capacity.
+ * pool of equal plans -- but a $200 plan (~4x a standard plan) burns ~1/4 per
+ * run, so sharing one E gives it the same share as every 1x lane and it idles
+ * at ~1/4 of its capacity.
  *
- * Each member's own meter still reveals its own burn: under the same even
- * spread every lane serves runsInSpan / width runs, so
- *
- *   E_raw(member) = delta(member) x width / runsInSpan
- *
- * which recovers each lane's true burn (and reduces to the pooled figure when
- * every delta is equal). A lane individualizes only on a minimal sample
- * (>= minRunsForIndiv group runs in its own span and >= minSpanMs of history);
- * until then it inherits the group E with weight 1. The capacity weight is
- * the group median over the per-lane burn, clamped so meter noise cannot mint
- * or destroy capacity.
+ * Each member's own meter still reveals its own burn: E_raw(member) is the
+ * member's weekly-used delta over its own span divided by the runs that
+ * burned that lane in the span (enforced hook picks -- the only picks that
+ * outrank reality -- plus an even split of the group's other mapped runs,
+ * so the figure stays exact once weighted spreading sends the big lane more
+ * traffic instead of collapsing back to equal weights). A lane
+ * individualizes only on a minimal sample
+ * (>= minRunsForIndiv lane runs over >= minSpanMs of history); until then it
+ * inherits the group E with weight 1. Burns driving shares are bounded to
+ * [median/8, median*4] (the weight clamp, applied to the burn itself), so one
+ * thin sample cannot mint capacity -- the weight clamp alone never bound
+ * targetShare or C*, which read the burn directly.
  */
 
 export const PLAN_SIZE = Object.freeze({
-  /** Minimal group-run sample before a lane individualizes (fast outlier path). */
+  /** Minimal lane-run sample before a lane individualizes (fast outlier path). */
   minRunsForIndiv: 3,
   /** Minimal member history span before a lane individualizes. */
   minSpanMs: 10 * 60 * 1000,
   /** Capacity weight clamps (median burn / lane burn). */
   weightMin: 0.25,
   weightMax: 8,
+  /** Burns driving shares are bounded to [median/8, median*4]. */
+  burnFloorDivisor: 8,
+  burnCeilFactor: 4,
 });
 
 function medianFinite(values) {
@@ -83,31 +87,80 @@ export function memberDelta(history, spanMs, nowMs) {
  *   memberKeys: account keys in the group
  *   historyOf(key): [{ atMs, usedPct }] weekly-used readings, oldest first
  *   spanMsOf(key): measured-rate span for the key (null: no measured rate yet)
- *   runsInSpan(spanMs): runs started on ANY member within the span
- *   width: member count (defaults to memberKeys.length)
+ *   runsInSpanFor(key, spanMs): runs that burned THIS lane within the span
+ *     (the caller passes enforced hook picks plus an even split of the
+ *     group's other mapped runs -- never an even share of the group total,
+ *     which collapses once weighted spreading works).
  * Returns Map(key -> rawBurnPerRunPct) for members with a minimal sample:
- * a measured span of at least minSpanMs, a non-negative delta, and at least
- * minRunsForIndiv group runs in that span. Members without a sample are
+ * a measured span of at least minSpanMs, a positive delta, and at least
+ * minRunsForIndiv lane runs in that span. Members without a sample are
  * absent (they inherit the group E). Counter resets void that member only.
  */
 export function perAccountRawBurn({
-  memberKeys, historyOf, spanMsOf, runsInSpan, width = null, nowMs,
+  memberKeys, historyOf, spanMsOf, runsInSpanFor, nowMs,
 } = {}) {
   const out = new Map();
-  const w = width ?? (memberKeys ?? []).length;
-  if (!(w > 0)) return out;
   for (const k of memberKeys ?? []) {
     const span = spanMsOf(k);
     if (!(span >= PLAN_SIZE.minSpanMs)) continue;
     const d = memberDelta(historyOf(k), span, nowMs);
     if (!d) continue;
-    const n = runsInSpan(span);
+    const n = runsInSpanFor(k, span);
     if (!(n >= PLAN_SIZE.minRunsForIndiv)) continue;
     if (!(d.delta > 0)) continue;
-    const raw = (d.delta * w) / n;
+    const raw = d.delta / n;
     if (raw > 0 && Number.isFinite(raw)) out.set(k, raw);
   }
   return out;
+}
+
+/**
+ * Bound burns to the group median before they drive shares: members of
+ * `burns` outside [median/8, median*4] are clamped (a thin sample cannot mint
+ * or destroy capacity through targetShare/C*, which read the burn directly,
+ * not the weight). Returns { burns, weights, median }: burns is a Map of the
+ * share-driving values, weights the clamped median/burn capacity weights.
+ * Members absent from `burns` (or a null median) keep weight 1 and no bound
+ * burn entry.
+ */
+export function boundBurnPerRun(burns, memberKeys = null) {
+  const entries = burns instanceof Map ? [...burns.entries()] : Object.entries(burns ?? {});
+  const keys = memberKeys ?? entries.map(([k]) => k);
+  const median = medianFinite(entries.map(([, v]) => v));
+  const out = new Map();
+  const bounded = new Map();
+  for (const k of keys) {
+    const e = burns instanceof Map ? burns.get(k) : burns?.[k];
+    if (!(e > 0) || median == null) {
+      out.set(k, 1);
+      continue;
+    }
+    const lo = median / PLAN_SIZE.burnFloorDivisor;
+    const hi = median * PLAN_SIZE.burnCeilFactor;
+    const b = Math.min(hi, Math.max(lo, e));
+    bounded.set(k, b);
+    out.set(k, Math.min(PLAN_SIZE.weightMax, Math.max(PLAN_SIZE.weightMin, median / b)));
+  }
+  return { burns: bounded, weights: out, median };
+}
+
+/**
+ * Solo-lane bound: a single-member group's median is its own burn, so
+ * boundBurnPerRun is vacuous there. Clamp the lane's burn to a cross-group
+ * reference median instead, with the same bounds and weight clamps.
+ * Returns { burn, weight } or null while either input is unusable.
+ */
+export function boundSoloBurn(burn, referenceMedian) {
+  if (!(burn > 0) || !(referenceMedian > 0)
+    || !Number.isFinite(burn) || !Number.isFinite(referenceMedian)) return null;
+  const b = Math.min(
+    referenceMedian * PLAN_SIZE.burnCeilFactor,
+    Math.max(referenceMedian / PLAN_SIZE.burnFloorDivisor, burn),
+  );
+  return {
+    burn: b,
+    weight: Math.min(PLAN_SIZE.weightMax, Math.max(PLAN_SIZE.weightMin, referenceMedian / b)),
+  };
 }
 
 /**

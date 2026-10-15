@@ -5,6 +5,8 @@ import {
   pooledBurnPerRun,
   perAccountRawBurn,
   capacityWeights,
+  boundBurnPerRun,
+  boundSoloBurn,
   PLAN_SIZE,
 } from '../src/pools.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
@@ -42,7 +44,7 @@ test('per-account raw burn recovers each lane burn under even spread', () => {
     memberKeys,
     historyOf: (k) => hists.get(k),
     spanMsOf: () => 60 * MIN,
-    runsInSpan: () => 90,
+    runsInSpanFor: () => 10,
     nowMs: NOW,
   });
   assert.equal(raw.size, 9);
@@ -58,7 +60,7 @@ test('capacity weights scale the big lane ~4x relative to the group median', () 
     memberKeys,
     historyOf: (k) => hists.get(k),
     spanMsOf: () => 60 * MIN,
-    runsInSpan: () => 90,
+    runsInSpanFor: () => 10,
     nowMs: NOW,
   });
   const weights = capacityWeights(raw);
@@ -68,18 +70,56 @@ test('capacity weights scale the big lane ~4x relative to the group median', () 
   assert.ok(Math.abs(weights.get(memberKeys[8]) - 4) < 1e-6, `big: ${weights.get(memberKeys[8])}`);
 });
 
+test('weighted spread is a stable fixed point: exact burns at 4:1 traffic', () => {
+  // Once the big lane serves 4x runs (8 vs 2 of 10), its delta is 4x larger
+  // in absolute terms but per-run it is still 1/4: normalizing by the
+  // lane's OWN runs recovers the same burns and weights instead of
+  // collapsing them back to 1 (the even-share normalization did).
+  const keys = ['small', 'big'];
+  const hists = new Map([
+    ['small', history(0.24, 0.243, NOW - 60 * MIN, NOW)],
+    ['big', history(0.10, 0.103, NOW - 60 * MIN, NOW)],
+  ]);
+  const served = { small: 3, big: 12 };
+  const raw = perAccountRawBurn({
+    memberKeys: keys,
+    historyOf: (k) => hists.get(k),
+    spanMsOf: () => 60 * MIN,
+    runsInSpanFor: (k) => served[k],
+    nowMs: NOW,
+  });
+  assert.ok(Math.abs(raw.get('small') - 0.001) < 1e-9, `small: ${raw.get('small')}`);
+  assert.ok(Math.abs(raw.get('big') - 0.00025) < 1e-9, `big: ${raw.get('big')}`);
+  const weights = capacityWeights(raw);
+  assert.ok(weights.get('big') / weights.get('small') > 3.9, `ratio holds: ${weights.get('big')}/${weights.get('small')}`);
+});
+
 test('minimal sample: lanes without enough runs keep no raw burn', () => {
   const { memberKeys, hists } = groupFixture();
   const raw = perAccountRawBurn({
     memberKeys,
     historyOf: (k) => hists.get(k),
     spanMsOf: () => 60 * MIN,
-    // Only 2 group runs observed: below the minimal sample.
-    runsInSpan: () => 2,
+    // Only 2 lane runs observed: below the minimal sample.
+    runsInSpanFor: () => 2,
     nowMs: NOW,
   });
   assert.equal(raw.size, 0, 'no lane individualizes on a thin sample');
   assert.ok(PLAN_SIZE.minRunsForIndiv >= 3, 'minimal sample stays small but non-trivial');
+});
+
+test('share-driving burns are bounded to the group median', () => {
+  const many = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`m${i}`, 0.001]));
+  const thin = boundBurnPerRun({ ...many, mint: 0.00001 }, [...Object.keys(many), 'mint']);
+  assert.equal(thin.burns.get('mint'), 0.001 / 8, `floored: ${thin.burns.get('mint')}`);
+  assert.equal(thin.weights.get('mint'), 8);
+  const fat = boundBurnPerRun({ ...many, hog: 1.0 }, [...Object.keys(many), 'hog']);
+  assert.equal(fat.burns.get('hog'), 0.001 * 4, `capped: ${fat.burns.get('hog')}`);
+  assert.equal(fat.weights.get('hog'), 0.25);
+  // A genuine 4x plan passes through untouched.
+  const real = boundBurnPerRun({ ...many, big: 0.00025 }, [...Object.keys(many), 'big']);
+  assert.equal(real.burns.get('big'), 0.00025);
+  assert.equal(real.weights.get('big'), 4);
 });
 
 test('weights clamp instead of exploding on noisy meters', () => {
@@ -98,7 +138,7 @@ test('uniform pools keep weight ~1 (pooled behavior unchanged)', () => {
     memberKeys: keys,
     historyOf: (k) => hists.get(k),
     spanMsOf: () => 60 * MIN,
-    runsInSpan: () => 30,
+    runsInSpanFor: () => 10,
     nowMs: NOW,
   });
   const weights = capacityWeights(raw);
@@ -163,6 +203,22 @@ test('concurrency slots scale with per-account burn (~4x for the big lane)', () 
   const byId = new Map(out.perAccount.map((r) => [r.accountId, r]));
   const ratio = byId.get('meta:lane-big').slots / byId.get('meta:lane-1').slots;
   assert.ok(Math.abs(ratio - 4) < 1e-9, `slots ratio ${ratio}`);
+});
+
+test('solo lanes clamp to the cross-group median, not their own burn', () => {
+  // A single-member group's median is its own burn (bound vacuous): the
+  // cross-group reference bounds it instead. Thin mint floored at M/8.
+  const mint = boundSoloBurn(0.00001, 0.001);
+  assert.equal(mint.burn, 0.001 / 8);
+  assert.equal(mint.weight, 8);
+  // Genuine 4x solo plan passes through.
+  const real = boundSoloBurn(0.00025, 0.001);
+  assert.equal(real.burn, 0.00025);
+  assert.equal(real.weight, 4);
+  // Unusable inputs yield null, never a guess.
+  assert.equal(boundSoloBurn(null, 0.001), null);
+  assert.equal(boundSoloBurn(0.001, null), null);
+  assert.equal(boundSoloBurn(0, 0.001), null);
 });
 
 test('single-lane groups (mixed codex/claude plans) already individualize', () => {

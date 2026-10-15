@@ -230,7 +230,6 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
     (laneLoad(a) - laneLoad(b)) ||
-    ((a.laneInFlight ?? 0) - (b.laneInFlight ?? 0)) ||
     (deficitOf(b) - deficitOf(a)) ||
     ((a.resetAtMs ?? Number.MAX_SAFE_INTEGER) - (b.resetAtMs ?? Number.MAX_SAFE_INTEGER)) ||
     (a.accountId < b.accountId ? -1 : a.accountId > b.accountId ? 1 : 0),

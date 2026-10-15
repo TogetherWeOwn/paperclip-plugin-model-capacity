@@ -67,7 +67,7 @@ import {
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
-import { buildCalibrationGroups, pooledBurnPerRun, perAccountRawBurn, capacityWeights } from './pools.mjs';
+import { buildCalibrationGroups, pooledBurnPerRun, perAccountRawBurn, boundBurnPerRun, boundSoloBurn } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
@@ -2103,22 +2103,47 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
     // Plan-size aware individualization: a lane inherits its group's pooled E
     // only until its own meter-vs-runs sample is measurable (minimal sample:
-    // PLAN_SIZE.minRunsForIndiv group runs over its own span), then its own
+    // PLAN_SIZE.minRunsForIndiv lane runs over its own span), then its own
     // smoothed burn drives its share. The first sample jumps at once (fast
     // outlier path: a 4x plan is detected as soon as its meter history spans
-    // the floor); later samples smooth normally. The capacity weight is the
-    // group median burn over the lane burn, clamped (see pools.mjs).
+    // the floor); later samples smooth normally. Lane runs are the ENFORCED
+    // hook picks onto the lane (started, decision inside the span -- the only
+    // picks that outrank reality, same discipline as E calibration) plus an
+    // even split of the group's other mapped runs, whose lane is unknowable;
+    // runs never mapped to the group stay out entirely, so per-lane counts
+    // always partition the pooled run count instead of exceeding it.
+    // Share-driving burns are bounded to the group median (see pools.mjs),
+    // so one thin sample cannot mint capacity.
+    const enforcedBurningInSpan = (gid, accountId, spanMs) => {
+      let n = 0;
+      for (const r of ledger.values()) {
+        if (r?.enforced !== true) continue;
+        if (r?.decidedAccount !== accountId) continue;
+        if (groupOfRun(r) !== gid) continue;
+        // Same anchor as the pooled count (startedAt): a run decided inside
+        // the span but started before it did not burn inside the span.
+        if (!(r?.startedAt >= nowMs - spanMs && r?.startedAt <= nowMs)) continue;
+        n += 1;
+      }
+      return n;
+    };
     const prevIndivE = smoothState.E_indiv != null && typeof smoothState.E_indiv === 'object'
       ? smoothState.E_indiv : {};
     const nextIndivE = new Map();
     const indivE = new Map(); // accountId -> smoothed per-lane burn per run
     for (const [gid, memberKeys] of calibMembers) {
+      const width = memberKeys.length;
       const rawByMember = perAccountRawBurn({
         memberKeys,
         historyOf: (k) => rateHistories[k] ?? [],
         spanMsOf: (k) => viewByKey.get(k)?.rateSpanMs ?? null,
-        runsInSpan: (spanMs) => runsInGroupSpan(gid, spanMs),
-        width: memberKeys.length,
+        runsInSpanFor: (k, spanMs) => {
+          const enforced = enforcedBurningInSpan(gid, k, spanMs);
+          let enforcedTotal = 0;
+          for (const m of memberKeys) enforcedTotal += enforcedBurningInSpan(gid, m, spanMs);
+          const rest = Math.max(0, runsInGroupSpan(gid, spanMs) - enforcedTotal);
+          return enforced + rest / width;
+        },
         nowMs,
       });
       for (const k of memberKeys) {
@@ -2141,11 +2166,32 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
       }
     }
+    // Share-driving burns: individualized lanes bounded to the group median,
+    // non-individualized lanes keep the pooled group figure (as today).
+    const boundE = new Map(); // accountId -> burn driving targetShare/C*
     const weightOf = new Map();
     for (const [gid, memberKeys] of calibMembers) {
       const eff = {};
       for (const k of memberKeys) eff[k] = indivE.get(k) ?? groupE.get(gid) ?? null;
-      for (const [k, w] of capacityWeights(eff, memberKeys)) weightOf.set(k, w);
+      const { burns, weights } = boundBurnPerRun(eff, memberKeys);
+      // Solo lane: the group median is its own burn, so the bound above is
+      // vacuous -- clamp an individualized solo burn to the cross-group
+      // median instead, so a thin sample cannot mint unbounded share.
+      if (memberKeys.length === 1 && medianMeasuredE != null) {
+        const k = memberKeys[0];
+        if (burns.has(k) && indivE.has(k)) {
+          const solo = boundSoloBurn(burns.get(k), medianMeasuredE);
+          if (solo) {
+            burns.set(k, solo.burn);
+            weights.set(k, solo.weight);
+          }
+        }
+      }
+      for (const [k, w] of weights) weightOf.set(k, w);
+      for (const [k, b] of burns) boundE.set(k, b);
+      for (const k of memberKeys) {
+        if (!burns.has(k) && groupE.has(gid)) boundE.set(k, groupE.get(gid));
+      }
     }
     for (const [gid, memberKeys] of calibMembers) {
       if (calibrationGroups[gid] == null) continue;
@@ -2155,11 +2201,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
     // Each account's target share is requiredRate / E (runs/hour it can
     // sustain; proportions match the per-account C* concurrency targets).
-    // E prefers the lane's own measured burn-per-run, then the group's pooled
-    // burn, then the ladder-average burn, then the calibration reference
-    // anchor; the guessed fallbacks are floored at the median measured burn
-    // so an uncalibrated anchor cannot claim a bigger share than a measured
-    // peer (#1).
+    // E prefers the lane's own median-bounded burn-per-run, then the group's
+    // pooled burn, then the ladder-average burn, then the calibration
+    // reference anchor; the guessed fallbacks are floored at the median
+    // measured burn so an uncalibrated anchor cannot claim a bigger share
+    // than a measured peer (#1).
     {
       const refAnchor = config.calibration?.referenceBurnPerRunPct ?? 0.0005;
       for (let i = 0; i < snapshot.accounts.length; i++) {
@@ -2168,7 +2214,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!view) continue;
         view.pool = poolOfKey(key);
         view.calibrationGroup = calibGroupOf.get(key) ?? key;
-        let E = indivE.get(key) ?? groupE.get(view.calibrationGroup) ?? null;
+        let E = boundE.get(key) ?? groupE.get(view.calibrationGroup) ?? null;
         view.burnCalibrated = E != null;
         view.burnIndividualized = indivE.has(key);
         if (E == null) {
@@ -2405,7 +2451,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
           })(),
           burnPerRunPct: burnOf(a.accountId),
-          measuredBurnPerRunPct: indivE.get(a.accountId) ?? groupE.get(gid) ?? null,
+          measuredBurnPerRunPct: boundE.get(a.accountId) ?? groupE.get(gid) ?? null,
           runsInWindow: runsInGroupSpan(gid, rateWindowMs),
           guardActive: a.guardActive,
           healthy: a.health === 'healthy' && a.action !== 'excluded',
