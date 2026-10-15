@@ -226,21 +226,24 @@ const MIN = 60000;
 const DRAIN_MODELS = ['gpt-6.1-sol', 'gpt-6.1-sol-lite', 'gpt-6.1-sol-micro'];
 const DRAIN_SLUGS = ['gpt-6-1-sol', 'gpt-6-1-sol-lite', 'gpt-6-1-sol-micro'];
 
-function driveDrain({ fractions, creditResetsAtH = 48 }) {
+function driveDrain({ fractions, creditResetsAtH = 48, creditFromStep = 0, preCreditWeekly = 0.9 }) {
   const state = new Map();
   const jobs = new Map();
   const handlers = new Map();
   let now = T0;
   let step = 0;
-  const accounts = () => [{
-    lane: 'cr', provider: 'codex', accountKey: 'cr', health: 'healthy', models: DRAIN_MODELS,
-    weekly: { used: 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
-    fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
-    observedAt: new Date(now).toISOString(), quality: 'live',
-    credits: [{ type: 'codex-credits', hasCredits: true, balance: 10,
-      ...(fractions[step] == null ? {} : { fraction: fractions[step] }),
-      resetsAt: new Date(T0 + creditResetsAtH * 3600000).toISOString() }],
-  }];
+  const accounts = () => {
+    const pre = step < creditFromStep;
+    return [{
+      lane: 'cr', provider: 'codex', accountKey: 'cr', health: 'healthy', models: DRAIN_MODELS,
+      weekly: { used: pre ? preCreditWeekly : 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+      fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+      observedAt: new Date(now).toISOString(), quality: 'live',
+      ...(!pre ? { credits: [{ type: 'codex-credits', hasCredits: true, balance: 10,
+        ...(fractions[step] == null ? {} : { fraction: fractions[step] }),
+        resetsAt: new Date(T0 + creditResetsAtH * 3600000).toISOString() }] } : {}),
+    }];
+  };
   const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
   const io = {
     config: { get: async () => config },
@@ -309,6 +312,31 @@ test('fraction-less credit lane holds the pointer on a multi-rung ladder', async
     assert.equal(view.headroomPct, 1);
     assert.notEqual(view.action, 'excluded');
     assert.equal(view.pointer, 0, `tick ${i}: pointer holds with no fraction signal`);
+  }
+});
+
+// Review round 3: pin positionError = 0 for credit lanes above the floor.
+// The lane first climbs on its weekly meter alone, then a fraction-less
+// credit entry arrives: the pointer must hold its rung instead of descending
+// on the synthetic 0%-used surplus (without the fix it falls 2→1→0 within
+// three ticks).
+test('fraction-less credit lane holds above the floor', async () => {
+  const d = driveDrain({ fractions: Array(60).fill(null), creditFromStep: 30 });
+  await d.setup();
+  let cap;
+  let rung = -1;
+  for (let i = 0; i < 30; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.ok(view.arms.length >= 3, `multi-rung ladder, got ${view.arms.length} arms`);
+    if (view.pointer >= 2) { rung = view.pointer; break; }
+  }
+  assert.ok(rung >= 2, `lane climbs above the floor on its weekly meter (rung ${rung})`);
+  for (let i = 30; i < 50; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.equal(view.headroomPct, 1, `tick ${i}: credit headroom is full-window`);
+    assert.equal(view.pointer, rung, `tick ${i}: pointer holds rung ${rung} with no fraction signal`);
   }
 });
 
@@ -407,3 +435,4 @@ test('C* slots scale with the credit horizon', async () => {
   const req48 = cap.accounts.find(a => a.accountId === 'codex:cr48').requiredRatePerHour;
   assert.ok(Math.abs(req48 - 0.5 / 47.5) < 1e-9, `required paces the 48h credit horizon: ${req48}`);
 });
+
