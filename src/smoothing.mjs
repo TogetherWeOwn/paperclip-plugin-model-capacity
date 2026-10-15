@@ -21,9 +21,35 @@ export const SMOOTHING_DEFAULTS = Object.freeze({
    * target that lags upward only under-uses it for a while.
    */
   targetDownHalfLifeMin: 10,
+  /** Verified additional capacity ramps quickly, not instantaneously. */
+  verifiedUpHalfLifeMin: 5,
+  /** Six default fast half-lives; events never extend themselves by polling. */
+  verifiedUpWindowMin: 30,
   /** A smoothed value older than this (no fresh sample) is dropped. */
   staleHours: 6,
 });
+
+/** Numeric knobs only; malformed config cannot disable damping. */
+export function normalizeSmoothing(raw) {
+  return Object.fromEntries(Object.entries(SMOOTHING_DEFAULTS).map(([key, fallback]) => [key,
+    typeof raw?.[key] === 'number' && Number.isFinite(raw[key]) && raw[key] > 0 ? raw[key] : fallback,
+  ]));
+}
+
+/** Persist a bounded fast-ramp window alongside the unrounded target. */
+export function smoothTarget(prev, sample, nowMs, { verifiedHeadroom = false, config = {} } = {}) {
+  const c = normalizeSmoothing(config);
+  if (!(sample > 0) || !Number.isFinite(sample)) return { target: null, fastUntilMs: 0 };
+  const fastUntilMs = verifiedHeadroom ? nowMs + c.verifiedUpWindowMin * 60000 : (prev?.fastUntilMs ?? 0);
+  return {
+    fastUntilMs,
+    target: smoothValue(prev?.target, sample, nowMs, {
+      halfLifeMs: (nowMs <= fastUntilMs ? Math.min(c.halfLifeMin, c.verifiedUpHalfLifeMin) : c.halfLifeMin) * 60000,
+      downHalfLifeMs: c.targetDownHalfLifeMin * 60000,
+      staleMs: c.staleHours * 3600000,
+    }),
+  };
+}
 
 const decay = (dtMs, halfLifeMs) => {
   if (!(halfLifeMs > 0)) return 0;

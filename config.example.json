@@ -83,6 +83,17 @@
     "doerStarvationMarginRuns": 4,
     "doerStarvationSustainMs": 600000
   },
+  "smoothing": {
+    "halfLifeMin": 30,
+    "targetDownHalfLifeMin": 10,
+    "verifiedUpHalfLifeMin": 5,
+    "verifiedUpWindowMin": 30,
+    "staleHours": 6
+  },
+  "credits": {
+    "freeTypes": ["codex-credits"],
+    "paidTypes": []
+  },
   "concurrency": {
     "maxTotal": 75,
     "meanRunDurationHours": 0.186

@@ -90,6 +90,19 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.46 = PER-ACCOUNT PLAN CALIBRATION + CREDIT POOLS + VERIFIED RAMP:
+ * meter-aligned per-account burn individualizes E within a calibration
+ * group (pooled E stays the cold-start prior; a missing or reset peer
+ * counter leaves the whole group on the prior); weekly-spent accounts with
+ * a spendable free-credit balance stay available, paced to drain the credit
+ * pool over the credit horizon. Upward capacity events (new account, reset,
+ * guard end, recovery) no longer serve the raw target at once: the v0.2.44
+ * instant bypass is retired and verified additional capacity ramps on a
+ * 5-minute half-life over a bounded 30-minute window, only for
+ * already-calibrated accounts (an uncalibrated feed addition keeps full
+ * damping); the rung-cooldown bypass on upward transitions is unchanged.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.44 = REVIEWER ROUTING + CAPACITY AUTO-HEAL: reviewer is a first-class
  * role (runnable capacity from qualified providers, default Claude only, plus
  * the hold/resume signal the review gate reads); feed diffs bypass the rung
@@ -223,7 +236,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.45';
+export const PLUGIN_VERSION = '0.2.46';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -561,6 +574,25 @@ const CONFIG_SCHEMA = {
             },
           },
         },
+      },
+    },
+    smoothing: {
+      type: 'object', additionalProperties: false,
+      description: 'Burn/cap damping and asymmetric fleet-target ramp. Verified headroom uses a bounded faster upward ramp; safety sheds are immediate.',
+      properties: {
+        halfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 30 },
+        targetDownHalfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 10 },
+        verifiedUpHalfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 5 },
+        verifiedUpWindowMin: { type: 'number', exclusiveMinimum: 0, default: 30 },
+        staleHours: { type: 'number', exclusiveMinimum: 0, default: 6 },
+      },
+    },
+    credits: {
+      type: 'object', additionalProperties: false,
+      description: 'Per-account credit pools: a weekly-spent account with a spendable balance stays available, paced to drain. Free-grant types spend by default; paid types only when listed.',
+      properties: {
+        freeTypes: { type: 'array', items: { type: 'string' }, default: ['codex-credits'], description: 'Free-grant credit types, spendable without further opt-in.' },
+        paidTypes: { type: 'array', items: { type: 'string' }, default: [], description: 'Paid credit types the operator additionally allows as capacity.' },
       },
     },
     shadow: {

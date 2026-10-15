@@ -59,6 +59,7 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
+import { normalizeCredits, usableCredit } from './credits.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
@@ -68,7 +69,8 @@ import {
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
-import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
+import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
+import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
@@ -263,6 +265,22 @@ export function validateConfigShape(raw) {
     }
     if ('exhaustedPct' in rr && !(typeof rr.exhaustedPct === 'number' && rr.exhaustedPct > 0 && rr.exhaustedPct <= 1)) {
       errors.push('reviewReserve.exhaustedPct must be a number in (0, 1]');
+    }
+  }
+  if (raw.smoothing != null) {
+    if (typeof raw.smoothing !== 'object' || Array.isArray(raw.smoothing)) errors.push('smoothing must be an object');
+    else for (const [key, value] of Object.entries(raw.smoothing)) {
+      if (!Object.hasOwn(SMOOTHING_DEFAULTS, key)) errors.push(`smoothing.${key} is unknown`);
+      else if (!(typeof value === 'number' && Number.isFinite(value) && value > 0)) errors.push(`smoothing.${key} must be a finite number > 0`);
+    }
+  }
+  if (raw.credits != null) {
+    if (typeof raw.credits !== 'object' || Array.isArray(raw.credits)) errors.push('credits must be an object');
+    else for (const [key, value] of Object.entries(raw.credits)) {
+      if (key !== 'freeTypes' && key !== 'paidTypes') errors.push(`credits.${key} is unknown`);
+      else if (!Array.isArray(value) || value.some(t => typeof t !== 'string' || t.trim().length === 0)) {
+        errors.push(`credits.${key} must be an array of non-empty strings`);
+      }
     }
   }
   const rv = raw.reviewer;
@@ -539,6 +557,10 @@ export function resolveConfig(raw = {}) {
     // free reset) so quota is spent when a provider restore lands. Enabled by
     // default; enabled:false restores linear-to-regular-reset pacing bit-for-bit.
     burnHorizon: normalizeBurnHorizon(raw.burnHorizon),
+    smoothing: normalizeSmoothing(raw.smoothing),
+    // Generic credit pools (see credits.mjs): free-grant types stay available
+    // past weekly exhaustion, paced to drain; paid types only when allowed.
+    credits: normalizeCredits(raw.credits),
     concurrency: {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
@@ -1645,6 +1667,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const hoursToReset = resetAtMs != null
         ? Math.max((resetAtMs - nowMs) / 3600000, 0.25)
         : null;
+      // Free-grant credit pools (see credits.mjs): a weekly-spent account
+      // with a spendable credit balance stays available, paced to drain the
+      // credits over the credit (else weekly) horizon. Detection is here so
+      // the required rate and plan position below already pace the credits;
+      // the headroom source and the exclusion gate follow suit below.
+      const credit = weeklyUsed != null && Math.max(0, 1 - weeklyUsed) <= WEEKLY_EXHAUSTED_PCT
+        ? usableCredit(account.credits, config.credits)
+        : null;
       // Burn horizon (see burnhorizon.mjs): pace to min(regular reset, H) so
       // the account is allowed to run ahead of linear pace when a provider
       // free reset is expected. Null reads as the regular reset (fail open).
@@ -1672,7 +1702,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
       }
       rateHistories[key] = history;
-      const measured = weeklyUsed != null
+      // Credit lanes pace the CREDIT drain, not the flat weekly meter (which
+      // sits at 100% while credits are spent and would read as rate 0
+      // forever): track the credit fraction as its own utilization series
+      // (1 - fraction) so the controller measures the real drain rate. An
+      // unquantified fraction has no measurable rate and gets no position
+      // signal either (positionError 0 below), so the pointer holds instead
+      // of climbing to the ceiling on fiction.
+      let creditHistory = null;
+      if (credit != null) {
+        const cFractionNow = credit.entry.fraction;
+        creditHistory = rateHistories[`credit:${key}`] ?? [];
+        if (cFractionNow != null) {
+          const cReadingAtMs = account.signalsAtMs ?? snapshot.observedAtMs ?? nowMs;
+          const cUsed = 1 - cFractionNow;
+          const cDup = creditHistory.some(p => p.atMs === cReadingAtMs && p.usedPct === cUsed);
+          if (!cDup) creditHistory = appendUtilReading(creditHistory, { atMs: cReadingAtMs, usedPct: cUsed }, nowMs);
+        }
+        rateHistories[`credit:${key}`] = creditHistory;
+      }
+      let measured = weeklyUsed != null
         ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
         : null;
       // New-account warmup : the CONTROLLER does not act on rate
@@ -1692,18 +1741,46 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const historySpanMs = history.length >= 2 ? history[history.length - 1].atMs - history[0].atMs : 0;
         warmingUp = isWarmupSpan(historySpanMs);
       }
+      if (credit != null) {
+        // The weekly series is flat at 100% on a credit lane, so its rate
+        // (0) and span (old) are both lies: measure the credit drain, and
+        // hold position pacing until the credit series spans the floor.
+        if ((creditHistory?.length ?? 0) >= 2) {
+          measured = measuredRatePerHour(creditHistory, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin);
+          warmingUp = isWarmupSpan(creditHistory[creditHistory.length - 1].atMs - creditHistory[0].atMs);
+        } else {
+          measured = null;
+          warmingUp = true;
+        }
+      }
       const controlMeasured = warmingUp ? null : measured;
       // Required rate needs no history and no calibration: whenever the
       // remaining fraction and the reset are both known it is a number.
       // Null (unknown) only when an input is missing -- never a 0 that
       // would read as "burn nothing".
-      const required = remaining != null && hoursToPaceReset != null
+      let required = remaining != null && hoursToPaceReset != null
         ? requiredRatePerHour({ remainingPct: remaining, hoursToReset: hoursToPaceReset })
         : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
-      const positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
+      let positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
         : 0;
+      if (credit != null) {
+        // Drain pace: the fraction (else a full window) paces the required
+        // rate over the credit (else weekly) horizon. There is deliberately
+        // NO position signal: windowStartMs assumes a 7-day weekly window,
+        // but the credit window's start is unknowable from a reset timestamp
+        // alone, so any scheduleError is fiction (a 48h credit reset reads
+        // ~43% behind and climbs to the ceiling on tick 0). Rate-only pacing
+        // holds through warmup and follows the measured credit drain after;
+        // the positive-balance guard above cuts the account off at zero on
+        // the next feed poll.
+        const cFraction = credit.entry.fraction ?? 1;
+        const cResetMs = credit.entry.resetsAtMs ?? resetAtMs;
+        const cHours = cResetMs != null ? Math.max((cResetMs - nowMs) / 3600000, 0.25) : null;
+        if (cHours != null) required = requiredRatePerHour({ remainingPct: cFraction, hoursToReset: cHours });
+        positionError = 0;
+      }
       // Plan position for the pace guard: the same error, but only while the
       // reading sits on a weekly window (reset ahead of now and no further
       // than one window plus clock slack). scheduleError clamps outside it,
@@ -1786,7 +1863,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const weeklySpent = weeklyRemaining != null && weeklyRemaining <= WEEKLY_EXHAUSTED_PCT;
       let headroomPct = null;
       let headroomSource = null;
-      if (weeklySpent) {
+      if (credit != null) {
+        // Backup capacity: the quantified fraction is the headroom. An
+        // unquantified fraction (balance asserted positive) reads as a full
+        // window so the lane stays routable; the balance guard cuts it off
+        // at zero on the next feed poll.
+        headroomPct = credit.entry.fraction ?? 1;
+        headroomSource = 'credits';
+      } else if (weeklySpent) {
         headroomPct = weeklyRemaining;
         headroomSource = 'weekly';
       } else if (fiveHourRemaining != null) {
@@ -1797,8 +1881,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         headroomSource = 'weekly-fallback';
       }
       // A healthy feed entry whose weekly window is spent cannot serve runs
-      // until it resets: report it excluded instead of narrating a hold.
-      if (account.health === 'healthy' && weeklySpent) {
+      // until it resets -- unless a spendable credit pool covers it (see
+      // above): report it excluded instead of narrating a hold.
+      if (account.health === 'healthy' && weeklySpent && credit == null) {
         step = {
           ...step,
           guardActive: false,
@@ -1829,6 +1914,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         fiveHourUsedPct: fiveHourUsed,
         headroomPct,
         headroomSource,
+        creditType: credit?.entry.type ?? null,
+        creditFree: credit?.creditFree ?? null,
+        creditBalance: credit?.entry.balance ?? null,
+        creditFraction: credit?.entry.fraction ?? null,
+        creditResetAtMs: credit?.entry.resetsAtMs ?? null,
         resetAtMs,
         remainingPct: remaining,
         hoursToReset,
@@ -2050,24 +2140,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (calibrationAccountOf(r) == null) unmappedRuns += 1;
     }
 
-    // Pooled-provider calibration. CLIProxy round-robins a
-    // provider's credentials, but a run maps to ONE lane (the first serving
-    // its model), so per-lane E divided one lane's delta by every pool run
-    // (~pool-width too low) and left sibling lanes uncalibrated. E is
-    // therefore measured per calibration GROUP: summed lane deltas over runs
-    // started on any member (see pools.mjs), EWMA-smoothed (#3), and read
-    // identically by every member.
+    // Pooled burn remains the cold-start prior. Real credential usage counters
+    // below individualize E; model-mapped lane identities alone never do so.
     const { groupOf: calibGroupOf, members: calibMembers } = buildCalibrationGroups(snapshot.accounts, stateKeys);
     const groupOfRun = (r) => calibGroupOf.get(calibrationAccountOf(r)) ?? null;
     const runsInGroupSpan = (gid, spanMs) => startedOnCountWhere(ledger, gid, nowMs - spanMs, groupOfRun);
     const viewByKey = new Map(accountViews.map(v => [v.accountId, v]));
     const smoothState = (await ctx.state.get(scopeKey(companyId, SMOOTH_KEY))) ?? {};
     const smoothOpts = {
-      halfLifeMs: SMOOTHING_DEFAULTS.halfLifeMin * 60000,
-      staleMs: SMOOTHING_DEFAULTS.staleHours * 3600000,
+      halfLifeMs: config.smoothing.halfLifeMin * 60000,
+      staleMs: config.smoothing.staleHours * 3600000,
     };
-    // The target falls on a shorter half-life than it rises (see smoothing.mjs).
-    const targetSmoothOpts = { ...smoothOpts, downHalfLifeMs: SMOOTHING_DEFAULTS.targetDownHalfLifeMin * 60000 };
+    const accountUsage = new Map(snapshot.accounts.map((a, i) => [stateKeys[i],
+      appendAccountUsage(smoothState.accountUsage?.[stateKeys[i]], a, nowMs),
+    ]));
     const prevSmoothE = smoothState.E != null && typeof smoothState.E === 'object' ? smoothState.E : {};
     const nextSmoothE = new Map();
     const groupE = new Map(); // gid -> smoothed pooled burn per run
@@ -2100,6 +2186,35 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
     const medianMeasuredE = medianPositive([...groupE.values()]);
+    const accountE = new Map();
+    const nextAccountE = new Map();
+    let verifiedPlanHeadroom = false;
+    for (const [gid, memberKeys] of calibMembers) {
+      const measured = calibrateAccounts({
+        memberKeys, historyOf: k => accountUsage.get(k),
+        groupBurnPerRunPct: groupE.get(gid) ?? null,
+        runsBetween: (from, to) => [...ledger.values()].filter(r => {
+          const at = r.startedAt ?? r.decidedAt;
+          return at > from && at <= to && groupOfRun(r) === gid;
+        }).length,
+        nowMs,
+      });
+      for (const [key, sample] of measured) {
+        const history = accountUsage.get(key);
+        const last = history?.at(-1);
+        const previous = Object.hasOwn(smoothState.accountE ?? {}, key) ? smoothState.accountE[key] : null;
+        const fresh = sample.source !== 'group-prior';
+        // Missing/no-motion readings carry knowledge, not fake new evidence.
+        // Epoch changes and stale knowledge discard the individual estimate.
+        const entry = fresh ? { ...sample, atMs: last.atMs, epoch: last.epoch }
+          : previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
+        accountE.set(key, entry);
+        if (entry.source !== 'group-prior') nextAccountE.set(key, entry);
+        const view = viewByKey.get(key);
+        if (fresh && view?.health === 'healthy' && view.action !== 'excluded' && !view.guardActive
+          && entry.capacityWeight >= (previous?.capacityWeight ?? 1) * 1.25) verifiedPlanHeadroom = true;
+      }
+    }
 
     // Each account's target share is requiredRate / E (runs/hour it can
     // sustain; proportions match the per-account C* concurrency targets).
@@ -2115,7 +2230,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!view) continue;
         view.pool = poolOfKey(key);
         view.calibrationGroup = calibGroupOf.get(key) ?? key;
-        let E = groupE.get(view.calibrationGroup) ?? null;
+        const individual = accountE.get(key);
+        let E = individual?.burnPerRunPct ?? groupE.get(view.calibrationGroup) ?? null;
+        view.capacityWeight = individual?.capacityWeight ?? 1;
+        view.calibrationConfidence = individual?.confidence ?? 0;
+        view.calibrationSource = individual?.source ?? 'group-prior';
+        view.attributedRuns = individual?.attributedRuns ?? null;
+        view.groupMedianBurnPerRunPct = individual?.groupMedianBurnPerRunPct ?? groupE.get(view.calibrationGroup) ?? null;
+        view.fiveHourBurnPerRunPct = individual?.fiveHourBurnPerRunPct ?? null;
         view.burnCalibrated = E != null;
         if (E == null) {
           const vals = Object.values(ladders[key]?.burnPerRunPct ?? {}).filter(v => v != null);
@@ -2340,18 +2462,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return {
           accountId: a.accountId,
           calibrationGroup: gid,
-          remainingPct: a.remainingPct ?? 0,
+          // Credit lanes pace the credit pool, not the spent weekly window:
+          // the C* need uses the credit fraction (else a full window) over
+          // the credit reset horizon, so the fleet target counts the credits.
+          remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.remainingPct ?? 0),
           // The C* need is the same term as targetShare (requiredRate / E):
           // both pace to the burn end, so the fleet target moves with the
           // allowance the horizon grants. burnHorizonMs is set only when a
           // finite regular reset binds after it, so the fallback is exact.
           hoursToReset: (() => {
+            if (a.creditType != null && a.creditResetAtMs != null) {
+              return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
+            }
             const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
             return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
           })(),
           burnPerRunPct: burnOf(a.accountId),
-          measuredBurnPerRunPct: groupE.get(gid) ?? null,
-          runsInWindow: runsInGroupSpan(gid, rateWindowMs),
+          measuredBurnPerRunPct: accountE.get(a.accountId)?.burnPerRunPct ?? groupE.get(gid) ?? null,
+          groupMedianBurnPerRunPct: viewByKey.get(a.accountId)?.groupMedianBurnPerRunPct ?? null,
+          runsInWindow: accountE.get(a.accountId)?.attributedRuns ?? runsInGroupSpan(gid, rateWindowMs),
           guardActive: a.guardActive,
           healthy: a.health === 'healthy' && a.action !== 'excluded',
         };
@@ -2363,20 +2492,27 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
     });
-    for (const row of concurrency.perAccount) row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
+    for (const row of concurrency.perAccount) {
+      row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
+      row.capacityWeight = accountE.get(row.accountId)?.capacityWeight ?? 1;
+    }
     // EWMA the served target. A zero (everything guarded: shed now) and a
     // null (weak: nothing measured) pass through unsmoothed and reset the
     // series, so safety sheds are never lagged.
     const rawTarget = concurrency.target;
-    let nextSmoothTarget = null;
+    // New accounts need their own evidence before an accelerated ramp. A
+    // previously known healthy account's reset/recovery can use its existing
+    // calibration. An uncalibrated feed addition never removes damping.
+    const verifiedFeedHeadroom = [...capacityDiff.upwardIds].some(key => {
+      const v = viewByKey.get(key);
+      return v?.health === 'healthy' && v.action !== 'excluded' && !v.guardActive && v.burnCalibrated
+        && (!capacityDiff.added.includes(key) || v.calibrationSource !== 'group-prior');
+    });
+    const targetStep = smoothTarget(smoothState, rawTarget, nowMs, {
+      verifiedHeadroom: verifiedPlanHeadroom || verifiedFeedHeadroom, config: config.smoothing,
+    });
+    const nextSmoothTarget = targetStep.target;
     if (rawTarget != null && rawTarget > 0) {
-      const prevT = Object.hasOwn(smoothState, 'target') ? smoothState.target : null;
-      // Auto-heal fast path: upward capacity transitions serve the raw target
-      // at once (no EWMA rise lag) so new/reset capacity raises caps now.
-      const upwardFastPath = capacityDiff.upwardIds.size > 0;
-      nextSmoothTarget = upwardFastPath
-        ? { value: rawTarget, atMs: nowMs }
-        : smoothValue(prevT, rawTarget, nowMs, targetSmoothOpts);
       concurrency.target = Math.min(nextSmoothTarget.value, config.concurrency.maxTotal);
       // Demand bound (current queues, applied after smoothing so a surge is
       // not lagged): never serve more concurrency than the queued work can
@@ -2958,6 +3094,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
     await ctx.state.set(scopeKey(companyId, SMOOTH_KEY), {
       atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
+      fastUntilMs: targetStep.fastUntilMs,
+      accountUsage: Object.fromEntries(accountUsage), accountE: Object.fromEntries(nextAccountE),
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
@@ -3122,11 +3260,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       medianMeasuredBurnPct: concurrency.medianMeasuredBurnPct ?? null,
       // Calibration groups: pooled providers measured as one (members > 1).
       calibrationGroups,
-      smoothing: {
-        halfLifeMin: SMOOTHING_DEFAULTS.halfLifeMin,
-        targetDownHalfLifeMin: SMOOTHING_DEFAULTS.targetDownHalfLifeMin,
-        staleHours: SMOOTHING_DEFAULTS.staleHours,
-      },
+      smoothing: { ...config.smoothing, fastUntilMs: targetStep.fastUntilMs },
       perAccount: concurrency.perAccount,
       accounts: accountViews,
       skippedArms: skipped,
@@ -3817,8 +3951,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         try {
           const prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
           const held = holdCaps(unheld, prevHold, nowMs, {
-            halfLifeMs: SMOOTHING_DEFAULTS.halfLifeMin * 60000,
-            staleMs: SMOOTHING_DEFAULTS.staleHours * 3600000,
+            halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
+            staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
             ceiling: cap.maxTotal ?? 75,
           });
           agents = held.entries;

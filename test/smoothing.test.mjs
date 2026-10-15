@@ -1,6 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ewma, smoothValue, holdCaps, SMOOTHING_DEFAULTS } from '../src/smoothing.mjs';
+import { ewma, smoothValue, smoothTarget, normalizeSmoothing, holdCaps, SMOOTHING_DEFAULTS } from '../src/smoothing.mjs';
+import { validateConfigShape } from '../src/plugin.mjs';
+import { buildManifest } from '../src/manifest.mjs';
+
+test('verified headroom rises on 5 minutes for a bounded event, never bypasses the down ramp', () => {
+  const now = 1_750_000_000_000;
+  let state = { target: { value: 4, atMs: now }, fastUntilMs: 0 };
+  const normal = smoothTarget(state, 16, now + 5 * 60000);
+  state = smoothTarget(state, 16, now + 5 * 60000, { verifiedHeadroom: true });
+  assert.equal(state.target.value, 10);
+  assert.ok(normal.target.value < 6);
+  const expiry = state.fastUntilMs;
+  const values = [state.target.value];
+  for (let minute = 10; minute <= 30; minute += 5) {
+    state = smoothTarget(state, 16, now + minute * 60000);
+    assert.equal(state.fastUntilMs, expiry, 'repeated samples do not renew an event');
+    values.push(state.target.value);
+  }
+  assert.ok(state.target.value / 4 > 3.9, '4x headroom is available within 30 minutes');
+  assert.ok(values.every((v, i) => i === 0 || (v >= values[i - 1] && v <= 16)), 'no overshoot/oscillation');
+  const down = smoothTarget(state, 4, now + 40 * 60000, { verifiedHeadroom: true });
+  assert.ok(Math.abs(down.target.value - (state.target.value + 4) / 2) < 1e-9);
+  assert.equal(smoothTarget(state, 0, now + 31 * 60000).target, null, 'safety shed clears smoothing');
+});
+
+test('smoothing is schema-declared, normalized and validated with the old defaults', () => {
+  assert.equal(normalizeSmoothing({}).halfLifeMin, 30);
+  assert.equal(normalizeSmoothing({}).targetDownHalfLifeMin, 10);
+  assert.equal(normalizeSmoothing({ halfLifeMin: 12 }).halfLifeMin, 12);
+  for (const value of [0, -1, Infinity, NaN, '5']) {
+    assert.equal(normalizeSmoothing({ halfLifeMin: value }).halfLifeMin, 30);
+    assert.ok(validateConfigShape({ smoothing: { halfLifeMin: value } }).length > 0);
+  }
+  const schema = buildManifest().instanceConfigSchema.properties.smoothing;
+  assert.equal(schema.properties.verifiedUpHalfLifeMin.default, 5);
+});
 
 // Live 12:05-12:56Z: target 28 -> 25 -> 20 -> 27.8 -> 11.8;
 // one agent want 16 -> 13 -> 9 -> 6 -> 10 -> 9 -> 7 -> 8 -> 12.

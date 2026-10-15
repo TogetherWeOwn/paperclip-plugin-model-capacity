@@ -156,6 +156,31 @@ export function parseFreeResets(body, nowMs = Date.now()) {
 }
 
 /**
+ * Generic per-account credit pools (see credits.mjs). Absent reads as null
+ * (no credits known); malformed entries are dropped individually, never
+ * promoted to capacity. Type names normalize to lowercase.
+ */
+export function parseCredits(raw) {
+  if (raw == null) return null;
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const c of raw) {
+    if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+    if (typeof c.type !== 'string' || c.type.trim().length === 0) continue;
+    const balance = typeof c.balance === 'number' && Number.isFinite(c.balance) && c.balance >= 0 ? c.balance : null;
+    const fraction = typeof c.fraction === 'number' && Number.isFinite(c.fraction)
+      && c.fraction >= 0 && c.fraction <= 1 ? c.fraction : null;
+    out.push({
+      type: c.type.trim().toLowerCase(),
+      hasCredits: c.hasCredits === true,
+      balance, fraction,
+      resetsAtMs: msOrNull(c.resetsAt) ?? null,
+    });
+  }
+  return out;
+}
+
+/**
  * Normalize one lane account entry. Unhealthy or unparseable entries are
  * kept with null windows (the pacer treats unknown as hold, never as
  * headroom) rather than dropped, so the shadow log can show the gap.
@@ -192,6 +217,16 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     weekly: { ...weekly, resetsAtMs: msOrNull(weekly.resetsAt) },
     fiveHour: { ...fiveHour, resetsAtMs: msOrNull(fiveHour.resetsAt) },
     signalsAtMs: msOrNull(entry?.observedAt) ?? nowMs,
+    // Keeper counters are credential-attributed and aligned to this meter's
+    // timestamp. Absent/invalid provenance stays unknown, never zero.
+    usage: (() => {
+      const u = entry?.usage;
+      const atMs = msOrNull(u?.observedAt);
+      if (typeof u?.epoch !== 'string' || !u.epoch || atMs == null
+        || !Number.isSafeInteger(u.requests) || u.requests < 0) return null;
+      return { observedAtMs: atMs, epoch: u.epoch, requests: u.requests };
+    })(),
+    credits: parseCredits(entry?.credits),
     nowMs,
   };
 }

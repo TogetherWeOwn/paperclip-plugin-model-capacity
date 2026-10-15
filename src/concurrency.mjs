@@ -84,7 +84,8 @@ export function computeConcurrencyTarget({
   // median is over distinct groups, so a wide pool cannot outvote the rest.
   const measuredByGroup = new Map();
   for (const a of list) {
-    if (a.measuredBurnPerRunPct > 0) measuredByGroup.set(a.calibrationGroup ?? a.accountId, a.measuredBurnPerRunPct);
+    if (a.measuredBurnPerRunPct > 0) measuredByGroup.set(a.calibrationGroup ?? a.accountId,
+      a.groupMedianBurnPerRunPct > 0 ? a.groupMedianBurnPerRunPct : a.measuredBurnPerRunPct);
   }
   const medianMeasured = medianPositive([...measuredByGroup.values()]);
   const perAccount = list.map(a => {
