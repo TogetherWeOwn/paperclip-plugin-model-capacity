@@ -6,11 +6,12 @@ import {
   perAccountRawBurn,
   capacityWeights,
   boundBurnPerRun,
-  boundSoloBurn,
   PLAN_SIZE,
 } from '../src/pools.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { computeConcurrencyTarget } from '../src/concurrency.mjs';
+import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // A $200 Meta plan (~4x a standard plan) shares a calibration group with
 // eight standard lanes. Its meter moves ~1/4 per run, so its burn per run is
@@ -70,26 +71,32 @@ test('capacity weights scale the big lane ~4x relative to the group median', () 
   assert.ok(Math.abs(weights.get(memberKeys[8]) - 4) < 1e-6, `big: ${weights.get(memberKeys[8])}`);
 });
 
-test('weighted spread is a stable fixed point: exact burns at 4:1 traffic', () => {
-  // Once the big lane serves 4x runs (8 vs 2 of 10), its delta is 4x larger
-  // in absolute terms but per-run it is still 1/4: normalizing by the
-  // lane's OWN runs recovers the same burns and weights instead of
-  // collapsing them back to 1 (the even-share normalization did).
+test('round-robin: skewed picks do not move even-split burns', () => {
+  // True burns 0.001/0.00025 with N=40 round-robin runs (each lane burns 20):
+  // deltas 0.02/0.005. Weighted spreading skews the hook picks 8/32, but the
+  // meter still moves N/width per lane -- the even share recovers the true
+  // burns whatever the picks are. Dividing by the pick count (the old bug)
+  // reads 0.0025/0.000156 (2.5x/0.6x) and runs to the clamps.
   const keys = ['small', 'big'];
   const hists = new Map([
-    ['small', history(0.24, 0.243, NOW - 60 * MIN, NOW)],
-    ['big', history(0.10, 0.103, NOW - 60 * MIN, NOW)],
+    ['small', history(0.24, 0.26, NOW - 60 * MIN, NOW)],
+    ['big', history(0.10, 0.105, NOW - 60 * MIN, NOW)],
   ]);
-  const served = { small: 3, big: 12 };
+  const picks = { small: 8, big: 32 };
+  const groupRuns = 40;
   const raw = perAccountRawBurn({
     memberKeys: keys,
     historyOf: (k) => hists.get(k),
     spanMsOf: () => 60 * MIN,
-    runsInSpanFor: (k) => served[k],
+    runsInSpanFor: () => groupRuns / keys.length,
     nowMs: NOW,
   });
   assert.ok(Math.abs(raw.get('small') - 0.001) < 1e-9, `small: ${raw.get('small')}`);
   assert.ok(Math.abs(raw.get('big') - 0.00025) < 1e-9, `big: ${raw.get('big')}`);
+  // The old pick-count normalization drifts: pin that this test catches it.
+  assert.equal(0.02 / picks.small, 0.0025);
+  assert.ok((0.02 / picks.small) / 0.001 > 2, 'pick-count inflates the small lane');
+  assert.ok((0.005 / picks.big) / 0.00025 < 0.7, 'pick-count deflates the big lane');
   const weights = capacityWeights(raw);
   assert.ok(weights.get('big') / weights.get('small') > 3.9, `ratio holds: ${weights.get('big')}/${weights.get('small')}`);
 });
@@ -205,20 +212,19 @@ test('concurrency slots scale with per-account burn (~4x for the big lane)', () 
   assert.ok(Math.abs(ratio - 4) < 1e-9, `slots ratio ${ratio}`);
 });
 
-test('solo lanes clamp to the cross-group median, not their own burn', () => {
-  // A single-member group's median is its own burn (bound vacuous): the
-  // cross-group reference bounds it instead. Thin mint floored at M/8.
-  const mint = boundSoloBurn(0.00001, 0.001);
-  assert.equal(mint.burn, 0.001 / 8);
-  assert.equal(mint.weight, 8);
-  // Genuine 4x solo plan passes through.
-  const real = boundSoloBurn(0.00025, 0.001);
-  assert.equal(real.burn, 0.00025);
-  assert.equal(real.weight, 4);
-  // Unusable inputs yield null, never a guess.
-  assert.equal(boundSoloBurn(null, 0.001), null);
-  assert.equal(boundSoloBurn(0.001, null), null);
-  assert.equal(boundSoloBurn(0, 0.001), null);
+test('solo lanes keep their own burn: no cross-provider clamp', () => {
+  // A single-member group's median is its own burn, so the group-median bound
+  // is vacuous -- weight 1, burn unchanged. An expensive provider's lane
+  // (0.01553, ~15x a 0.001 median elsewhere) is never clamped to 4x another
+  // provider's median; burns are fractions of each lane's OWN weekly quota.
+  const solo = boundBurnPerRun({ 'claude:lane': 0.01553 }, ['claude:lane']);
+  assert.equal(solo.burns.get('claude:lane'), 0.01553);
+  assert.equal(solo.weights.get('claude:lane'), 1);
+  // A thin solo sample is still bounded only to its own group median
+  // (vacuous for width 1), never to a cross-group reference.
+  const thin = boundBurnPerRun({ 'codex:lane': 0.00001 }, ['codex:lane']);
+  assert.equal(thin.burns.get('codex:lane'), 0.00001);
+  assert.equal(thin.weights.get('codex:lane'), 1);
 });
 
 test('single-lane groups (mixed codex/claude plans) already individualize', () => {
@@ -229,4 +235,195 @@ test('single-lane groups (mixed codex/claude plans) already individualize', () =
   ];
   const { groupOf } = buildCalibrationGroups(accounts, ['codex:plus', 'codex:pro']);
   assert.notEqual(groupOf.get('codex:plus'), groupOf.get('codex:pro'));
+});
+
+// Shadow-tick wiring: two Meta lanes sharing one model individualize to
+// their own even-split burns (picks differ from burn: all 20 runs record on
+// lane-1 while CLIProxy round-robins), solos keep their own meters with no
+// cross-provider clamp, and every downstream surface (effectiveBurn,
+// targetShare, C* slots, capacityWeight, persisted E_indiv) follows the
+// individualized burn. A second phase with skewed enforced picks proves the
+// even split holds while the picks move.
+const PT0 = Date.parse('2026-10-10T12:00:00Z');
+const PSECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
+const PAA_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
+const paaRows = () => ([
+  { slug: 'muse-spark-1-3-xhigh', intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 },
+  { slug: 'claude-sonnet-5-5-high', intelligenceIndex: 66, intelligenceIndexCostPerTask: 18, price1mInputTokens: 3, price1mOutputTokens: 15 },
+  { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  { slug: 'gpt-oss-120b', intelligenceIndex: 33, intelligenceIndexCostPerTask: 4, price1mInputTokens: 0.1, price1mOutputTokens: 0.4 },
+]);
+const planLane = (o, now) => ({
+  lane: o.lane, provider: o.provider, accountKey: o.key, health: 'healthy', models: o.models,
+  weekly: { used: o.weekly, resetsAt: new Date(PT0 + 4 * 24 * 60 * MIN).toISOString() },
+  fiveHour: { used: o.fiveHour ?? 0.1, resetsAt: new Date(now + 4 * 60 * MIN).toISOString() },
+  observedAt: new Date(now).toISOString(), quality: 'live',
+});
+const planFleet = ({ now, small, big, claude, codex, guardSolos = false }) => ([
+  planLane({ lane: 'meta-small', provider: 'meta', key: 'meta-small', models: ['muse-spark-1.3-contributor'], weekly: small }, now),
+  planLane({ lane: 'meta-big', provider: 'meta', key: 'meta-big', models: ['muse-spark-1.3-contributor'], weekly: big }, now),
+  planLane({ lane: 'claude-1', provider: 'claude', key: 'claude-1', models: ['claude-sonnet-5-5'], weekly: claude, fiveHour: guardSolos ? 0.9 : 0.1 }, now),
+  planLane({ lane: 'codex-1', provider: 'codex', key: 'codex-1', models: ['gpt-5-3'], weekly: codex, fiveHour: guardSolos ? 0.9 : 0.1 }, now),
+]);
+const pStarted = (runId, atMs, agentId, model) => ({
+  type: 'agent.run.started', companyId: 'acme', entityId: runId,
+  payload: { run: { agentId, model } }, occurredAt: new Date(atMs).toISOString(),
+});
+const pFinished = (runId, atMs, agentId = 'eng') => ({
+  type: 'agent.run.finished', companyId: 'acme', entityId: runId,
+  payload: { run: { agentId } }, occurredAt: new Date(atMs).toISOString(),
+});
+const pHookParams = (runId) => ({
+  runId, companyId: 'acme', agentId: 'eng', issueId: null,
+  adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,
+  agentDefaultModel: null, previous: null, issueOverrideModel: null,
+  deadlineMs: 1500,
+});
+function planDrive({ config = {} } = {}) {
+  const store = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  const skey = (k) => JSON.stringify(k);
+  let now = PT0;
+  let accounts = [];
+  const io = {
+    config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: PSECRET } }) },
+    state: { get: async (k) => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts }, now) }) },
+    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    issues: {
+      get: async () => null,
+      list: async ({ status } = {}) => (status === 'todo' ? [{ id: 'i1', assigneeAgentId: 'eng', status: 'todo' }] : []),
+    },
+    jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+    events: { on: (n, fn) => { handlers.set(n, fn); } },
+    logger: { info() {}, error() {} },
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  return {
+    store,
+    setup: async () => {
+      await plugin.setup(io);
+      store.set(skey(PAA_KEY), { fetchedAt: new Date(PT0).toISOString(), rows: paaRows(), duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    step: async ({ at, fleet, fire = [] }) => {
+      now = at;
+      accounts = fleet;
+      for (const e of fire) await handlers.get(e.type)(e);
+      await jobs.get('shadow-tick')({});
+    },
+    hook: (runId) => plugin.onResolveRunModel(pHookParams(runId)),
+    capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+    setNow: (t) => { now = t; },
+  };
+}
+
+test('plan-size shadow tick: even-split individualization drives shares, slots, weights and persists', async () => {
+  const d = planDrive({ config: { enforce: true } });
+  await d.setup();
+  // 20 Meta runs (all record on lane-1 while the meter round-robins), 4
+  // Claude runs (expensive solo, delta 0.062 over 4 runs = 0.0155/run) and 4
+  // Codex runs (delta 0.004 over 4 runs = 0.001/run).
+  const metaRuns = Array.from({ length: 20 }, (_, i) => `ps-${i}`);
+  const claudeRuns = Array.from({ length: 4 }, (_, i) => `pc-${i}`);
+  const codexRuns = Array.from({ length: 4 }, (_, i) => `px-${i}`);
+  // Flat meters until the final reading so the first sample jumps at once
+  // (no EWMA lag): T0 and T0+12 read the same, T0+24 carries the full delta.
+  await d.step({
+    at: PT0, fleet: planFleet({ now: PT0, small: 0.29, big: 0.2975, claude: 0.20, codex: 0.10 }),
+  });
+  await d.step({
+    at: PT0 + 12 * MIN,
+    fleet: planFleet({ now: PT0 + 12 * MIN, small: 0.29, big: 0.2975, claude: 0.20, codex: 0.10 }),
+    fire: [
+      ...metaRuns.map((id, i) => pStarted(id, PT0 + 1 * MIN + i * 30 * 1000, 'eng', 'muse-spark-1.3-contributor')),
+      ...claudeRuns.map((id, i) => pStarted(id, PT0 + 2 * MIN + i * MIN, 'eng', 'claude-sonnet-5-5')),
+      ...codexRuns.map((id, i) => pStarted(id, PT0 + 3 * MIN + i * MIN, 'eng', 'gpt-5-3')),
+    ],
+  });
+  await d.step({
+    at: PT0 + 24 * MIN,
+    fleet: planFleet({ now: PT0 + 24 * MIN, small: 0.30, big: 0.30, claude: 0.262, codex: 0.104 }),
+    fire: [
+      ...metaRuns.map((id) => pFinished(id, PT0 + 24 * MIN)),
+      ...claudeRuns.map((id) => pFinished(id, PT0 + 24 * MIN)),
+      ...codexRuns.map((id) => pFinished(id, PT0 + 24 * MIN)),
+    ],
+  });
+  const cap = await d.capacity();
+  const byId = new Map(cap.accounts.map((a) => [a.accountId, a]));
+  const small = byId.get('meta:meta-small');
+  const big = byId.get('meta:meta-big');
+  const claude = byId.get('claude:claude-1');
+  const codex = byId.get('codex:codex-1');
+  assert.ok(small && big && claude && codex, 'all four lanes present');
+  // Same calibration group for the Meta pair, solos alone.
+  assert.equal(small.calibrationGroup, big.calibrationGroup, 'meta pair shares one group');
+  assert.notEqual(claude.calibrationGroup, small.calibrationGroup);
+  // Even-split burns: 0.01/10 and 0.0025/10, whatever the recorded lane.
+  // First sample jumps at once (no EWMA lag), so the figures are exact.
+  assert.ok(small.burnIndividualized === true && big.burnIndividualized === true, 'both meta lanes individualized');
+  assert.ok(Math.abs(small.effectiveBurnPerRunPct - 0.001) < 1e-9, `small burn ${small.effectiveBurnPerRunPct}`);
+  assert.ok(Math.abs(big.effectiveBurnPerRunPct - 0.00025) < 1e-9, `big burn ${big.effectiveBurnPerRunPct}`);
+  assert.ok(Math.abs((big.effectiveBurnPerRunPct / small.effectiveBurnPerRunPct) - 0.25) < 1e-9, 'big burns ~1/4 per run');
+  // Weights: median/small ~1, median/big ~4 (median of [0.001, 0.00025] = 0.000625).
+  assert.ok(Math.abs((small.capacityWeight ?? 1) - 0.625) < 0.15, `small weight ${small.capacityWeight}`);
+  assert.ok(Math.abs((big.capacityWeight ?? 1) - 2.5) < 0.5, `big weight ${big.capacityWeight}`);
+  assert.ok((big.capacityWeight ?? 0) > (small.capacityWeight ?? 0) * 3, 'big weighs ~4x small');
+  // TargetShare and C* follow the individualized burn (~4x for the big lane).
+  assert.ok(small.targetShare != null && big.targetShare != null);
+  assert.ok((big.targetShare / small.targetShare) > 3 && (big.targetShare / small.targetShare) < 5, `share ratio ${big.targetShare}/${small.targetShare}`);
+  const perAcc = new Map(cap.perAccount.map((r) => [r.accountId, r]));
+  assert.ok(perAcc.get('meta:meta-big').slots / perAcc.get('meta:meta-small').slots > 3, 'C* slots ~4x for the big lane');
+  assert.equal(perAcc.get('meta:meta-big').capacityWeight, big.capacityWeight, 'select view carries the weight');
+  assert.equal(perAcc.get('meta:meta-big').burnIndividualized, true);
+  // Solos keep their own meters: expensive Claude is never clamped to 4x the
+  // cross-group median, and /capacity groups agree with per-account burns.
+  assert.ok(Math.abs(claude.effectiveBurnPerRunPct - 0.0155) < 1e-9, `claude solo ${claude.effectiveBurnPerRunPct} keeps its own burn`);
+  assert.ok(Math.abs(codex.effectiveBurnPerRunPct - 0.001) < 1e-9, `codex solo ${codex.effectiveBurnPerRunPct}`);
+  const claudeGroup = cap.calibrationGroups[claude.calibrationGroup];
+  assert.ok(claudeGroup, 'solo group reported');
+  assert.ok(Math.abs((claudeGroup.burnPerRunPct ?? 0) - claude.effectiveBurnPerRunPct) < 1e-9, 'solo group burn matches per-account (no clamp contradiction)');
+  // E_indiv persists in smoothing state (mutant c: dropping it must fail).
+  const smoothing = d.store.get(JSON.stringify({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'smoothing-v1' }));
+  assert.ok(smoothing && smoothing.E_indiv && smoothing.E_indiv['meta:meta-big'] != null, 'E_indiv carried over');
+  assert.ok(Math.abs(smoothing.E_indiv['meta:meta-big'].value - 0.00025) < 1e-9, 'persisted big E_indiv');
+  // Carry-over tick with flat meters and no new runs keeps the wiring.
+  await d.step({
+    at: PT0 + 30 * MIN,
+    fleet: planFleet({ now: PT0 + 30 * MIN, small: 0.30, big: 0.30, claude: 0.262, codex: 0.104 }),
+  });
+  const cap2 = await d.capacity();
+  const byId2 = new Map(cap2.accounts.map((a) => [a.accountId, a]));
+  assert.equal(byId2.get('meta:meta-big').burnIndividualized, true, 'E_indiv survives a flat tick');
+  assert.ok(Math.abs(byId2.get('meta:meta-big').effectiveBurnPerRunPct - 0.00025) / 0.00025 < 0.1, 'flat tick keeps big burn');
+  // Skewed enforced picks must not move the even-split burns: guard the solos
+  // so hook decisions land on the Meta pair, with meters reflecting
+  // round-robin actual burn (each lane burns N/width=15 runs: total deltas
+  // 0.015/0.00375 over 30 group runs). Old pick-count logic reads
+  // 0.015/12 and 0.00375/18 (1.25x/0.83x) once the 10 picks skew 2/8.
+  const skewRuns = Array.from({ length: 10 }, (_, i) => `ps2-${i}`);
+  await d.step({
+    at: PT0 + 36 * MIN,
+    fleet: planFleet({ now: PT0 + 36 * MIN, small: 0.305, big: 0.30125, claude: 0.262, codex: 0.104, guardSolos: true }),
+    fire: skewRuns.map((id) => pStarted(id, PT0 + 36 * MIN, 'eng', 'muse-spark-1.3-contributor')),
+  });
+  for (const id of skewRuns) {
+    const out = await d.hook(id);
+    assert.equal(out.kind, 'decide', `hook decides ${id}`);
+  }
+  await d.step({
+    at: PT0 + 37 * MIN,
+    fleet: planFleet({ now: PT0 + 37 * MIN, small: 0.305, big: 0.30125, claude: 0.262, codex: 0.104, guardSolos: true }),
+  });
+  const cap3 = await d.capacity();
+  const byId3 = new Map(cap3.accounts.map((a) => [a.accountId, a]));
+  const small3 = byId3.get('meta:meta-small');
+  const big3 = byId3.get('meta:meta-big');
+  // Tight enough to fail the old pick-count wiring (6%/4% drift) while the
+  // even split holds (samples equal prev, so smoothing holds exact).
+  assert.ok(Math.abs(small3.effectiveBurnPerRunPct - 0.001) / 0.001 < 0.02, `skewed picks keep small burn ${small3.effectiveBurnPerRunPct}`);
+  assert.ok(Math.abs(big3.effectiveBurnPerRunPct - 0.00025) / 0.00025 < 0.02, `skewed picks keep big burn ${big3.effectiveBurnPerRunPct}`);
 });

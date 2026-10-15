@@ -33,17 +33,21 @@ import { canonicalModelName } from './arms.mjs';
  * at ~1/4 of its capacity.
  *
  * Each member's own meter still reveals its own burn: E_raw(member) is the
- * member's weekly-used delta over its own span divided by the runs that
- * burned that lane in the span (enforced hook picks -- the only picks that
- * outrank reality -- plus an even split of the group's other mapped runs,
- * so the figure stays exact once weighted spreading sends the big lane more
- * traffic instead of collapsing back to equal weights). A lane
+ * member's weekly-used delta over its own span divided by the even share of
+ * the group's runs in the span (group runs / width). CLIProxy round-robins a
+ * calibration group's shared model across its lanes and the enforced hook
+ * returns only model/effort/env, so a pick does not choose the credential
+ * that burns -- each lane's meter moves for about N/width runs whatever the
+ * picks are, and normalizing by the even share recovers each lane's own burn
+ * while weighted spreading skews the picks. A lane
  * individualizes only on a minimal sample
  * (>= minRunsForIndiv lane runs over >= minSpanMs of history); until then it
  * inherits the group E with weight 1. Burns driving shares are bounded to
  * [median/8, median*4] (the weight clamp, applied to the burn itself), so one
  * thin sample cannot mint capacity -- the weight clamp alone never bound
- * targetShare or C*, which read the burn directly.
+ * targetShare or C*, which read the burn directly. Single-member groups are
+ * never clamped against other providers: a solo lane's burn is already its
+ * own meter over its own runs, in its own quota units.
  */
 
 export const PLAN_SIZE = Object.freeze({
@@ -87,10 +91,9 @@ export function memberDelta(history, spanMs, nowMs) {
  *   memberKeys: account keys in the group
  *   historyOf(key): [{ atMs, usedPct }] weekly-used readings, oldest first
  *   spanMsOf(key): measured-rate span for the key (null: no measured rate yet)
- *   runsInSpanFor(key, spanMs): runs that burned THIS lane within the span
- *     (the caller passes enforced hook picks plus an even split of the
- *     group's other mapped runs -- never an even share of the group total,
- *     which collapses once weighted spreading works).
+ *   runsInSpanFor(key, spanMs): even share of the group's runs in the span
+ *     (group runs / width -- never the lane's pick count, which skews once
+ *     weighted spreading works while the meter still moves N/width per lane).
  * Returns Map(key -> rawBurnPerRunPct) for members with a minimal sample:
  * a measured span of at least minSpanMs, a positive delta, and at least
  * minRunsForIndiv lane runs in that span. Members without a sample are
@@ -142,25 +145,6 @@ export function boundBurnPerRun(burns, memberKeys = null) {
     out.set(k, Math.min(PLAN_SIZE.weightMax, Math.max(PLAN_SIZE.weightMin, median / b)));
   }
   return { burns: bounded, weights: out, median };
-}
-
-/**
- * Solo-lane bound: a single-member group's median is its own burn, so
- * boundBurnPerRun is vacuous there. Clamp the lane's burn to a cross-group
- * reference median instead, with the same bounds and weight clamps.
- * Returns { burn, weight } or null while either input is unusable.
- */
-export function boundSoloBurn(burn, referenceMedian) {
-  if (!(burn > 0) || !(referenceMedian > 0)
-    || !Number.isFinite(burn) || !Number.isFinite(referenceMedian)) return null;
-  const b = Math.min(
-    referenceMedian * PLAN_SIZE.burnCeilFactor,
-    Math.max(referenceMedian / PLAN_SIZE.burnFloorDivisor, burn),
-  );
-  return {
-    burn: b,
-    weight: Math.min(PLAN_SIZE.weightMax, Math.max(PLAN_SIZE.weightMin, referenceMedian / b)),
-  };
 }
 
 /**

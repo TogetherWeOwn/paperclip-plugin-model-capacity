@@ -206,12 +206,14 @@ install ran live:
    `E = sum(lane deltas) / runs on any member`, read by every member
    (`calibrationGroups` on `/capacity`). Lanes with different plan sizes
    individualize: once a lane has 3 of its own runs over 10 min of history,
-   its burn is its own delta over its own lane runs (enforced picks plus an
-   even split of the group's other mapped runs), smoothed, bounded to
-   [group-median/8, group-median*4], and weighed at median-burn/lane-burn
-   (clamped [0.25, 8]) -- a 4x plan burns ~1/4 per run and serves ~4x the
-   share through targetShare, C* slots, the pace-guard pool cap and
-   weight-normalized lane spreading. Until then it inherits the group E.
+   its burn is its own delta over the even share of the group's runs
+   (group runs / width -- picks never route credentials under round-robin),
+   smoothed, bounded to [group-median/8, group-median*4], and weighed at
+   median-burn/lane-burn (clamped [0.25, 8]) -- a 4x plan burns ~1/4 per run
+   and serves ~4x the share through targetShare, C* slots, the pace-guard
+   pool cap and weight-normalized lane spreading. Until then it inherits the
+   group E. Single-lane groups never clamp against other providers: a solo
+   lane keeps its own meter over its own runs.
    Placement treats a provider's lanes
    as one candidate (shares sum against the pooled in-flight) and spreads
    decisions over the pool's lanes.

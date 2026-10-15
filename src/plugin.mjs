@@ -67,7 +67,7 @@ import {
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
-import { buildCalibrationGroups, pooledBurnPerRun, perAccountRawBurn, boundBurnPerRun, boundSoloBurn } from './pools.mjs';
+import { buildCalibrationGroups, pooledBurnPerRun, perAccountRawBurn, boundBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
@@ -2106,27 +2106,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // PLAN_SIZE.minRunsForIndiv lane runs over its own span), then its own
     // smoothed burn drives its share. The first sample jumps at once (fast
     // outlier path: a 4x plan is detected as soon as its meter history spans
-    // the floor); later samples smooth normally. Lane runs are the ENFORCED
-    // hook picks onto the lane (started, decision inside the span -- the only
-    // picks that outrank reality, same discipline as E calibration) plus an
-    // even split of the group's other mapped runs, whose lane is unknowable;
-    // runs never mapped to the group stay out entirely, so per-lane counts
-    // always partition the pooled run count instead of exceeding it.
+    // the floor); later samples smooth normally. Lane runs are the even share
+    // of the group's runs in the span (group runs / width): CLIProxy
+    // round-robins a calibration group's shared model across its lanes and
+    // the hook returns only model/effort/env, so a pick never chooses the
+    // credential that burns -- each lane's meter moves for about N/width runs
+    // whatever the picks are, and normalizing by the pick count feeds back
+    // through weighted spreading into the clamps. Runs never mapped to the
+    // group stay out entirely.
     // Share-driving burns are bounded to the group median (see pools.mjs),
-    // so one thin sample cannot mint capacity.
-    const enforcedBurningInSpan = (gid, accountId, spanMs) => {
-      let n = 0;
-      for (const r of ledger.values()) {
-        if (r?.enforced !== true) continue;
-        if (r?.decidedAccount !== accountId) continue;
-        if (groupOfRun(r) !== gid) continue;
-        // Same anchor as the pooled count (startedAt): a run decided inside
-        // the span but started before it did not burn inside the span.
-        if (!(r?.startedAt >= nowMs - spanMs && r?.startedAt <= nowMs)) continue;
-        n += 1;
-      }
-      return n;
-    };
+    // so one thin sample cannot mint capacity. Single-member groups are
+    // never clamped against other providers: a solo lane's burn is its own
+    // meter over its own runs, in its own quota units.
     const prevIndivE = smoothState.E_indiv != null && typeof smoothState.E_indiv === 'object'
       ? smoothState.E_indiv : {};
     const nextIndivE = new Map();
@@ -2137,13 +2128,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         memberKeys,
         historyOf: (k) => rateHistories[k] ?? [],
         spanMsOf: (k) => viewByKey.get(k)?.rateSpanMs ?? null,
-        runsInSpanFor: (k, spanMs) => {
-          const enforced = enforcedBurningInSpan(gid, k, spanMs);
-          let enforcedTotal = 0;
-          for (const m of memberKeys) enforcedTotal += enforcedBurningInSpan(gid, m, spanMs);
-          const rest = Math.max(0, runsInGroupSpan(gid, spanMs) - enforcedTotal);
-          return enforced + rest / width;
-        },
+        runsInSpanFor: (k, spanMs) => runsInGroupSpan(gid, spanMs) / width,
         nowMs,
       });
       for (const k of memberKeys) {
@@ -2168,25 +2153,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     // Share-driving burns: individualized lanes bounded to the group median,
     // non-individualized lanes keep the pooled group figure (as today).
+    // Single-member groups are never clamped against other providers: with
+    // one member the group median is the lane's own burn, so boundBurnPerRun
+    // is vacuous and the solo lane keeps its own meter over its own runs.
     const boundE = new Map(); // accountId -> burn driving targetShare/C*
     const weightOf = new Map();
     for (const [gid, memberKeys] of calibMembers) {
       const eff = {};
       for (const k of memberKeys) eff[k] = indivE.get(k) ?? groupE.get(gid) ?? null;
       const { burns, weights } = boundBurnPerRun(eff, memberKeys);
-      // Solo lane: the group median is its own burn, so the bound above is
-      // vacuous -- clamp an individualized solo burn to the cross-group
-      // median instead, so a thin sample cannot mint unbounded share.
-      if (memberKeys.length === 1 && medianMeasuredE != null) {
-        const k = memberKeys[0];
-        if (burns.has(k) && indivE.has(k)) {
-          const solo = boundSoloBurn(burns.get(k), medianMeasuredE);
-          if (solo) {
-            burns.set(k, solo.burn);
-            weights.set(k, solo.weight);
-          }
-        }
-      }
       for (const [k, w] of weights) weightOf.set(k, w);
       for (const [k, b] of burns) boundE.set(k, b);
       for (const k of memberKeys) {
