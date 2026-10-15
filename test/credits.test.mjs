@@ -318,7 +318,7 @@ test('fraction-less credit lane holds the pointer on a multi-rung ladder', async
 // Review round 3: pin positionError = 0 for credit lanes above the floor.
 // The lane first climbs on its weekly meter alone, then a fraction-less
 // credit entry arrives: the pointer must hold its rung instead of descending
-// on the synthetic 0%-used surplus (without the fix it falls 2→1→0 within
+// on the weekly 100%-used position (without the fix it falls 2→1→0 within
 // three ticks).
 test('fraction-less credit lane holds above the floor', async () => {
   const d = driveDrain({ fractions: Array(60).fill(null), creditFromStep: 30 });
@@ -337,6 +337,31 @@ test('fraction-less credit lane holds above the floor', async () => {
     const view = cap.accounts.find(a => a.accountId === 'codex:cr');
     assert.equal(view.headroomPct, 1, `tick ${i}: credit headroom is full-window`);
     assert.equal(view.pointer, rung, `tick ${i}: pointer holds rung ${rung} with no fraction signal`);
+  }
+});
+
+// Review round 4: the quantified twin. positionError = 0 covers every credit
+// lane, so a slowly draining quantified fraction must also hold its rung
+// through the 60-minute warmup instead of descending on the weekly 100%-used
+// position (mutant M2 zeroes the error only when fraction == null: falls
+// 2→1→0, then re-climbs when the measured drain takes over).
+test('quantified slow drain holds above the floor through warmup', async () => {
+  const fractions = Array.from({ length: 80 }, (_, i) => 0.6 - Math.max(0, i - 30) * 0.0004);
+  const d = driveDrain({ fractions, creditFromStep: 30 });
+  await d.setup();
+  let cap;
+  let rung = -1;
+  for (let i = 0; i < 30; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.ok(view.arms.length >= 3, `multi-rung ladder, got ${view.arms.length} arms`);
+    if (view.pointer >= 2) { rung = view.pointer; break; }
+  }
+  assert.ok(rung >= 2, `lane climbs above the floor on its weekly meter (rung ${rung})`);
+  for (let i = 30; i <= 41; i++) {
+    cap = await d.tick(i);
+    const view = cap.accounts.find(a => a.accountId === 'codex:cr');
+    assert.equal(view.pointer, rung, `tick ${i}: pointer holds rung ${rung} while the quantified drain warms up`);
   }
 });
 
@@ -435,4 +460,5 @@ test('C* slots scale with the credit horizon', async () => {
   const req48 = cap.accounts.find(a => a.accountId === 'codex:cr48').requiredRatePerHour;
   assert.ok(Math.abs(req48 - 0.5 / 47.5) < 1e-9, `required paces the 48h credit horizon: ${req48}`);
 });
+
 
