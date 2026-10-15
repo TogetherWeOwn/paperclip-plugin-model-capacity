@@ -192,6 +192,15 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     weekly: { ...weekly, resetsAtMs: msOrNull(weekly.resetsAt) },
     fiveHour: { ...fiveHour, resetsAtMs: msOrNull(fiveHour.resetsAt) },
     signalsAtMs: msOrNull(entry?.observedAt) ?? nowMs,
+    // Keeper counters are credential-attributed and aligned to this meter's
+    // timestamp. Absent/invalid provenance stays unknown, never zero.
+    usage: (() => {
+      const u = entry?.usage;
+      const atMs = msOrNull(u?.observedAt);
+      if (typeof u?.epoch !== 'string' || !u.epoch || atMs == null
+        || !Number.isSafeInteger(u.requests) || u.requests < 0) return null;
+      return { observedAtMs: atMs, epoch: u.epoch, requests: u.requests };
+    })(),
     nowMs,
   };
 }
