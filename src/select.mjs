@@ -102,7 +102,10 @@ export function allowanceOf(shortfall, poolShare) {
  *   already made this tick -- callers re-sort per run with fresh counts),
  *   pool (optional: lanes that share one credential pool),
  *   laneInFlight (optional: this lane's own count, spreads decisions across
- *   a pool), placementQ (optional: fleet quality of the arm this account
+ *   a pool), capacityWeight (optional: plan-size weight, 1/burn relative to
+ *   the pool median -- a 4x plan weighs ~4, so 4 in flight on it reads like
+ *   1 elsewhere; absent reads as 1),
+ *   placementQ (optional: fleet quality of the arm this account
  *   would run for the run's role),
  *   provider (optional: aggregator detection, e.g. 'devin'),
  *   models (optional: canonical-or-raw model ids served, for the
@@ -120,8 +123,10 @@ export function allowanceOf(shortfall, poolShare) {
  * Untagged views are their own pool, which is the old behavior.
  *
  * Sort: need band, then the placement blend (when quality is known), then
- * water-filling shortfall (largest first), then the lane with the fewest
- * in-flight, then deficit, then earliest reset, then accountId. Bands are
+ * water-filling shortfall (largest first), then the lane with the smallest
+ * weight-normalized in-flight (laneInFlight / capacityWeight, so a 4x plan
+ * holds ~4x runs before looking full), then deficit, then earliest reset,
+ * then accountId. Bands are
  * metered-behind (0), reactive (1), metered-ahead/over-burning (2), and
  * aggregator fallback-only (3, last). A fallback-only aggregator (Devin
  * serving only models a qualified native also serves; owner rule
@@ -213,10 +218,18 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
       score.set(v, qw * q + aw * allowanceOf(shortfall(v), poolShare.get(poolKeyOf(v))));
     }
   }
+  // Weight-normalized lane load: a 4x plan holds ~4x runs before looking
+  // full. Absent weights read as 1 (bit-identical to the old order).
+  const laneLoad = (v) => {
+    const w = v?.capacityWeight;
+    const weight = typeof w === 'number' && Number.isFinite(w) && w > 0 ? w : 1;
+    return (v?.laneInFlight ?? 0) / weight;
+  };
   const order = [...qualified].sort((a, b) =>
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
+    (laneLoad(a) - laneLoad(b)) ||
     ((a.laneInFlight ?? 0) - (b.laneInFlight ?? 0)) ||
     (deficitOf(b) - deficitOf(a)) ||
     ((a.resetAtMs ?? Number.MAX_SAFE_INTEGER) - (b.resetAtMs ?? Number.MAX_SAFE_INTEGER)) ||

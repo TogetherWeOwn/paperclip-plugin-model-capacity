@@ -24,6 +24,116 @@
 
 import { canonicalModelName } from './arms.mjs';
 
+/**
+ * Plan-size aware calibration.
+ *
+ * Pooled E (above) is the group's average burn, which is exactly right for a
+ * pool of equal plans under an even traffic spread -- but a $200 plan (~4x a
+ * standard plan) burns ~1/4 per run, so sharing one E gives it the same share
+ * as every 1x lane and it idles at ~1/4 of its capacity.
+ *
+ * Each member's own meter still reveals its own burn: under the same even
+ * spread every lane serves runsInSpan / width runs, so
+ *
+ *   E_raw(member) = delta(member) x width / runsInSpan
+ *
+ * which recovers each lane's true burn (and reduces to the pooled figure when
+ * every delta is equal). A lane individualizes only on a minimal sample
+ * (>= minRunsForIndiv group runs in its own span and >= minSpanMs of history);
+ * until then it inherits the group E with weight 1. The capacity weight is
+ * the group median over the per-lane burn, clamped so meter noise cannot mint
+ * or destroy capacity.
+ */
+
+export const PLAN_SIZE = Object.freeze({
+  /** Minimal group-run sample before a lane individualizes (fast outlier path). */
+  minRunsForIndiv: 3,
+  /** Minimal member history span before a lane individualizes. */
+  minSpanMs: 10 * 60 * 1000,
+  /** Capacity weight clamps (median burn / lane burn). */
+  weightMin: 0.25,
+  weightMax: 8,
+});
+
+function medianFinite(values) {
+  const v = (values ?? []).filter((x) => typeof x === 'number' && Number.isFinite(x) && x > 0)
+    .sort((a, b) => a - b);
+  if (v.length === 0) return null;
+  const mid = v.length >> 1;
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+}
+
+/**
+ * One member's weekly-used delta over its own span, or null while it has
+ * fewer than two in-span readings. Zero movement is a real reading (an idle
+ * lane burns nothing); callers decide whether it individualizes.
+ */
+export function memberDelta(history, spanMs, nowMs) {
+  if (!(spanMs > 0)) return null;
+  const pts = (history ?? []).filter((p) => Number.isFinite(p?.atMs) && Number.isFinite(p?.usedPct)
+    && nowMs - p.atMs <= spanMs && p.atMs <= nowMs + 60000);
+  if (pts.length < 2) return null;
+  const delta = pts[pts.length - 1].usedPct - pts[0].usedPct;
+  if (!Number.isFinite(delta) || delta < 0) return null;
+  return { delta, points: pts.length };
+}
+
+/**
+ * Per-member raw burn for one calibration group.
+ *   memberKeys: account keys in the group
+ *   historyOf(key): [{ atMs, usedPct }] weekly-used readings, oldest first
+ *   spanMsOf(key): measured-rate span for the key (null: no measured rate yet)
+ *   runsInSpan(spanMs): runs started on ANY member within the span
+ *   width: member count (defaults to memberKeys.length)
+ * Returns Map(key -> rawBurnPerRunPct) for members with a minimal sample:
+ * a measured span of at least minSpanMs, a non-negative delta, and at least
+ * minRunsForIndiv group runs in that span. Members without a sample are
+ * absent (they inherit the group E). Counter resets void that member only.
+ */
+export function perAccountRawBurn({
+  memberKeys, historyOf, spanMsOf, runsInSpan, width = null, nowMs,
+} = {}) {
+  const out = new Map();
+  const w = width ?? (memberKeys ?? []).length;
+  if (!(w > 0)) return out;
+  for (const k of memberKeys ?? []) {
+    const span = spanMsOf(k);
+    if (!(span >= PLAN_SIZE.minSpanMs)) continue;
+    const d = memberDelta(historyOf(k), span, nowMs);
+    if (!d) continue;
+    const n = runsInSpan(span);
+    if (!(n >= PLAN_SIZE.minRunsForIndiv)) continue;
+    if (!(d.delta > 0)) continue;
+    const raw = (d.delta * w) / n;
+    if (raw > 0 && Number.isFinite(raw)) out.set(k, raw);
+  }
+  return out;
+}
+
+/**
+ * Capacity weight per member: group median burn / lane burn, clamped to
+ * [weightMin, weightMax]. A 4x plan (1/4 the burn) weighs ~4; uniform pools
+ * weigh ~1. Members absent from the burn map weigh exactly 1 (inherit).
+ */
+export function capacityWeights(burnByAccount, memberKeys = null) {
+  const entries = burnByAccount instanceof Map
+    ? [...burnByAccount.entries()]
+    : Object.entries(burnByAccount ?? {});
+  const keys = memberKeys ?? entries.map(([k]) => k);
+  const median = medianFinite(entries.map(([, v]) => v));
+  const out = new Map();
+  for (const k of keys) {
+    const e = burnByAccount instanceof Map ? burnByAccount.get(k) : burnByAccount?.[k];
+    if (!(e > 0) || median == null) {
+      out.set(k, 1);
+      continue;
+    }
+    const w = median / e;
+    out.set(k, Math.min(PLAN_SIZE.weightMax, Math.max(PLAN_SIZE.weightMin, w)));
+  }
+  return out;
+}
+
 function find(parent, x) {
   while (parent.get(x) !== x) {
     parent.set(x, parent.get(parent.get(x)));

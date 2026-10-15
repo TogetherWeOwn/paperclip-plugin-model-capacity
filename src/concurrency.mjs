@@ -80,13 +80,19 @@ export function computeConcurrencyTarget({
   // measured E still counts as calibrated, so an all-guarded fleet reads
   // target 0 (shed everything) instead of weak/null (recommend nothing).
   const anyMeasured = list.some(a => a.measuredBurnPerRunPct > 0);
-  // One measured E per calibration group (pool members share it): the
-  // median is over distinct groups, so a wide pool cannot outvote the rest.
+  // One measured E per calibration group: the median is over distinct
+  // groups, so a wide pool cannot outvote the rest. Plan-size aware pools
+  // individualize E per member (a 4x plan burns ~1/4 per run), so a group
+  // contributes the median of its members' burns, not the last one seen.
   const measuredByGroup = new Map();
   for (const a of list) {
-    if (a.measuredBurnPerRunPct > 0) measuredByGroup.set(a.calibrationGroup ?? a.accountId, a.measuredBurnPerRunPct);
+    if (a.measuredBurnPerRunPct > 0) {
+      const g = a.calibrationGroup ?? a.accountId;
+      if (!measuredByGroup.has(g)) measuredByGroup.set(g, []);
+      measuredByGroup.get(g).push(a.measuredBurnPerRunPct);
+    }
   }
-  const medianMeasured = medianPositive([...measuredByGroup.values()]);
+  const medianMeasured = medianPositive([...measuredByGroup.values()].map(medianPositive));
   const perAccount = list.map(a => {
     if (a.guardActive) {
       return {

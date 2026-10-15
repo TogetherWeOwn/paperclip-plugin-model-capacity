@@ -67,7 +67,7 @@ import {
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
-import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
+import { buildCalibrationGroups, pooledBurnPerRun, perAccountRawBurn, capacityWeights } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, smoothValue, holdCaps } from './smoothing.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
@@ -2101,12 +2101,65 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     const medianMeasuredE = medianPositive([...groupE.values()]);
 
+    // Plan-size aware individualization: a lane inherits its group's pooled E
+    // only until its own meter-vs-runs sample is measurable (minimal sample:
+    // PLAN_SIZE.minRunsForIndiv group runs over its own span), then its own
+    // smoothed burn drives its share. The first sample jumps at once (fast
+    // outlier path: a 4x plan is detected as soon as its meter history spans
+    // the floor); later samples smooth normally. The capacity weight is the
+    // group median burn over the lane burn, clamped (see pools.mjs).
+    const prevIndivE = smoothState.E_indiv != null && typeof smoothState.E_indiv === 'object'
+      ? smoothState.E_indiv : {};
+    const nextIndivE = new Map();
+    const indivE = new Map(); // accountId -> smoothed per-lane burn per run
+    for (const [gid, memberKeys] of calibMembers) {
+      const rawByMember = perAccountRawBurn({
+        memberKeys,
+        historyOf: (k) => rateHistories[k] ?? [],
+        spanMsOf: (k) => viewByKey.get(k)?.rateSpanMs ?? null,
+        runsInSpan: (spanMs) => runsInGroupSpan(gid, spanMs),
+        width: memberKeys.length,
+        nowMs,
+      });
+      for (const k of memberKeys) {
+        const raw = rawByMember.get(k) ?? null;
+        const prev = Object.hasOwn(prevIndivE, k) ? prevIndivE[k] : null;
+        if (raw != null) {
+          const entry = prev != null
+            ? smoothValue(prev, raw, nowMs, smoothOpts)
+            : { value: raw, atMs: nowMs };
+          if (entry?.value > 0) {
+            indivE.set(k, entry.value);
+            nextIndivE.set(k, entry);
+          }
+        } else if (prev != null) {
+          const kept = smoothValue(prev, null, nowMs, smoothOpts);
+          if (kept?.value > 0) {
+            indivE.set(k, kept.value);
+            nextIndivE.set(k, kept);
+          }
+        }
+      }
+    }
+    const weightOf = new Map();
+    for (const [gid, memberKeys] of calibMembers) {
+      const eff = {};
+      for (const k of memberKeys) eff[k] = indivE.get(k) ?? groupE.get(gid) ?? null;
+      for (const [k, w] of capacityWeights(eff, memberKeys)) weightOf.set(k, w);
+    }
+    for (const [gid, memberKeys] of calibMembers) {
+      if (calibrationGroups[gid] == null) continue;
+      calibrationGroups[gid].individualized = memberKeys.filter((k) => indivE.has(k)).length;
+      calibrationGroups[gid].weights = Object.fromEntries(memberKeys.map((k) => [k, weightOf.get(k) ?? 1]));
+    }
+
     // Each account's target share is requiredRate / E (runs/hour it can
     // sustain; proportions match the per-account C* concurrency targets).
-    // E prefers the group's measured burn-per-run, then the ladder-average
-    // burn, then the calibration reference anchor; the guessed fallbacks are
-    // floored at the median measured burn so an uncalibrated anchor cannot
-    // claim a bigger share than a measured peer (#1).
+    // E prefers the lane's own measured burn-per-run, then the group's pooled
+    // burn, then the ladder-average burn, then the calibration reference
+    // anchor; the guessed fallbacks are floored at the median measured burn
+    // so an uncalibrated anchor cannot claim a bigger share than a measured
+    // peer (#1).
     {
       const refAnchor = config.calibration?.referenceBurnPerRunPct ?? 0.0005;
       for (let i = 0; i < snapshot.accounts.length; i++) {
@@ -2115,8 +2168,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!view) continue;
         view.pool = poolOfKey(key);
         view.calibrationGroup = calibGroupOf.get(key) ?? key;
-        let E = groupE.get(view.calibrationGroup) ?? null;
+        let E = indivE.get(key) ?? groupE.get(view.calibrationGroup) ?? null;
         view.burnCalibrated = E != null;
+        view.burnIndividualized = indivE.has(key);
         if (E == null) {
           const vals = Object.values(ladders[key]?.burnPerRunPct ?? {}).filter(v => v != null);
           if (vals.length > 0) E = vals.reduce((s, v) => s + v, 0) / vals.length;
@@ -2124,6 +2178,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (medianMeasuredE != null && E < medianMeasuredE) E = medianMeasuredE;
         }
         view.effectiveBurnPerRunPct = E;
+        view.capacityWeight = weightOf.get(key) ?? 1;
         view.targetShare = view.requiredRatePerHour != null && view.requiredRatePerHour > 0
           ? view.requiredRatePerHour / E
           : null;
@@ -2350,7 +2405,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
           })(),
           burnPerRunPct: burnOf(a.accountId),
-          measuredBurnPerRunPct: groupE.get(gid) ?? null,
+          measuredBurnPerRunPct: indivE.get(a.accountId) ?? groupE.get(gid) ?? null,
           runsInWindow: runsInGroupSpan(gid, rateWindowMs),
           guardActive: a.guardActive,
           healthy: a.health === 'healthy' && a.action !== 'excluded',
@@ -2363,7 +2418,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
     });
-    for (const row of concurrency.perAccount) row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
+    for (const row of concurrency.perAccount) {
+      row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
+      row.capacityWeight = weightOf.get(row.accountId) ?? 1;
+      row.burnIndividualized = indivE.has(row.accountId);
+    }
     // EWMA the served target. A zero (everything guarded: shed now) and a
     // null (weak: nothing measured) pass through unsmoothed and reset the
     // series, so safety sheds are never lagged.
@@ -2596,6 +2655,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
+          capacityWeight: v.capacityWeight ?? 1,
           duplicates,
           held: !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
@@ -2884,6 +2944,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           headroomSource: view?.headroomSource ?? null,
           remainingKnown: view?.remainingPct != null,
           targetShare: view?.targetShare ?? null,
+          capacityWeight: view?.capacityWeight ?? 1,
+          effectiveBurnPerRunPct: view?.effectiveBurnPerRunPct ?? null,
           reactive: view?.reactive === true,
           health: view?.health ?? 'unknown',
           meter: view?.meter ?? null,
@@ -2957,7 +3019,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     await ctx.state.set(scopeKey(companyId, PACING_KEY), nextPacing);
     await ctx.state.set(scopeKey(companyId, RATE_KEY), rateHistories);
     await ctx.state.set(scopeKey(companyId, SMOOTH_KEY), {
-      atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
+      atMs: nowMs, E: Object.fromEntries(nextSmoothE), E_indiv: Object.fromEntries(nextIndivE),
+      target: nextSmoothTarget,
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is

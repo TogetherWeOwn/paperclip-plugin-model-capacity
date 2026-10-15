@@ -82,6 +82,16 @@
  * gpt-5-5 displaces gpt-5-4 on flat cost). 1M claude decoration keeps the
  * prefix. No capability, egress, secret or env-key change.
  *
+ * v0.2.46 = PLAN-SIZE AWARE CAPACITY: lanes individualize burn-per-run from
+ * their own meter-vs-runs sample (minimal sample: 3 group runs over 10 min of
+ * history; inherits the group pooled E until then, first sample jumps at
+ * once) and weigh capacity by group-median burn over lane burn, clamped to
+ * [0.25, 8] -- a 4x plan burns ~1/4 per run and serves ~4x the share via
+ * targetShare, C* slots, the pace-guard pool cap and weight-normalized
+ * in-pool lane spreading. Uniform pools weigh ~1 (bit-identical shares);
+ * single-lane groups (mixed codex/claude plans) already calibrate alone.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.45 = DOER-STARVATION SCOPE: per-provider liveRuns/idle on the supply
  * signal (one provider's reviewer traffic no longer masks another provider's
  * idle headroom) plus a C*-vs-live-doer starvation wake sustained across
@@ -223,7 +233,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.45';
+export const PLUGIN_VERSION = '0.2.46';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
