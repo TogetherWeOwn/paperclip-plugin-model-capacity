@@ -106,12 +106,24 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
   // reset trims that meter alone, so use the prior until its windows align.
   const sameSpan = (sample, u) => sample && u && sample.fromMs === u.fromMs && sample.toMs === u.toMs;
   const allWeeklyAligned = aligned && [...weekly.entries()].every(([k, s]) => !s || sameSpan(s, usage.get(k)));
-  const baseline = requestsPerRun > 0 && medianWeekly > 0 && allWeeklyAligned
-    ? medianWeekly * requestsPerRun : groupBurnPerRunPct;
+  // Absolute per-account burn needs complete attribution: the baseline scale
+  // (median per-request burn x requests per run) is only valid when every
+  // peer's counters cover the same span the run count does. With a missing
+  // or reset peer there is no run scale, so pricing a relative weight
+  // against the pooled prior overstates capacity whenever request shares
+  // are uneven (the prior is a per-pool-run average, not a per-request
+  // scale). Fall back to the pooled prior for the whole group instead.
+  const absoluteOk = requestsPerRun > 0 && medianWeekly > 0 && allWeeklyAligned;
+  const baseline = absoluteOk ? medianWeekly * requestsPerRun : groupBurnPerRunPct;
   const out = new Map();
   for (const k of memberKeys) {
-    const w = weekly.get(k);
-    const f = fiveHour.get(k);
+    // Weekly evidence without a run scale falls back to the pooled prior,
+    // never to a 5h-relative weight: the account measured its weekly burn,
+    // so pricing it off the noisier window would invent precision. Accounts
+    // with no weekly evidence keep the existing 5h-relative path.
+    const wRaw = weekly.get(k);
+    const w = absoluteOk ? wRaw : null;
+    const f = wRaw ? null : fiveHour.get(k);
     const selected = w ?? f;
     const e = estimate(selected, w ? medianWeekly : medianFiveHour);
     const prior = groupBurnPerRunPct > 0 ? groupBurnPerRunPct : null;

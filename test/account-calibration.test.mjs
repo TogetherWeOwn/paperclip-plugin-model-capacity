@@ -100,3 +100,34 @@ test('capacity weights are bounded for unusually large and small plans', () => {
   assert.equal(r.get('tiny').capacityWeight, 0.25);
   assert.equal(r.get('huge').capacityWeight, 8);
 });
+
+test('a missing or reset peer counter keeps the pooled prior for the whole group (no relative pricing without a run scale)', () => {
+  // Uneven request shares: large serves 700 of 1000 requests for one quantum.
+  const full = { a: history(0.16, 100), b: history(0.16, 100), c: history(0.16, 100), large: history(0.01, 700) };
+  const aligned = calibrate(full, 0.004);
+  assert.equal(aligned.get('large').source, 'account-weekly');
+  assert.ok(aligned.get('large').capacityWeight > 1);
+  assert.equal(aligned.get('a').source, 'account-weekly');
+  // A peer with a single stale point has no usage span: no run scale exists,
+  // so pricing the others' relative weights against the pooled prior would
+  // overstate the small accounts whenever shares are uneven.
+  const staleC = [reading(NOW + 30 * MIN, 200, 0.26)]
+    .reduce((h, a) => appendAccountUsage(h, a, NOW + 30 * MIN), []);
+  const missing = calibrate({ ...full, c: staleC }, 0.004);
+  for (const k of ['a', 'b', 'c', 'large']) {
+    const e = missing.get(k);
+    assert.equal(e.source, 'group-prior');
+    assert.equal(e.capacityWeight, 1);
+    assert.equal(e.burnPerRunPct, 0.004);
+    assert.equal(e.attributedRuns, null);
+  }
+  // A mid-window counter reset trims the peer to a single post-reset point: same fallback.
+  const resetC = [reading(NOW, 100, 0.1), reading(NOW + 30 * MIN, 800, 0.11,
+    { usage: { epoch: 'keeper-2', requests: 800, observedAtMs: NOW + 30 * MIN } })]
+    .reduce((h, a) => appendAccountUsage(h, a, NOW + 30 * MIN), []);
+  const reset = calibrate({ ...full, c: resetC }, 0.004);
+  for (const k of ['a', 'b', 'c', 'large']) {
+    assert.equal(reset.get(k).source, 'group-prior');
+    assert.equal(reset.get(k).capacityWeight, 1);
+  }
+});

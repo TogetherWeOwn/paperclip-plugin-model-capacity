@@ -1,4 +1,4 @@
-# Model Capacity plugin (v0.2.19, all-providers)
+# Model Capacity plugin (v0.2.46, all-providers)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -18,6 +18,74 @@ modelResolve: true })`): it adds `run.model.resolve` with a minimal
 sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
+
+## Automatic account plan sizing
+
+No provider/plan-size table is needed. The accounts feed can include credential-attributed
+Keeper counters alongside each account's meters:
+
+```json
+{
+  "observedAt": "2026-10-15T00:00:00Z",
+  "usage": { "observedAt": "2026-10-15T00:00:00Z", "epoch": "keeper-generation-1", "requests": 12345 }
+}
+```
+
+`requests` is a cumulative successful-request count **at the meter timestamp**, not at
+feed-publish time. The stable `epoch` changes on source reset/rotation. Missing counters
+are unknown, never zero. Optional token counters may accompany this contract; this
+version uses request shares, so workload differences (tokens/request, model mix, cache)
+are a limitation of the inferred effective capacity, not proof of a commercial plan tier.
+
+The plugin derives per-account burn from its meter deltas and request share of actual
+pool runs. The group value is the prior: one 1pp meter quantum and four requests admit
+a provisional estimate; four quanta remove shrinkage. Low-burn outliers get conservative
+provisional capacity immediately. Relative weights are bounded to 0.25–8; per-account
+`targetShare` and sustainable slots scale once, and pool caps sum those slots. Five-hour
+fractions are never mistaken for weekly fractions; five-hour-only evidence adjusts a
+weekly prior by a relative weight. Missing/stale evidence retains bounded knowledge or
+falls back to the pooled prior. When any peer's counters are missing or reset
+mid-span there is no run scale, so the whole group keeps the pooled prior
+(weight 1) instead of pricing relative weights against it. Resets and counter
+epochs never bridge samples.
+
+`/capacity` exposes weight, source, confidence and attributed-run equivalents. Verified
+healthy calibrated additions/reset headroom use a 5-minute upward target half-life for
+30 minutes. Ordinary upward/burn/cap damping remains 30 minutes, downward target damping
+10 minutes, and staleness 6 hours. All five knobs live under `smoothing` (see example
+config); zero/negative/non-finite values are invalid. Safety sheds still act immediately.
+
+**Routing boundary:** the plugin chooses models and pool admission, not a credential
+inside CLIProxy. A four-times-larger plan earns four-times the sustainable slot budget;
+real traffic follows that budget only with quota-aware credential selection in the proxy.
+Plain round-robin cannot guarantee per-account traffic shares. This release neither
+modifies proxy strategy nor redeploys it.
+
+## Credit pools (free grants and allowed paid types)
+
+A weekly-spent account is normally excluded until its window resets. Providers
+can grant credit pools on top of the metered allowance; the feed reports them
+per account (nothing provider-specific on the plugin side):
+
+```json
+{
+  "credits": [{ "type": "codex-credits", "hasCredits": true, "balance": 12.5,
+                "fraction": 0.4, "resetsAt": "2026-10-22T01:44:14Z" }]
+}
+```
+
+`hasCredits` with a positive `balance` keeps the account AVAILABLE, paced to
+drain over the credit (else weekly) horizon; `fraction` (0..1 remaining, when
+the feed can normalize it) quantifies the pace, otherwise the account drains
+like a fresh window and the balance guard cuts it off at zero. Headroom
+reports the quantified fraction only, so healthier accounts are preferred
+while the credits last. Only types listed under `credits.freeTypes` (default
+`["codex-credits"]`) or `credits.paidTypes` (default `[]`) count; unknown
+types, a missing flag, and a zero/unknown balance are never capacity.
+
+Feed note: `live_accounts.py` does not emit `credits` yet; it should map the
+CLIProxy auth-file quota signals (e.g. `X-Codex-Credits-Has-Credits` and
+`X-Codex-Credits-Balance`) into this contract.
 
 ## Credential readiness admission
 

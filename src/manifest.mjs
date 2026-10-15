@@ -223,7 +223,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.45';
+export const PLUGIN_VERSION = '0.2.46';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -561,6 +561,25 @@ const CONFIG_SCHEMA = {
             },
           },
         },
+      },
+    },
+    smoothing: {
+      type: 'object', additionalProperties: false,
+      description: 'Burn/cap damping and asymmetric fleet-target ramp. Verified headroom uses a bounded faster upward ramp; safety sheds are immediate.',
+      properties: {
+        halfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 30 },
+        targetDownHalfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 10 },
+        verifiedUpHalfLifeMin: { type: 'number', exclusiveMinimum: 0, default: 5 },
+        verifiedUpWindowMin: { type: 'number', exclusiveMinimum: 0, default: 30 },
+        staleHours: { type: 'number', exclusiveMinimum: 0, default: 6 },
+      },
+    },
+    credits: {
+      type: 'object', additionalProperties: false,
+      description: 'Per-account credit pools: a weekly-spent account with a spendable balance stays available, paced to drain. Free-grant types spend by default; paid types only when listed.',
+      properties: {
+        freeTypes: { type: 'array', items: { type: 'string' }, default: ['codex-credits'], description: 'Free-grant credit types, spendable without further opt-in.' },
+        paidTypes: { type: 'array', items: { type: 'string' }, default: [], description: 'Paid credit types the operator additionally allows as capacity.' },
       },
     },
     shadow: {
