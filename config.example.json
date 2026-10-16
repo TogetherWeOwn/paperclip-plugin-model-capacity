@@ -91,6 +91,7 @@
     "staleHours": 6
   },
   "credits": {
+    "priority": "fallback",
     "freeTypes": ["codex-credits"],
     "paidTypes": []
   },

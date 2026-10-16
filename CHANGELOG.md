@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.47 — 2026-10-16
+
+- Make credit-funded capacity a fallback tier after subscription lanes with usable role headroom; exclude credit capacity from role concurrency targets while plan headroom remains.
+- Add `credits.priority: "fallback" | "normal"`, defaulting to `fallback`.
+
 ## 0.2.46 — 2026-10-15
 
 - Learn per-account effective burn from meter-aligned credential usage counters. Pooled calibration remains a cold-start prior, not permanent equal-plan sizing. No provider-specific plan configuration.

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeCredits, usableCredit, DEFAULT_CREDITS } from '../src/credits.mjs';
 import { parseLaneAccount, parseCredits } from '../src/cliproxy.mjs';
-import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { createModelCapacityPlugin, validateConfigShape } from '../src/plugin.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -15,6 +15,32 @@ test('credits config defaults to the free Codex grant and rejects unknown keys',
   assert.deepEqual(normalizeCredits({}).paidTypes, []);
   assert.deepEqual(normalizeCredits({ freeTypes: ['  X  ', 'x'] }).freeTypes, ['x']);
   assert.deepEqual(DEFAULT_CREDITS.freeTypes, ['codex-credits']);
+});
+
+test('credits priority defaults to fallback and validates the normal compatibility setting', () => {
+  assert.equal(normalizeCredits(null).priority, 'fallback');
+  assert.equal(normalizeCredits({ priority: 'normal' }).priority, 'normal');
+  assert.deepEqual(validateConfigShape({ credits: { priority: 'fallback' } }), []);
+  assert.deepEqual(validateConfigShape({ credits: { priority: 'normal' } }), []);
+  assert.ok(validateConfigShape({ credits: { priority: 'first' } }).some(e => e.includes('credits.priority')));
+});
+
+test('credit-funded accounts are a fallback tier after plan headroom', () => {
+  const plan = { accountId: 'meta:plan', health: 'healthy', headroomPct: 0.65, targetShare: 1,
+    measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: -1, resetAtMs: T0 + 1000 };
+  const credits = { accountId: 'codex:credits', health: 'healthy', headroomPct: 0.9, targetShare: 1,
+    measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: 10, creditFallback: true, resetAtMs: T0 + 2000 };
+  const accounts = [plan, credits];
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback' })[0].accountId, 'meta:plan');
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 } })[0].accountId, 'meta:plan',
+    'callers without an explicit priority inherit the safe fallback default');
+  assert.equal(orderAccountsForRun([{ ...plan, headroomPct: 0 }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits');
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'normal' })[0].accountId, 'codex:credits');
+  assert.equal(orderAccountsForRun([{ ...plan, roleEligible: false }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'role-ineligible plan capacity does not block the credit lane');
 });
 
 test('usage parser keeps credits provenance: unknown or empty is never capacity', () => {
@@ -48,17 +74,25 @@ test('only allowed types with a positive balance are spendable; paid needs opt-i
   assert.equal(usableCredit([{ type: 'unknown', hasCredits: true, balance: 3 }], { paidTypes: ['unknown'] }).creditFree, false);
 });
 
-function drive(extraAccounts, configCredits) {
+function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], baseProvider = 'codex', progressive = false,
+  rows = [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
+    intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }] } = {}) {
   const state = new Map();
   const jobs = new Map();
   const handlers = new Map();
-  const now = T0;
+  let now = T0;
+  let step = 0;
   const accounts = () => [
-    { lane: 'ok', provider: 'codex', accountKey: 'ok', health: 'healthy', models: ['gpt-6.1-sol'],
-      weekly: { used: 0.2, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
-      fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
-      observedAt: new Date(now).toISOString(), quality: 'live' },
-    ...extraAccounts,
+    { lane: 'ok', provider: baseProvider, accountKey: 'ok', health: 'healthy', models: baseModels,
+      weekly: { used: 0.2 + (progressive ? step * 0.01 : 0), resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+      fiveHour: { used: 0.1 + (progressive ? step * 0.04 : 0), resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+      observedAt: new Date(now).toISOString(), quality: 'live',
+      ...(progressive ? { usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 } } : {}) },
+    ...extraAccounts.map(a => progressive ? ({ ...a,
+      fiveHour: { ...a.fiveHour, used: 0.1 + step * 0.04 },
+      observedAt: new Date(now).toISOString(),
+      usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 },
+    }) : a),
   ];
   const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false },
     ...(configCredits === undefined ? {} : { credits: configCredits }) };
@@ -74,15 +108,26 @@ function drive(extraAccounts, configCredits) {
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  const setup = async () => {
+    await plugin.setup(io);
+    state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
+    await plugin.onConfigChanged(config, { companyId: 'acme' });
+  };
+  const tick = async i => {
+    if (i != null && progressive) {
+      step = i;
+      now = T0 + i * 5 * 60000;
+    }
+    await jobs.get('shadow-tick')({});
+    return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
+  };
   return {
-    run: async () => {
-      await plugin.setup(io);
-      state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows: [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
-        intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }], duplicateSlugs: [] });
-      await plugin.onConfigChanged(config, { companyId: 'acme' });
-      await jobs.get('shadow-tick')({});
-      return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
-    },
+    setup,
+    tick,
+    start: async (runId, model) => handlers.get('agent.run.started')({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+      payload: { run: { agentId: 'agent-9', provider: 'codex', model } }, occurredAt: new Date(now).toISOString() }),
+    shadow: async () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+    run: async () => { await setup(); return tick(); },
   };
 }
 
@@ -90,6 +135,25 @@ const spent = (key, credits) => ({ lane: key, provider: 'codex', accountKey: key
   weekly: { used: 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
   fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
   observedAt: new Date(T0).toISOString(), quality: 'live', ...(credits === undefined ? {} : { credits }) });
+
+test('shadow tick routes a run to plan headroom before higher-quality credit capacity', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const rows = [
+    { slug: 'gpt-6-1-sol', intelligenceIndex: 80, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
+  ];
+  const credit = { ...spent('credit', free), models: ['gpt-6.1-sol'] };
+  const d = drive([credit], undefined, { baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', progressive: true, rows });
+  await d.setup();
+  await d.start('plan-headroom-run', 'gpt-6.1-sol');
+  let cap;
+  for (let i = 0; i <= 2; i++) cap = await d.tick(i);
+  const shadow = (await d.shadow()).body;
+  const entry = shadow.entries.find(e => e.runId === 'plan-headroom-run');
+  assert.equal(entry?.accountId, 'meta:ok', JSON.stringify({ shadow, tick: cap.shadow }));
+  assert.equal(entry?.eventTime, false, 'the tick path made the fallback decision');
+});
 
 test('weekly-spent Codex lane with free credits stays available and paced; without stays excluded', async () => {
   const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4, resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
@@ -206,7 +270,7 @@ function driveCreditGroup() {
   };
 }
 
-test('credit capacity counts in C* slots over the credit horizon', async () => {
+test('credit capacity does not inflate concurrency while plan headroom remains', async () => {
   const d = driveCreditGroup();
   await d.setup();
   let cap;
@@ -214,8 +278,9 @@ test('credit capacity counts in C* slots over the credit horizon', async () => {
   const view = cap.accounts.find(a => a.accountId === 'codex:cr');
   assert.equal(view.calibrationSource, 'account-five-hour');
   const row = cap.perAccount.find(a => a.accountId === 'codex:cr');
-  assert.ok(row.slots > 0, `credit lane earns concurrency slots, got ${row.slots}`);
-  assert.ok(row.runsPerHour > 0, `credit lane earns runs/hour, got ${row.runsPerHour}`);
+  const planRow = cap.perAccount.find(a => a.accountId === 'codex:ok');
+  assert.equal(row.usableSlots, 0, `credit lane is excluded from target while plan headroom remains, got ${row.usableSlots}`);
+  assert.ok(planRow.usableSlots > 0, 'plan lane retains its concurrency capacity');
 });
 
 const MIN = 60000;

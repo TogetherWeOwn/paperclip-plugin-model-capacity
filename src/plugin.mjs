@@ -277,8 +277,10 @@ export function validateConfigShape(raw) {
   if (raw.credits != null) {
     if (typeof raw.credits !== 'object' || Array.isArray(raw.credits)) errors.push('credits must be an object');
     else for (const [key, value] of Object.entries(raw.credits)) {
-      if (key !== 'freeTypes' && key !== 'paidTypes') errors.push(`credits.${key} is unknown`);
-      else if (!Array.isArray(value) || value.some(t => typeof t !== 'string' || t.trim().length === 0)) {
+      if (!['priority', 'freeTypes', 'paidTypes'].includes(key)) errors.push(`credits.${key} is unknown`);
+      else if (key === 'priority' && !['fallback', 'normal'].includes(value)) {
+        errors.push('credits.priority must be "fallback" or "normal"');
+      } else if (key !== 'priority' && (!Array.isArray(value) || value.some(t => typeof t !== 'string' || t.trim().length === 0))) {
         errors.push(`credits.${key} must be an array of non-empty strings`);
       }
     }
@@ -1914,6 +1916,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         fiveHourUsedPct: fiveHourUsed,
         headroomPct,
         headroomSource,
+        creditFallback: config.credits.priority === 'fallback' && credit != null,
         creditType: credit?.entry.type ?? null,
         creditFree: credit?.creditFree ?? null,
         creditBalance: credit?.entry.balance ?? null,
@@ -2287,16 +2290,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const rrQueued = queuedReviewsByAccount(ledger, {
         agentIds: [...reviewAgentIdSet], nowMs, staleHorizonMs,
       });
-      const rrAccounts = accountViews.map(v => ({
-        accountId: v.accountId,
-        provider: v.provider,
-        weeklyUsed: v.weeklyUsedPct,
-        weeklyElapsed: v.weeklyElapsed ?? null,
-        hoursToWeeklyReset: v.hoursToReset,
-        fiveHourUsed: v.fiveHourUsedPct,
-        fiveHourElapsed: v.fiveHourElapsed ?? null,
-        hoursTo5hReset: v.hoursTo5hReset ?? null,
-      }));
+      const planProvidersWithHeadroom = new Set(accountViews
+        .filter(v => v.creditFallback !== true && v.health === 'healthy' && v.action !== 'excluded'
+          && v.guardActive !== true && v.headroomPct != null && v.headroomPct > 0.05)
+        .map(v => String(v.provider ?? '').toLowerCase()));
+      const rrAccounts = accountViews
+        .filter(v => config.credits.priority !== 'fallback' || v.creditFallback !== true
+          || !planProvidersWithHeadroom.has(String(v.provider ?? '').toLowerCase()))
+        .map(v => ({
+          accountId: v.accountId,
+          provider: v.provider,
+          weeklyUsed: v.weeklyUsedPct,
+          weeklyElapsed: v.weeklyElapsed ?? null,
+          hoursToWeeklyReset: v.hoursToReset,
+          fiveHourUsed: v.fiveHourUsedPct,
+          fiveHourElapsed: v.fiveHourElapsed ?? null,
+          hoursTo5hReset: v.hoursTo5hReset ?? null,
+        }));
       const perProvider = {};
       const heldAccountIds = [];
       const rrNext = { byProvider: {} };
@@ -2431,6 +2441,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     const roleExclusions = eligibility.exclusions;
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
+    const viewById = new Map(accountViews.map(v => [v.accountId, v]));
     const roleAccess = Object.create(null);
     for (const a of ordered) {
       const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId], nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg);
@@ -2441,6 +2452,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         });
       }
       roleAccess[a.accountId] = entry;
+    }
+    if (config.credits.priority === 'fallback') {
+      for (const role of ROLES) {
+        const heldForNonReview = new Set(reviewReserveView.heldAccountIds ?? []);
+        const planHasHeadroom = ordered.some(a => {
+          const view = viewById.get(a.accountId);
+          const usableHeadroom = view?.reactive === true
+            || (view?.guardActive !== true && view?.headroomPct != null && view.headroomPct > 0.05);
+          return view?.creditFallback !== true && view?.health === 'healthy' && view.action !== 'excluded'
+            && usableHeadroom && !heldForNonReview.has(a.accountId)
+            && roleAccess[a.accountId]?.[role]?.eligible === true;
+        });
+        if (!planHasHeadroom) continue;
+        for (const a of ordered) {
+          const view = viewById.get(a.accountId);
+          if (view?.creditFallback === true && roleAccess[a.accountId]?.[role]?.eligible === true) {
+            roleAccess[a.accountId][role] = { ...roleAccess[a.accountId][role], eligible: false };
+          }
+        }
+      }
     }
     const demand = await roleDemandFor(companyId, config, nowMs);
     // In-flight runs per role join the demand bound (see concurrency.mjs):
@@ -2531,7 +2562,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // verify against proof-of-life (a fresh start clears `unverified`) or
     // the stale horizon -- never the 60-min rate window, which would drop
     // still-running runs across restarts.
-    const viewById = new Map(accountViews.map(v => [v.accountId, v]));
     // Cross-account dominance + aggregator fallback-only.
     // Served models come from the lane feed (authoritative); ladders may
     // already exclude unserved ids. Views without a feed models list fail
@@ -2728,6 +2758,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           provider: v.provider,
           models: v.models,
           fallbackOnly: v.fallbackOnly,
+          creditFallback: v.creditFallback,
+          roleEligible: roleAccess[v.accountId]?.[role]?.eligible === true,
           inFlight: pools[v.pool] ?? 0,
           paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
@@ -2742,6 +2774,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           reviewReserve: applyReserve
             ? { heldAccountIds: reviewReserveView.heldAccountIds, forReview: opts.forReview === true }
             : null,
+          creditPriority: config.credits.priority,
         },
       );
     };
@@ -3018,6 +3051,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
           headroomPct: view?.headroomPct ?? null,
           headroomSource: view?.headroomSource ?? null,
+          creditFallback: view?.creditFallback === true,
           remainingKnown: view?.remainingPct != null,
           targetShare: view?.targetShare ?? null,
           reactive: view?.reactive === true,
@@ -3039,6 +3073,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
       paceGuard: paceOpts,
+      creditPriority: config.credits.priority,
       // Tick's review-reserve verdict: held accounts plus the agent ids
       // that run past the hold. The hook and event-time path read this.
       reviewReserve: reviewReserveView,
@@ -3539,6 +3574,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return {
           ...a,
           ladderRungs,
+          roleEligible: roleLadderAccess(ladderRungs, {
+            role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
+            trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
+          }).eligible,
           held: !duplicates && !rungsHaveEligibleArms(ladderRungs),
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
@@ -3556,6 +3595,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         reviewReserve: live.reviewReserve?.enabled === true
           ? { heldAccountIds: live.reviewReserve.heldAccountIds ?? [], forReview }
           : null,
+        creditPriority: live.creditPriority ?? 'fallback',
       },
     );
   }

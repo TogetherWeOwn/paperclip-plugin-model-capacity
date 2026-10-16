@@ -22,6 +22,8 @@
  */
 
 export const DEFAULT_CREDITS = Object.freeze({
+  /** Credit-backed capacity is used only after subscription headroom. */
+  priority: 'fallback',
   /** Free-grant types, spendable without further opt-in. */
   freeTypes: ['codex-credits'],
   /** Paid types the operator additionally allows as capacity. */
@@ -37,6 +39,7 @@ const cleanTypes = value => Array.isArray(value)
 /** String lists only; malformed config cannot invent capacity. */
 export function normalizeCredits(raw) {
   return {
+    priority: raw?.priority === 'normal' ? 'normal' : 'fallback',
     freeTypes: cleanTypes(raw?.freeTypes) ?? [...DEFAULT_CREDITS.freeTypes],
     paidTypes: cleanTypes(raw?.paidTypes) ?? [...DEFAULT_CREDITS.paidTypes],
   };
