@@ -36,6 +36,7 @@
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+import { hasUsablePlanHeadroom } from './credits.mjs';
 import { isFallbackOnlyView, nativeQualifiedModels } from './cross-account.mjs';
 import { paceGuardPools } from './paceguard.mjs';
 
@@ -124,8 +125,8 @@ export function allowanceOf(shortfall, poolShare) {
  * Sort: need band, then the placement blend (when quality is known), then
  * water-filling shortfall (largest first), then the lane with the fewest
  * in-flight, then deficit, then earliest reset, then accountId. With
- * creditPriority 'fallback', any qualified plan lane sorts before every
- * credit-funded lane; otherwise the prior ordering is preserved. Bands are
+ * creditPriority 'fallback', a qualified plan lane with usable headroom
+ * sorts before every credit-funded lane; otherwise the prior ordering is preserved. Bands are
  * metered-behind (0), reactive (1), metered-ahead/over-burning (2), and
  * aggregator fallback-only (3, last). A fallback-only aggregator (Devin
  * serving only models a qualified native also serves; owner rule
@@ -217,7 +218,8 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
       score.set(v, qw * q + aw * allowanceOf(shortfall(v), poolShare.get(poolKeyOf(v))));
     }
   }
-  const hasPlanHeadroom = qualified.some(v => v.creditFallback !== true && v.roleEligible !== false);
+  const hasPlanHeadroom = qualified.some(v => v.creditFallback !== true
+    && v.roleEligible !== false && hasUsablePlanHeadroom(v, reservePct));
   const order = [...qualified].sort((a, b) =>
     (creditPriority === 'fallback' && hasPlanHeadroom
       ? Number(a.creditFallback === true) - Number(b.creditFallback === true)

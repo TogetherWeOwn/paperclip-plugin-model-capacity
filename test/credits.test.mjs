@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeCredits, usableCredit, DEFAULT_CREDITS } from '../src/credits.mjs';
+import {
+  normalizeCredits, usableCredit, DEFAULT_CREDITS, hasUsablePlanHeadroom, gateCreditConcurrencyRoles,
+} from '../src/credits.mjs';
 import { parseLaneAccount, parseCredits } from '../src/cliproxy.mjs';
 import { createModelCapacityPlugin, validateConfigShape } from '../src/plugin.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
@@ -17,6 +19,30 @@ test('credits config defaults to the free Codex grant and rejects unknown keys',
   assert.deepEqual(DEFAULT_CREDITS.freeTypes, ['codex-credits']);
 });
 
+test('plan headroom needs weekly quota unless the lane is reactive', () => {
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: null, headroomPct: 0.6 }), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.01, headroomPct: 0.6 }), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.6 }), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.2 }, 0.1), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.2 }, 0.25), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: true, remainingPct: null, headroomPct: null }), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: true, guardActive: true }), false);
+});
+
+test('credit concurrency keeps roles without non-credit plan slots', () => {
+  const access = {
+    'codex:credit': { doer: { eligible: true }, thinker: { eligible: true } },
+    'meta:plan': { doer: { eligible: true } },
+  };
+  const withoutPlanSlots = gateCreditConcurrencyRoles(access, ['codex:credit'], new Set());
+  assert.equal(withoutPlanSlots['codex:credit'].doer.eligible, true,
+    'a reactive or otherwise zero-slot plan lane cannot suppress credit concurrency');
+  const withDoerPlanSlots = gateCreditConcurrencyRoles(access, ['codex:credit'], new Set(['doer']));
+  assert.equal(withDoerPlanSlots['codex:credit'].doer.eligible, false);
+  assert.equal(withDoerPlanSlots['codex:credit'].thinker.eligible, true);
+  assert.equal(access['codex:credit'].doer.eligible, true, 'the helper does not mutate route eligibility');
+});
+
 test('credits priority defaults to fallback and validates the normal compatibility setting', () => {
   assert.equal(normalizeCredits(null).priority, 'fallback');
   assert.equal(normalizeCredits({ priority: 'normal' }).priority, 'normal');
@@ -26,7 +52,7 @@ test('credits priority defaults to fallback and validates the normal compatibili
 });
 
 test('credit-funded accounts are a fallback tier after plan headroom', () => {
-  const plan = { accountId: 'meta:plan', health: 'healthy', headroomPct: 0.65, targetShare: 1,
+  const plan = { accountId: 'meta:plan', health: 'healthy', headroomPct: 0.65, remainingPct: 0.7, targetShare: 1,
     measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: -1, resetAtMs: T0 + 1000 };
   const credits = { accountId: 'codex:credits', health: 'healthy', headroomPct: 0.9, targetShare: 1,
     measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: 10, creditFallback: true, resetAtMs: T0 + 2000 };
@@ -34,9 +60,15 @@ test('credit-funded accounts are a fallback tier after plan headroom', () => {
   assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback' })[0].accountId, 'meta:plan');
   assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 } })[0].accountId, 'meta:plan',
     'callers without an explicit priority inherit the safe fallback default');
-  assert.equal(orderAccountsForRun([{ ...plan, headroomPct: 0 }, credits], {
+  assert.equal(orderAccountsForRun([{ ...plan, headroomPct: 0, remainingPct: 0 }, credits], {
     placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
   })[0].accountId, 'codex:credits');
+  assert.equal(orderAccountsForRun([{ ...plan, remainingPct: null }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'unknown weekly usage is not usable plan capacity');
+  assert.equal(orderAccountsForRun([{ ...plan, guardActive: true }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'guarded plan capacity does not block credit fallback');
   assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'normal' })[0].accountId, 'codex:credits');
   assert.equal(orderAccountsForRun([{ ...plan, roleEligible: false }, credits], {
     placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',

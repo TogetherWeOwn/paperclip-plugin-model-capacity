@@ -21,6 +21,30 @@
  * (else weekly) horizon and the positive-balance guard cuts it off at zero.
  */
 
+export const WEEKLY_EXHAUSTED_PCT = 0.01;
+
+/** Plan headroom only blocks credits when its quota is allocatable. */
+export function hasUsablePlanHeadroom(view, reservePct = 0.05) {
+  return view?.guardActive !== true
+    && (view?.reactive === true || (view?.remainingPct != null
+      && view.remainingPct > WEEKLY_EXHAUSTED_PCT && view?.headroomPct != null && view.headroomPct > reservePct));
+}
+
+/** Keep credit concurrency eligible for roles without usable plan slots. */
+export function gateCreditConcurrencyRoles(roleAccess, creditAccountIds, planSlotsByRole) {
+  const gated = Object.fromEntries(Object.entries(roleAccess ?? {}).map(([accountId, entry]) => [
+    accountId, Object.fromEntries(Object.entries(entry).map(([role, access]) => [role, { ...access }])),
+  ]));
+  for (const accountId of creditAccountIds ?? []) {
+    for (const role of planSlotsByRole ?? []) {
+      if (gated[accountId]?.[role]?.eligible === true) {
+        gated[accountId][role] = { ...gated[accountId][role], eligible: false };
+      }
+    }
+  }
+  return gated;
+}
+
 export const DEFAULT_CREDITS = Object.freeze({
   /** Credit-backed capacity is used only after subscription headroom. */
   priority: 'fallback',
