@@ -2292,7 +2292,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       });
       const planProvidersWithHeadroom = new Set(accountViews
         .filter(v => v.creditFallback !== true && v.health === 'healthy' && v.action !== 'excluded'
-          && v.guardActive !== true && v.headroomPct != null && v.headroomPct > 0.05)
+          && v.guardActive !== true && (v.reactive === true || (v.headroomPct != null && v.headroomPct > 0.05)))
         .map(v => String(v.provider ?? '').toLowerCase()));
       const rrAccounts = accountViews
         .filter(v => config.credits.priority !== 'fallback' || v.creditFallback !== true
@@ -2458,8 +2458,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const heldForNonReview = new Set(reviewReserveView.heldAccountIds ?? []);
         const planHasHeadroom = ordered.some(a => {
           const view = viewById.get(a.accountId);
-          const usableHeadroom = view?.reactive === true
-            || (view?.guardActive !== true && view?.headroomPct != null && view.headroomPct > 0.05);
+          const usableHeadroom = view?.guardActive !== true
+            && (view?.reactive === true || (view?.headroomPct != null && view.headroomPct > 0.05));
           return view?.creditFallback !== true && view?.health === 'healthy' && view.action !== 'excluded'
             && usableHeadroom && !heldForNonReview.has(a.accountId)
             && roleAccess[a.accountId]?.[role]?.eligible === true;
