@@ -36,6 +36,7 @@
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+import { hasUsablePlanHeadroom } from './credits.mjs';
 import { isFallbackOnlyView, nativeQualifiedModels } from './cross-account.mjs';
 import { paceGuardPools } from './paceguard.mjs';
 
@@ -109,7 +110,9 @@ export function allowanceOf(shortfall, poolShare) {
  *   aggregator fallback rule), fallbackOnly (optional precomputed
  *   aggregator fallback flag -- when absent and `models` is present it is
  *   derived: an aggregator serving only models a qualified native also
- *   serves) }]
+ *   serves), creditFallback (optional: credit-funded headroom, placed after
+ *   plan headroom when `creditPriority: 'fallback'`), roleEligible (optional:
+ *   whether the account can serve the current role) }]
  * Unhealthy accounts and metered accounts without headroom are dropped;
  * healthy reactive accounts qualify without headroom.
  *
@@ -121,7 +124,9 @@ export function allowanceOf(shortfall, poolShare) {
  *
  * Sort: need band, then the placement blend (when quality is known), then
  * water-filling shortfall (largest first), then the lane with the fewest
- * in-flight, then deficit, then earliest reset, then accountId. Bands are
+ * in-flight, then deficit, then earliest reset, then accountId. With
+ * creditPriority 'fallback', a qualified plan lane with usable headroom
+ * sorts before every credit-funded lane; otherwise the prior ordering is preserved. Bands are
  * metered-behind (0), reactive (1), metered-ahead/over-burning (2), and
  * aggregator fallback-only (3, last). A fallback-only aggregator (Devin
  * serving only models a qualified native also serves; owner rule
@@ -155,7 +160,7 @@ export function orderAccountsForRun(views, opts = {}) {
  * so plugin-routed work leaves quota for the Reviewer. Review runs
  * (forReview true) see the unheld order; absent the option nothing is held.
  */
-export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null, reviewReserve = null } = {}) {
+export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null, reviewReserve = null, creditPriority = 'fallback' } = {}) {
   const eligible = (views ?? []).filter(v => {
     if (v == null || v.health !== 'healthy') return false;
     if (isReactiveAccount(v)) return true;
@@ -213,7 +218,12 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
       score.set(v, qw * q + aw * allowanceOf(shortfall(v), poolShare.get(poolKeyOf(v))));
     }
   }
+  const hasPlanHeadroom = qualified.some(v => v.creditFallback !== true
+    && v.roleEligible !== false && hasUsablePlanHeadroom(v, reservePct));
   const order = [...qualified].sort((a, b) =>
+    (creditPriority === 'fallback' && hasPlanHeadroom
+      ? Number(a.creditFallback === true) - Number(b.creditFallback === true)
+      : 0) ||
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
