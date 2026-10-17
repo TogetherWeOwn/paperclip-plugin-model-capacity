@@ -33,27 +33,33 @@ test('plan headroom needs weekly quota unless the lane is reactive', () => {
 test('only usable, unheld plan slots suppress credit concurrency for their roles', () => {
   const usable = { accountId: 'meta:usable', usableSlots: 1, eligibleRoles: ['thinker'] };
   const lowHeadroom = { accountId: 'meta:low', usableSlots: 1, eligibleRoles: ['doer'] };
-  const reactiveZero = { accountId: 'meta:reactive', usableSlots: 0, eligibleRoles: ['thinker'] };
-  const held = { accountId: 'meta:held', usableSlots: 1, eligibleRoles: ['thinker'] };
-  const excluded = { accountId: 'meta:excluded', usableSlots: 1, eligibleRoles: ['thinker'] };
+  const reactiveZero = { accountId: 'meta:reactive', usableSlots: 0, eligibleRoles: ['other'] };
+  const held = { accountId: 'meta:held', usableSlots: 1, eligibleRoles: ['reviewer'] };
+  const excluded = { accountId: 'meta:excluded', usableSlots: 1, eligibleRoles: ['excluded-role'] };
+  const creditFallback = { accountId: 'meta:credit-fallback', usableSlots: 1, eligibleRoles: ['credit-role'] };
   const views = new Map([
     ['meta:usable', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
     ['meta:low', { remainingPct: 0.5, headroomPct: 0.02, health: 'healthy' }],
     ['meta:reactive', { reactive: true, health: 'healthy' }],
     ['meta:held', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
     ['meta:excluded', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy', action: 'excluded' }],
+    ['meta:credit-fallback', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy', creditFallback: true }],
   ]);
-  const roles = planConcurrencyRoles([usable, lowHeadroom, reactiveZero, held, excluded], views, ['meta:held']);
+  const roles = planConcurrencyRoles([usable, lowHeadroom, reactiveZero, held, excluded, creditFallback], views, ['meta:held']);
   assert.deepEqual([...roles], ['thinker'],
-    'low-headroom, zero-slot reactive, held, and excluded plans cannot suppress credit roles');
+    'only the usable thinker lane suppresses credit roles; skipped rows have disjoint roles');
   const access = { 'codex:credit': {
     doer: { eligible: true }, thinker: { eligible: true }, other: { eligible: true },
+    reviewer: { eligible: true }, 'excluded-role': { eligible: true }, 'credit-role': { eligible: true },
   } };
   const gated = gateCreditConcurrencyRoles(access, ['codex:credit'], roles);
   assert.equal(gated['codex:credit'].doer.eligible, true,
     'a plan lane eligible only for thinkers cannot suppress doer credits');
   assert.equal(gated['codex:credit'].thinker.eligible, false);
   assert.equal(gated['codex:credit'].other.eligible, true);
+  assert.equal(gated['codex:credit'].reviewer.eligible, true);
+  assert.equal(gated['codex:credit']['excluded-role'].eligible, true);
+  assert.equal(gated['codex:credit']['credit-role'].eligible, true);
   assert.equal(access['codex:credit'].thinker.eligible, true, 'the helper does not mutate route eligibility');
 });
 
@@ -207,22 +213,34 @@ test('shadow tick routes a run to plan headroom before higher-quality credit cap
   assert.equal(entry?.eventTime, false, 'the tick path made the fallback decision');
 });
 
+// Both lanes serve the same doer model, and the credit lane is far hungrier
+// (nearly full fraction draining over 2h), so under the old ordering the
+// credit lane wins on shortfall alone. Only the fallback demotion can put
+// the plan lane first -- which is what makes the normal-mode run below a
+// real negative control for the hook wiring (creditPriority, remainingPct,
+// guardActive and roleEligible all have to reach the hook-side sort).
 test('hook selection prefers plan headroom over a higher-ranked credit lane', async () => {
-  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
-    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 1000, fraction: 0.99,
+    resetsAt: new Date(T0 + 2 * 3600000).toISOString() }];
   const rows = [
-    { slug: 'gpt-6-1-sol', intelligenceIndex: 80, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
     { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
   ];
-  const accounts = [{ ...spent('credit', free), models: ['gpt-6.1-sol'] }];
-  const d = drive(accounts, undefined, {
-    baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', enforce: true, rows,
-  });
-  await d.setup();
-  await d.tick();
-  const decision = await d.hook('hook-plan-first');
-  assert.equal(decision.kind, 'decide');
-  assert.match(decision.model, /gemini-2-5-flash/);
+  const accounts = [{ ...spent('credit', free), models: ['gemini-2-5-flash'] }];
+  const hookWith = async credits => {
+    const d = drive(structuredClone(accounts), credits, {
+      baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', enforce: true, rows,
+    });
+    await d.setup();
+    await d.tick();
+    return d.hook('hook-plan-first');
+  };
+  const fallback = await hookWith(undefined);
+  assert.equal(fallback.kind, 'decide');
+  assert.match(fallback.reason, /on meta:ok/, 'fallback ordering routes the hook run to plan headroom');
+  const normal = await hookWith({ priority: 'normal' });
+  assert.equal(normal.kind, 'decide');
+  assert.match(normal.reason, /on codex:credit/,
+    'negative control: the same fixture under normal priority picks the hungrier credit lane');
 });
 
 test('review reserve excludes credit accounts while same-provider plan headroom exists', async () => {
@@ -235,6 +253,26 @@ test('review reserve excludes credit accounts while same-provider plan headroom 
   await d.tick();
   const cap = (await d.api('capacity')).body;
   assert.deepEqual(cap.reviewReserve.perProvider.codex.accounts.map(a => a.accountId), ['codex:ok']);
+});
+
+test('review reserve keeps credit accounts when the same-provider plan lane has no usable headroom', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const guardedPlan = { lane: 'guarded', provider: 'codex', accountKey: 'guarded', health: 'healthy',
+    models: ['gpt-6.1-sol'],
+    weekly: { used: 0.2, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+    fiveHour: { used: 0.99, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+    observedAt: new Date(T0).toISOString(), quality: 'live' };
+  const d = drive([spent('credit', free), guardedPlan], undefined, {
+    baseProvider: 'meta',
+    reviewReserve: { enabled: true, providers: ['codex'], agentIds: ['reviewer'] },
+  });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const ids = cap.reviewReserve.perProvider.codex.accounts.map(a => a.accountId);
+  assert.ok(ids.includes('codex:credit'),
+    `credit lane stays in the reserve when no codex plan lane has usable headroom, got ${JSON.stringify(ids)}`);
 });
 
 test('weekly-spent Codex lane with free credits stays available and paced; without stays excluded', async () => {
