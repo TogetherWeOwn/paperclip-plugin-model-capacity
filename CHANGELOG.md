@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.49 — 2026-10-17
+
+- Arm-aware burn calibration: burn per run is measured per arm (model+effort) per calibration pool, not per account. Pooled meter deltas split across the arms that ran in the span by responsibility (each arm's prior burn times its run count, scaled to the observed delta); a pure-span sample measures its arm exactly. Pricing follows the current ledger run mix over the pacing window, with cost-anchor priors for never-measured arms, so switching doers from an expensive arm to a cheap arm raises slots within one tick of ledger evidence instead of waiting for quantized meter quanta.
+- A dominant-arm change segments old-mix measurements immediately: the pooled EWMA restarts and members' persisted individual estimates are discarded until fresh per-account evidence re-accumulates (a first-seen mix that reprices the pool by more than 25% segments too, so an upgrade onto an already-switched fleet recovers on the first tick). Arm-less runs (no decision, no model) price as their own `unattributed` segment rather than vanishing from the denominator.
+- Ledger decisions record effort; the shadow log exposes the decided `armId` (parity golden regenerated: only the newly visible arm id differs).
+- Regression: an expensive-to-cheap arm switch raises concurrency slots within one tick (`test/arm-calibration.test.mjs`). Full suite: 776 green.
+
 ## 0.2.48 — 2026-10-17
 
 - AA leaderboard resilience (fleet stall 10-17): a leaderboard fetch or parse failure keeps the previous snapshot's raw leaderboard layer — persisted separately on success as `leaderboardRows`, never the previous merged rows — and never stores an empty `leaderboardSlugs` over a non-empty one. The kept layer merges gap-fill only, so fresh API values (intelligence index, prices, coding index) always land and win; the stale layer only supplies fields the API left null.

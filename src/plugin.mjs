@@ -73,6 +73,7 @@ import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, alloc
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
+import { armKeyOfRecord, countRunsByArm, attributeArmBurn, effectiveBurnForMix, dominantArm, UNATTRIBUTED_ARM } from './arm-calibration.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
@@ -2171,8 +2172,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       appendAccountUsage(smoothState.accountUsage?.[stateKeys[i]], a, nowMs),
     ]));
     const prevSmoothE = smoothState.E != null && typeof smoothState.E === 'object' ? smoothState.E : {};
+    const prevArmE = smoothState.armE != null && typeof smoothState.armE === 'object' ? smoothState.armE : {};
+    const prevArmEpoch = smoothState.armEpoch != null && typeof smoothState.armEpoch === 'object' ? smoothState.armEpoch : {};
     const nextSmoothE = new Map();
-    const groupE = new Map(); // gid -> smoothed pooled burn per run
+    const nextArmE = {};
+    const nextArmEpoch = {};
+    const groupE = new Map(); // gid -> mix-weighted effective burn per run
+    const armEpochReset = new Set(); // gids whose old-mix estimates were segmented
     const calibrationGroups = {};
     for (const [gid, memberKeys] of calibMembers) {
       const pooled = pooledBurnPerRun({
@@ -2185,19 +2191,107 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         runsInSpanFor: (k, spanMs) => startedOnCountWhere(ledger, k, nowMs - spanMs, calibrationAccountOf),
         nowMs,
       });
-      const entry = smoothValue(Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
+      // Anchor (cost-model relative) burn per arm key for this pool, from the
+      // member ladders' per-arm burn maps: indexed under both the routed arm
+      // id and the bare model+effort form that model-only runs key by, so a
+      // never-measured arm still prices relative to the pool it joins.
+      const anchorByArm = {};
+      for (const k of memberKeys) {
+        const burns = ladders[k]?.burnPerRunPct ?? {};
+        const rungArms = [...(ladders[k]?.rungs ?? []), ...(ladders[k]?.credentialRanking?.candidates ?? [])];
+        const seen = new Set();
+        for (const a of rungArms) {
+          if (a?.armId == null || seen.has(a.armId)) continue;
+          seen.add(a.armId);
+          const anchor = burns[a.armId];
+          if (!(anchor > 0)) continue;
+          for (const key of [
+            armKeyOfRecord({ armId: a.armId, effort: a.effort ?? null }),
+            armKeyOfRecord({ armId: null, actualModel: a.model ?? null, effort: a.effort ?? null }),
+            a.armId,
+          ]) {
+            if (key == null) continue;
+            anchorByArm[key] = anchorByArm[key] != null ? Math.max(anchorByArm[key], anchor) : anchor;
+          }
+        }
+      }
+      // Per-arm run counts over the pooled sample's span: the ledger knows
+      // each run's arm, so the meter delta splits by responsibility.
+      let runsByArm = {};
+      if (pooled && pooled.spanMs > 0) {
+        const since = nowMs - pooled.spanMs;
+        runsByArm = countRunsByArm([...ledger.values()].filter(r =>
+          r?.startedAt != null && r.startedAt >= since && groupOfRun(r) === gid),
+        { unattributed: UNATTRIBUTED_ARM });
+      }
+      const prevGroupArms = prevArmE[gid] != null && typeof prevArmE[gid] === 'object' ? prevArmE[gid] : {};
+      const priorByArm = {};
+      for (const [arm, e] of Object.entries(prevGroupArms)) {
+        if (Number.isFinite(e?.value) && e.value > 0
+          && Number.isFinite(e?.atMs) && nowMs - e.atMs <= smoothOpts.staleMs) priorByArm[arm] = e.value;
+      }
+      const rawArms = pooled
+        ? attributeArmBurn({ deltaPct: pooled.deltaPct, runsByArm, priorByArm, anchorByArm })
+        : {};
+      const smoothedArms = {};
+      for (const [arm, raw] of Object.entries(rawArms)) {
+        const armEntry = smoothValue(Object.hasOwn(prevGroupArms, arm) ? prevGroupArms[arm] : null,
+          raw, nowMs, smoothOpts);
+        if (armEntry) smoothedArms[arm] = armEntry;
+      }
+      // Arms with no fresh sample keep their measurement while it is not
+      // stale, so the current mix can still price them.
+      for (const [arm, e] of Object.entries(prevGroupArms)) {
+        if (!(arm in smoothedArms) && Number.isFinite(e?.value)
+          && Number.isFinite(e?.atMs) && nowMs - e.atMs <= smoothOpts.staleMs) smoothedArms[arm] = e;
+      }
+      // The CURRENT run mix over the pacing window: pricing follows what
+      // runs now, not the mix that produced the last meter quantum.
+      const mixSince = nowMs - rateWindowMs;
+      const mixCounts = countRunsByArm([...ledger.values()].filter(r =>
+        r?.startedAt != null && r.startedAt >= mixSince && groupOfRun(r) === gid),
+      { unattributed: UNATTRIBUTED_ARM });
+      const mixTotal = Object.values(mixCounts).reduce((s, n) => s + n, 0);
+      const mixShares = {};
+      if (mixTotal > 0) for (const [arm, n] of Object.entries(mixCounts)) mixShares[arm] = n / mixTotal;
+      const dom = dominantArm(mixShares);
+      const prevDom = typeof prevArmEpoch[gid] === 'string' ? prevArmEpoch[gid] : null;
+      nextArmEpoch[gid] = dom ?? prevDom ?? null;
+      // Arm-mix segmentation: when the dominant arm changes, the pooled EWMA
+      // priced the OLD mix -- restart it at once instead of waiting out
+      // meter quanta. A first-seen mix that reprices the pool by >25%
+      // segments too, so an upgrade onto a switched fleet recovers now.
+      let entry = smoothValue(dom != null && prevDom != null && dom !== prevDom ? null
+        : Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
         pooled?.burnPerRunPct ?? null, nowMs, smoothOpts);
+      const armEValues = {};
+      for (const [arm, e] of Object.entries(smoothedArms)) armEValues[arm] = e.value;
+      const effective = effectiveBurnForMix({
+        armE: armEValues, mixShares,
+        pooledBurn: entry?.value ?? null, anchorByArm,
+      });
+      const priced = effective ?? entry?.value ?? null;
+      if (dom != null && prevDom == null && priced != null && entry?.value != null && entry.value > 0
+        && Math.abs(priced - entry.value) / entry.value > 0.25) {
+        entry = smoothValue(null, pooled?.burnPerRunPct ?? null, nowMs, smoothOpts);
+        armEpochReset.add(gid);
+      }
+      if (dom != null && prevDom != null && dom !== prevDom) armEpochReset.add(gid);
       if (entry) {
-        groupE.set(gid, entry.value);
         nextSmoothE.set(gid, entry);
       }
+      if (priced != null) groupE.set(gid, priced);
+      if (Object.keys(smoothedArms).length > 0) nextArmE[gid] = smoothedArms;
       if (memberKeys.length > 1 || pooled) {
         calibrationGroups[gid] = {
           members: memberKeys.length,
           contributing: pooled?.contributing ?? 0,
           runs: pooled?.runs ?? 0,
           rawBurnPerRunPct: pooled?.burnPerRunPct ?? null,
-          burnPerRunPct: entry?.value ?? null,
+          burnPerRunPct: priced,
+          armBurnPerRunPct: Object.fromEntries(Object.entries(smoothedArms).map(([a, e]) => [a, e.value])),
+          dominantArm: dom,
+          armMixReset: armEpochReset.has(gid),
         };
       }
     }
@@ -2218,7 +2312,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       for (const [key, sample] of measured) {
         const history = accountUsage.get(key);
         const last = history?.at(-1);
-        const previous = Object.hasOwn(smoothState.accountE ?? {}, key) ? smoothState.accountE[key] : null;
+        // A segmented mix epoch discards the member's old-mix individual
+        // estimate: it reprices off the mix-weighted group prior until fresh
+        // per-account evidence re-accumulates.
+        const previous = armEpochReset.has(gid) ? null
+          : Object.hasOwn(smoothState.accountE ?? {}, key) ? smoothState.accountE[key] : null;
         const fresh = sample.source !== 'group-prior';
         // Missing/no-motion readings carry knowledge, not fake new evidence.
         // Epoch changes and stale knowledge discard the individual estimate.
@@ -2963,6 +3061,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         recordDecision(ledger, {
           runId: run.runId, agentId: run.agentId, accountId: decision.accountId,
           armId: decision.armId ?? null,
+          effort: decision.effort ?? null,
           enforced: false, wouldModel, rung: decision.rung,
           trial: decision.trial === true,
           family: inferFamily(canonicalModelName(decision.model)),
@@ -3166,6 +3265,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
       fastUntilMs: targetStep.fastUntilMs,
       accountUsage: Object.fromEntries(accountUsage), accountE: Object.fromEntries(nextAccountE),
+      armE: nextArmE, armEpoch: nextArmEpoch,
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
@@ -3759,6 +3859,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         agentId: String(run.agentId ?? 'unknown'),
         accountId: d.accountId,
         armId: d.armId ?? null,
+        effort: d.effort ?? null,
         enforced: false,
         wouldModel: decoratedModelFor(d, emitAdapter) ?? `${d.model}(${d.effort ?? 'default'})`,
         rung: d.rung,
@@ -4275,6 +4376,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             agentId: String(params.agentId ?? 'unknown'),
             accountId: d.accountId,
             armId: d.armId ?? null,
+            effort: d.effort ?? null,
             enforced: true,
             wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
             rung: d.rung,

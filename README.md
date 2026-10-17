@@ -47,7 +47,13 @@ weekly prior by a relative weight. Missing/stale evidence retains bounded knowle
 falls back to the pooled prior. When any peer's counters are missing or reset
 mid-span there is no run scale, so the whole group keeps the pooled prior
 (weight 1) instead of pricing relative weights against it. Resets and counter
-epochs never bridge samples.
+epochs never bridge samples. Burn is measured per arm (model+effort) per pool,
+not per account: each pooled sample splits across the arms that ran in its
+span by responsibility, and pricing follows the current ledger run mix, so an
+arm switch reprices within one tick instead of waiting for meter quanta.
+Never-measured arms price off cost-anchor ratios; a dominant-arm change
+segments the pooled average and the members' old-mix estimates at once.
+Runs with no attributable arm price as their own `unattributed` segment.
 
 `/capacity` exposes weight, source, confidence and attributed-run equivalents. Verified
 healthy calibrated additions/reset headroom use a 5-minute upward target half-life for
