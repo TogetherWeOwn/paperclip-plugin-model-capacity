@@ -14,6 +14,7 @@ import {
   attributeArmBurn,
   effectiveBurnForMix,
   dominantArm,
+  rebaseSampleToMix,
   UNATTRIBUTED_ARM,
 } from '../src/arm-calibration.mjs';
 import { computeConcurrencyTarget } from '../src/concurrency.mjs';
@@ -22,16 +23,38 @@ const EXPENSIVE = 'wonder-full-era:high';
 const CHEAP = 'muse-spark-1.3-contributor:xhigh';
 
 test('armKeyOfRecord keys runs by model+effort', () => {
-  assert.equal(armKeyOfRecord({ armId: 'muse-spark-1-3-xhigh' }), 'muse-spark-1-3-xhigh');
+  // Routed arm ids resolve only for enforced decisions (or a shadow pick the
+  // observed model confirms); otherwise the key derives from what ran.
+  assert.equal(
+    armKeyOfRecord({ armId: 'muse-spark-1-3-xhigh', enforced: true }),
+    'muse-spark-1-3-xhigh',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'muse-spark-1-3-xhigh', actualModel: 'muse-spark-1.3-contributor', modelMatch: true }),
+    'muse-spark-1-3-xhigh',
+  );
   assert.equal(
     armKeyOfRecord({ armId: null, actualModel: 'muse-spark-1.3-contributor', effort: 'xhigh' }),
     'muse-spark-1.3-contributor:xhigh',
   );
-  // Decorated wouldModel carries the effort when the record has no arm id.
+  // A non-enforced shadow guess (wouldModel only) keys nothing: it buckets
+  // as unattributed instead of attributing burn to an arm that never ran.
+  assert.equal(armKeyOfRecord({ armId: 'shadow-arm', wouldModel: 'muse-spark-1.3-contributor(xhigh)' }), null);
   assert.equal(
-    armKeyOfRecord({ armId: null, wouldModel: 'muse-spark-1.3-contributor(xhigh)' }),
+    armKeyOfRecord({ armId: null, wouldModel: 'muse-spark-1.3-contributor(xhigh)', enforced: true }),
     'muse-spark-1.3-contributor:xhigh',
   );
+  // A shadow pick the observed model contradicts keys by what actually ran.
+  assert.equal(
+    armKeyOfRecord({
+      armId: 'claude-haiku-5-5:max', effort: 'max',
+      actualModel: 'claude-opus-5-5', wouldModel: 'claude-haiku-5-5(max)',
+      modelMatch: false,
+    }),
+    'claude-opus-5-5:max',
+  );
+  // Unknown or pending models yield no key.
+  assert.equal(armKeyOfRecord({ armId: null, actualModel: 'unknown' }), null);
   assert.equal(armKeyOfRecord({}), null);
 });
 
@@ -65,10 +88,15 @@ test('attributeArmBurn prices an unseen arm off anchor ratios, not the pool aver
 });
 
 test('countRunsByArm buckets arm-less runs instead of dropping them', () => {
-  assert.deepEqual(countRunsByArm([{ armId: 'a' }, {}]), { a: 1 });
+  assert.deepEqual(countRunsByArm([{ armId: 'a', enforced: true }, {}]), { a: 1 });
   assert.deepEqual(
-    countRunsByArm([{ armId: 'a' }, {}], { unattributed: UNATTRIBUTED_ARM }),
+    countRunsByArm([{ armId: 'a', enforced: true }, {}], { unattributed: UNATTRIBUTED_ARM }),
     { a: 1, [UNATTRIBUTED_ARM]: 1 },
+  );
+  // A non-enforced shadow guess with no observed model is arm-less too.
+  assert.deepEqual(
+    countRunsByArm([{ armId: 'a', wouldModel: 'm:a(max)' }], { unattributed: UNATTRIBUTED_ARM }),
+    { [UNATTRIBUTED_ARM]: 1 },
   );
 });
 
@@ -102,6 +130,49 @@ test('expensive-to-cheap switch raises slots within one tick of ledger evidence'
   const after = slotsFor(price({ [CHEAP]: 1 }));
   assert.ok(before > 0 && after > 0);
   assert.ok(after > before * 2, `slots must rise within one tick: ${before} -> ${after}`);
+});
+
+test('effectiveBurnForMix prices unmeasured arms off the measured arms, not the arm universe', () => {
+  // Fleet measured on opus at pooled=0.012; haiku never ran. Anchors are
+  // indexed under alias keys (as the tick does). The consistent prior is
+  // pooled * haikuAnchor / opusAnchor = 0.012*0.0005/0.00333 ~= 0.0018 --
+  // NOT pooled scaled by the universe average (~0.00313, 1.74x too high).
+  const priced = effectiveBurnForMix({
+    armE: { 'a:max': 0.012 },
+    mixShares: { 'h:max': 1 },
+    pooledBurn: 0.012,
+    anchorByArm: { 'a:max': 0.00333, a: 0.00333, 'h:max': 0.0005, h: 0.0005 },
+  });
+  assert.ok(Math.abs(priced - 0.0018018) < 1e-4, `mispriced unmeasured arm: ${priced}`);
+  // With no measured arm at all, fall back to pooled directly.
+  assert.ok(Math.abs(effectiveBurnForMix({
+    armE: {}, mixShares: { 'h:max': 1 }, pooledBurn: 0.012,
+    anchorByArm: { 'a:max': 0.00333, 'h:max': 0.0005 },
+  }) - 0.012) < 1e-12);
+});
+
+test('rebaseSampleToMix re-bases a counter estimate onto the mix price', () => {
+  // Window implies the old-mix scale (0.006) while the mix price moved to
+  // the cheap arm (0.001): the estimate follows the mix, inversely in weight.
+  const out = rebaseSampleToMix(
+    { source: 'account-weekly', burnPerRunPct: 0.006, capacityWeight: 1, groupMedianBurnPerRunPct: 0.006 },
+    { priced: 0.001, pooled: 0.006 },
+  );
+  assert.ok(Math.abs(out.burnPerRunPct - 0.001) < 1e-12, `${out.burnPerRunPct}`);
+  assert.ok(Math.abs(out.capacityWeight - 6) < 1e-12, `${out.capacityWeight}`);
+  assert.equal(out.groupMedianBurnPerRunPct, 0.001);
+  // Non-weekly samples and missing scales pass through untouched.
+  const prior = { source: 'group-prior', burnPerRunPct: 0.006, capacityWeight: 1 };
+  assert.equal(rebaseSampleToMix(prior, { priced: 0.001, pooled: 0.006 }), prior);
+  const weekly = { source: 'account-weekly', burnPerRunPct: 0.006, capacityWeight: 1 };
+  assert.equal(rebaseSampleToMix(weekly, { priced: null, pooled: 0.006 }), weekly);
+  assert.equal(rebaseSampleToMix(weekly, { priced: 0.001, pooled: null }), weekly);
+  // The rescale clamps at 8x either way.
+  const clamped = rebaseSampleToMix(
+    { source: 'account-weekly', burnPerRunPct: 0.006, capacityWeight: 1 },
+    { priced: 0.00006, pooled: 0.006 },
+  );
+  assert.ok(Math.abs(clamped.burnPerRunPct - 0.006 / 8) < 1e-15, `${clamped.burnPerRunPct}`);
 });
 
 test('effectiveBurnForMix falls back to the pooled burn with no arm evidence', () => {

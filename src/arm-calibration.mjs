@@ -34,25 +34,62 @@ function effortOfDecorated(model) {
 }
 
 /**
- * Stable arm key (model+effort) for one ledger record. Prefers the routed
- * armId (classic ids already encode effort); otherwise the canonical model
- * plus the recorded, decorated, or family-default effort.
+ * Stable arm key (model+effort) for one ledger record. The routed armId (and
+ * the decided effort) outrank observed reality only for an enforced hook
+ * decision -- or a shadow pick the observed model confirms (modelMatch): a
+ * non-enforced shadow/event-time pick is a routing guess, not observed burn
+ * (see calibrationAccount in ledger.mjs). Otherwise the key derives from the
+ * model that actually ran (actualModel, else eventModel -- never wouldModel),
+ * and unknown or pending models yield no key (they bucket as unattributed).
  */
 export function armKeyOfRecord(r) {
   if (r == null || typeof r !== 'object') return null;
-  const armId = typeof r.armId === 'string' && r.armId.length > 0 ? r.armId : null;
-  const model = canonicalModelName(r.actualModel)
-    ?? canonicalModelName(r.wouldModel)
+  const useDecision = r.enforced === true || r.modelMatch === true;
+  const armId = useDecision && typeof r.armId === 'string' && r.armId.length > 0 ? r.armId : null;
+  if (armId != null) {
+    // Classic routed ids already encode effort; a pending run may name no
+    // model yet, so the model is only needed for the effort suffix.
+    const modelForEffort = canonicalModelName(r.actualModel)
+      ?? canonicalModelName(r.wouldModel)
+      ?? canonicalModelName(r.eventModel)
+      ?? null;
+    const decidedEffort = typeof r.effort === 'string' && EFFORTS.has(r.effort) ? r.effort : null;
+    const effort = decidedEffort
+      ?? effortOfDecorated(r.actualModel)
+      ?? effortOfDecorated(r.eventModel)
+      ?? effortOfDecorated(r.wouldModel)
+      ?? (modelForEffort != null ? dynamicEffort(modelForEffort) : null);
+    if (effort != null && !armId.endsWith(`-${effort}`)) return `${armId}:${effort}`;
+    return armId;
+  }
+  if (useDecision) {
+    // Enforced (or model-confirmed) record without an arm id: the decided
+    // model is trustworthy.
+    const model = canonicalModelName(r.actualModel)
+      ?? canonicalModelName(r.wouldModel)
+      ?? canonicalModelName(r.eventModel)
+      ?? null;
+    if (model == null || model === 'unknown') return null;
+    const decidedEffort = typeof r.effort === 'string' && EFFORTS.has(r.effort) ? r.effort : null;
+    const effort = decidedEffort
+      ?? effortOfDecorated(r.actualModel)
+      ?? effortOfDecorated(r.eventModel)
+      ?? effortOfDecorated(r.wouldModel)
+      ?? dynamicEffort(model);
+    if (effort != null && !model.endsWith(`-${effort}`)) return `${model}:${effort}`;
+    return model;
+  }
+  // Non-enforced guess: key by what actually ran, with the effort parsed
+  // from the observed model -- never the decided arm or effort.
+  const observed = canonicalModelName(r.actualModel)
     ?? canonicalModelName(r.eventModel)
     ?? null;
-  const effort = (typeof r.effort === 'string' && EFFORTS.has(r.effort) ? r.effort : null)
-    ?? effortOfDecorated(r.wouldModel)
-    ?? effortOfDecorated(r.actualModel)
-    ?? (model != null ? dynamicEffort(model) : null);
-  const base = armId ?? model;
-  if (base == null) return null;
-  if (effort != null && !base.endsWith(`-${effort}`)) return `${base}:${effort}`;
-  return base;
+  if (observed == null || observed === 'unknown') return null;
+  const effort = effortOfDecorated(r.actualModel)
+    ?? effortOfDecorated(r.eventModel)
+    ?? dynamicEffort(observed);
+  if (effort != null && !observed.endsWith(`-${effort}`)) return `${observed}:${effort}`;
+  return observed;
 }
 
 /**
@@ -131,6 +168,30 @@ export function attributeArmBurn({ deltaPct, runsByArm, priorByArm = {}, anchorB
   return out;
 }
 
+/**
+ * Re-base a fresh counter-backed (account-weekly) estimate onto the
+ * mix-priced group baseline. The 90-minute counter window still spans the OLD
+ * mix, so scale by priced/pooled (clamped 8x either way) and move the baseline
+ * with it; the capacity weight scales inversely so weight stays consistent
+ * with the new burn. Non-weekly samples and missing scales pass through
+ * untouched.
+ */
+export function rebaseSampleToMix(sample, { priced = null, pooled = null } = {}) {
+  if (sample?.source !== 'account-weekly') return sample;
+  const burn = positive(sample.burnPerRunPct);
+  const p = positive(priced);
+  const q = positive(pooled);
+  if (burn == null || p == null || q == null) return sample;
+  if (!Number.isFinite(sample.capacityWeight)) return sample;
+  const s = clamp(p / q, 1 / 8, 8);
+  return {
+    ...sample,
+    burnPerRunPct: burn * s,
+    capacityWeight: sample.capacityWeight / s,
+    groupMedianBurnPerRunPct: p,
+  };
+}
+
 /** Highest-share arm of a mix (share-weighted { [armKey]: share }); ties break lexically. */
 export function dominantArm(mixShares) {
   let best = null;
@@ -154,22 +215,34 @@ export function dominantArm(mixShares) {
  *
  * Measured arms price at measurement. Unmeasured arms price at the pooled
  * scale times their anchor ratio -- so a first-time switch to a cheaper arm
- * reprices at once instead of inheriting the old arm's burn. Null when
- * nothing usable exists (no mix, no pooled burn, no measured arm).
+ * reprices at once instead of inheriting the old arm's burn. The anchor
+ * scale derives from arms carrying both a measurement and an anchor, so the
+ * caller must supply measurement-era anchors for measured arms (the tick
+ * records them on its armE entries -- current ladders may no longer serve
+ * the old mix). Null when nothing usable exists (no mix, no pooled burn,
+ * no measured arm).
  */
 export function effectiveBurnForMix({ armE = {}, mixShares = {}, pooledBurn = null, anchorByArm = {} } = {}) {
   const entries = Object.entries(mixShares ?? {}).filter(([, s]) => s > 0);
   const total = entries.reduce((s, [, x]) => s + x, 0);
   if (!(total > 0)) return null;
   const pooled = positive(pooledBurn);
-  // The anchor average is over the pool's whole known arm universe, NOT the
-  // current mix: a single-arm mix averaged over itself would always ratio to
-  // 1 and inherit the old arm's burn. The universe average keeps an
-  // unmeasured arm's prior honest relative to the pool it prices.
-  const anchorAvg = (() => {
-    const vals = Object.values(anchorByArm ?? {}).map(positive).filter(v => v != null);
-    if (vals.length === 0) return null;
-    return vals.reduce((s, v) => s + v, 0) / vals.length;
+  // Anchor scale from the arms that produced the pooled measurement (arms
+  // with both a measurement in armE and an anchor in anchorByArm), NOT the
+  // pool's whole arm universe: pooled prices the OLD mix, so an unmeasured
+  // arm's prior must rescale pooled by its anchor relative to the measured
+  // arms' anchors. Consulting only armE keys also ignores alias duplication
+  // in anchorByArm (one arm indexed under several equivalent keys). With no
+  // measured arm, fall back to pooled directly.
+  const anchorScale = (() => {
+    const scales = [];
+    for (const [a, v] of Object.entries(armE ?? {})) {
+      const m = positive(v);
+      const anchor = positive(anchorByArm?.[a]);
+      if (m != null && anchor != null && anchor > 0) scales.push(m / anchor);
+    }
+    if (scales.length === 0) return null;
+    return scales.reduce((s, v) => s + v, 0) / scales.length;
   })();
   let num = 0;
   let priced = 0;
@@ -178,9 +251,8 @@ export function effectiveBurnForMix({ armE = {}, mixShares = {}, pooledBurn = nu
     let e = measured;
     if (e == null && pooled != null) {
       const anchor = positive(anchorByArm[a]);
-      e = anchor != null && anchorAvg != null && anchorAvg > 0
-        ? pooled * (anchor / anchorAvg)
-        : pooled;
+      if (anchor != null && anchorScale != null && anchorScale > 0) e = anchor * anchorScale;
+      else e = pooled;
     }
     if (e == null) continue;
     num += (s / total) * e;

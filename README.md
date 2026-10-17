@@ -51,8 +51,15 @@ epochs never bridge samples. Burn is measured per arm (model+effort) per pool,
 not per account: each pooled sample splits across the arms that ran in its
 span by responsibility, and pricing follows the current ledger run mix, so an
 arm switch reprices within one tick instead of waiting for meter quanta.
-Never-measured arms price off cost-anchor ratios; a dominant-arm change
-segments the pooled average and the members' old-mix estimates at once.
+Never-measured arms price off cost-anchor ratios rescaled by the measured
+arms (measurement-era anchors ride with each arm estimate, so a switch onto
+lanes that no longer serve the old arm still reprices); a dominant-arm change
+segments the pooled average and the members' old-mix estimates at once, but
+only when the new arm holds a clear (>=60%) share and reprices the pool by
+more than 25%, so near-even mixes do not flap smoothing. Only enforced hook
+decisions (or shadow picks the observed model confirms) attribute burn by
+arm id; other runs key by the model that actually ran. Fresh counter-backed
+estimates re-base onto the mix-priced group baseline on a segmented tick.
 Runs with no attributable arm price as their own `unattributed` segment.
 
 `/capacity` exposes weight, source, confidence and attributed-run equivalents. Verified

@@ -94,9 +94,13 @@
  * (model+effort) per calibration pool instead of per account. Pooled meter
  * deltas split across the arms that ran in the span by responsibility; pricing
  * follows the current ledger run mix with cost-anchor priors for unmeasured
- * arms, so an arm switch reprices within one tick instead of waiting out
+ * arms (rescaled off the measured arms, measurement-era anchors recorded per
+ * arm), so an arm switch reprices within one tick instead of waiting out
  * meter quanta. A dominant-arm change segments the pooled EWMA and the
- * members' old-mix individual estimates at once. Ledger decisions record
+ * members' old-mix individual estimates at once past a 60% share and 25%
+ * reprice hysteresis; only enforced (or model-confirmed) decisions attribute
+ * by arm id, others key by the executed model, and fresh counter estimates
+ * re-base onto the mix price on a segmented tick. Ledger decisions record
  * effort and the shadow log exposes the decided arm. No capability, egress,
  * secret or env-key change.
  *
