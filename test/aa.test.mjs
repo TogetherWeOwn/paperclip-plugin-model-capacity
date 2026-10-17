@@ -118,6 +118,40 @@ test('leaderboard parser rejects unknown shapes', () => {
   assert.equal(parseAaLeaderboardHtml('prefix "{\\"models\\":[{\\"slug\\":\\"glm-4-5v\\", "x": 1'), null);
 });
 
+test('leaderboard parser reads the 2026-10-17 initialModels page (any first slug)', () => {
+  const models = [
+    { slug: 'jt-35b-flash', intelligenceIndex: 18.6, terminalbenchHard: 0.28 },
+    { slug: 'claude-opus-5-5', intelligenceIndex: 57.6, terminalBench40: 0.59,
+      percentile05OutputTokensPerSecond: 90.8, intelligenceIndexCostPerTask: 5.9 },
+  ];
+  const escaped = JSON.stringify(models).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const html = `<html><script>self.__next_f.push([1,"x{\\"initialModels\\":${escaped}}"])</script></html>`;
+  const rows = parseAaLeaderboardHtml(html);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].slug, 'jt-35b-flash');
+  assert.equal(rows[1].slug, 'claude-opus-5-5');
+  // Renamed fields backfill the canonical names.
+  assert.equal(rows[1].terminalbenchV40, 0.59);
+  assert.equal(rows[1].outputTokensPerSecondP5, 90.8);
+});
+
+test('leaderboard parser maps the full 2026-10-17 rename set', () => {
+  const models = [{
+    slug: 'm', terminalBench21: 0.41, terminalBench40: 0.59,
+    percentile05OutputTokensPerSecond: 1, quartile25OutputTokensPerSecond: 2,
+    quartile75OutputTokensPerSecond: 3, percentile95OutputTokensPerSecond: 4,
+  }];
+  const escaped = JSON.stringify(models).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const html = `<html><script>"{\\"initialModels\\":${escaped}}"</script></html>`;
+  const [row] = parseAaLeaderboardHtml(html);
+  assert.equal(row.terminalbenchV21, 0.41);
+  assert.equal(row.terminalbenchV40, 0.59);
+  assert.equal(row.outputTokensPerSecondP5, 1);
+  assert.equal(row.outputTokensPerSecondP25, 2);
+  assert.equal(row.outputTokensPerSecondP75, 3);
+  assert.equal(row.outputTokensPerSecondP95, 4);
+});
+
 test('merge: leaderboard wins non-null fields, API fills gaps, union of slugs', () => {
   const api = [
     { slug: 'a', intelligenceIndex: 50, terminalbenchHard: 60, intelligenceIndexCostPerTask: null, price1mInputTokens: 2, price1mOutputTokens: 6 },

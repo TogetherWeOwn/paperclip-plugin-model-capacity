@@ -26,7 +26,15 @@ export const AA_LEADERBOARD_URL = 'https://artificialanalysis.ai/leaderboards/mo
 /** The only URLs this client may fetch. */
 const ALLOWED_URLS = new Set([AA_FREE_LIST_URL, AA_LEADERBOARD_URL]);
 
-/** Flat numeric fields carried from leaderboard records (model-selection parity). */
+/** Flat numeric fields carried from leaderboard records (model-selection parity).
+ *
+ * The 2026-10-17 page renamed two families of fields: `terminalbenchV21` /
+ * `terminalbenchV40` are now `terminalBench21` / `terminalBench40` (capital
+ * B), and the output-speed percentiles are now `percentile05*` /
+ * `quartile25*` / `quartile75*` / `percentile95*`. Both spellings are carried
+ * so old snapshots keep parsing; buildLeaderboardRow backfills the canonical
+ * `terminalbenchV*` / `outputTokensPerSecondP*` names below.
+ */
 export const LEADERBOARD_NUMERIC_FIELDS = Object.freeze([
   'intelligenceIndex',
   'intelligenceIndexCostPerTask',
@@ -39,6 +47,14 @@ export const LEADERBOARD_NUMERIC_FIELDS = Object.freeze([
   'outputTokensPerSecondP25',
   'outputTokensPerSecondP75',
   'outputTokensPerSecondP95',
+  'percentile05OutputTokensPerSecond',
+  'quartile25OutputTokensPerSecond',
+  'quartile75OutputTokensPerSecond',
+  'percentile95OutputTokensPerSecond',
+  'percentile05TimeToFirstTokenSeconds',
+  'quartile25TimeToFirstTokenSeconds',
+  'quartile75TimeToFirstTokenSeconds',
+  'percentile95TimeToFirstTokenSeconds',
   'medianTimeToFirstTokenSeconds',
   'medianTimeToFirstAnswerTokenSeconds',
   'medianEndToEndResponseTimeSeconds',
@@ -51,6 +67,8 @@ export const LEADERBOARD_NUMERIC_FIELDS = Object.freeze([
   'ifbench',
   'tau2',
   'terminalbenchHard',
+  'terminalBench21',
+  'terminalBench40',
   'mmmuPro',
   'gdpvalNormalized',
   'terminalbenchV21',
@@ -266,10 +284,23 @@ export async function fetchAaLeaderboard({ http, url = AA_LEADERBOARD_URL, timeo
   return { ok: true, html };
 }
 
-// Anchor of the embedded models array on the leaderboard page. The page
+// Anchors of the embedded models array on the leaderboard page. The page
 // embeds the JSON inside a JS string, so the quotes carry literal
-// backslashes: {\"models\":[{\"slug\":\"glm-4-5v\"...
-const LEADERBOARD_ANCHOR = '{\\"models\\":[{\\"slug\\":\\"glm-4-5v\\"';
+// backslashes: {\"initialModels\":[{\"slug\":\"...
+// The key changed from `models` to `initialModels` on 2026-10-17 and the
+// first slug rotates as models launch, so anchors name only the key and the
+// array bracket -- never a specific slug. Escaped anchors (inside
+// self.__next_f JS strings) are tried first; raw anchors cover a future
+// unescaped embed.
+const LEADERBOARD_ANCHORS = Object.freeze([
+  '{\\"initialModels\\":[',
+  '{\\"models\\":[',
+  '"initialModels":[',
+  '"models":[',
+]);
+// Legacy single anchor kept for the one test that imports it indirectly;
+// prefer LEADERBOARD_ANCHORS for new code.
+const LEADERBOARD_ANCHOR = '{\\"models\\":[';
 const LEADERBOARD_BRACKET_OFFSET = LEADERBOARD_ANCHOR.indexOf('[');
 
 function extractBalancedArray(html, arrayStart) {
@@ -302,6 +333,43 @@ function extractBalancedArray(html, arrayStart) {
   return null;
 }
 
+/**
+ * Balanced-array extraction for a RAW (unescaped) JSON embed: `"key":[{...}]`
+ * served as literal HTML/JSON. String-aware: `"` toggles only when not
+ * backslash-escaped, and `\` escapes the next char inside strings. Brackets
+ * inside strings never affect depth.
+ */
+function extractBalancedJsonArray(html, arrayStart) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = arrayStart; i < html.length; i++) {
+    const ch = html[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '[') depth += 1;
+    else if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) return html.slice(arrayStart, i + 1);
+    }
+  }
+  return null;
+}
+
 function buildLeaderboardRow(rec) {
   const slug = rec?.slug;
   if (typeof slug !== 'string' || slug.length === 0) return null;
@@ -309,23 +377,18 @@ function buildLeaderboardRow(rec) {
   for (const key of LEADERBOARD_STRING_FIELDS) row[key] = typeof rec[key] === 'string' ? rec[key] : null;
   for (const key of LEADERBOARD_BOOLEAN_FIELDS) row[key] = typeof rec[key] === 'boolean' ? rec[key] : null;
   for (const key of LEADERBOARD_NUMERIC_FIELDS) row[key] = num(rec[key]);
+  // 2026-10-17 renames: backfill the canonical names the quality composite
+  // reads so a page carrying only the new spelling still scores.
+  if (row.terminalbenchV21 == null) row.terminalbenchV21 = num(rec.terminalBench21);
+  if (row.terminalbenchV40 == null) row.terminalbenchV40 = num(rec.terminalBench40);
+  if (row.outputTokensPerSecondP5 == null) row.outputTokensPerSecondP5 = num(rec.percentile05OutputTokensPerSecond);
+  if (row.outputTokensPerSecondP25 == null) row.outputTokensPerSecondP25 = num(rec.quartile25OutputTokensPerSecond);
+  if (row.outputTokensPerSecondP75 == null) row.outputTokensPerSecondP75 = num(rec.quartile75OutputTokensPerSecond);
+  if (row.outputTokensPerSecondP95 == null) row.outputTokensPerSecondP95 = num(rec.percentile95OutputTokensPerSecond);
   return row;
 }
 
-/** Parse leaderboard HTML into flat rows; null when the shape is unknown. */
-export function parseAaLeaderboardHtml(html) {
-  if (typeof html !== 'string') return null;
-  const anchorIndex = html.indexOf(LEADERBOARD_ANCHOR);
-  if (anchorIndex < 0) return null;
-  const balanced = extractBalancedArray(html, anchorIndex + LEADERBOARD_BRACKET_OFFSET);
-  if (balanced === null) return null;
-  const unescaped = balanced.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-  let parsed;
-  try {
-    parsed = JSON.parse(unescaped);
-  } catch {
-    return null;
-  }
+function rowsFromParsed(parsed) {
   if (!Array.isArray(parsed)) return null;
   const rows = [];
   for (const entry of parsed) {
@@ -334,6 +397,33 @@ export function parseAaLeaderboardHtml(html) {
     if (row) rows.push(row);
   }
   return rows.length > 0 ? rows : null;
+}
+
+/** Parse leaderboard HTML into flat rows; null when the shape is unknown. */
+export function parseAaLeaderboardHtml(html) {
+  if (typeof html !== 'string') return null;
+  for (const anchor of LEADERBOARD_ANCHORS) {
+    const anchorIndex = html.indexOf(anchor);
+    if (anchorIndex < 0) continue;
+    const arrayStart = anchorIndex + anchor.indexOf('[');
+    const escaped = anchor.includes('\\"');
+    const balanced = escaped
+      ? extractBalancedArray(html, arrayStart)
+      : extractBalancedJsonArray(html, arrayStart);
+    if (balanced === null) continue;
+    const unescaped = escaped
+      ? balanced.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      : balanced;
+    let parsed;
+    try {
+      parsed = JSON.parse(unescaped);
+    } catch {
+      continue;
+    }
+    const rows = rowsFromParsed(parsed);
+    if (rows) return rows;
+  }
+  return null;
 }
 
 /**
@@ -363,6 +453,42 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
     for (const [k, v] of Object.entries(row)) {
       if (k === 'slug') continue;
       if (v != null) base[k] = v;
+    }
+  }
+  const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([s]) => s);
+  return { rows: [...bySlug.values()], duplicateSlugs: duplicates, leaderboardSlugs: [...leaderboardSlugs] };
+}
+
+/**
+ * Gap-fill fresh API rows from a KEPT (stale) leaderboard layer: the fresh
+ * API row wins every field it carries (non-null); the kept row only fills
+ * fields the API left null, and kept-only slugs still appear. Unlike
+ * mergeAaRows -- where a fresh leaderboard legitimately wins -- a stale
+ * layer must never overwrite fresh API values (intelligence index, prices,
+ * codingIndex) while the leaderboard is failing. Returns the same shape
+ * as mergeAaRows, with leaderboardSlugs taken from the kept layer.
+ */
+export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
+  const bySlug = new Map();
+  const counts = new Map();
+  for (const row of apiRows ?? []) {
+    if (!row || typeof row.slug !== 'string') continue;
+    counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
+    if (!bySlug.has(row.slug)) bySlug.set(row.slug, { ...row });
+  }
+  const leaderboardSlugs = new Set();
+  for (const row of keptRows ?? []) {
+    if (!row || typeof row.slug !== 'string') continue;
+    counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
+    leaderboardSlugs.add(row.slug);
+    const base = bySlug.get(row.slug);
+    if (!base) {
+      bySlug.set(row.slug, { ...row });
+      continue;
+    }
+    for (const [k, v] of Object.entries(row)) {
+      if (k === 'slug') continue;
+      if (v != null && base[k] == null) base[k] = v;
     }
   }
   const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([s]) => s);
