@@ -24,6 +24,30 @@ export const DEFAULT_CONCURRENCY = Object.freeze({
 
 export const ROLES = Object.freeze(['doer', 'thinker', 'other']);
 
+/**
+ * Fleet-stall alarms (pure decision; the plugin logs and rate-limits them).
+ * `accounts` are the concurrency inputs ({ accountId, healthy (boolean,
+ * already health+exclusion folded), guardActive, remainingPct }).
+ * The target-0 alarm counts only healthy accounts that could actually
+ * serve: a 5h-guarded account gets 0 slots by design and an account with
+ * no remaining headroom sustains nothing, so an all-guarded / all-spent
+ * fleet reading target 0 is an intended shed, not a stall.
+ */
+export function fleetStallAlarms({ ladders, accountCount, accounts, target } = {}) {
+  const alarms = [];
+  const ladderKeys = Object.keys(ladders ?? {});
+  if (accountCount > 0 && ladderKeys.length > 0
+    && ladderKeys.every(k => ((ladders[k]?.rungs ?? []).length === 0))) {
+    alarms.push({ code: 'all-ladders-empty' });
+  }
+  const withHeadroom = (accounts ?? []).filter(a =>
+    a?.healthy === true && !a.guardActive && a.remainingPct > 0);
+  if (accountCount > 0 && withHeadroom.length > 0 && target === 0) {
+    alarms.push({ code: 'target-zero-with-headroom', accountIds: withHeadroom.map(a => a.accountId) });
+  }
+  return alarms;
+}
+
 export function medianPositive(values) {
   const v = values.filter(x => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
   if (v.length === 0) return null;

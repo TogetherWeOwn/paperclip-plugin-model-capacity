@@ -459,6 +459,42 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
   return { rows: [...bySlug.values()], duplicateSlugs: duplicates, leaderboardSlugs: [...leaderboardSlugs] };
 }
 
+/**
+ * Gap-fill fresh API rows from a KEPT (stale) leaderboard layer: the fresh
+ * API row wins every field it carries (non-null); the kept row only fills
+ * fields the API left null, and kept-only slugs still appear. Unlike
+ * mergeAaRows -- where a fresh leaderboard legitimately wins -- a stale
+ * layer must never overwrite fresh API values (intelligence index, prices,
+ * codingIndex) while the leaderboard is failing. Returns the same shape
+ * as mergeAaRows, with leaderboardSlugs taken from the kept layer.
+ */
+export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
+  const bySlug = new Map();
+  const counts = new Map();
+  for (const row of apiRows ?? []) {
+    if (!row || typeof row.slug !== 'string') continue;
+    counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
+    if (!bySlug.has(row.slug)) bySlug.set(row.slug, { ...row });
+  }
+  const leaderboardSlugs = new Set();
+  for (const row of keptRows ?? []) {
+    if (!row || typeof row.slug !== 'string') continue;
+    counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
+    leaderboardSlugs.add(row.slug);
+    const base = bySlug.get(row.slug);
+    if (!base) {
+      bySlug.set(row.slug, { ...row });
+      continue;
+    }
+    for (const [k, v] of Object.entries(row)) {
+      if (k === 'slug') continue;
+      if (v != null && base[k] == null) base[k] = v;
+    }
+  }
+  const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([s]) => s);
+  return { rows: [...bySlug.values()], duplicateSlugs: duplicates, leaderboardSlugs: [...leaderboardSlugs] };
+}
+
 /** Parse fetched text into normalized rows; null when the shape is unknown. */
 export function parseAaFreeList(text) {
   let parsed;

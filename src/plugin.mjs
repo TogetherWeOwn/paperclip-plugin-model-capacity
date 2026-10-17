@@ -35,7 +35,7 @@ import {
   isReactiveAccount,
   CliproxyCache,
 } from './cliproxy.mjs';
-import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows } from './aa.mjs';
+import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
   canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES,
@@ -69,7 +69,7 @@ import {
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
@@ -872,6 +872,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   const eligibilityWarnedAt = new Map();
   const missingServedModelsWarned = new Set();
   const ELIGIBILITY_WARN_EVERY_MS = 60 * 60 * 1000;
+  // Fleet-stall alarms, logged at error level at most once an hour per
+  // company and code (shadow-tick runs every minute; a standing stall must
+  // stay visible without a line per tick). Same limiter shape as
+  // warnEligibility below.
+  const fleetAlarmedAt = new Map();
+  const FLEET_ALARM_EVERY_MS = 60 * 60 * 1000;
+  function errorFleetAlarm(companyId, code, message, fields, nowMs) {
+    const key = `${companyId}:${code}`;
+    const last = fleetAlarmedAt.get(key);
+    if (last != null && nowMs - last >= 0 && nowMs - last < FLEET_ALARM_EVERY_MS) return;
+    fleetAlarmedAt.set(key, nowMs);
+    ctx.logger.error(message, { companyId, code, ...fields });
+  }
+
   function warnEligibility(companyId, warnings, nowMs) {
     for (const w of warnings ?? []) {
       const key = `${companyId}:${w.code}:${w.role ?? ''}`;
@@ -2545,32 +2559,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     concurrency.targetRaw = rawTarget;
 
     // Fleet-stall alarm (2026-10-17): an empty ladder on EVERY account, or a
-    // zero served target while healthy accounts remain, pages at error level.
-    // A healthy fleet must never read target 0 with "no account has headroom".
-    {
-      const ladderKeys = Object.keys(ladders ?? {});
-      const allLaddersEmpty = (snapshot.accounts ?? []).length > 0
-        && ladderKeys.length > 0
-        && ladderKeys.every(k => ((ladders[k]?.rungs ?? []).length === 0));
-      if (allLaddersEmpty) {
-        ctx.logger.error('model-capacity: all account ladders empty', {
-          companyId,
+    // zero served target while accounts with headroom remain, pages at
+    // error level (rate-limited to hourly per company+code). Guarded and
+    // zero-headroom accounts are excluded from the target-0 set: an
+    // all-guarded fleet reading target 0 is the designed shed, not a stall.
+    for (const alarm of fleetStallAlarms({
+      ladders, accountCount: (snapshot.accounts ?? []).length,
+      accounts: concurrencyAccounts, target: concurrency.target,
+    })) {
+      if (alarm.code === 'all-ladders-empty') {
+        errorFleetAlarm(companyId, alarm.code, 'model-capacity: all account ladders empty', {
           accounts: (snapshot.accounts ?? []).length,
           aaRows: aaSnapshot?.rows?.length ?? 0,
           leaderboardSlugs: aaSnapshot?.leaderboardSlugs?.length ?? 0,
           lastLeaderboardError: aaSnapshot?.lastLeaderboardError ?? null,
-        });
-      }
-      const healthyAccounts = (accountViews ?? []).filter(v => v?.health === 'healthy' && v?.action !== 'excluded');
-      if ((snapshot.accounts ?? []).length > 0 && healthyAccounts.length > 0 && concurrency.target === 0) {
-        ctx.logger.error('model-capacity: capacity target is 0 with healthy accounts', {
-          companyId,
-          healthyAccounts: healthyAccounts.map(v => v.accountId),
+        }, nowMs);
+      } else if (alarm.code === 'target-zero-with-headroom') {
+        errorFleetAlarm(companyId, alarm.code, 'model-capacity: capacity target is 0 with healthy accounts', {
+          healthyAccounts: alarm.accountIds,
           targetRaw: rawTarget,
           aaRows: aaSnapshot?.rows?.length ?? 0,
           leaderboardSlugs: aaSnapshot?.leaderboardSlugs?.length ?? 0,
           lastLeaderboardError: aaSnapshot?.lastLeaderboardError ?? null,
-        });
+        }, nowMs);
       }
     }
 
@@ -3791,10 +3802,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return { status: 'error', error: 'aa-parse-failed' };
     }
     // Second source is best-effort but NEVER zeroing: a leaderboard fetch
-    // or parse failure keeps the PREVIOUS snapshot's leaderboard-derived
-    // rows (2026-10-17: a parse failure stored API-only rows with
-    // leaderboardSlugs [] and every ladder lost its arms). Fresh API rows
-    // still land; only the leaderboard layer is carried forward.
+    // or parse failure keeps the PREVIOUS snapshot's raw leaderboard layer
+    // (2026-10-17: a parse failure stored API-only rows with
+    // leaderboardSlugs [] and every ladder lost its arms). The raw layer
+    // is persisted separately on success (`leaderboardRows`) so the keep
+    // path overlays leaderboard-only rows -- never the previous MERGED
+    // rows, whose stale API values would win every non-null field. The
+    // keep path also merges gap-fill only: fresh API values always win,
+    // the stale layer only supplies fields the API left null. Snapshots
+    // stored before the raw layer existed fall back to their merged rows
+    // filtered to the leaderboard slugs, still gap-fill only, until the
+    // first successful refresh stores the raw layer.
     let leaderboardRows = [];
     let leaderboardError = null;
     if (!board.ok || !board.html) {
@@ -3809,15 +3827,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     const prevSlugs = Array.isArray(previous.leaderboardSlugs) ? previous.leaderboardSlugs : [];
     const prevRows = Array.isArray(previous.rows) ? previous.rows : [];
+    const prevLeaderboardRows = (Array.isArray(previous.leaderboardRows) ? previous.leaderboardRows : [])
+      .filter(r => r && typeof r.slug === 'string');
+    const keptRows = prevLeaderboardRows.length > 0
+      ? prevLeaderboardRows
+      : prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug));
     let merged;
     let leaderboardAt;
     let keptPreviousLeaderboard = false;
     if (leaderboardError) {
-      const prevBoardRows = prevSlugs.length > 0
-        ? prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug))
-        : [];
-      if (prevBoardRows.length > 0) {
-        merged = mergeAaRows(parsed.rows, prevBoardRows);
+      if (keptRows.length > 0) {
+        merged = mergeAaRowsGapFill(parsed.rows, keptRows);
         keptPreviousLeaderboard = true;
       } else {
         merged = mergeAaRows(parsed.rows, []);
@@ -3833,9 +3853,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     } else {
       merged = mergeAaRows(parsed.rows, leaderboardRows);
       if (merged.leaderboardSlugs.length === 0 && prevSlugs.length > 0) {
-        const prevBoardRows = prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug));
-        if (prevBoardRows.length > 0) {
-          merged = mergeAaRows(parsed.rows, prevBoardRows);
+        if (keptRows.length > 0) {
+          merged = mergeAaRowsGapFill(parsed.rows, keptRows);
         } else {
           merged = { ...merged, leaderboardSlugs: [...prevSlugs] };
         }
@@ -3846,11 +3865,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         ? nowIso
         : (previous.leaderboardAt ?? null);
     }
+    // The raw layer carried into the next snapshot: freshly parsed rows on
+    // success, the kept layer on failure (never the merged rows).
+    const storedLeaderboardRows = keptPreviousLeaderboard ? keptRows : leaderboardRows;
     await ctx.state.set(scopeKey(companyId, AA_KEY), {
       fetchedAt: nowIso,
       rows: merged.rows,
       duplicateSlugs: merged.duplicateSlugs,
       leaderboardSlugs: merged.leaderboardSlugs,
+      leaderboardRows: storedLeaderboardRows,
       leaderboardAt,
       lastAttemptAt: nowIso,
       lastError: null,
@@ -3869,9 +3892,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     return {
       status: 'ok', rows: merged.rows.length,
-      leaderboardRows: keptPreviousLeaderboard
-        ? prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug)).length
-        : leaderboardRows.length,
+      leaderboardRows: storedLeaderboardRows.length,
       leaderboardError, keptPreviousLeaderboard,
     };
   }

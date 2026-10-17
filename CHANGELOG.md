@@ -2,10 +2,10 @@
 
 ## 0.2.48 — 2026-10-17
 
-- AA leaderboard resilience (fleet stall 10-17): a leaderboard fetch or parse failure keeps the previous snapshot's leaderboard-derived rows and never stores an empty `leaderboardSlugs` over a non-empty one; fresh API rows still land.
+- AA leaderboard resilience (fleet stall 10-17): a leaderboard fetch or parse failure keeps the previous snapshot's raw leaderboard layer — persisted separately on success as `leaderboardRows`, never the previous merged rows — and never stores an empty `leaderboardSlugs` over a non-empty one. The kept layer merges gap-fill only, so fresh API values (intelligence index, prices, coding index) always land and win; the stale layer only supplies fields the API left null.
 - Parser reads the current `initialModels` page (any first slug) plus the legacy `models` embed; maps renamed `terminalBench21`/`terminalBench40` and `percentile05`/`quartile25`/`quartile75`/`percentile95` speed fields to the canonical `terminalbenchV*` / `outputTokensPerSecondP*` names. Fixture: `test/fixtures/aa-leaderboard-20261017.html` (4 real rows from today's page).
 - Regression: a parse failure after a good snapshot keeps ladders non-empty with positive per-account share and never stalls the fleet target at 0 (`test/aa-refresh-keep-leaderboard.test.mjs`).
-- Error-level alarms when every account ladder is empty or the served target reads 0 with healthy accounts.
+- Error-level alarms when every account ladder is empty or the served target reads 0 while healthy accounts with headroom remain. Guarded and zero-headroom accounts don't count toward the target-0 alarm (an all-guarded target 0 is the designed shed), and both alarms are rate-limited to at most once an hour per company.
 - 0.2.47 shipped first, so this takes 0.2.48.
 
 ## 0.2.47 — 2026-10-16
