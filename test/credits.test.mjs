@@ -194,23 +194,38 @@ const spent = (key, credits) => ({ lane: key, provider: 'codex', accountKey: key
   fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
   observedAt: new Date(T0).toISOString(), quality: 'live', ...(credits === undefined ? {} : { credits }) });
 
+// Same fixture as the hook test below, on the tick path: both lanes serve
+// the same doer model and the credit lane is far hungrier, so under the old
+// ordering it wins on shortfall alone. The normal-mode run is the negative
+// control pinning the tick wiring (creditPriority, creditFallback and
+// remainingPct all have to reach the tick-side allocation order).
 test('shadow tick routes a run to plan headroom before higher-quality credit capacity', async () => {
-  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
-    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 1000, fraction: 0.99,
+    resetsAt: new Date(T0 + 2 * 3600000).toISOString() }];
   const rows = [
-    { slug: 'gpt-6-1-sol', intelligenceIndex: 80, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
     { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
   ];
-  const credit = { ...spent('credit', free), models: ['gpt-6.1-sol'] };
-  const d = drive([credit], undefined, { baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', progressive: true, rows });
-  await d.setup();
-  await d.start('plan-headroom-run', 'gpt-6.1-sol');
-  let cap;
-  for (let i = 0; i <= 2; i++) cap = await d.tick(i);
-  const shadow = (await d.shadow()).body;
-  const entry = shadow.entries.find(e => e.runId === 'plan-headroom-run');
-  assert.equal(entry?.accountId, 'meta:ok', JSON.stringify({ shadow, tick: cap.shadow }));
-  assert.equal(entry?.eventTime, false, 'the tick path made the fallback decision');
+  const accounts = [{ ...spent('credit', free), models: ['gemini-2-5-flash'] }];
+  const tickWith = async credits => {
+    const d = drive(structuredClone(accounts), credits, {
+      baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', progressive: true, rows,
+    });
+    await d.setup();
+    await d.start('plan-headroom-run', 'gemini-2-5-flash');
+    let cap;
+    for (let i = 0; i <= 2; i++) cap = await d.tick(i);
+    const shadow = (await d.shadow()).body;
+    const entry = shadow.entries.find(e => e.runId === 'plan-headroom-run');
+    return { entry, shadow, cap };
+  };
+  const fallback = await tickWith(undefined);
+  assert.equal(fallback.entry?.accountId, 'meta:ok',
+    JSON.stringify({ shadow: fallback.shadow, tick: fallback.cap.shadow }));
+  assert.equal(fallback.entry?.eventTime, false, 'the tick path made the fallback decision');
+  const normal = await tickWith({ priority: 'normal' });
+  assert.equal(normal.entry?.accountId, 'codex:credit',
+    `negative control: the same fixture under normal priority picks the hungrier credit lane, got ${JSON.stringify({ shadow: normal.shadow, tick: normal.cap.shadow })}`);
+  assert.equal(normal.entry?.eventTime, false, 'the tick path made the normal-priority decision');
 });
 
 // Both lanes serve the same doer model, and the credit lane is far hungrier
