@@ -73,6 +73,7 @@ import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, alloc
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
+import { armKeyOfRecord, countRunsByArm, attributeArmBurn, effectiveBurnForMix, dominantArm, rebaseSampleToMix, UNATTRIBUTED_ARM } from './arm-calibration.mjs';
 import {
   issueSnapshot, classifyOutcome, familyOutcomes,
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
@@ -2171,8 +2172,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       appendAccountUsage(smoothState.accountUsage?.[stateKeys[i]], a, nowMs),
     ]));
     const prevSmoothE = smoothState.E != null && typeof smoothState.E === 'object' ? smoothState.E : {};
+    const prevArmE = smoothState.armE != null && typeof smoothState.armE === 'object' ? smoothState.armE : {};
+    const prevArmEpoch = smoothState.armEpoch != null && typeof smoothState.armEpoch === 'object' ? smoothState.armEpoch : {};
+    const prevArmEpochAt = smoothState.armEpochAt != null && typeof smoothState.armEpochAt === 'object' ? smoothState.armEpochAt : {};
     const nextSmoothE = new Map();
-    const groupE = new Map(); // gid -> smoothed pooled burn per run
+    const nextArmE = {};
+    const nextArmEpoch = {};
+    const nextArmEpochAt = {};
+    const groupE = new Map(); // gid -> mix-weighted effective burn per run
+    const groupPoolE = new Map(); // gid -> pooled EWMA base the mix price rescales (for counter rebase)
+    const armEpochReset = new Set(); // gids whose old-mix estimates were segmented
+    // Keeper counter spans cover KEEP_MS (see calibration.mjs): after a mix
+    // switch the fresh account-weekly sample still spans old-mix runs until
+    // the window rolls past the segmentation tick.
+    const COUNTER_WINDOW_MS = 90 * 60000;
     const calibrationGroups = {};
     for (const [gid, memberKeys] of calibMembers) {
       const pooled = pooledBurnPerRun({
@@ -2185,19 +2198,150 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         runsInSpanFor: (k, spanMs) => startedOnCountWhere(ledger, k, nowMs - spanMs, calibrationAccountOf),
         nowMs,
       });
-      const entry = smoothValue(Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null,
+      // Anchor (cost-model relative) burn per arm key for this pool, from the
+      // member ladders' per-arm burn maps: indexed under both the routed arm
+      // id and the bare model+effort form that model-only runs key by, so a
+      // never-measured arm still prices relative to the pool it joins.
+      const anchorByArm = {};
+      for (const k of memberKeys) {
+        const burns = ladders[k]?.burnPerRunPct ?? {};
+        const rungArms = [...(ladders[k]?.rungs ?? []), ...(ladders[k]?.credentialRanking?.candidates ?? [])];
+        const seen = new Set();
+        for (const a of rungArms) {
+          if (a?.armId == null || seen.has(a.armId)) continue;
+          seen.add(a.armId);
+          const anchor = burns[a.armId];
+          if (!(anchor > 0)) continue;
+          for (const key of [
+            // Routed arm ids resolve only for enforced decisions (see
+            // armKeyOfRecord), so index the ladder's own arms as enforced.
+            armKeyOfRecord({ armId: a.armId, effort: a.effort ?? null, enforced: true }),
+            armKeyOfRecord({ armId: null, actualModel: a.model ?? null, effort: a.effort ?? null }),
+            a.armId,
+          ]) {
+            if (key == null) continue;
+            anchorByArm[key] = anchorByArm[key] != null ? Math.max(anchorByArm[key], anchor) : anchor;
+          }
+        }
+      }
+      // Per-arm run counts over the pooled sample's span: the ledger knows
+      // each run's arm, so the meter delta splits by responsibility.
+      let runsByArm = {};
+      if (pooled && pooled.spanMs > 0) {
+        const since = nowMs - pooled.spanMs;
+        runsByArm = countRunsByArm([...ledger.values()].filter(r =>
+          r?.startedAt != null && r.startedAt >= since && groupOfRun(r) === gid),
+        { unattributed: UNATTRIBUTED_ARM });
+      }
+      const prevGroupArms = prevArmE[gid] != null && typeof prevArmE[gid] === 'object' ? prevArmE[gid] : {};
+      const priorByArm = {};
+      for (const [arm, e] of Object.entries(prevGroupArms)) {
+        if (Number.isFinite(e?.value) && e.value > 0
+          && Number.isFinite(e?.atMs) && nowMs - e.atMs <= smoothOpts.staleMs) priorByArm[arm] = e.value;
+      }
+      const rawArms = pooled
+        ? attributeArmBurn({ deltaPct: pooled.deltaPct, runsByArm, priorByArm, anchorByArm })
+        : {};
+      const smoothedArms = {};
+      for (const [arm, raw] of Object.entries(rawArms)) {
+        const armEntry = smoothValue(Object.hasOwn(prevGroupArms, arm) ? prevGroupArms[arm] : null,
+          raw, nowMs, smoothOpts);
+        if (!armEntry) continue;
+        // Remember the anchor the measurement priced against: lanes may stop
+        // serving the old arm after a switch, and the rescale needs the
+        // measurement-era anchor, not the current ladder (which no longer
+        // names it). Prefer the previously recorded anchor when present.
+        const anchor = prevGroupArms[arm]?.anchor ?? anchorByArm[arm] ?? null;
+        smoothedArms[arm] = anchor != null && anchor > 0 ? { ...armEntry, anchor } : armEntry;
+      }
+      // Arms with no fresh sample keep their measurement while it is not
+      // stale, so the current mix can still price them.
+      for (const [arm, e] of Object.entries(prevGroupArms)) {
+        if (!(arm in smoothedArms) && Number.isFinite(e?.value)
+          && Number.isFinite(e?.atMs) && nowMs - e.atMs <= smoothOpts.staleMs) smoothedArms[arm] = e;
+      }
+      // Rescale anchors: recorded measurement-era anchors win for measured
+      // arms (current ladders may no longer serve them); current anchors
+      // price unmeasured arms joining the mix.
+      const scaleAnchorByArm = { ...anchorByArm };
+      for (const [arm, e] of Object.entries(smoothedArms)) {
+        if (e?.anchor != null && e.anchor > 0) scaleAnchorByArm[arm] = e.anchor;
+      }
+      // The CURRENT run mix over the pacing window: pricing follows what
+      // runs now, not the mix that produced the last meter quantum.
+      const mixSince = nowMs - rateWindowMs;
+      const mixCounts = countRunsByArm([...ledger.values()].filter(r =>
+        r?.startedAt != null && r.startedAt >= mixSince && groupOfRun(r) === gid),
+      { unattributed: UNATTRIBUTED_ARM });
+      const mixTotal = Object.values(mixCounts).reduce((s, n) => s + n, 0);
+      const mixShares = {};
+      if (mixTotal > 0) for (const [arm, n] of Object.entries(mixCounts)) mixShares[arm] = n / mixTotal;
+      const dom = dominantArm(mixShares);
+      const prevDom = typeof prevArmEpoch[gid] === 'string' ? prevArmEpoch[gid] : null;
+      const carried = Object.hasOwn(prevSmoothE, gid) ? prevSmoothE[gid] : null;
+      const carriedVal = carried?.value ?? null;
+      const armEValues = {};
+      for (const [arm, e] of Object.entries(smoothedArms)) armEValues[arm] = e.value;
+      // Provisional price from the CARRIED pooled value first: a flip with no
+      // fresh meter sample (flat quantized meter) must not destroy the
+      // persisted estimate before effectiveBurnForMix can use it.
+      const provisional = effectiveBurnForMix({
+        armE: armEValues, mixShares,
+        pooledBurn: carriedVal, anchorByArm: scaleAnchorByArm,
+      });
+      const repriceVsCarried = provisional != null && carriedVal != null && carriedVal > 0
+        ? Math.abs(provisional - carriedVal) / carriedVal : null;
+      // Hysteresis: a dominant-arm flip segments only when the new arm holds
+      // a clear share (>=60%) AND reprices the pool by >25% against the
+      // carried value. A near-even mix sliding across 50/50 is run-count
+      // noise, not an arm switch, and must not reset smoothing.
+      const domShare = dom != null ? (mixShares[dom] ?? 0) : 0;
+      const flipped = dom != null && prevDom != null && dom !== prevDom;
+      const segmentedFlip = flipped && domShare >= 0.6
+        && repriceVsCarried != null && repriceVsCarried > 0.25;
+      // Arm-mix segmentation: a segmented flip restarts the pooled EWMA --
+      // but only when a fresh sample exists. With no fresh sample the
+      // carried entry is kept, so the pool stays calibrated. A first-seen
+      // mix that reprices the pool by >25% segments too, so an upgrade onto
+      // a switched fleet recovers now.
+      let entry = smoothValue(segmentedFlip && pooled?.burnPerRunPct == null ? carried : (segmentedFlip ? null : carried),
         pooled?.burnPerRunPct ?? null, nowMs, smoothOpts);
+      const poolBase = entry?.value ?? carriedVal ?? null;
+      const effective = effectiveBurnForMix({
+        armE: armEValues, mixShares,
+        pooledBurn: poolBase, anchorByArm: scaleAnchorByArm,
+      });
+      const priced = effective ?? poolBase ?? null;
+      if (dom != null && prevDom == null && priced != null && poolBase != null && poolBase > 0
+        && Math.abs(priced - poolBase) / poolBase > 0.25) {
+        if (pooled?.burnPerRunPct != null) entry = smoothValue(null, pooled?.burnPerRunPct ?? null, nowMs, smoothOpts);
+        armEpochReset.add(gid);
+      }
+      if (segmentedFlip) armEpochReset.add(gid);
+      // The epoch advances only on segmentation; otherwise the previous epoch
+      // arm persists so near-even mixes do not flap the epoch every tick.
+      nextArmEpoch[gid] = armEpochReset.has(gid) && dom != null ? dom : (prevDom ?? dom ?? null);
+      // Segmentation time persists so fresh counter-backed samples keep
+      // re-basing onto the mix price until the 90-minute counter window rolls
+      // past the switch (otherwise the rebase lasts one tick and snaps back).
+      if (armEpochReset.has(gid)) nextArmEpochAt[gid] = nowMs;
+      else if (Number.isFinite(prevArmEpochAt[gid])) nextArmEpochAt[gid] = prevArmEpochAt[gid];
       if (entry) {
-        groupE.set(gid, entry.value);
         nextSmoothE.set(gid, entry);
       }
+      if (priced != null) groupE.set(gid, priced);
+      if (poolBase != null) groupPoolE.set(gid, poolBase);
+      if (Object.keys(smoothedArms).length > 0) nextArmE[gid] = smoothedArms;
       if (memberKeys.length > 1 || pooled) {
         calibrationGroups[gid] = {
           members: memberKeys.length,
           contributing: pooled?.contributing ?? 0,
           runs: pooled?.runs ?? 0,
           rawBurnPerRunPct: pooled?.burnPerRunPct ?? null,
-          burnPerRunPct: entry?.value ?? null,
+          burnPerRunPct: priced,
+          armBurnPerRunPct: Object.fromEntries(Object.entries(smoothedArms).map(([a, e]) => [a, e.value])),
+          dominantArm: dom,
+          armMixReset: armEpochReset.has(gid),
         };
       }
     }
@@ -2218,11 +2362,27 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       for (const [key, sample] of measured) {
         const history = accountUsage.get(key);
         const last = history?.at(-1);
-        const previous = Object.hasOwn(smoothState.accountE ?? {}, key) ? smoothState.accountE[key] : null;
+        // A segmented mix epoch discards the member's old-mix individual
+        // estimate: it reprices off the mix-weighted group prior until fresh
+        // per-account evidence re-accumulates.
+        const previous = armEpochReset.has(gid) ? null
+          : Object.hasOwn(smoothState.accountE ?? {}, key) ? smoothState.accountE[key] : null;
         const fresh = sample.source !== 'group-prior';
+        // A segmented mix epoch re-bases fresh counter-backed estimates onto
+        // the mix-priced group baseline (see rebaseSampleToMix): the
+        // 90-minute counter window still spans the OLD mix, so without this
+        // counter-backed lanes wait out the meter window while group-prior
+        // lanes already reprice. The rebase persists until the counter window
+        // rolls past the segmentation tick -- otherwise it lasts one tick and
+        // the next tick snaps back to the old-mix window value.
+        const epochAt = armEpochReset.has(gid) ? nowMs : prevArmEpochAt[gid] ?? null;
+        const inWindow = Number.isFinite(epochAt) && nowMs - epochAt < COUNTER_WINDOW_MS;
+        const rebased = inWindow
+          ? rebaseSampleToMix(sample, { priced: groupE.get(gid) ?? null, pooled: groupPoolE.get(gid) ?? null })
+          : sample;
         // Missing/no-motion readings carry knowledge, not fake new evidence.
         // Epoch changes and stale knowledge discard the individual estimate.
-        const entry = fresh ? { ...sample, atMs: last.atMs, epoch: last.epoch }
+        const entry = fresh ? { ...rebased, atMs: last.atMs, epoch: last.epoch }
           : previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
         accountE.set(key, entry);
         if (entry.source !== 'group-prior') nextAccountE.set(key, entry);
@@ -2963,6 +3123,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         recordDecision(ledger, {
           runId: run.runId, agentId: run.agentId, accountId: decision.accountId,
           armId: decision.armId ?? null,
+          effort: decision.effort ?? null,
           enforced: false, wouldModel, rung: decision.rung,
           trial: decision.trial === true,
           family: inferFamily(canonicalModelName(decision.model)),
@@ -3166,6 +3327,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
       fastUntilMs: targetStep.fastUntilMs,
       accountUsage: Object.fromEntries(accountUsage), accountE: Object.fromEntries(nextAccountE),
+      armE: nextArmE, armEpoch: nextArmEpoch, armEpochAt: nextArmEpochAt,
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
@@ -3759,6 +3921,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         agentId: String(run.agentId ?? 'unknown'),
         accountId: d.accountId,
         armId: d.armId ?? null,
+        effort: d.effort ?? null,
         enforced: false,
         wouldModel: decoratedModelFor(d, emitAdapter) ?? `${d.model}(${d.effort ?? 'default'})`,
         rung: d.rung,
@@ -4275,6 +4438,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             agentId: String(params.agentId ?? 'unknown'),
             accountId: d.accountId,
             armId: d.armId ?? null,
+            effort: d.effort ?? null,
             enforced: true,
             wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
             rung: d.rung,
