@@ -60,7 +60,7 @@ import {
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import {
-  normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, gateCreditConcurrencyRoles,
+  normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
@@ -2505,13 +2505,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
     let concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });
     if (config.credits.priority === 'fallback') {
-      const heldForNonReview = new Set(reviewReserveView.heldAccountIds ?? []);
-      const planSlotsByRole = new Set();
-      for (const row of concurrency.perAccount) {
-        const view = viewById.get(row.accountId);
-        if (view?.creditFallback === true || heldForNonReview.has(row.accountId) || row.usableSlots <= 0) continue;
-        for (const role of row.eligibleRoles ?? []) planSlotsByRole.add(role);
-      }
+      const planSlotsByRole = planConcurrencyRoles(
+        concurrency.perAccount, viewById, reviewReserveView.heldAccountIds,
+      );
       const creditAccountIds = ordered.filter(a => viewById.get(a.accountId)?.creditFallback === true).map(a => a.accountId);
       concurrencyRoleAccess = gateCreditConcurrencyRoles(roleAccess, creditAccountIds, planSlotsByRole);
       concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });

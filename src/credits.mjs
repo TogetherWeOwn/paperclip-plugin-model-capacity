@@ -30,6 +30,19 @@ export function hasUsablePlanHeadroom(view, reservePct = 0.05) {
       && view.remainingPct > WEEKLY_EXHAUSTED_PCT && view?.headroomPct != null && view.headroomPct > reservePct));
 }
 
+/** Roles with allocatable non-credit concurrency after selection/reserve gates. */
+export function planConcurrencyRoles(perAccount, viewsById, heldAccountIds = []) {
+  const held = new Set(heldAccountIds ?? []);
+  const roles = new Set();
+  for (const row of perAccount ?? []) {
+    const view = viewsById?.get(row.accountId);
+    if (view?.creditFallback === true || view?.action === 'excluded' || !hasUsablePlanHeadroom(view)
+      || held.has(row.accountId) || !(row.usableSlots > 0)) continue;
+    for (const role of row.eligibleRoles ?? []) roles.add(role);
+  }
+  return roles;
+}
+
 /** Keep credit concurrency eligible for roles without usable plan slots. */
 export function gateCreditConcurrencyRoles(roleAccess, creditAccountIds, planSlotsByRole) {
   const gated = Object.fromEntries(Object.entries(roleAccess ?? {}).map(([accountId, entry]) => [

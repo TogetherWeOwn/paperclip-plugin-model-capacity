@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  normalizeCredits, usableCredit, DEFAULT_CREDITS, hasUsablePlanHeadroom, gateCreditConcurrencyRoles,
+  normalizeCredits, usableCredit, DEFAULT_CREDITS, hasUsablePlanHeadroom,
+  planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from '../src/credits.mjs';
 import { parseLaneAccount, parseCredits } from '../src/cliproxy.mjs';
 import { createModelCapacityPlugin, validateConfigShape } from '../src/plugin.mjs';
@@ -29,18 +30,31 @@ test('plan headroom needs weekly quota unless the lane is reactive', () => {
   assert.equal(hasUsablePlanHeadroom({ reactive: true, guardActive: true }), false);
 });
 
-test('credit concurrency keeps roles without non-credit plan slots', () => {
-  const access = {
-    'codex:credit': { doer: { eligible: true }, thinker: { eligible: true } },
-    'meta:plan': { doer: { eligible: true } },
-  };
-  const withoutPlanSlots = gateCreditConcurrencyRoles(access, ['codex:credit'], new Set());
-  assert.equal(withoutPlanSlots['codex:credit'].doer.eligible, true,
-    'a reactive or otherwise zero-slot plan lane cannot suppress credit concurrency');
-  const withDoerPlanSlots = gateCreditConcurrencyRoles(access, ['codex:credit'], new Set(['doer']));
-  assert.equal(withDoerPlanSlots['codex:credit'].doer.eligible, false);
-  assert.equal(withDoerPlanSlots['codex:credit'].thinker.eligible, true);
-  assert.equal(access['codex:credit'].doer.eligible, true, 'the helper does not mutate route eligibility');
+test('only usable, unheld plan slots suppress credit concurrency for their roles', () => {
+  const usable = { accountId: 'meta:usable', usableSlots: 1, eligibleRoles: ['thinker'] };
+  const lowHeadroom = { accountId: 'meta:low', usableSlots: 1, eligibleRoles: ['doer'] };
+  const reactiveZero = { accountId: 'meta:reactive', usableSlots: 0, eligibleRoles: ['thinker'] };
+  const held = { accountId: 'meta:held', usableSlots: 1, eligibleRoles: ['thinker'] };
+  const excluded = { accountId: 'meta:excluded', usableSlots: 1, eligibleRoles: ['thinker'] };
+  const views = new Map([
+    ['meta:usable', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
+    ['meta:low', { remainingPct: 0.5, headroomPct: 0.02, health: 'healthy' }],
+    ['meta:reactive', { reactive: true, health: 'healthy' }],
+    ['meta:held', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
+    ['meta:excluded', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy', action: 'excluded' }],
+  ]);
+  const roles = planConcurrencyRoles([usable, lowHeadroom, reactiveZero, held, excluded], views, ['meta:held']);
+  assert.deepEqual([...roles], ['thinker'],
+    'low-headroom, zero-slot reactive, held, and excluded plans cannot suppress credit roles');
+  const access = { 'codex:credit': {
+    doer: { eligible: true }, thinker: { eligible: true }, other: { eligible: true },
+  } };
+  const gated = gateCreditConcurrencyRoles(access, ['codex:credit'], roles);
+  assert.equal(gated['codex:credit'].doer.eligible, true,
+    'a plan lane eligible only for thinkers cannot suppress doer credits');
+  assert.equal(gated['codex:credit'].thinker.eligible, false);
+  assert.equal(gated['codex:credit'].other.eligible, true);
+  assert.equal(access['codex:credit'].thinker.eligible, true, 'the helper does not mutate route eligibility');
 });
 
 test('credits priority defaults to fallback and validates the normal compatibility setting', () => {
@@ -107,7 +121,7 @@ test('only allowed types with a positive balance are spendable; paid needs opt-i
 });
 
 function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], baseProvider = 'codex', progressive = false,
-  rows = [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
+  enforce = false, reviewReserve = { enabled: false }, rows = [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
     intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }] } = {}) {
   const state = new Map();
   const jobs = new Map();
@@ -126,7 +140,7 @@ function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], bas
       usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 },
     }) : a),
   ];
-  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false },
+  const config = { enforce, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve,
     ...(configCredits === undefined ? {} : { credits: configCredits }) };
   const io = {
     config: { get: async () => config },
@@ -157,8 +171,14 @@ function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], bas
     setup,
     tick,
     start: async (runId, model) => handlers.get('agent.run.started')({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
-      payload: { run: { agentId: 'agent-9', provider: 'codex', model } }, occurredAt: new Date(now).toISOString() }),
+      payload: { run: { agentId: 'agent-9', provider: 'codex', adapterType: 'claude-code', model } }, occurredAt: new Date(now).toISOString() }),
     shadow: async () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+    hook: (runId, agentId = 'agent-9') => plugin.onResolveRunModel({
+      runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
+      invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
+      issueOverrideModel: null, deadlineMs: 1500,
+    }),
+    api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     run: async () => { await setup(); return tick(); },
   };
 }
@@ -185,6 +205,36 @@ test('shadow tick routes a run to plan headroom before higher-quality credit cap
   const entry = shadow.entries.find(e => e.runId === 'plan-headroom-run');
   assert.equal(entry?.accountId, 'meta:ok', JSON.stringify({ shadow, tick: cap.shadow }));
   assert.equal(entry?.eventTime, false, 'the tick path made the fallback decision');
+});
+
+test('hook selection prefers plan headroom over a higher-ranked credit lane', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const rows = [
+    { slug: 'gpt-6-1-sol', intelligenceIndex: 80, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
+  ];
+  const accounts = [{ ...spent('credit', free), models: ['gpt-6.1-sol'] }];
+  const d = drive(accounts, undefined, {
+    baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', enforce: true, rows,
+  });
+  await d.setup();
+  await d.tick();
+  const decision = await d.hook('hook-plan-first');
+  assert.equal(decision.kind, 'decide');
+  assert.match(decision.model, /gemini-2-5-flash/);
+});
+
+test('review reserve excludes credit accounts while same-provider plan headroom exists', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const d = drive([spent('credit', free)], undefined, {
+    reviewReserve: { enabled: true, providers: ['codex'], agentIds: ['reviewer'] },
+  });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.deepEqual(cap.reviewReserve.perProvider.codex.accounts.map(a => a.accountId), ['codex:ok']);
 });
 
 test('weekly-spent Codex lane with free credits stays available and paced; without stays excluded', async () => {
