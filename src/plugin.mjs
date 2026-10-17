@@ -2524,6 +2524,36 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     concurrency.targetRaw = rawTarget;
 
+    // Fleet-stall alarm (2026-10-17): an empty ladder on EVERY account, or a
+    // zero served target while healthy accounts remain, pages at error level.
+    // A healthy fleet must never read target 0 with "no account has headroom".
+    {
+      const ladderKeys = Object.keys(ladders ?? {});
+      const allLaddersEmpty = (snapshot.accounts ?? []).length > 0
+        && ladderKeys.length > 0
+        && ladderKeys.every(k => ((ladders[k]?.rungs ?? []).length === 0));
+      if (allLaddersEmpty) {
+        ctx.logger.error('model-capacity: all account ladders empty', {
+          companyId,
+          accounts: (snapshot.accounts ?? []).length,
+          aaRows: aaSnapshot?.rows?.length ?? 0,
+          leaderboardSlugs: aaSnapshot?.leaderboardSlugs?.length ?? 0,
+          lastLeaderboardError: aaSnapshot?.lastLeaderboardError ?? null,
+        });
+      }
+      const healthyAccounts = (accountViews ?? []).filter(v => v?.health === 'healthy' && v?.action !== 'excluded');
+      if ((snapshot.accounts ?? []).length > 0 && healthyAccounts.length > 0 && concurrency.target === 0) {
+        ctx.logger.error('model-capacity: capacity target is 0 with healthy accounts', {
+          companyId,
+          healthyAccounts: healthyAccounts.map(v => v.accountId),
+          targetRaw: rawTarget,
+          aaRows: aaSnapshot?.rows?.length ?? 0,
+          leaderboardSlugs: aaSnapshot?.leaderboardSlugs?.length ?? 0,
+          lastLeaderboardError: aaSnapshot?.lastLeaderboardError ?? null,
+        });
+      }
+    }
+
     // Ledger first: hook and event-time decisions since the last tick are
     // already in it (no queues to merge). Restart reconciliation only marks
     // unverifiable records -- it never deletes, so the shadow log survives
@@ -3726,8 +3756,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx.logger.error('model-capacity: AA parse failed; keeping prior snapshot', { companyId });
       return { status: 'error', error: 'aa-parse-failed' };
     }
-    // Second source is best-effort: a leaderboard failure degrades to
-    // API-only rows, never to dropping the fresh API snapshot.
+    // Second source is best-effort but NEVER zeroing: a leaderboard fetch
+    // or parse failure keeps the PREVIOUS snapshot's leaderboard-derived
+    // rows (2026-10-17: a parse failure stored API-only rows with
+    // leaderboardSlugs [] and every ladder lost its arms). Fresh API rows
+    // still land; only the leaderboard layer is carried forward.
     let leaderboardRows = [];
     let leaderboardError = null;
     if (!board.ok || !board.html) {
@@ -3740,21 +3773,73 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         leaderboardRows = boardParsed;
       }
     }
-    const merged = mergeAaRows(parsed.rows, leaderboardRows);
+    const prevSlugs = Array.isArray(previous.leaderboardSlugs) ? previous.leaderboardSlugs : [];
+    const prevRows = Array.isArray(previous.rows) ? previous.rows : [];
+    let merged;
+    let leaderboardAt;
+    let keptPreviousLeaderboard = false;
+    if (leaderboardError) {
+      const prevBoardRows = prevSlugs.length > 0
+        ? prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug))
+        : [];
+      if (prevBoardRows.length > 0) {
+        merged = mergeAaRows(parsed.rows, prevBoardRows);
+        keptPreviousLeaderboard = true;
+      } else {
+        merged = mergeAaRows(parsed.rows, []);
+      }
+      // Never store an empty leaderboardSlugs over a non-empty one: when the
+      // previous snapshot has slugs but its rows are gone (pruned state),
+      // keep the slug list so downstream guards see continuity.
+      if (merged.leaderboardSlugs.length === 0 && prevSlugs.length > 0) {
+        merged = { ...merged, leaderboardSlugs: [...prevSlugs] };
+        keptPreviousLeaderboard = true;
+      }
+      leaderboardAt = previous.leaderboardAt ?? null;
+    } else {
+      merged = mergeAaRows(parsed.rows, leaderboardRows);
+      if (merged.leaderboardSlugs.length === 0 && prevSlugs.length > 0) {
+        const prevBoardRows = prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug));
+        if (prevBoardRows.length > 0) {
+          merged = mergeAaRows(parsed.rows, prevBoardRows);
+        } else {
+          merged = { ...merged, leaderboardSlugs: [...prevSlugs] };
+        }
+        keptPreviousLeaderboard = true;
+        leaderboardError = 'aa-leaderboard-empty-kept-previous';
+      }
+      leaderboardAt = leaderboardRows.length > 0 && !keptPreviousLeaderboard
+        ? nowIso
+        : (previous.leaderboardAt ?? null);
+    }
     await ctx.state.set(scopeKey(companyId, AA_KEY), {
       fetchedAt: nowIso,
       rows: merged.rows,
       duplicateSlugs: merged.duplicateSlugs,
       leaderboardSlugs: merged.leaderboardSlugs,
-      leaderboardAt: leaderboardRows.length > 0 ? nowIso : (previous.leaderboardAt ?? null),
+      leaderboardAt,
       lastAttemptAt: nowIso,
       lastError: null,
       lastLeaderboardError: leaderboardError,
+      ...(keptPreviousLeaderboard ? { leaderboardKeptFromPrevious: true } : {}),
     });
-    ctx.logger.info('model-capacity: AA snapshot refreshed', {
-      companyId, rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError,
-    });
-    return { status: 'ok', rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError };
+    if (leaderboardError) {
+      ctx.logger.error('model-capacity: AA leaderboard failed; kept prior leaderboard rows', {
+        companyId, leaderboardError, keptPreviousLeaderboard,
+        rows: merged.rows.length, leaderboardSlugs: merged.leaderboardSlugs.length,
+      });
+    } else {
+      ctx.logger.info('model-capacity: AA snapshot refreshed', {
+        companyId, rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError,
+      });
+    }
+    return {
+      status: 'ok', rows: merged.rows.length,
+      leaderboardRows: keptPreviousLeaderboard
+        ? prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug)).length
+        : leaderboardRows.length,
+      leaderboardError, keptPreviousLeaderboard,
+    };
   }
 
   return {

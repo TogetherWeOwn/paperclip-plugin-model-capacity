@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.48 — 2026-10-17
+
+- AA leaderboard resilience (fleet stall 10-17): a leaderboard fetch or parse failure keeps the previous snapshot's leaderboard-derived rows and never stores an empty `leaderboardSlugs` over a non-empty one; fresh API rows still land.
+- Parser reads the current `initialModels` page (any first slug) plus the legacy `models` embed; maps renamed `terminalBench21`/`terminalBench40` and `percentile05`/`quartile25`/`quartile75`/`percentile95` speed fields to the canonical `terminalbenchV*` / `outputTokensPerSecondP*` names. Fixture: `test/fixtures/aa-leaderboard-20261017.html` (4 real rows from today's page).
+- Regression: a parse failure after a good snapshot keeps ladders non-empty with positive per-account share and never stalls the fleet target at 0 (`test/aa-refresh-keep-leaderboard.test.mjs`).
+- Error-level alarms when every account ladder is empty or the served target reads 0 with healthy accounts.
+- 0.2.47 is claimed by an open PR, so this takes 0.2.48. Full suite: 755 green.
+
 ## 0.2.46 — 2026-10-15
 
 - Learn per-account effective burn from meter-aligned credential usage counters. Pooled calibration remains a cold-start prior, not permanent equal-plan sizing. No provider-specific plan configuration.

@@ -90,6 +90,16 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.48 = AA LEADERBOARD RESILIENCE (2026-10-17 fleet stall): a leaderboard
+ * fetch or parse failure keeps the previous snapshot's leaderboard-derived
+ * rows and never stores an empty leaderboardSlugs over a non-empty one; the
+ * parser reads the current `initialModels` page (any first slug) plus the
+ * legacy `models` embed and maps the renamed terminalBench21/40 and
+ * percentile/quartile speed fields to the canonical names; error-level logs
+ * fire when every account ladder is empty or the served target reads 0 with
+ * healthy accounts. 0.2.47 is claimed by an open PR, so this takes 0.2.48.
+ * No capability, egress, secret or env-key change.
+ *
  * v0.2.46 = PER-ACCOUNT PLAN CALIBRATION + CREDIT POOLS + VERIFIED RAMP:
  * meter-aligned per-account burn individualizes E within a calibration
  * group (pooled E stays the cold-start prior; a missing or reset peer
@@ -236,7 +246,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.46';
+export const PLUGIN_VERSION = '0.2.48';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
