@@ -99,6 +99,61 @@ test('armKeyOfRecord converges matched, mismatched and pending records of one ex
   assert.equal(dominantArm({ 'muse-spark-1.3-contributor:xhigh': 1 }), 'muse-spark-1.3-contributor:xhigh');
 });
 
+test('armKeyOfRecord converges sonnet high vs max by observed effort, not shadow pick', () => {
+  // Shadow mode does not enforce effort, so a matched model must not confirm
+  // the decided effort: twelve runs that all executed bare claude-sonnet-5-5
+  // (default effort max) key one way whether the shadow pick agreed or not,
+  // or the 60% dominant-arm gate sees 50/50 and blocks a genuine switch.
+  const SONNET = 'claude-sonnet-5-5';
+  const matched = armKeyOfRecord({
+    armId: 'claude-sonnet-5-5-high', effort: 'high',
+    actualModel: SONNET, wouldModel: `${SONNET}(high)`,
+    modelMatch: true,
+  });
+  const mismatched = armKeyOfRecord({
+    armId: 'claude-opus-5-5-xhigh', effort: 'xhigh',
+    actualModel: SONNET, wouldModel: 'claude-opus-5-5(xhigh)',
+    modelMatch: false,
+  });
+  const pending = armKeyOfRecord({
+    armId: 'claude-sonnet-5-5-high', effort: 'high',
+    actualModel: SONNET, wouldModel: `${SONNET}(high)`,
+    modelMatch: null,
+  });
+  assert.equal(matched, 'claude-sonnet-5-5:max', `matched: ${matched}`);
+  assert.equal(mismatched, 'claude-sonnet-5-5:max', `mismatched: ${mismatched}`);
+  assert.equal(pending, 'claude-sonnet-5-5:max', `pending: ${pending}`);
+  const counts = countRunsByArm([
+    ...Array.from({ length: 6 }, () => ({
+      armId: 'claude-sonnet-5-5-high', effort: 'high',
+      actualModel: SONNET, modelMatch: true,
+    })),
+    ...Array.from({ length: 6 }, () => ({
+      armId: 'claude-opus-5-5-xhigh', effort: 'xhigh',
+      actualModel: SONNET, modelMatch: false,
+    })),
+  ]);
+  assert.deepEqual(counts, { 'claude-sonnet-5-5:max': 12 });
+  // Enforced records still trust the decided effort (the hook enforced it).
+  assert.equal(
+    armKeyOfRecord({
+      armId: 'claude-sonnet-5-5-high', effort: 'high',
+      actualModel: SONNET, modelMatch: false, enforced: true,
+    }),
+    'claude-sonnet-5-5:high',
+  );
+  // Decorated observed models converge on the observed effort either way.
+  const decorated = 'claude-sonnet-5-5(high)';
+  assert.equal(
+    armKeyOfRecord({ armId: 'claude-sonnet-5-5-high', effort: 'high', actualModel: decorated, modelMatch: true }),
+    'claude-sonnet-5-5:high',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'claude-opus-5-5-xhigh', effort: 'xhigh', actualModel: decorated, modelMatch: false }),
+    'claude-sonnet-5-5:high',
+  );
+});
+
 test('attributeArmBurn measures the single arm of a pure span exactly', () => {
   const raw = attributeArmBurn({ deltaPct: 0.02, runsByArm: { [EXPENSIVE]: 10 } });
   assert.ok(Math.abs(raw[EXPENSIVE] - 0.002) < 1e-12);
