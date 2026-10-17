@@ -59,7 +59,9 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
-import { normalizeCredits, usableCredit } from './credits.mjs';
+import {
+  normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
+} from './credits.mjs';
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
@@ -102,9 +104,6 @@ import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 
 const NS = 'model-capacity';
-// Weekly remainder at or below this floor: the account cannot serve runs
-// until its weekly window resets, whatever its 5h meter reads.
-const WEEKLY_EXHAUSTED_PCT = 0.01;
 const AA_KEY = 'aa-snapshot-v1';
 const TRIAL_KEY = 'trial-families-v1';
 const PACING_KEY = 'pacing-v1';
@@ -277,8 +276,10 @@ export function validateConfigShape(raw) {
   if (raw.credits != null) {
     if (typeof raw.credits !== 'object' || Array.isArray(raw.credits)) errors.push('credits must be an object');
     else for (const [key, value] of Object.entries(raw.credits)) {
-      if (key !== 'freeTypes' && key !== 'paidTypes') errors.push(`credits.${key} is unknown`);
-      else if (!Array.isArray(value) || value.some(t => typeof t !== 'string' || t.trim().length === 0)) {
+      if (!['priority', 'freeTypes', 'paidTypes'].includes(key)) errors.push(`credits.${key} is unknown`);
+      else if (key === 'priority' && !['fallback', 'normal'].includes(value)) {
+        errors.push('credits.priority must be "fallback" or "normal"');
+      } else if (key !== 'priority' && (!Array.isArray(value) || value.some(t => typeof t !== 'string' || t.trim().length === 0))) {
         errors.push(`credits.${key} must be an array of non-empty strings`);
       }
     }
@@ -1914,6 +1915,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         fiveHourUsedPct: fiveHourUsed,
         headroomPct,
         headroomSource,
+        creditFallback: config.credits.priority === 'fallback' && credit != null,
         creditType: credit?.entry.type ?? null,
         creditFree: credit?.creditFree ?? null,
         creditBalance: credit?.entry.balance ?? null,
@@ -2287,16 +2289,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const rrQueued = queuedReviewsByAccount(ledger, {
         agentIds: [...reviewAgentIdSet], nowMs, staleHorizonMs,
       });
-      const rrAccounts = accountViews.map(v => ({
-        accountId: v.accountId,
-        provider: v.provider,
-        weeklyUsed: v.weeklyUsedPct,
-        weeklyElapsed: v.weeklyElapsed ?? null,
-        hoursToWeeklyReset: v.hoursToReset,
-        fiveHourUsed: v.fiveHourUsedPct,
-        fiveHourElapsed: v.fiveHourElapsed ?? null,
-        hoursTo5hReset: v.hoursTo5hReset ?? null,
-      }));
+      const planProvidersWithHeadroom = new Set(accountViews
+        .filter(v => v.creditFallback !== true && v.health === 'healthy' && v.action !== 'excluded'
+          && hasUsablePlanHeadroom(v))
+        .map(v => String(v.provider ?? '').toLowerCase()));
+      const rrAccounts = accountViews
+        .filter(v => config.credits.priority !== 'fallback' || v.creditFallback !== true
+          || !planProvidersWithHeadroom.has(String(v.provider ?? '').toLowerCase()))
+        .map(v => ({
+          accountId: v.accountId,
+          provider: v.provider,
+          weeklyUsed: v.weeklyUsedPct,
+          weeklyElapsed: v.weeklyElapsed ?? null,
+          hoursToWeeklyReset: v.hoursToReset,
+          fiveHourUsed: v.fiveHourUsedPct,
+          fiveHourElapsed: v.fiveHourElapsed ?? null,
+          hoursTo5hReset: v.hoursTo5hReset ?? null,
+        }));
       const perProvider = {};
       const heldAccountIds = [];
       const rrNext = { byProvider: {} };
@@ -2431,6 +2440,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     const roleExclusions = eligibility.exclusions;
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
+    const viewById = new Map(accountViews.map(v => [v.accountId, v]));
     const roleAccess = Object.create(null);
     for (const a of ordered) {
       const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId], nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg);
@@ -2442,6 +2452,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       roleAccess[a.accountId] = entry;
     }
+    let concurrencyRoleAccess = roleAccess;
     const demand = await roleDemandFor(companyId, config, nowMs);
     // In-flight runs per role join the demand bound (see concurrency.mjs):
     // the queued-issue count cannot see runs on in_review issues, chat or
@@ -2456,42 +2467,51 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const role = roleOf(config, agentId);
       if (Object.hasOwn(roleRunning, role)) roleRunning[role] += 1;
     }
-    const concurrency = computeConcurrencyTarget({
-      accounts: ordered.map(a => {
-        const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
-        return {
-          accountId: a.accountId,
-          calibrationGroup: gid,
-          // Credit lanes pace the credit pool, not the spent weekly window:
-          // the C* need uses the credit fraction (else a full window) over
-          // the credit reset horizon, so the fleet target counts the credits.
-          remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.remainingPct ?? 0),
-          // The C* need is the same term as targetShare (requiredRate / E):
-          // both pace to the burn end, so the fleet target moves with the
-          // allowance the horizon grants. burnHorizonMs is set only when a
-          // finite regular reset binds after it, so the fallback is exact.
-          hoursToReset: (() => {
-            if (a.creditType != null && a.creditResetAtMs != null) {
-              return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
-            }
-            const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
-            return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
-          })(),
-          burnPerRunPct: burnOf(a.accountId),
-          measuredBurnPerRunPct: accountE.get(a.accountId)?.burnPerRunPct ?? groupE.get(gid) ?? null,
-          groupMedianBurnPerRunPct: viewByKey.get(a.accountId)?.groupMedianBurnPerRunPct ?? null,
-          runsInWindow: accountE.get(a.accountId)?.attributedRuns ?? runsInGroupSpan(gid, rateWindowMs),
-          guardActive: a.guardActive,
-          healthy: a.health === 'healthy' && a.action !== 'excluded',
-        };
-      }),
+    const concurrencyAccounts = ordered.map(a => {
+      const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
+      return {
+        accountId: a.accountId,
+        calibrationGroup: gid,
+        // Credit lanes pace the credit pool, not the spent weekly window:
+        // the C* need uses the credit fraction (else a full window) over
+        // the credit reset horizon, so the fleet target counts the credits.
+        remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.remainingPct ?? 0),
+        // The C* need is the same term as targetShare (requiredRate / E):
+        // both pace to the burn end, so the fleet target moves with the
+        // allowance the horizon grants. burnHorizonMs is set only when a
+        // finite regular reset binds after it, so the fallback is exact.
+        hoursToReset: (() => {
+          if (a.creditType != null && a.creditResetAtMs != null) {
+            return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
+          }
+          const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
+          return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
+        })(),
+        burnPerRunPct: burnOf(a.accountId),
+        measuredBurnPerRunPct: accountE.get(a.accountId)?.burnPerRunPct ?? groupE.get(gid) ?? null,
+        groupMedianBurnPerRunPct: viewByKey.get(a.accountId)?.groupMedianBurnPerRunPct ?? null,
+        runsInWindow: accountE.get(a.accountId)?.attributedRuns ?? runsInGroupSpan(gid, rateWindowMs),
+        guardActive: a.guardActive,
+        healthy: a.health === 'healthy' && a.action !== 'excluded',
+      };
+    });
+    const concurrencyOptions = {
+      accounts: concurrencyAccounts,
       meanRunDurationHours: config.concurrency.meanRunDurationHours,
       maxTotal: config.concurrency.maxTotal,
-      roleAccess,
       roleDemand: demand.byRole,
       roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
-    });
+    };
+    let concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });
+    if (config.credits.priority === 'fallback') {
+      const planSlotsByRole = planConcurrencyRoles(
+        concurrency.perAccount, viewById, reviewReserveView.heldAccountIds,
+      );
+      const creditAccountIds = ordered.filter(a => viewById.get(a.accountId)?.creditFallback === true).map(a => a.accountId);
+      concurrencyRoleAccess = gateCreditConcurrencyRoles(roleAccess, creditAccountIds, planSlotsByRole);
+      concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });
+    }
     for (const row of concurrency.perAccount) {
       row.calibrationGroup = calibGroupOf.get(row.accountId) ?? row.accountId;
       row.capacityWeight = accountE.get(row.accountId)?.capacityWeight ?? 1;
@@ -2561,7 +2581,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // verify against proof-of-life (a fresh start clears `unverified`) or
     // the stale horizon -- never the 60-min rate window, which would drop
     // still-running runs across restarts.
-    const viewById = new Map(accountViews.map(v => [v.accountId, v]));
     // Cross-account dominance + aggregator fallback-only.
     // Served models come from the lane feed (authoritative); ladders may
     // already exclude unserved ids. Views without a feed models list fail
@@ -2749,6 +2768,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
+          remainingPct: v.remainingPct,
+          reactive: v.reactive === true,
+          guardActive: v.guardActive === true,
           measuredRatePerHour: v.measuredRatePerHour,
           requiredRatePerHour: v.requiredRatePerHour,
           targetShare: v.targetShare ?? null,
@@ -2758,6 +2780,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           provider: v.provider,
           models: v.models,
           fallbackOnly: v.fallbackOnly,
+          creditFallback: v.creditFallback,
+          roleEligible: roleAccess[v.accountId]?.[role]?.eligible === true,
           inFlight: pools[v.pool] ?? 0,
           paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
@@ -2772,6 +2796,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           reviewReserve: applyReserve
             ? { heldAccountIds: reviewReserveView.heldAccountIds, forReview: opts.forReview === true }
             : null,
+          creditPriority: config.credits.priority,
         },
       );
     };
@@ -3048,9 +3073,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           pointer: view?.guardActive ? 0 : (view?.pointer ?? 0),
           headroomPct: view?.headroomPct ?? null,
           headroomSource: view?.headroomSource ?? null,
+          creditFallback: view?.creditFallback === true,
           remainingKnown: view?.remainingPct != null,
+          remainingPct: view?.remainingPct ?? null,
           targetShare: view?.targetShare ?? null,
           reactive: view?.reactive === true,
+          guardActive: view?.guardActive === true,
           health: view?.health ?? 'unknown',
           meter: view?.meter ?? null,
           quality: view?.quality ?? 'unknown',
@@ -3069,6 +3097,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       rateDeadbandRel: config.pacing.rateDeadbandRel,
       placement: config.placement,
       paceGuard: paceOpts,
+      creditPriority: config.credits.priority,
       // Tick's review-reserve verdict: held accounts plus the agent ids
       // that run past the hold. The hook and event-time path read this.
       reviewReserve: reviewReserveView,
@@ -3569,6 +3598,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return {
           ...a,
           ladderRungs,
+          roleEligible: roleLadderAccess(ladderRungs, {
+            role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
+            trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
+          }).eligible,
           held: !duplicates && !rungsHaveEligibleArms(ladderRungs),
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
@@ -3586,6 +3619,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         reviewReserve: live.reviewReserve?.enabled === true
           ? { heldAccountIds: live.reviewReserve.heldAccountIds ?? [], forReview }
           : null,
+        creditPriority: live.creditPriority ?? 'fallback',
       },
     );
   }

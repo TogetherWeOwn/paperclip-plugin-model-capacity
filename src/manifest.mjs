@@ -97,8 +97,14 @@
  * legacy `models` embed and maps the renamed terminalBench21/40 and
  * percentile/quartile speed fields to the canonical names; error-level logs
  * fire when every account ladder is empty or the served target reads 0 with
- * healthy accounts. 0.2.47 is claimed by an open PR, so this takes 0.2.48.
+ * healthy accounts. 0.2.47 shipped first, so this takes 0.2.48.
  * No capability, egress, secret or env-key change.
+ *
+ * v0.2.47 = PLAN-FIRST CREDIT FALLBACK: credit-funded lanes sort after
+ * subscription lanes with role-usable headroom; credit-funded capacity does
+ * not inflate role concurrency while plan capacity remains. The
+ * credits.priority setting defaults to fallback and can be set to normal to
+ * restore the previous ordering. No capability, egress, secret or env-key change.
  *
  * v0.2.46 = PER-ACCOUNT PLAN CALIBRATION + CREDIT POOLS + VERIFIED RAMP:
  * meter-aligned per-account burn individualizes E within a calibration
@@ -599,8 +605,9 @@ const CONFIG_SCHEMA = {
     },
     credits: {
       type: 'object', additionalProperties: false,
-      description: 'Per-account credit pools: a weekly-spent account with a spendable balance stays available, paced to drain. Free-grant types spend by default; paid types only when listed.',
+      description: 'Per-account credit pools: credit-funded capacity is a fallback after subscription headroom by default. Free-grant types spend by default; paid types only when listed.',
       properties: {
+        priority: { type: 'string', enum: ['fallback', 'normal'], default: 'fallback', description: 'Use credits only after plan headroom (fallback), or allow the prior normal placement ordering.' },
         freeTypes: { type: 'array', items: { type: 'string' }, default: ['codex-credits'], description: 'Free-grant credit types, spendable without further opt-in.' },
         paidTypes: { type: 'array', items: { type: 'string' }, default: [], description: 'Paid credit types the operator additionally allows as capacity.' },
       },

@@ -81,7 +81,11 @@ like a fresh window and the balance guard cuts it off at zero. Headroom
 reports the quantified fraction, or a full window when the fraction is
 unquantified, so the lane stays routable; the fleet concurrency target counts
 the credit fraction over the credit reset horizon, and the rung controller
-measures the credit-fraction drain (not the flat weekly meter). Credit lanes
+measures the credit-fraction drain (not the flat weekly meter). By default,
+`credits.priority: "fallback"` places credit-funded lanes after subscription
+lanes with usable headroom for the current role and excludes credit-funded
+capacity from role concurrency targets while plan capacity is available. Set
+it to `"normal"` to restore the prior quality/placement ordering. Credit lanes
 carry no position signal — the credit window's start is unknowable from a
 reset timestamp alone, so any schedule error would be fiction — and the
 pointer holds at its rung until the measured drain rate takes over after the

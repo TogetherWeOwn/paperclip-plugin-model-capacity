@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeCredits, usableCredit, DEFAULT_CREDITS } from '../src/credits.mjs';
+import {
+  normalizeCredits, usableCredit, DEFAULT_CREDITS, hasUsablePlanHeadroom,
+  planConcurrencyRoles, gateCreditConcurrencyRoles,
+} from '../src/credits.mjs';
 import { parseLaneAccount, parseCredits } from '../src/cliproxy.mjs';
-import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { createModelCapacityPlugin, validateConfigShape } from '../src/plugin.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -15,6 +18,81 @@ test('credits config defaults to the free Codex grant and rejects unknown keys',
   assert.deepEqual(normalizeCredits({}).paidTypes, []);
   assert.deepEqual(normalizeCredits({ freeTypes: ['  X  ', 'x'] }).freeTypes, ['x']);
   assert.deepEqual(DEFAULT_CREDITS.freeTypes, ['codex-credits']);
+});
+
+test('plan headroom needs weekly quota unless the lane is reactive', () => {
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: null, headroomPct: 0.6 }), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.01, headroomPct: 0.6 }), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.6 }), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.2 }, 0.1), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: false, remainingPct: 0.02, headroomPct: 0.2 }, 0.25), false);
+  assert.equal(hasUsablePlanHeadroom({ reactive: true, remainingPct: null, headroomPct: null }), true);
+  assert.equal(hasUsablePlanHeadroom({ reactive: true, guardActive: true }), false);
+});
+
+test('only usable, unheld plan slots suppress credit concurrency for their roles', () => {
+  const usable = { accountId: 'meta:usable', usableSlots: 1, eligibleRoles: ['thinker'] };
+  const lowHeadroom = { accountId: 'meta:low', usableSlots: 1, eligibleRoles: ['doer'] };
+  const reactiveZero = { accountId: 'meta:reactive', usableSlots: 0, eligibleRoles: ['other'] };
+  const held = { accountId: 'meta:held', usableSlots: 1, eligibleRoles: ['reviewer'] };
+  const excluded = { accountId: 'meta:excluded', usableSlots: 1, eligibleRoles: ['excluded-role'] };
+  const creditFallback = { accountId: 'meta:credit-fallback', usableSlots: 1, eligibleRoles: ['credit-role'] };
+  const views = new Map([
+    ['meta:usable', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
+    ['meta:low', { remainingPct: 0.5, headroomPct: 0.02, health: 'healthy' }],
+    ['meta:reactive', { reactive: true, health: 'healthy' }],
+    ['meta:held', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy' }],
+    ['meta:excluded', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy', action: 'excluded' }],
+    ['meta:credit-fallback', { remainingPct: 0.5, headroomPct: 0.4, health: 'healthy', creditFallback: true }],
+  ]);
+  const roles = planConcurrencyRoles([usable, lowHeadroom, reactiveZero, held, excluded, creditFallback], views, ['meta:held']);
+  assert.deepEqual([...roles], ['thinker'],
+    'only the usable thinker lane suppresses credit roles; skipped rows have disjoint roles');
+  const access = { 'codex:credit': {
+    doer: { eligible: true }, thinker: { eligible: true }, other: { eligible: true },
+    reviewer: { eligible: true }, 'excluded-role': { eligible: true }, 'credit-role': { eligible: true },
+  } };
+  const gated = gateCreditConcurrencyRoles(access, ['codex:credit'], roles);
+  assert.equal(gated['codex:credit'].doer.eligible, true,
+    'a plan lane eligible only for thinkers cannot suppress doer credits');
+  assert.equal(gated['codex:credit'].thinker.eligible, false);
+  assert.equal(gated['codex:credit'].other.eligible, true);
+  assert.equal(gated['codex:credit'].reviewer.eligible, true);
+  assert.equal(gated['codex:credit']['excluded-role'].eligible, true);
+  assert.equal(gated['codex:credit']['credit-role'].eligible, true);
+  assert.equal(access['codex:credit'].thinker.eligible, true, 'the helper does not mutate route eligibility');
+});
+
+test('credits priority defaults to fallback and validates the normal compatibility setting', () => {
+  assert.equal(normalizeCredits(null).priority, 'fallback');
+  assert.equal(normalizeCredits({ priority: 'normal' }).priority, 'normal');
+  assert.deepEqual(validateConfigShape({ credits: { priority: 'fallback' } }), []);
+  assert.deepEqual(validateConfigShape({ credits: { priority: 'normal' } }), []);
+  assert.ok(validateConfigShape({ credits: { priority: 'first' } }).some(e => e.includes('credits.priority')));
+});
+
+test('credit-funded accounts are a fallback tier after plan headroom', () => {
+  const plan = { accountId: 'meta:plan', health: 'healthy', headroomPct: 0.65, remainingPct: 0.7, targetShare: 1,
+    measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: -1, resetAtMs: T0 + 1000 };
+  const credits = { accountId: 'codex:credits', health: 'healthy', headroomPct: 0.9, targetShare: 1,
+    measuredRatePerHour: 0.5, requiredRatePerHour: 1, placementQ: 10, creditFallback: true, resetAtMs: T0 + 2000 };
+  const accounts = [plan, credits];
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback' })[0].accountId, 'meta:plan');
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 } })[0].accountId, 'meta:plan',
+    'callers without an explicit priority inherit the safe fallback default');
+  assert.equal(orderAccountsForRun([{ ...plan, headroomPct: 0, remainingPct: 0 }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits');
+  assert.equal(orderAccountsForRun([{ ...plan, remainingPct: null }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'unknown weekly usage is not usable plan capacity');
+  assert.equal(orderAccountsForRun([{ ...plan, guardActive: true }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'guarded plan capacity does not block credit fallback');
+  assert.equal(orderAccountsForRun(accounts, { placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'normal' })[0].accountId, 'codex:credits');
+  assert.equal(orderAccountsForRun([{ ...plan, roleEligible: false }, credits], {
+    placement: { qualityWeight: 1, allowanceWeight: 0 }, creditPriority: 'fallback',
+  })[0].accountId, 'codex:credits', 'role-ineligible plan capacity does not block the credit lane');
 });
 
 test('usage parser keeps credits provenance: unknown or empty is never capacity', () => {
@@ -48,19 +126,27 @@ test('only allowed types with a positive balance are spendable; paid needs opt-i
   assert.equal(usableCredit([{ type: 'unknown', hasCredits: true, balance: 3 }], { paidTypes: ['unknown'] }).creditFree, false);
 });
 
-function drive(extraAccounts, configCredits) {
+function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], baseProvider = 'codex', progressive = false,
+  enforce = false, reviewReserve = { enabled: false }, rows = [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
+    intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }] } = {}) {
   const state = new Map();
   const jobs = new Map();
   const handlers = new Map();
-  const now = T0;
+  let now = T0;
+  let step = 0;
   const accounts = () => [
-    { lane: 'ok', provider: 'codex', accountKey: 'ok', health: 'healthy', models: ['gpt-6.1-sol'],
-      weekly: { used: 0.2, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
-      fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
-      observedAt: new Date(now).toISOString(), quality: 'live' },
-    ...extraAccounts,
+    { lane: 'ok', provider: baseProvider, accountKey: 'ok', health: 'healthy', models: baseModels,
+      weekly: { used: 0.2 + (progressive ? step * 0.01 : 0), resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+      fiveHour: { used: 0.1 + (progressive ? step * 0.04 : 0), resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+      observedAt: new Date(now).toISOString(), quality: 'live',
+      ...(progressive ? { usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 } } : {}) },
+    ...extraAccounts.map(a => progressive ? ({ ...a,
+      fiveHour: { ...a.fiveHour, used: 0.1 + step * 0.04 },
+      observedAt: new Date(now).toISOString(),
+      usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 },
+    }) : a),
   ];
-  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false },
+  const config = { enforce, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve,
     ...(configCredits === undefined ? {} : { credits: configCredits }) };
   const io = {
     config: { get: async () => config },
@@ -74,15 +160,32 @@ function drive(extraAccounts, configCredits) {
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  const setup = async () => {
+    await plugin.setup(io);
+    state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
+    await plugin.onConfigChanged(config, { companyId: 'acme' });
+  };
+  const tick = async i => {
+    if (i != null && progressive) {
+      step = i;
+      now = T0 + i * 5 * 60000;
+    }
+    await jobs.get('shadow-tick')({});
+    return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
+  };
   return {
-    run: async () => {
-      await plugin.setup(io);
-      state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows: [{ slug: 'gpt-6-1-sol', intelligenceIndex: 60,
-        intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }], duplicateSlugs: [] });
-      await plugin.onConfigChanged(config, { companyId: 'acme' });
-      await jobs.get('shadow-tick')({});
-      return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
-    },
+    setup,
+    tick,
+    start: async (runId, model) => handlers.get('agent.run.started')({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+      payload: { run: { agentId: 'agent-9', provider: 'codex', adapterType: 'claude-code', model } }, occurredAt: new Date(now).toISOString() }),
+    shadow: async () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
+    hook: (runId, agentId = 'agent-9') => plugin.onResolveRunModel({
+      runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
+      invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
+      issueOverrideModel: null, deadlineMs: 1500,
+    }),
+    api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    run: async () => { await setup(); return tick(); },
   };
 }
 
@@ -90,6 +193,102 @@ const spent = (key, credits) => ({ lane: key, provider: 'codex', accountKey: key
   weekly: { used: 1.0, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
   fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
   observedAt: new Date(T0).toISOString(), quality: 'live', ...(credits === undefined ? {} : { credits }) });
+
+// Same fixture as the hook test below, on the tick path: both lanes serve
+// the same doer model and the credit lane is far hungrier, so under the old
+// ordering it wins on shortfall alone. The normal-mode run is the negative
+// control pinning the tick wiring (creditPriority, creditFallback and
+// remainingPct all have to reach the tick-side allocation order).
+test('shadow tick routes a run to plan headroom before higher-quality credit capacity', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 1000, fraction: 0.99,
+    resetsAt: new Date(T0 + 2 * 3600000).toISOString() }];
+  const rows = [
+    { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
+  ];
+  const accounts = [{ ...spent('credit', free), models: ['gemini-2-5-flash'] }];
+  const tickWith = async credits => {
+    const d = drive(structuredClone(accounts), credits, {
+      baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', progressive: true, rows,
+    });
+    await d.setup();
+    await d.start('plan-headroom-run', 'gemini-2-5-flash');
+    let cap;
+    for (let i = 0; i <= 2; i++) cap = await d.tick(i);
+    const shadow = (await d.shadow()).body;
+    const entry = shadow.entries.find(e => e.runId === 'plan-headroom-run');
+    return { entry, shadow, cap };
+  };
+  const fallback = await tickWith(undefined);
+  assert.equal(fallback.entry?.accountId, 'meta:ok',
+    JSON.stringify({ shadow: fallback.shadow, tick: fallback.cap.shadow }));
+  assert.equal(fallback.entry?.eventTime, false, 'the tick path made the fallback decision');
+  const normal = await tickWith({ priority: 'normal' });
+  assert.equal(normal.entry?.accountId, 'codex:credit',
+    `negative control: the same fixture under normal priority picks the hungrier credit lane, got ${JSON.stringify({ shadow: normal.shadow, tick: normal.cap.shadow })}`);
+  assert.equal(normal.entry?.eventTime, false, 'the tick path made the normal-priority decision');
+});
+
+// Both lanes serve the same doer model, and the credit lane is far hungrier
+// (nearly full fraction draining over 2h), so under the old ordering the
+// credit lane wins on shortfall alone. Only the fallback demotion can put
+// the plan lane first -- which is what makes the normal-mode run below a
+// real negative control for the hook wiring (creditPriority, remainingPct,
+// guardActive and roleEligible all have to reach the hook-side sort).
+test('hook selection prefers plan headroom over a higher-ranked credit lane', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 1000, fraction: 0.99,
+    resetsAt: new Date(T0 + 2 * 3600000).toISOString() }];
+  const rows = [
+    { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
+  ];
+  const accounts = [{ ...spent('credit', free), models: ['gemini-2-5-flash'] }];
+  const hookWith = async credits => {
+    const d = drive(structuredClone(accounts), credits, {
+      baseModels: ['gemini-2-5-flash'], baseProvider: 'meta', enforce: true, rows,
+    });
+    await d.setup();
+    await d.tick();
+    return d.hook('hook-plan-first');
+  };
+  const fallback = await hookWith(undefined);
+  assert.equal(fallback.kind, 'decide');
+  assert.match(fallback.reason, /on meta:ok/, 'fallback ordering routes the hook run to plan headroom');
+  const normal = await hookWith({ priority: 'normal' });
+  assert.equal(normal.kind, 'decide');
+  assert.match(normal.reason, /on codex:credit/,
+    'negative control: the same fixture under normal priority picks the hungrier credit lane');
+});
+
+test('review reserve excludes credit accounts while same-provider plan headroom exists', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const d = drive([spent('credit', free)], undefined, {
+    reviewReserve: { enabled: true, providers: ['codex'], agentIds: ['reviewer'] },
+  });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.deepEqual(cap.reviewReserve.perProvider.codex.accounts.map(a => a.accountId), ['codex:ok']);
+});
+
+test('review reserve keeps credit accounts when the same-provider plan lane has no usable headroom', async () => {
+  const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4,
+    resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
+  const guardedPlan = { lane: 'guarded', provider: 'codex', accountKey: 'guarded', health: 'healthy',
+    models: ['gpt-6.1-sol'],
+    weekly: { used: 0.2, resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+    fiveHour: { used: 0.99, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+    observedAt: new Date(T0).toISOString(), quality: 'live' };
+  const d = drive([spent('credit', free), guardedPlan], undefined, {
+    baseProvider: 'meta',
+    reviewReserve: { enabled: true, providers: ['codex'], agentIds: ['reviewer'] },
+  });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const ids = cap.reviewReserve.perProvider.codex.accounts.map(a => a.accountId);
+  assert.ok(ids.includes('codex:credit'),
+    `credit lane stays in the reserve when no codex plan lane has usable headroom, got ${JSON.stringify(ids)}`);
+});
 
 test('weekly-spent Codex lane with free credits stays available and paced; without stays excluded', async () => {
   const free = [{ type: 'codex-credits', hasCredits: true, balance: 12.5, fraction: 0.4, resetsAt: new Date(T0 + 96 * 3600000).toISOString() }];
@@ -206,7 +405,7 @@ function driveCreditGroup() {
   };
 }
 
-test('credit capacity counts in C* slots over the credit horizon', async () => {
+test('credit capacity does not inflate concurrency while plan headroom remains', async () => {
   const d = driveCreditGroup();
   await d.setup();
   let cap;
@@ -214,8 +413,9 @@ test('credit capacity counts in C* slots over the credit horizon', async () => {
   const view = cap.accounts.find(a => a.accountId === 'codex:cr');
   assert.equal(view.calibrationSource, 'account-five-hour');
   const row = cap.perAccount.find(a => a.accountId === 'codex:cr');
-  assert.ok(row.slots > 0, `credit lane earns concurrency slots, got ${row.slots}`);
-  assert.ok(row.runsPerHour > 0, `credit lane earns runs/hour, got ${row.runsPerHour}`);
+  const planRow = cap.perAccount.find(a => a.accountId === 'codex:ok');
+  assert.equal(row.usableSlots, 0, `credit lane is excluded from target while plan headroom remains, got ${row.usableSlots}`);
+  assert.ok(planRow.usableSlots > 0, 'plan lane retains its concurrency capacity');
 });
 
 const MIN = 60000;
