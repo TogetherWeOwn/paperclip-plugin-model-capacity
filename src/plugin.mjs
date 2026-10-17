@@ -2174,12 +2174,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const prevSmoothE = smoothState.E != null && typeof smoothState.E === 'object' ? smoothState.E : {};
     const prevArmE = smoothState.armE != null && typeof smoothState.armE === 'object' ? smoothState.armE : {};
     const prevArmEpoch = smoothState.armEpoch != null && typeof smoothState.armEpoch === 'object' ? smoothState.armEpoch : {};
+    const prevArmEpochAt = smoothState.armEpochAt != null && typeof smoothState.armEpochAt === 'object' ? smoothState.armEpochAt : {};
     const nextSmoothE = new Map();
     const nextArmE = {};
     const nextArmEpoch = {};
+    const nextArmEpochAt = {};
     const groupE = new Map(); // gid -> mix-weighted effective burn per run
     const groupPoolE = new Map(); // gid -> pooled EWMA base the mix price rescales (for counter rebase)
     const armEpochReset = new Set(); // gids whose old-mix estimates were segmented
+    // Keeper counter spans cover KEEP_MS (see calibration.mjs): after a mix
+    // switch the fresh account-weekly sample still spans old-mix runs until
+    // the window rolls past the segmentation tick.
+    const COUNTER_WINDOW_MS = 90 * 60000;
     const calibrationGroups = {};
     for (const [gid, memberKeys] of calibMembers) {
       const pooled = pooledBurnPerRun({
@@ -2315,6 +2321,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // The epoch advances only on segmentation; otherwise the previous epoch
       // arm persists so near-even mixes do not flap the epoch every tick.
       nextArmEpoch[gid] = armEpochReset.has(gid) && dom != null ? dom : (prevDom ?? dom ?? null);
+      // Segmentation time persists so fresh counter-backed samples keep
+      // re-basing onto the mix price until the 90-minute counter window rolls
+      // past the switch (otherwise the rebase lasts one tick and snaps back).
+      if (armEpochReset.has(gid)) nextArmEpochAt[gid] = nowMs;
+      else if (Number.isFinite(prevArmEpochAt[gid])) nextArmEpochAt[gid] = prevArmEpochAt[gid];
       if (entry) {
         nextSmoothE.set(gid, entry);
       }
@@ -2361,8 +2372,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // the mix-priced group baseline (see rebaseSampleToMix): the
         // 90-minute counter window still spans the OLD mix, so without this
         // counter-backed lanes wait out the meter window while group-prior
-        // lanes already reprice.
-        const rebased = armEpochReset.has(gid)
+        // lanes already reprice. The rebase persists until the counter window
+        // rolls past the segmentation tick -- otherwise it lasts one tick and
+        // the next tick snaps back to the old-mix window value.
+        const epochAt = armEpochReset.has(gid) ? nowMs : prevArmEpochAt[gid] ?? null;
+        const inWindow = Number.isFinite(epochAt) && nowMs - epochAt < COUNTER_WINDOW_MS;
+        const rebased = inWindow
           ? rebaseSampleToMix(sample, { priced: groupE.get(gid) ?? null, pooled: groupPoolE.get(gid) ?? null })
           : sample;
         // Missing/no-motion readings carry knowledge, not fake new evidence.
@@ -3312,7 +3327,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       atMs: nowMs, E: Object.fromEntries(nextSmoothE), target: nextSmoothTarget,
       fastUntilMs: targetStep.fastUntilMs,
       accountUsage: Object.fromEntries(accountUsage), accountE: Object.fromEntries(nextAccountE),
-      armE: nextArmE, armEpoch: nextArmEpoch,
+      armE: nextArmE, armEpoch: nextArmEpoch, armEpochAt: nextArmEpochAt,
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is

@@ -183,6 +183,51 @@ test('expensive-to-cheap switch reprices within one tick and segments old-mix es
   assert.ok(Math.abs(E7 - E5) / E5 < 0.5, `cheap price persists without meter quanta: ${E5} -> ${E7}`);
 });
 
+test('counter-lane rebase persists until the counter window rolls past the switch', async () => {
+  // Overlapping windows: the switch lands 70min after the last expensive
+  // phase so the 60-minute run-mix window isolates the cheap arm while the
+  // 90-minute Keeper counter window still spans old-mix runs. The rebase must
+  // hold on the tick AFTER the switch, not just the switch tick.
+  const d = drive();
+  await d.setup();
+  await d.step({ at: T0, lanes: Lanes.exp(0.24, 100) });
+  await d.step({ at: T0 + 12 * MIN, lanes: Lanes.exp(0.28, 200), fire: runsFor('exp1', EXPENSIVE, T0 + 12 * MIN, 12) });
+  await d.step({ at: T0 + 24 * MIN, lanes: Lanes.exp(0.32, 300), fire: runsFor('exp2', EXPENSIVE, T0 + 24 * MIN, 12) });
+  let cap = await d.capacity();
+  let { rows } = metaGroup(cap);
+  const E1 = meanMeasured(rows);
+
+  const t3 = T0 + 94 * MIN;
+  await d.step({ at: t3, lanes: Lanes.cheap(0.332, 400), fire: runsFor('cheap1', CHEAP, t3, 12) });
+  cap = await d.capacity();
+  let g = metaGroup(cap);
+  assert.equal(g.group.armMixReset, true, 'switch tick segments the old mix');
+  const switchSlots = meanSlots(g.rows);
+  for (const r of g.rows) {
+    const ratio = r.measuredBurnPerRunPct / g.group.burnPerRunPct;
+    assert.ok(ratio > 0.5 && ratio < 2, `switch tick ${r.accountId} tracks the mix price`);
+  }
+
+  // Next tick, 12 minutes later: the counter window still spans the expensive
+  // phase, so a one-tick rebase would snap back to the old-mix value here.
+  await d.step({ at: t3 + 12 * MIN, lanes: Lanes.cheap(0.344, 500), fire: runsFor('cheap2', CHEAP, t3 + 12 * MIN, 12) });
+  cap = await d.capacity();
+  g = metaGroup(cap);
+  assert.ok(E1 > 0, 'phase-1 burn reads out');
+  for (const r of g.rows) {
+    const ratio = r.measuredBurnPerRunPct / g.group.burnPerRunPct;
+    assert.ok(ratio > 0.5 && ratio < 2,
+      `tick-after-switch ${r.accountId} still tracks the mix price: ${r.measuredBurnPerRunPct} vs ${g.group.burnPerRunPct}`);
+  }
+  // No snap back to the old-mix window value: the pool stays repriced cheap
+  // (meter quanta add noise, so slots may swing -- but they must not collapse
+  // to the ~20% level the one-tick bug produced).
+  const Enext = meanMeasured(g.rows);
+  assert.ok(Enext < E1 * 0.75, `pool stays repriced the tick after the switch: ${E1} -> ${Enext}`);
+  assert.ok(meanSlots(g.rows) > switchSlots * 0.4,
+    `slots hold the tick after the switch: ${switchSlots} -> ${meanSlots(g.rows)}`);
+});
+
 test('near-even mix does not flap the epoch or reset smoothing', async () => {
   const d = drive();
   await d.setup();

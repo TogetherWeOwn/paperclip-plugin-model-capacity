@@ -23,15 +23,17 @@ const EXPENSIVE = 'wonder-full-era:high';
 const CHEAP = 'muse-spark-1.3-contributor:xhigh';
 
 test('armKeyOfRecord keys runs by model+effort', () => {
-  // Routed arm ids resolve only for enforced decisions (or a shadow pick the
-  // observed model confirms); otherwise the key derives from what ran.
+  // One canonical namespace: enforced and model-confirmed records map the
+  // routed arm id to the served model, so a matched pick converges with
+  // mismatched/pending records for the same executed arm. Otherwise the key
+  // derives from what ran.
   assert.equal(
     armKeyOfRecord({ armId: 'muse-spark-1-3-xhigh', enforced: true }),
-    'muse-spark-1-3-xhigh',
+    'muse-spark-1.3-contributor:xhigh',
   );
   assert.equal(
     armKeyOfRecord({ armId: 'muse-spark-1-3-xhigh', actualModel: 'muse-spark-1.3-contributor', modelMatch: true }),
-    'muse-spark-1-3-xhigh',
+    'muse-spark-1.3-contributor:xhigh',
   );
   assert.equal(
     armKeyOfRecord({ armId: null, actualModel: 'muse-spark-1.3-contributor', effort: 'xhigh' }),
@@ -56,6 +58,45 @@ test('armKeyOfRecord keys runs by model+effort', () => {
   // Unknown or pending models yield no key.
   assert.equal(armKeyOfRecord({ armId: null, actualModel: 'unknown' }), null);
   assert.equal(armKeyOfRecord({}), null);
+});
+
+test('armKeyOfRecord converges matched, mismatched and pending records of one executed arm', () => {
+  // The incident regime: shadow agreement is partial, so half the fleet's
+  // records confirm the pick while half disagree or are still pending. All
+  // executed muse-spark-1.3-contributor must count under one key, or the 60%
+  // dominant-arm gate sees ~50% per alias and blocks a genuine switch.
+  const CHEAP_MODEL = 'muse-spark-1.3-contributor';
+  const matched = armKeyOfRecord({
+    armId: 'muse-spark-1-3-xhigh', effort: 'xhigh',
+    actualModel: CHEAP_MODEL, wouldModel: `${CHEAP_MODEL}(xhigh)`,
+    modelMatch: true,
+  });
+  const mismatched = armKeyOfRecord({
+    armId: 'claude-sonnet-5-5-high', effort: 'high',
+    actualModel: CHEAP_MODEL, wouldModel: 'claude-sonnet-5-5(high)',
+    modelMatch: false,
+  });
+  const pending = armKeyOfRecord({
+    armId: 'muse-spark-1-3-xhigh', effort: 'xhigh',
+    actualModel: CHEAP_MODEL, wouldModel: `${CHEAP_MODEL}(xhigh)`,
+    modelMatch: null,
+  });
+  assert.equal(matched, 'muse-spark-1.3-contributor:xhigh', `matched: ${matched}`);
+  assert.equal(mismatched, 'muse-spark-1.3-contributor:xhigh', `mismatched: ${mismatched}`);
+  assert.equal(pending, 'muse-spark-1.3-contributor:xhigh', `pending: ${pending}`);
+  // Half-and-half still holds a 100% share under one key.
+  const counts = countRunsByArm([
+    ...Array.from({ length: 6 }, () => ({
+      armId: 'muse-spark-1-3-xhigh', effort: 'xhigh',
+      actualModel: CHEAP_MODEL, modelMatch: true,
+    })),
+    ...Array.from({ length: 6 }, () => ({
+      armId: 'claude-sonnet-5-5-high', effort: 'high',
+      actualModel: CHEAP_MODEL, modelMatch: false,
+    })),
+  ]);
+  assert.deepEqual(counts, { 'muse-spark-1.3-contributor:xhigh': 12 });
+  assert.equal(dominantArm({ 'muse-spark-1.3-contributor:xhigh': 1 }), 'muse-spark-1.3-contributor:xhigh');
 });
 
 test('attributeArmBurn measures the single arm of a pure span exactly', () => {
