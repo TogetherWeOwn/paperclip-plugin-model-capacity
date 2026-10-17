@@ -90,6 +90,20 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.49 = ARM-AWARE BURN CALIBRATION: burn per run is measured per arm
+ * (model+effort) per calibration pool instead of per account. Pooled meter
+ * deltas split across the arms that ran in the span by responsibility; pricing
+ * follows the current ledger run mix with cost-anchor priors for unmeasured
+ * arms (rescaled off the measured arms, measurement-era anchors recorded per
+ * arm), so an arm switch reprices within one tick instead of waiting out
+ * meter quanta. A dominant-arm change segments the pooled EWMA and the
+ * members' old-mix individual estimates at once past a 60% share and 25%
+ * reprice hysteresis; only enforced (or model-confirmed) decisions attribute
+ * by arm id, others key by the executed model, and fresh counter estimates
+ * re-base onto the mix price on a segmented tick. Ledger decisions record
+ * effort and the shadow log exposes the decided arm. No capability, egress,
+ * secret or env-key change.
+ *
  * v0.2.48 = AA LEADERBOARD RESILIENCE (2026-10-17 fleet stall): a leaderboard
  * fetch or parse failure keeps the previous snapshot's leaderboard-derived
  * rows and never stores an empty leaderboardSlugs over a non-empty one; the
@@ -252,7 +266,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.48';
+export const PLUGIN_VERSION = '0.2.49';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

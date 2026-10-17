@@ -9,7 +9,8 @@
  * Record:
  *   { runId, agentId, issueId, adapterType,
  *     decidedAccount (hook/shadow decision, null until decided),
- *     decidedAt, enforced, wouldModel, rung, trial, family, reason, eventTime,
+ *     decidedAt, enforced, armId, effort, wouldModel, rung, trial, family,
+ *     reason, eventTime,
  *     eventModel/eventModelSource (what a run event carried),
  *     actualModel/actualModelSource/actualModelError/actualPending/modelMatch,
  *     actualAccount (resolved from a model, never a guess that overrides a
@@ -109,6 +110,8 @@ export function recordDecision(ledger, decision, atMs) {
   r.decidedAt = atMs;
   r.enforced = enforced;
   if (decision?.armId != null) r.armId = String(decision.armId);
+  // Effort rides the record so burn calibration keys runs by model+effort.
+  if (decision?.effort != null) r.effort = String(decision.effort);
   if (decision?.wouldModel != null) r.wouldModel = decision.wouldModel;
   if (decision?.rung != null) r.rung = decision.rung;
   if (decision?.trial === true) r.trial = true;
@@ -346,6 +349,8 @@ export function shadowEntries(ledger, { limit = 100 } = {}) {
     modelMatch: r.modelMatch ?? null,
     account: r.decidedAccount,
     accountId: r.decidedAccount,
+    armId: r.armId ?? null,
+    effort: r.effort ?? null,
     rung: r.rung ?? null,
     trial: r.trial === true,
     family: r.family ?? null,
