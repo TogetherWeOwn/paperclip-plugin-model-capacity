@@ -320,6 +320,13 @@ test('armKeyOfRecord converges pending and backfilled records for an effort-word
     armKeyOfRecord({ armId: 'foo-bar-high', effort: 'high', wouldModel: 'foo-bar(high)', enforced: true }),
     'foo-bar:high',
   );
+  // Bare wouldModel in prefixed served form (what the pool anchor index
+  // passes on prefixed lanes) also keeps the served id verbatim, at a
+  // non-default effort.
+  assert.equal(
+    armKeyOfRecord({ armId: 'nemotron-3-ultra', effort: 'high', wouldModel: 'devin/nemotron-3-ultra', enforced: true }),
+    'nemotron-3-ultra:high',
+  );
   // Syntax alone cannot disambiguate: with no served-id context the strip
   // still applies (the hook always records wouldModel, so production never
   // hits this path).
