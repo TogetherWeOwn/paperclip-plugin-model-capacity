@@ -271,6 +271,40 @@ test('rebaseSampleToMix re-bases a counter estimate onto the mix price', () => {
   assert.ok(Math.abs(clamped.burnPerRunPct - 0.006 / 8) < 1e-15, `${clamped.burnPerRunPct}`);
 });
 
+test('armKeyOfRecord converges pending and backfilled records for an operator armId', () => {
+  // The modelFromArmId dash-suffix strip: a pending enforced record for an
+  // operator armId (no observed model yet) keys the same colon-form key as
+  // the backfilled observed record, or one executed arm splits by stage --
+  // including when the keyed effort differs from the armId suffix.
+  assert.equal(
+    armKeyOfRecord({ armId: 'foo-bar-high', effort: 'high', enforced: true }),
+    'foo-bar:high',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'foo-bar-high', actualModel: 'foo-bar', effort: 'high', enforced: true }),
+    'foo-bar:high',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'foo-bar-high', wouldModel: 'foo-bar(max)', enforced: true }),
+    'foo-bar:max',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'foo-bar-high', actualModel: 'foo-bar(max)', enforced: true }),
+    'foo-bar:max',
+  );
+});
+
+test('armKeyOfRecord keeps served model ids that end in effort words verbatim', () => {
+  // canonicalArmKey strips a dash suffix only when it equals the effort
+  // being keyed: effort words inside a served model name are preserved, and
+  // sibling ids that differ only by the suffix never collapse into one arm.
+  assert.equal(armKeyOfRecord({ actualModel: 'nemotron-3-ultra' }), 'nemotron-3-ultra:max');
+  const low = armKeyOfRecord({ actualModel: 'gemini-3.1-pro-low' });
+  const high = armKeyOfRecord({ actualModel: 'gemini-3.1-pro-high' });
+  assert.equal(low, 'gemini-3.1-pro-low:max');
+  assert.equal(high, 'gemini-3.1-pro-high:max');
+});
+
 test('effectiveBurnForMix falls back to the pooled burn with no arm evidence', () => {
   assert.equal(effectiveBurnForMix({ armE: {}, mixShares: {}, pooledBurn: 0.002 }), null);
   assert.ok(Math.abs(effectiveBurnForMix({

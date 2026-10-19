@@ -90,6 +90,9 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.51 = REVIEW NITS: arm keys keep served model ids verbatim unless the
+ *   dash suffix equals the keyed effort; the redundant modelMatch branch folds
+ *   into the enforced path (no behavior change); target-0 alarm call-site test.
  * v0.2.50 = MUSE MAX EFFORT: Meta accepts reasoning.effort=max for Muse 1.3
  *   Contributor, so the Muse family cap is max (ultra still refused) and
  *   muse-spark-1.3-contributor gains a max arm above its xhigh arm.
@@ -269,7 +272,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.50';
+export const PLUGIN_VERSION = '0.2.51';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

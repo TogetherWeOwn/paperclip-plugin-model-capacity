@@ -44,7 +44,12 @@ function modelFromArmId(armId) {
   // Dynamic arms carry the model id as the arm id; operator armIds may carry
   // a trailing -<effort> (e.g. foo-bar-high) -- strip to the bare model so a
   // pending enforced record keys the same colon-form key as the backfilled
-  // observed record (foo-bar:high, not foo-bar-high).
+  // observed record (foo-bar:high, not foo-bar-high). Routed armIds only:
+  // served model ids keep their suffix (see canonicalArmKey). Known edge: a
+  // dynamic arm whose served id ends in an effort word (nemotron-3-ultra)
+  // strips here but not on the backfilled observed path, so a pending record
+  // briefly mis-keys until backfill. ArmId syntax cannot tell an operator
+  // arm from such a served id; disambiguating needs served-id context.
   const m = /-(minimal|low|medium|high|xhigh|max|ultra)$/.exec(armId);
   if (m && EFFORTS.has(m[1]) && armId.length > m[0].length) {
     return armId.slice(0, -m[0].length);
@@ -64,17 +69,15 @@ function canonicalArmKey(model, effort) {
   if (model == null || model === 'unknown') return null;
   if (effort == null) return model;
   // Normalize a dash-suffixed spelling (pending armId) to the colon form the
-  // observed path keys, so one executed arm never splits by record stage.
+  // observed path keys, so one executed arm never splits by record stage --
+  // but ONLY when the suffix equals the effort being keyed. A broader strip
+  // rewrites served model ids that use effort words as part of the name
+  // (nemotron-3-ultra, qwen3.7-max) and collapses sibling ids that differ
+  // only by the suffix (gemini-3.1-pro-low vs -high).
   if (model.endsWith(`-${effort}`) && model.length > effort.length + 1) {
     return `${model.slice(0, -(effort.length + 1))}:${effort}`;
   }
-  // Strip any other trailing -<effort> before appending, so a stale suffix
-  // cannot ride along (foo-bar-high priced at max -> foo-bar:max).
-  const m = /-(minimal|low|medium|high|xhigh|max|ultra)$/.exec(model);
-  const bare = m && EFFORTS.has(m[1]) && model.length > m[0].length
-    ? model.slice(0, -m[0].length)
-    : model;
-  return `${bare}:${effort}`;
+  return `${model}:${effort}`;
 }
 
 /** Effort from a decorated `model(effort)[1m]` string, else null. */
@@ -85,17 +88,17 @@ function effortOfDecorated(model) {
 }
 
 /**
- * Stable arm key (model+effort) for one ledger record. Both branches key in
+ * Stable arm key (model+effort) for one ledger record. Every record keys in
  * ONE canonical `model:effort` namespace so the same executed arm never
- * splits across spellings by shadow-pick agreement: only enforced records
- * trust the decided effort (the hook actually enforced it); every other
- * record -- matched, mismatched, pending or undecided -- keys purely by
- * what actually ran (actualModel, else eventModel -- never wouldModel, never
- * the decided arm or effort). A non-enforced shadow/event-time pick is a
- * routing guess, not observed burn: shadow mode does not enforce effort, so
- * a matched model does not confirm the decided effort (see
- * calibrationAccount in ledger.mjs). Unknown or pending models yield no key
- * (they bucket as unattributed).
+ * splits across spellings: only enforced records trust the decided arm id
+ * and effort (the hook actually enforced them); every other record --
+ * matched, mismatched, pending or undecided -- keys purely by what actually
+ * ran (actualModel, else eventModel -- never wouldModel, never the decided
+ * arm or effort). A non-enforced shadow/event-time pick is a routing guess,
+ * not observed burn: shadow mode does not enforce effort, so a matched
+ * model does not confirm the decided effort (see calibrationAccount in
+ * ledger.mjs). Unknown or pending models yield no key (they bucket as
+ * unattributed).
  */
 export function armKeyOfRecord(r) {
   if (r == null || typeof r !== 'object') return null;
@@ -109,34 +112,29 @@ export function armKeyOfRecord(r) {
     ?? (observedClean != null ? dynamicEffort(observedClean) : null);
   const decidedEffort = typeof r.effort === 'string' && EFFORTS.has(r.effort) ? r.effort : null;
   const armId = typeof r.armId === 'string' && r.armId.length > 0 ? r.armId : null;
-  if (enforced || r.modelMatch === true) {
-    // Same executed arm, one key: prefer the observed model so a matched pick
-    // (armId spelling) converges with mismatched/pending records (observed
-    // spelling). The arm id maps through the classic table when no observed
-    // model exists yet (pending enforced records).
+  if (enforced) {
+    // Same executed arm, one key: prefer the observed model so an enforced
+    // pick (armId spelling) converges with the backfilled observed record
+    // (observed spelling). The arm id maps through the classic table when no
+    // observed model exists yet (pending enforced records).
     const fromArm = modelFromArmId(armId);
     const model = observedClean
       ?? (fromArm != null ? canonicalModelName(fromArm) ?? fromArm : null)
       ?? canonicalModelName(r.wouldModel)
       ?? null;
     if (model == null || model === 'unknown') return null;
-    // Effort: enforced records trust the decided effort (actually enforced);
-    // a shadow match confirms the model only, not the effort, so matched
-    // records use the same observed-effort rule as mismatched/pending ones.
-    // Without an observed model a non-enforced match has nothing observed to
-    // key by, so it yields no key instead of guessing from the pick.
-    if (enforced) {
-      const effort = decidedEffort
-        ?? observedEffort
-        ?? effortOfDecorated(r.wouldModel)
-        ?? effortFromArmId(armId);
-      return canonicalArmKey(model, effort);
-    }
-    if (observedClean == null) return null;
-    return canonicalArmKey(observedClean, observedEffort);
+    // Enforced records trust the decided effort (the hook actually enforced
+    // it), falling back to the observed effort and then the arm id suffix.
+    const effort = decidedEffort
+      ?? observedEffort
+      ?? effortOfDecorated(r.wouldModel)
+      ?? effortFromArmId(armId);
+    return canonicalArmKey(model, effort);
   }
   // Non-enforced guess: key by what actually ran, with the effort parsed
-  // from the observed model -- never the decided arm or effort.
+  // from the observed model -- never the decided arm or effort. A shadow
+  // match confirms the model only, not the effort, so matched records use
+  // the same observed rule as mismatched/pending ones.
   if (observedClean == null) return null;
   return canonicalArmKey(observedClean, observedEffort);
 }

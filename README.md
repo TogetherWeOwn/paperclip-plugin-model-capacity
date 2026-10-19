@@ -57,8 +57,8 @@ lanes that no longer serve the old arm still reprices); a dominant-arm change
 segments the pooled average and the members' old-mix estimates at once, but
 only when the new arm holds a clear (>=60%) share and reprices the pool by
 more than 25%, so near-even mixes do not flap smoothing. Only enforced hook
-decisions (or shadow picks the observed model confirms) attribute burn by
-arm id; other runs key by the model that actually ran. Fresh counter-backed
+decisions attribute burn by arm id; every other run keys by the model that
+actually ran. Fresh counter-backed
 estimates re-base onto the mix-priced group baseline on a segmented tick.
 Runs with no attributable arm price as their own `unattributed` segment.
 
