@@ -331,3 +331,43 @@ test('all-ladders-empty alarm fires once across repeated ticks (rate-limited)', 
   const alarms = errors.filter(([msg]) => String(msg).includes('all account ladders empty'));
   assert.equal(alarms.length, 1, `alarm logged once across two ticks (got ${alarms.length})`);
 });
+
+// Nit (target-0 alarm call-site wiring): only the helper decision and the
+// sibling all-ladders-empty branch were covered. A calibrated account with
+// headroom but no servable arm (empty ladders) reads target 0, so the tick
+// must page through the target-zero branch of the call site too.
+test('target-zero-with-headroom alarm fires through the tick when calibrated capacity cannot serve', async () => {
+  const { store, jobs, fake, plugin, errors, skey } = drive({ boardHtml: '<html>unused</html>' });
+  await plugin.setup(fake);
+  await plugin.onConfigChanged(
+    { cliproxy: { laneKeySecretRef: SECRET }, aa: { apiKeySecretRef: SECRET } },
+    { companyId: 'acme' },
+  );
+  // No AA snapshot seeded: every ladder is empty.
+  // One fresh usage point plus the measured individual estimate a previous
+  // tick persisted: with no new evidence the tick carries the knowledge
+  // (accountE), so the fleet calibrates without a multi-tick history.
+  const SMOOTH_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'smoothing-v1' };
+  store.set(skey(SMOOTH_KEY), {
+    accountUsage: {
+      'claude:a1': [{
+        atMs: TICK - 60 * 1000, epoch: 'e1', requests: 100,
+        weekly: 0.3, weeklyReset: Date.parse('2026-10-24T05:00:00Z'),
+        fiveHour: 0.1, fiveHourReset: Date.parse('2026-10-17T10:00:00Z'),
+      }],
+    },
+    accountE: {
+      'claude:a1': {
+        burnPerRunPct: 0.002, capacityWeight: 1, source: 'account-weekly',
+        atMs: TICK - 60 * 1000, epoch: 'e1',
+      },
+    },
+  });
+  await jobs.get('shadow-tick')({});
+  const empty = errors.filter(([msg]) => String(msg).includes('all account ladders empty'));
+  assert.equal(empty.length, 1, 'empty ladders alarm fires');
+  const alarms = errors.filter(([msg]) => String(msg).includes('capacity target is 0 with healthy accounts'));
+  assert.equal(alarms.length, 1, `target-0 alarm logged once (got ${alarms.length}): ${JSON.stringify(errors)}`);
+  assert.equal(alarms[0][1].code, 'target-zero-with-headroom');
+  assert.deepEqual(alarms[0][1].healthyAccounts, ['claude:a1']);
+});
