@@ -170,6 +170,12 @@ test('luna and astra families resolve to gpt-6-luna / gpt-6-astra ids', () => {
   assert.ok(arms.every(a => a.providers.includes('codex')));
 });
 
+test('the default arm table ships Spark 1.3 Contributor at max above xhigh', () => {
+  const { arms } = resolveArms(rows(['muse-spark-1-3', 'muse-spark-1-3-xhigh']));
+  const spark = arms.filter(a => a.family === 'muse' && a.model === 'muse-spark-1.3-contributor');
+  assert.deepEqual(spark.map(a => [a.armId, a.effort]), [['muse-spark-1-3', 'max'], ['muse-spark-1-3-xhigh', 'xhigh']]);
+});
+
 test('muse base slug resolves as the Contributor max arm', () => {
   const { arms, skipped } = resolveArms(rows(['muse-spark-1-3', 'muse-spark-1-3-xhigh']), [
     { aaSlug: 'muse-spark-1-3', model: 'muse-spark-1.3-contributor', effort: 'max', family: 'muse', providers: ['meta'] },
