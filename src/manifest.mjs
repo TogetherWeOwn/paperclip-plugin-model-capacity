@@ -90,6 +90,9 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.50 = MUSE MAX EFFORT: Meta accepts reasoning.effort=max for Muse 1.3
+ *   Contributor, so the Muse family cap is max (ultra still refused) and
+ *   muse-spark-1.3-contributor gains a max arm above its xhigh arm.
  * v0.2.49 = ARM-AWARE BURN CALIBRATION: burn per run is measured per arm
  * (model+effort) per calibration pool instead of per account. Pooled meter
  * deltas split across the arms that ran in the span by responsibility; pricing
@@ -266,7 +269,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.49';
+export const PLUGIN_VERSION = '0.2.50';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

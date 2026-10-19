@@ -34,9 +34,9 @@ test('base slug means max effort; suffixed slugs parse', () => {
   assert.equal(parseEffortSuffix('muse-spark-1-3-contributor-xhigh'), 'xhigh');
 });
 
-test('muse contributor rows are capped at xhigh', () => {
+test('muse rows allow max but not ultra', () => {
   assert.equal(effortAllowed('muse', 'xhigh'), true);
-  assert.equal(effortAllowed('muse', 'max'), false);
+  assert.equal(effortAllowed('muse', 'max'), true);
   assert.equal(effortAllowed('muse', 'ultra'), false);
   assert.equal(effortAllowed('sol', 'max'), true);
 });
@@ -170,13 +170,14 @@ test('luna and astra families resolve to gpt-6-luna / gpt-6-astra ids', () => {
   assert.ok(arms.every(a => a.providers.includes('codex')));
 });
 
-test('muse base slug is skipped: Contributor has no max effort', () => {
+test('muse base slug resolves as the Contributor max arm', () => {
   const { arms, skipped } = resolveArms(rows(['muse-spark-1-3', 'muse-spark-1-3-xhigh']), [
     { aaSlug: 'muse-spark-1-3', model: 'muse-spark-1.3-contributor', effort: 'max', family: 'muse', providers: ['meta'] },
     { aaSlug: 'muse-spark-1-3-xhigh', model: 'muse-spark-1.3-contributor', effort: 'xhigh', family: 'muse', providers: ['meta'] },
   ]);
-  assert.deepEqual(arms.map(a => a.armId), ['muse-spark-1-3-xhigh']);
-  assert.deepEqual(skipped, [{ aaSlug: 'muse-spark-1-3', reason: 'effort-inexpressible' }]);
+  assert.deepEqual(arms.map(a => a.armId), ['muse-spark-1-3', 'muse-spark-1-3-xhigh']);
+  assert.deepEqual(arms.map(a => a.effort), ['max', 'xhigh']);
+  assert.deepEqual(skipped, []);
 });
 
 test('ambiguous and absent slugs are reported, not silently dropped', () => {

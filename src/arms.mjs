@@ -26,8 +26,12 @@
 
 export const EFFORT_ORDER = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
-/** Families with a ceiling below max (Muse contributor rows top out at xhigh). */
-export const MAX_EFFORT_BY_FAMILY = Object.freeze({ muse: 'xhigh' });
+/**
+ * Families with a ceiling below ultra. Meta's responses API accepts
+ * `reasoning.effort` none..max for Muse 1.3 Contributor models and rejects
+ * anything else (probed 2026-10-19).
+ */
+export const MAX_EFFORT_BY_FAMILY = Object.freeze({ muse: 'max' });
 
 /**
  * Families proven by months of fleet history. Arms of these families route
@@ -332,6 +336,7 @@ export const DEFAULT_ARM_MAP = Object.freeze([
   { aaSlug: 'gpt-6-astra-high', model: 'gpt-6-astra', effort: 'high', family: 'astra', providers: ['codex'] },
   { aaSlug: 'gpt-6-astra-medium', model: 'gpt-6-astra', effort: 'medium', family: 'astra', providers: ['codex'] },
   { aaSlug: 'gpt-6-astra-low', model: 'gpt-6-astra', effort: 'low', family: 'astra', providers: ['codex'] },
+  { aaSlug: 'muse-spark-1-3', model: 'muse-spark-1.3-contributor', effort: 'max', family: 'muse', providers: ['meta'] },
   { aaSlug: 'muse-spark-1-3-xhigh', model: 'muse-spark-1.3-contributor', effort: 'xhigh', family: 'muse', providers: ['meta'] },
 ]);
 
