@@ -90,6 +90,11 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.52 = PENDING ARM-ID DISAMBIGUATION: the pending enforced path passes
+ *   the decided served id (wouldModel) into the arm-id strip, so a dynamic
+ *   arm whose served id ends in an effort word keys verbatim like its
+ *   backfilled record while operator armIds keep stripping; the pool anchor
+ *   index passes the same context.
  * v0.2.51 = REVIEW NITS: arm keys keep served model ids verbatim unless the
  *   dash suffix equals the keyed effort; the redundant modelMatch branch folds
  *   into the enforced path (no behavior change); target-0 alarm call-site test.
@@ -272,7 +277,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.51';
+export const PLUGIN_VERSION = '0.2.52';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

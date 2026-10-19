@@ -53,7 +53,7 @@ const startedEvt = (runId, atMs, agentId, model, provider = null) => ({
 const runsFor = (prefix, model, atMs, n, provider = null) =>
   Array.from({ length: n }, (_, i) => startedEvt(`${prefix}-${i}`, atMs - (n - i) * MIN, 'eng', model, provider));
 
-function drive() {
+function drive(opts = {}) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -63,6 +63,7 @@ function drive() {
   const config = {
     cliproxy: { laneKeySecretRef: SECRET },
     reviewReserve: { enabled: false },
+    ...(opts.configExtra ?? {}),
   };
   const io = {
     config: { get: async () => ({ ...config }) },
@@ -79,7 +80,7 @@ function drive() {
   return {
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_SKEY), { fetchedAt: new Date(T0).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_SKEY), { fetchedAt: new Date(T0).toISOString(), rows: [...aaRows(), ...(opts.extraAaRows ?? [])], duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     step: async ({ at, lanes, fire = [] }) => {
@@ -276,4 +277,54 @@ test('burn attributes to the executed model, not a shadow routing guess', async 
   const shadow = await d.shadow();
   const entries = JSON.stringify(shadow);
   assert.ok(entries.includes('spark'), `shadow holds the mismatched guess: ${entries.slice(0, 300)}`);
+});
+
+test('pool anchor keeps an effort-word served id verbatim at a non-default effort', async () => {
+  // The pool anchor index keys each ladder arm in enforced form with its
+  // served model as context (see armKeyOfRecord): a dynamic arm whose served
+  // id ends in an effort word (nemotron-3-ultra) at a non-default effort
+  // (high) must index its anchor under nemotron-3-ultra:high -- the same key
+  // its ledger runs use. Without the served-id context the anchor lands under
+  // the stripped key (nemotron-3:high), the backup keys do not rescue it (the
+  // observed form keys :max regardless of the decided effort), and the
+  // unmeasured arm prices at the pooled scale instead of its anchor ratio.
+  // Mutant check: dropping `wouldModel: a.model ?? null` at the anchor call
+  // site must turn this test red (burn stays expensive, no mix reset).
+  const NEMOTRON = 'nemotron-3-ultra';
+  const d = drive({
+    configExtra: { modelAaOverrides: { [NEMOTRON]: { slug: 'nemotron-3-ultra-550b-a55b', effort: 'high' } } },
+    extraAaRows: [
+      { slug: 'nemotron-3-ultra-550b-a55b', intelligenceIndex: 60, intelligenceIndexCostPerTask: 10, price1mInputTokens: 2, price1mOutputTokens: 8 },
+    ],
+  });
+  await d.setup();
+  const nemoLanes = (weekly, req) => ([
+    { lane: 'meta-lane-1', weekly, models: [NEMOTRON], requests: req },
+    { lane: 'meta-lane-2', weekly, models: [NEMOTRON], requests: req },
+  ]);
+  // Phase 1: expensive arm only, meters moving +0.04/tick/lane.
+  await d.step({ at: T0, lanes: Lanes.exp(0.24, 100) });
+  await d.step({ at: T0 + 12 * MIN, lanes: Lanes.exp(0.28, 200), fire: runsFor('exp1', EXPENSIVE, T0 + 12 * MIN, 12) });
+  await d.step({ at: T0 + 24 * MIN, lanes: Lanes.exp(0.32, 300), fire: runsFor('exp2', EXPENSIVE, T0 + 24 * MIN, 12) });
+  let cap = await d.capacity();
+  let { rows, group } = metaGroup(cap);
+  assert.equal(rows.every(r => r.calibrated), true, 'phase-1 pool calibrated');
+  const E1 = meanMeasured(rows);
+  const slots1 = meanSlots(rows);
+
+  // Phase 2 (SWITCH): nemotron-3-ultra at high effort. Runs carry the decided
+  // effort in decorated form so the ledger keys nemotron-3-ultra:high. The
+  // first switch tick carries ledger evidence but no fresh pooled sample yet,
+  // so the anchor (7x cheaper) must reprice the unmeasured arm at once --
+  // which only happens when the anchor is indexed under the ledger key.
+  const t3 = T0 + 99 * MIN;
+  await d.step({ at: t3, lanes: nemoLanes(0.332, 400), fire: runsFor('nemo1', `${NEMOTRON}(high)`, t3, 12) });
+  cap = await d.capacity();
+  ({ rows, group } = metaGroup(cap));
+  assert.equal(group.dominantArm, 'nemotron-3-ultra:high', `switch-tick dom keys the executed arm: ${group.dominantArm}`);
+  assert.equal(group.armMixReset, true, 'switch tick segments the old mix');
+  assert.equal(rows.every(r => r.calibrated), true, 'switch tick keeps the pool calibrated (no uncalibrated drop)');
+  const E3 = meanMeasured(rows);
+  assert.ok(E3 < E1 * 0.75, `burn reprices within one tick of ledger evidence: ${E1} -> ${E3}`);
+  assert.ok(meanSlots(rows) > slots1 * 2, `slots rise within one tick: ${slots1} -> ${meanSlots(rows)}`);
 });
