@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.50 — 2026-10-19
+
+- Muse max effort: Meta's responses API accepts `reasoning.effort=max` for `muse-spark-1.3-contributor` (it echoes `max` and rejects unknown values such as `ultra`; probed 2026-10-19). The Muse family cap moves from xhigh to max, and Spark 1.3 Contributor gains a static `muse-spark-1-3` (max) arm above its xhigh arm. On the AA snapshot the composite Q is 0.294 (max) vs -0.068 (xhigh), so the ladder prefers max and steps down to xhigh under pacing pressure.
+
 ## 0.2.49 — 2026-10-17
 
 - Arm-aware burn calibration: burn per run is measured per arm (model+effort) per calibration pool, not per account. Pooled meter deltas split across the arms that ran in the span by responsibility (each arm's prior burn times its run count, scaled to the observed delta); a pure-span sample measures its arm exactly. Pricing follows the current ledger run mix over the pacing window, with cost-anchor priors for never-measured arms, so switching doers from an expensive arm to a cheap arm raises slots within one tick of ledger evidence instead of waiting for quantized meter quanta.
