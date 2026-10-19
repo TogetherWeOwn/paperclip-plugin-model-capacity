@@ -37,7 +37,7 @@ const MODEL_BY_ARM_ID = new Map(
 );
 
 /** Model id behind a routed arm id (classic table, else dynamic identity). */
-function modelFromArmId(armId) {
+function modelFromArmId(armId, { servedId = null } = {}) {
   if (typeof armId !== 'string' || armId.length === 0) return null;
   const mapped = MODEL_BY_ARM_ID.get(armId);
   if (mapped) return mapped;
@@ -45,11 +45,12 @@ function modelFromArmId(armId) {
   // a trailing -<effort> (e.g. foo-bar-high) -- strip to the bare model so a
   // pending enforced record keys the same colon-form key as the backfilled
   // observed record (foo-bar:high, not foo-bar-high). Routed armIds only:
-  // served model ids keep their suffix (see canonicalArmKey). Known edge: a
-  // dynamic arm whose served id ends in an effort word (nemotron-3-ultra)
-  // strips here but not on the backfilled observed path, so a pending record
-  // briefly mis-keys until backfill. ArmId syntax cannot tell an operator
-  // arm from such a served id; disambiguating needs served-id context.
+  // served model ids keep their suffix (see canonicalArmKey). ArmId syntax
+  // cannot tell an operator arm from a dynamic arm whose served id ends in
+  // an effort word (nemotron-3-ultra), so the pending path passes the served
+  // id it decided (wouldModel): when it equals the arm id verbatim, the arm
+  // id IS the model and skips the strip.
+  if (servedId != null && servedId === armId) return armId;
   const m = /-(minimal|low|medium|high|xhigh|max|ultra)$/.exec(armId);
   if (m && EFFORTS.has(m[1]) && armId.length > m[0].length) {
     return armId.slice(0, -m[0].length);
@@ -117,18 +118,23 @@ export function armKeyOfRecord(r) {
     // pick (armId spelling) converges with the backfilled observed record
     // (observed spelling). The arm id maps through the classic table when no
     // observed model exists yet (pending enforced records).
-    const fromArm = modelFromArmId(armId);
+    const wouldCanonical = canonicalModelName(r.wouldModel) ?? null;
+    const fromArm = modelFromArmId(armId, { servedId: wouldCanonical });
     const model = observedClean
       ?? (fromArm != null ? canonicalModelName(fromArm) ?? fromArm : null)
-      ?? canonicalModelName(r.wouldModel)
+      ?? wouldCanonical
       ?? null;
     if (model == null || model === 'unknown') return null;
     // Enforced records trust the decided effort (the hook actually enforced
-    // it), falling back to the observed effort and then the arm id suffix.
+    // it), falling back to the observed effort and then the arm id suffix --
+    // except a served id kept verbatim above, whose trailing effort word is
+    // part of the model name rather than an effort: it falls back like the
+    // observed path (dynamic default) instead of misreading its own suffix.
+    const servedVerbatim = wouldCanonical != null && wouldCanonical === armId;
     const effort = decidedEffort
       ?? observedEffort
       ?? effortOfDecorated(r.wouldModel)
-      ?? effortFromArmId(armId);
+      ?? (servedVerbatim ? dynamicEffort(armId) : effortFromArmId(armId));
     return canonicalArmKey(model, effort);
   }
   // Non-enforced guess: key by what actually ran, with the effort parsed

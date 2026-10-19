@@ -2214,8 +2214,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (!(anchor > 0)) continue;
           for (const key of [
             // Routed arm ids resolve only for enforced decisions (see
-            // armKeyOfRecord), so index the ladder's own arms as enforced.
-            armKeyOfRecord({ armId: a.armId, effort: a.effort ?? null, enforced: true }),
+            // armKeyOfRecord), so index the ladder's own arms as enforced --
+            // with the served model as context so a dynamic arm whose served
+            // id ends in an effort word keys verbatim, like its ledger runs.
+            armKeyOfRecord({ armId: a.armId, effort: a.effort ?? null, wouldModel: a.model ?? null, enforced: true }),
             armKeyOfRecord({ armId: null, actualModel: a.model ?? null, effort: a.effort ?? null }),
             a.armId,
           ]) {

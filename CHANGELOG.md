@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.52 — 2026-10-19
+
+- Pending arm-id disambiguation: the pending enforced path passes the decided served id (`wouldModel`) into the arm-id dash-strip, so a dynamic arm whose served id ends in an effort word (`nemotron-3-ultra`) keys verbatim (`nemotron-3-ultra:max`) exactly like its backfilled record, while operator armIds (`foo-bar-high`) keep stripping to the colon form (`foo-bar:high`). A served id kept verbatim also skips the arm-id-suffix effort fallback (its trailing effort word is part of the name) and defaults like the observed path instead. The pool anchor index passes the same served-id context when indexing ladder arms. ArmId syntax alone cannot distinguish the two spellings, so records without served-id context keep the previous strip behavior.
+
 ## 0.2.51 — 2026-10-19
 
 - Review nits (week of 2026-10-19): arm keys no longer rewrite served model ids that end in effort words (`nemotron-3-ultra` keys `nemotron-3-ultra:max`, and `gemini-3.1-pro-low`/`-high` stay distinct arms) — the dash-suffix strip now applies only when the suffix equals the effort being keyed, and the pending-vs-backfilled operator-armId convergence is pinned by a test. The redundant `modelMatch === true` branch folds into the enforced path (no behavior change); the arm-id attribution docs are corrected (only enforced decisions attribute burn by arm id). The target-0 fleet alarm's call-site wiring is covered through the real shadow tick.

@@ -294,6 +294,41 @@ test('armKeyOfRecord converges pending and backfilled records for an operator ar
   );
 });
 
+test('armKeyOfRecord converges pending and backfilled records for an effort-word served id', () => {
+  // The served-id disambiguation: a pending enforced record for a dynamic
+  // arm whose served id ends in an effort word (nemotron-3-ultra) names the
+  // served id in wouldModel, so the arm id skips the dash-suffix strip and
+  // keys exactly like the backfilled observed record.
+  assert.equal(
+    armKeyOfRecord({ armId: 'nemotron-3-ultra', effort: 'max', wouldModel: 'nemotron-3-ultra(max)', enforced: true }),
+    'nemotron-3-ultra:max',
+  );
+  assert.equal(
+    armKeyOfRecord({ armId: 'nemotron-3-ultra', actualModel: 'nemotron-3-ultra', effort: 'max', enforced: true }),
+    'nemotron-3-ultra:max',
+  );
+  // Without any decided effort the pending record still converges: the
+  // served suffix is not misread as an effort (ultra) but defaults like the
+  // observed path (max).
+  assert.equal(
+    armKeyOfRecord({ armId: 'nemotron-3-ultra', wouldModel: 'nemotron-3-ultra', enforced: true }),
+    'nemotron-3-ultra:max',
+  );
+  // Operator armIds keep stripping when the served id differs from the arm
+  // id -- the context only exempts verbatim served ids.
+  assert.equal(
+    armKeyOfRecord({ armId: 'foo-bar-high', effort: 'high', wouldModel: 'foo-bar(high)', enforced: true }),
+    'foo-bar:high',
+  );
+  // Syntax alone cannot disambiguate: with no served-id context the strip
+  // still applies (the hook always records wouldModel, so production never
+  // hits this path).
+  assert.equal(
+    armKeyOfRecord({ armId: 'nemotron-3-ultra', effort: 'max', enforced: true }),
+    'nemotron-3:max',
+  );
+});
+
 test('armKeyOfRecord keeps served model ids that end in effort words verbatim', () => {
   // canonicalArmKey strips a dash suffix only when it equals the effort
   // being keyed: effort words inside a served model name are preserved, and
