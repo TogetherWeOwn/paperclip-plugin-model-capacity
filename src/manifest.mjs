@@ -538,8 +538,12 @@ const CONFIG_SCHEMA = {
       },
     },
     reviewerRouting: {
-      type: 'object', additionalProperties: false, required: ['arms'],
-      description: 'Reviewer routing: runs of the listed agents (default reviewReserve.agentIds) are routed to the first-ranked arm whose provider has a healthy, non-exhausted account with headroom instead of keeping the adapter model. Ranking: burn-mode accounts, plan before credit headroom, the pool most behind its pace plan, the most remaining quota per hour, then arm order. No arm qualifies: keep. Absent (or enabled:false) = keep, exactly as before.',
+      type: 'object', additionalProperties: false,
+      anyOf: [
+        { required: ['enabled'], properties: { enabled: { const: false } } },
+        { required: ['arms'] },
+      ],
+      description: 'Reviewer routing: runs of the listed agents (default reviewReserve.agentIds) are routed to the first-ranked arm whose provider has a healthy, non-exhausted account with headroom instead of keeping the adapter model. Ranking: plan before credit headroom, burn-mode accounts, the pool most behind its pace plan, the most remaining quota per hour, then arm order. No arm qualifies: keep. Absent (or enabled:false) = keep, exactly as before. When disabled, arms may be omitted; supplied arms are still validated.',
       properties: {
         enabled: { type: 'boolean', default: true },
         agentIds: { type: ['array', 'null'], items: { type: 'string', minLength: 1 }, default: null, description: 'Review-agent ids routed. Null (default) resolves to reviewReserve.agentIds.' },

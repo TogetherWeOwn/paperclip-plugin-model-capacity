@@ -8,8 +8,8 @@
  * arm whose provider has a servable account, ranked:
  *   1. plan-funded headroom before credit-funded headroom (burn mode never
  *      spends paid credits ahead of plan quota)
- *   2. accounts flagged by burn mode (config `burnMode`, matched by account
- *      id, lane or label; absent key = nothing flagged)
+ *   2. accounts flagged by the tick's identity-aware burn verdict (legacy
+ *      views without a verdict fall back to config `burnMode` matching)
  *   3. the pool most behind its pace plan (most negative mean planAhead;
  *      unknown plan position counts as on-plan, 0)
  *   4. the pool with the most remaining quota per hour to reset
@@ -41,6 +41,7 @@ export function validateReviewerRouting(raw) {
     && (!Array.isArray(raw.agentIds) || raw.agentIds.some((s) => typeof s !== 'string' || s.length === 0))) {
     errors.push('reviewerRouting.agentIds must be an array of non-empty strings or null');
   }
+  if (raw.enabled === false && !('arms' in raw)) return errors;
   if (!Array.isArray(raw.arms) || raw.arms.length === 0) {
     errors.push('reviewerRouting.arms must be a non-empty array');
   } else {
