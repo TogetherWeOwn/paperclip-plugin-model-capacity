@@ -68,7 +68,7 @@ import {
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
-  recordAccountBalanceExhaustion,
+  recordAccountBalanceExhaustion, isBalanceExhaustion,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
@@ -1971,6 +1971,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // failed post-restart read can never wipe the saved ledger. The next
     // tick retries the load (rejected loads are not cached).
     const ledger = await loadLedger(companyId);
+    // Allocation targets and provider pools. CLIProxy round-robins lanes
+    // of the same provider onto shared credentials, so lane-level in-flight
+    // spreading is theater: pressure is real only at the provider bucket.
+    // Built here (not with the calibration block below) because the breaker
+    // scan attributes balance exhaustion through the same provider fallback.
+    const keyToProvider = new Map(stateKeys.map((k, i) =>
+      [k, String(snapshot.accounts[i]?.provider ?? String(k).split(':')[0]).toLowerCase()]));
+    const poolOfKey = (key) => keyToProvider.get(key) ?? String(key).split(':')[0].toLowerCase();
+    // Provider fallback for model-less runs: a run naming only a provider
+    // still burned that provider's quota, so calibration and the
+    // mapped/unmapped census count it under the first matching account.
+    // In-flight attribution never uses this (decided ?? actual, else
+    // unattributed) -- it is E-calibration scope only, plus the balance
+    // fan-out below (a 402 names the serving lane, not the routing guess).
+    const keyOfProvider = new Map();
+    for (const [k, p] of keyToProvider) if (p && !keyOfProvider.has(p)) keyOfProvider.set(p, k);
     // Arm circuit breaker: memory truth loaded once per worker start (like the
     // ledger); every tick reuses it and persists it below. Finished-run
     // failed events feed it here -- never in the event path, which performs
@@ -1981,6 +1997,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const breakerTransitions = [...breakerHousekeep(breakers, nowMs, breakersCfg)];
     {
       const seen = new Set(breakers.seen ?? []);
+      const keepAgents = new Set(config.roles?.keepAgentIds ?? []);
       for (const rec of terminalRecords(ledger)) {
         if (rec?.runId == null || seen.has(rec.runId)) continue;
         seen.add(rec.runId);
@@ -1990,11 +2007,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // that happened to be attributed (kept runs can have no armId).
         if (acct == null) continue;
         if (rec.status === 'failed') {
-          const balanceTrips = recordAccountBalanceExhaustion(breakers, acct, {
-            atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText, armId: arm,
-          }, nowMs, breakersCfg);
-          breakerTransitions.push(...balanceTrips);
-          if (balanceTrips.length > 0 || arm == null) continue;
+          // A 402 names where the run BURNED, not where shadow guessed: a
+          // non-enforced routed pick is a guess, so the fan-out attributes
+          // actual-first (the calibration mapping). Enforced and kept
+          // decisions are authoritative -- a pinned run burns its serving
+          // account by construction -- and keep decided-first. Balance text
+          // never falls through to the per-arm path below: on an already-open
+          // account the fan-out returns no new transitions, and falling
+          // through would trip the decided arm on the wrong account.
+          if (isBalanceExhaustion(rec.errorText)) {
+            const decidedAuthoritative = rec.enforced === true || keepAgents.has(rec.agentId);
+            const balanceAcct = decidedAuthoritative
+              ? (rec.decidedAccount ?? calibrationAccount(rec, keyOfProvider) ?? acct)
+              : (calibrationAccount(rec, keyOfProvider) ?? acct);
+            const balanceTrips = recordAccountBalanceExhaustion(breakers, balanceAcct, {
+              atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText,
+              // The attributed arm belongs to the decided account; when the
+              // serving account differs it must not seed breaker state there.
+              armId: balanceAcct === acct ? arm : null,
+            }, nowMs, breakersCfg);
+            breakerTransitions.push(...balanceTrips);
+            continue;
+          }
+          if (arm == null) continue;
           const fatal = classifyArmError(rec.errorText, breakersCfg) === 'fatal';
           if (breakerProbeRunId(breakers, acct, arm, nowMs, breakersCfg) === rec.runId) {
             const t = resolveProbe(breakers, acct, arm, rec.runId, fatal ? 'arm-fatal' : 'other', rec.errorText, nowMs, breakersCfg);
@@ -2139,19 +2174,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // until the shadow TTL trims them, so finished runs never haunt
     // in-flight no matter how stale the rate window is.
     const terminalIds = new Set(terminalRecords(ledger).map(r => r.runId));
-    // Allocation targets and provider pools. CLIProxy round-robins lanes
-    // of the same provider onto shared credentials, so lane-level in-flight
-    // spreading is theater: pressure is real only at the provider bucket.
-    const keyToProvider = new Map(stateKeys.map((k, i) =>
-      [k, String(snapshot.accounts[i]?.provider ?? String(k).split(':')[0]).toLowerCase()]));
-    const poolOfKey = (key) => keyToProvider.get(key) ?? String(key).split(':')[0].toLowerCase();
-    // Provider fallback for model-less runs: a run naming only a provider
-    // still burned that provider's quota, so calibration and the
-    // mapped/unmapped census count it under the first matching account.
-    // In-flight attribution never uses this (decided ?? actual, else
-    // unattributed) -- it is E-calibration scope only.
-    const keyOfProvider = new Map();
-    for (const [k, p] of keyToProvider) if (p && !keyOfProvider.has(p)) keyOfProvider.set(p, k);
     // E-calibration burns calibrate where the run ACTUALLY burned
     // (model-mapped actual, provider fallback): a non-enforced shadow pick
     // is a routing guess, not observed burn. Only the enforced hook

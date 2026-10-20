@@ -109,7 +109,7 @@ export function sanitizeBreakers(raw) {
  * Generic transients (stream drops, 429/overload, context exhaustion) never
  * match a specific pattern and are vetoed off the generic 400 rule.
  */
-function isBalanceExhaustion(text) {
+export function isBalanceExhaustion(text) {
   const t = String(text ?? '').toLowerCase();
   const hasBalance = /\b(?:balance|credits?)\b/.test(t);
   const hasEmptyBalance = /\b(?:balance|credits?)\s+(?:(?:is|are)\s+)?empty\b|\bempty\s+(?:balance|credits?)\b/.test(t);

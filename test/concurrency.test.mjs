@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
 
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
@@ -23,6 +23,101 @@ test('kept agents spend the fleet target from their own paced pool', () => {
   assert.equal(out.kept[0].maxConcurrentRuns, 4);
   assert.equal(out.routed[0].maxConcurrentRuns, 16);
   assert.equal(out.kept[0].maxConcurrentRuns + out.routed[0].maxConcurrentRuns, 20);
+});
+
+test('kept allocation never exceeds its fleet share when the target is below the pool cap', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 3,
+    maxTotal: 75,
+    demandFactor: 1,
+    agents: [
+      { agentId: 'reviewer', running: 0, queued: 40 },
+      { agentId: 'doer', running: 0, queued: 40 },
+    ],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }, { accountId: 'codex:1', pool: 'codex' }],
+    perAccount: [{ accountId: 'meta:1', slots: 12 }, { accountId: 'codex:1', slots: 30 }],
+    pacePools: [{ pool: 'meta', cap: 4 }],
+  });
+
+  assert.ok(out.kept[0].maxConcurrentRuns <= 3,
+    `kept Reviewer cap ${out.kept[0].maxConcurrentRuns} must not exceed its fleet share of 3`);
+  const total = out.kept.reduce((s, e) => s + e.maxConcurrentRuns, 0)
+    + out.routed.reduce((s, e) => s + e.maxConcurrentRuns, 0);
+  assert.ok(total <= 3, `fleet total ${total} must not exceed the target of 3`);
+});
+
+test('shared-pool kept members split the pool ceiling instead of each holding it', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 20,
+    maxTotal: 75,
+    agents: [
+      { agentId: 'reviewer', running: 0, queued: 30 },
+      { agentId: 'keeper2', running: 0, queued: 30 },
+    ],
+    keepAgentIds: ['reviewer', 'keeper2'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' }, keeper2: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }, { accountId: 'codex:1', pool: 'codex' }],
+    perAccount: [{ accountId: 'meta:1', slots: 12 }, { accountId: 'codex:1', slots: 30 }],
+    pacePools: [{ pool: 'meta', cap: 4 }],
+  });
+
+  const byId = new Map([...out.kept, ...out.routed].map(e => [e.agentId, e]));
+  assert.equal(byId.get('reviewer').maxConcurrentRuns, 2);
+  assert.equal(byId.get('keeper2').maxConcurrentRuns, 2);
+  // Each member's floor ceiling is its own share: a reserved floor of 3 for
+  // either member is blocked (3 > 2) instead of stacking to 6 past the cap.
+  assert.equal(out.keptCeilings.get('reviewer'), 2);
+  assert.equal(out.keptCeilings.get('keeper2'), 2);
+});
+
+test('target-constrained shared pool splits headroom so floors cannot jointly exceed the cap', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 2,
+    maxTotal: 75,
+    agents: [
+      { agentId: 'keeperA', running: 0, queued: 10 },
+      { agentId: 'keeperB', running: 0, queued: 10 },
+    ],
+    keepAgentIds: ['keeperA', 'keeperB'],
+    keptByAgent: { keeperA: { accountId: 'meta:1' }, keeperB: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }],
+    perAccount: [{ accountId: 'meta:1', slots: 30 }],
+    pacePools: [{ pool: 'meta', cap: 10 }],
+  });
+
+  // Under-allocated group (G=2 < C=10): each ceiling grants only an equal
+  // headroom share, so the ceiling sum stays within the pace cap.
+  const byId = new Map(out.kept.map(e => [e.agentId, e]));
+  assert.equal(byId.get('keeperA').maxConcurrentRuns, 1);
+  assert.equal(byId.get('keeperB').maxConcurrentRuns, 1);
+  assert.equal(out.keptCeilings.get('keeperA'), 5);
+  assert.equal(out.keptCeilings.get('keeperB'), 5);
+
+  // Full floor chain, mirroring the /caps route: floors of 6 each are both
+  // blocked (6 > 5) instead of stacking to 12 past the cap of 10.
+  const blockedOf = (spec) => out.kept
+    .filter(e => {
+      const floor = computeReservedFloor(e.running, e.queued, spec);
+      return floor != null && floor > out.keptCeilings.get(e.agentId);
+    })
+    .map(e => e.agentId);
+  const overFloors = { keeperA: { base: 6, perQueued: 100, max: 6 }, keeperB: { base: 6, perQueued: 100, max: 6 } };
+  assert.deepEqual(blockedOf(overFloors.keeperA).sort(), ['keeperA', 'keeperB']);
+  const held = applyReservedFloors(out.kept, {
+    reservedFloors: overFloors, ceiling: 75,
+    blockedAgentIds: [...blockedOf(overFloors.keeperA)],
+  });
+  assert.equal(held.entries.reduce((s, e) => s + e.allocated, 0), 2);
+
+  // A feasible combo still lifts: floors of 4 each fit the shared 10.
+  const fitFloors = { keeperA: { base: 4, perQueued: 100, max: 4 }, keeperB: { base: 4, perQueued: 100, max: 4 } };
+  assert.deepEqual(blockedOf(fitFloors.keeperA), []);
+  const lifted = applyReservedFloors(out.kept, {
+    reservedFloors: fitFloors, ceiling: 75, blockedAgentIds: [],
+  });
+  assert.equal(lifted.entries.reduce((s, e) => s + e.allocated, 0), 8);
 });
 
 test('breaker-exhausted kept account does not contribute pool capacity', () => {

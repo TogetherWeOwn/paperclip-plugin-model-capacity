@@ -427,10 +427,28 @@ export function allocateKeptAndRoutedCaps({
   const groupCaps = allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
   for (const groupCap of groupCaps) {
     const group = groupById.get(groupCap.agentId);
-    const entries = allocateDemandCaps(groupCap.allocated, group.members, group.ceiling);
+    // The member ceiling is the group's fleet share, never the full pool
+    // ceiling: with a target below the pool cap the below-target branch
+    // would otherwise allocate up to the pool cap and overshoot the fleet
+    // target. Zero-share groups keep a zero ceiling (running is still
+    // preserved by the floor-running backstop, never granted new slots).
+    const share = Math.min(group.ceiling, groupCap.allocated);
+    const entries = allocateDemandCaps(groupCap.allocated, group.members, share);
     kept.push(...entries);
+    // Per-agent ceilings: each member owns its allocation plus an EQUAL
+    // share of the pool's unallocated headroom. Granting every member the
+    // full headroom would let n members' ceilings (and admitted floors)
+    // stack to n*(C-G)+G past the pace cap whenever the group is
+    // target-constrained (G < C). Equal shares keep the ceiling sum at or
+    // under C, so admitted floors can never jointly exceed the pool cap;
+    // the split is conservative (some feasible floor combos are refused)
+    // and running still floors (pre-existing runs are reported, never
+    // hidden).
+    const groupAllocated = entries.reduce((sum, e) => sum + e.allocated, 0);
+    const headroomShare = entries.length === 0 ? 0
+      : Math.floor((group.ceiling - groupAllocated) / entries.length);
     for (const entry of entries) {
-      keptCeilings.set(entry.agentId, Math.max(group.ceiling, entry.running));
+      keptCeilings.set(entry.agentId, Math.max(entry.running, entry.allocated + headroomShare));
     }
   }
   const keptTotal = kept.reduce((sum, agent) => sum + agent.allocated, 0);
