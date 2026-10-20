@@ -572,7 +572,7 @@ const CONFIG_SCHEMA = {
         maxCooloffHours: { type: 'number', exclusiveMinimum: 0, default: 48 },
         probeTimeoutMs: { type: 'integer', minimum: 60000, default: 7200000 },
         fatalPatterns: {
-          type: 'array', default: ['unknown provider for model', 'unknown provider', 'unrecognized_model', 'unrecognized model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model', 'model is unavailable', 'no healthy managed', '402+balance'],
+          type: 'array', default: ['unknown provider for model', 'unknown provider', 'unrecognized_model', 'unrecognized model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model', 'model is unavailable', 'no healthy managed'],
           description: 'Case-insensitive substring hits; entries with "+" need every part ("400+model") and are vetoed by transient patterns. Balance/credit exhaustion is also recognized as an unconditional immediate lane-wide trip, even when a gateway wrapper omits 402.',
           items: { type: 'string' },
         },

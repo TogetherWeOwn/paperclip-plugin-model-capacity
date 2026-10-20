@@ -49,6 +49,18 @@ test('a 402 balance exhaustion trips its arm immediately', () => {
   assert.equal(wrapped?.transition, 'opened', 'the balance exhaustion survives the gateway wrapper');
 });
 
+test('a 402 balance failure without exhaustion wording does not trip the account', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'xai:lane-1', armId: 'grok-4.7' }], T0);
+  const errorText = '402 balance check unavailable; retry after account verification';
+
+  assert.equal(classifyArmError(errorText, cfg), null);
+  assert.deepEqual(recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText,
+  }, T0, cfg), []);
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-4.7', T0, cfg), 'closed');
+});
+
 test('a kept-run balance failure opens every known arm on its account', () => {
   const store = createBreakerStore();
   noteKnownArms(store, [

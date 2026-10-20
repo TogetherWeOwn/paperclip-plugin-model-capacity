@@ -437,10 +437,10 @@ export function allocateKeptAndRoutedCaps({
   // Preserve the existing ordinary-agent allocation exactly when no kept
   // demand is consuming capacity. Once kept agents are active, they share the
   // fleet target and leave only its remainder for routed demand.
-  const routedTarget = kept.length === 0
+  const routedTarget = keptTotal === 0
     ? target
     : (target == null ? null : Math.max(0, totalCeiling - keptTotal));
-  const routedCeiling = Math.max(1, Math.floor(kept.length === 0
+  const routedCeiling = Math.max(1, Math.floor(keptTotal === 0
     ? maxTotal
     : Math.min(maxTotal - keptTotal, totalCeiling - keptTotal)));
   const routed = allocateDemandCaps(

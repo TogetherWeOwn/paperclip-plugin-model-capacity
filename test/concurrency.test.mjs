@@ -58,6 +58,22 @@ test('unresolved kept pool demand remains visible as zero capacity', () => {
   assert.equal(out.routed[0].maxConcurrentRuns, 5);
 });
 
+test('unresolved zero-cap kept demand does not shrink routed capacity', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 60,
+    maxTotal: 75,
+    agents: [
+      { agentId: 'reviewer', running: 0, queued: 32 },
+      { agentId: 'doer', running: 0, queued: 70 },
+    ],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: {},
+  });
+
+  assert.equal(out.kept[0].maxConcurrentRuns, 0);
+  assert.equal(out.routed[0].maxConcurrentRuns, 70);
+});
+
 test('kept-agent demand factor scales its pool capacity', () => {
   const out = allocateKeptAndRoutedCaps({
     target: 10,

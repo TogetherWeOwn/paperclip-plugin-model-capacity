@@ -55,7 +55,6 @@ export const DEFAULT_BREAKERS = {
     '400+model',
     'model is unavailable',
     'no healthy managed',
-    '402+balance',
   ],
   vetoPatterns: [
     'context length',
@@ -113,7 +112,7 @@ export function sanitizeBreakers(raw) {
 function isBalanceExhaustion(text) {
   const t = String(text ?? '').toLowerCase();
   return /\b(?:balance|credits?)\b/.test(t)
-    && (/\b402\b/.test(t) || /\b(?:exhausted|depleted|insufficient|empty)\b/.test(t));
+    && /\b(?:exhausted|depleted|insufficient|empty)\b/.test(t);
 }
 
 export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
