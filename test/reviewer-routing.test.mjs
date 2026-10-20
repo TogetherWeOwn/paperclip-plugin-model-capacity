@@ -324,3 +324,12 @@ test('absent reviewerRouting: the pinned reviewer keeps, exactly as before', asy
   assert.notEqual(doer.reason ?? '', '');
   assert.doesNotMatch(doer.reason ?? '', /reviewer routing/);
 });
+
+test('select: burn mode never ranks credit-funded headroom above plan headroom', () => {
+  const r = selectReviewerRoute({
+    cfg: CFG, burnTokens: new Set(['claude:a1']),
+    accounts: [view('claude:a1', { creditFallback: true }), view('meta:m3', { planAhead: 0.2 })],
+  });
+  assert.equal(r.accountId, 'meta:m3');
+  assert.equal(r.burn, false);
+});

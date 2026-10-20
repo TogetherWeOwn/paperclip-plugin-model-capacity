@@ -6,9 +6,10 @@
  * With `reviewerRouting: { agentIds?, arms: [{ provider, model, effort? }] }`
  * a run of a listed agent (default reviewReserve.agentIds) is routed to the
  * arm whose provider has a servable account, ranked:
- *   1. accounts flagged by burn mode (config `burnMode`, matched by account
+ *   1. plan-funded headroom before credit-funded headroom (burn mode never
+ *      spends paid credits ahead of plan quota)
+ *   2. accounts flagged by burn mode (config `burnMode`, matched by account
  *      id, lane or label; absent key = nothing flagged)
- *   2. plan-funded headroom before credit-funded headroom
  *   3. the pool most behind its pace plan (most negative mean planAhead;
  *      unknown plan position counts as on-plan, 0)
  *   4. the pool with the most remaining quota per hour to reset
@@ -212,8 +213,8 @@ export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), ser
     };
   }
   cands.sort((x, y) =>
-    (Number(y.burn) - Number(x.burn))
-    || (Number(x.credit) - Number(y.credit))
+    (Number(x.credit) - Number(y.credit))
+    || (Number(y.burn) - Number(x.burn))
     || (x.ahead - y.ahead)
     || (y.perHour - x.perHour)
     || (x.armIndex - y.armIndex)
