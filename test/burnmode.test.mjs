@@ -349,9 +349,9 @@ test('plugin: a flat whole-percent meter with a run in flight never reports 0%/h
 
 test('order: a burn account on credit fallback never outranks plan headroom', () => {
   const r = orderAccountsWithPacing([
-    view('claude:a', { pool: 'a', planAhead: -0.3, targetShare: 9 }),
-    view('codex:b', { pool: 'b', planAhead: 0.0, targetShare: 1, burn: true, creditFallback: true }),
-    view('meta:c', { pool: 'c', planAhead: 0.0, targetShare: 1, burn: true }),
+    view('claude:a', { pool: 'a', planAhead: -0.3, targetShare: 9, remainingPct: 0.5 }),
+    view('codex:b', { pool: 'b', planAhead: 0.0, targetShare: 1, burn: true, creditFallback: true, remainingPct: 0 }),
+    view('meta:c', { pool: 'c', planAhead: 0.0, targetShare: 1, burn: true, remainingPct: 0.5 }),
   ], { pacing: PACING });
   assert.deepEqual(ids(r), ['meta:c', 'claude:a', 'codex:b']);
 });
