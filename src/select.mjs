@@ -231,11 +231,13 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // ordering key (eligibility, health and headroom were applied above, so
   // an exhausted burn account never reaches this sort). No burn flag on
   // any view leaves this key 0 and the order exactly as before.
+  // Credits-only-after-plan still outranks burn: a burn account already on
+  // credit fallback (plan spent) never jumps ahead of plan headroom.
   const order = [...qualified].sort((a, b) =>
-    (Number(b.burn === true) - Number(a.burn === true)) ||
     (creditPriority === 'fallback' && hasPlanHeadroom
       ? Number(a.creditFallback === true) - Number(b.creditFallback === true)
       : 0) ||
+    (Number(b.burn === true) - Number(a.burn === true)) ||
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
