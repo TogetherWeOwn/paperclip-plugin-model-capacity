@@ -3403,8 +3403,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const access = roleAccess?.[v.accountId];
         const thinker = access?.thinker;
         const doer = access?.doer;
+        // Reviewer routing: an account that serves a configured reviewer arm
+        // (same provider, model in its served list) is reviewer-eligible
+        // too -- routed reviews run that arm, not a role-ladder arm.
+        const pool = String(v.pool ?? v.provider ?? '').toLowerCase();
+        const servesRoutingArm = (config.reviewerRouting?.arms ?? []).some((arm) => arm.provider === pool
+          && (v.models ?? []).some((m) => String(canonicalModelName(m) ?? '').toLowerCase()
+            === String(canonicalModelName(arm.model) ?? '').toLowerCase()));
         const eligible = (thinker?.eligible === true && thinker?.trialOnly !== true)
-          || (doer?.eligible === true && doer?.trialOnly !== true);
+          || (doer?.eligible === true && doer?.trialOnly !== true)
+          || servesRoutingArm;
         return {
           accountId: v.accountId,
           provider: v.provider,
@@ -3893,13 +3901,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * breaker (open and half-open probes route nothing here). Returns true or
    * a refusal string; `match` is the ladder arm used for attribution.
    */
-  function reviewerArmCheck(account, arm, { ladderArms = [], roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock() } = {}) {
+  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock() } = {}) {
     const canon = String(canonicalModelName(arm.model) ?? '').toLowerCase();
     if (!canon) return { ok: 'model unmappable' };
     const sameModel = (m) => String(canonicalModelName(m) ?? '').toLowerCase() === canon;
     const matches = ladderArms.filter((x) => x != null && sameModel(x.model));
     const listed = (account.models ?? []).some(sameModel);
     if (matches.length === 0 && !listed) return { ok: `${arm.model} not served` };
+    // Credential readiness enforced: only a credential-ready ladder arm
+    // (the tick's readiness-filtered rungs) may serve, like normal routing.
+    if (readyArms != null && !readyArms.some((x) => x != null && sameModel(x.model))) {
+      return { ok: `${arm.model} has no credential-ready arm` };
+    }
     const excluded = new Set(normalizeExcludedFamilies(roleExcluded));
     const fam = inferFamily(canon);
     if (fam && excluded.has(fam)) return { ok: `family ${fam} excluded for the role` };
@@ -3940,7 +3953,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       burnTokens: new Set(live.burnModeTokens ?? []),
       inFlightOf: (a) => (a.inFlight ?? 0) + (pending.get(a.accountId) ?? 0),
       serves: (a, arm) => {
-        const r = reviewerArmCheck(a, arm, { ladderArms: liveLadderArms(a), roleExcluded, bstore, bcfg, nowMs });
+        const r = reviewerArmCheck(a, arm, {
+          ladderArms: liveLadderArms(a),
+          readyArms: credentialReadinessEnforced(companyId) ? (a.ladderRungs ?? []).flatMap((g) => g?.arms ?? []) : null,
+          roleExcluded, bstore, bcfg, nowMs,
+        });
         if (r.ok === true) matchOf.set(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`, r.match);
         return r.ok;
       },
