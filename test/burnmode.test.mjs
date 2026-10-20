@@ -355,3 +355,21 @@ test('order: a burn account on credit fallback never outranks plan headroom', ()
   ], { pacing: PACING });
   assert.deepEqual(ids(r), ['meta:c', 'claude:a', 'codex:b']);
 });
+
+test('burn: provider:label scopes an email to one provider; excludes win (owner config 2026-10-20)', async () => {
+  const { normalizeBurnMode, isBurnAccount } = await import('../src/burnmode.mjs');
+  const cfg = normalizeBurnMode({ accounts: ['codex:*', 'meta:*', '!meta:owner-b@example.test', '!meta:owner-a@example.test'] });
+  assert.equal(isBurnAccount(cfg, { accountId: 'codex:codex-lane-1', provider: 'codex', label: 'owner-a@example.test' }), true);
+  assert.equal(isBurnAccount(cfg, { accountId: 'meta:meta-lane-4', provider: 'meta', label: 'owner-a@example.test' }), false);
+  assert.equal(isBurnAccount(cfg, { accountId: 'meta:meta-lane-7', provider: 'meta', label: 'owner-b@example.test' }), false);
+  assert.equal(isBurnAccount(cfg, { accountId: 'meta:meta-lane-3', provider: 'meta', label: 'POOL-C@EXAMPLE.TEST' }), true);
+  assert.equal(isBurnAccount(cfg, { accountId: 'claude:claude-lane-4', provider: 'claude', label: 'owner-b@example.test' }), false);
+});
+
+test('reviewer routing burn flag follows burn-mode rules', async () => {
+  const { isBurnFlagged } = await import('../src/reviewerrouting.mjs');
+  const t = new Set(['codex:*', 'meta:*', '!meta:owner-b@example.test']);
+  assert.equal(isBurnFlagged({ accountId: 'meta:meta-lane-7', pool: 'meta', label: 'owner-b@example.test' }, t), false);
+  assert.equal(isBurnFlagged({ accountId: 'meta:meta-lane-1', pool: 'meta', label: 'pool-d@example.test' }, t), true);
+  assert.equal(isBurnFlagged({ accountId: 'claude:claude-lane-4', pool: 'claude', label: 'owner-b@example.test' }, t), false);
+});

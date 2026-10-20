@@ -84,6 +84,9 @@ function identitiesOf(account, key = null) {
   add(account?.label);
   add(account?.email);
   add(account?.name);
+  // 'provider:label' names one provider's account when the same email exists on several providers.
+  const provider = providerOf(account, key);
+  if (provider) for (const v of [...ids]) if (!v.includes(':')) ids.add(`${provider}:${v}`);
   return ids;
 }
 
