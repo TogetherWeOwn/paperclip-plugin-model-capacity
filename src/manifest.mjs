@@ -476,6 +476,14 @@ const CONFIG_SCHEMA = {
         },
       },
     },
+    burnMode: {
+      type: 'object', additionalProperties: false,
+      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, now + horizonMinutes), are never capped by the pace guard or held by the review reserve, and are preferred by routing. Empty burns nothing.',
+      properties: {
+        accounts: { type: 'array', items: { type: 'string', minLength: 1 }, default: [] },
+        horizonMinutes: { type: 'number', minimum: 1, default: 60, description: 'Pace horizon for burn accounts (minutes).' },
+      },
+    },
     reviewReserve: {
       type: 'object', additionalProperties: false,
       description: 'Review reserve: the demand-driven share of each reserved provider pace held back for review runs (native port of the host stopgap). A reserved-provider account above (elapsed + margin) x (1 - R) on the weekly or 5h window is held for non-review runs; review runs (agentIds, default roles.keepAgentIds) and pinned agents bypass. enabled:false restores pre-reserve admission.',

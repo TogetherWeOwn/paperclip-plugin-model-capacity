@@ -59,6 +59,7 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
+import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs } from './burnmode.mjs';
 import {
   normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
@@ -229,6 +230,8 @@ export function validateConfigShape(raw) {
       }
     }
   }
+  // Burn mode: operator-flagged accounts spend ASAP (see burnmode.mjs).
+  errors.push(...validateBurnMode(raw.burnMode));
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   // Review reserve: every knob is validated so a typo fails closed at config
   // load, never as a silent full-hold or a dead reserve in the tick.
@@ -559,6 +562,10 @@ export function resolveConfig(raw = {}) {
     // free reset) so quota is spent when a provider restore lands. Enabled by
     // default; enabled:false restores linear-to-regular-reset pacing bit-for-bit.
     burnHorizon: normalizeBurnHorizon(raw.burnHorizon),
+    // Burn mode (see burnmode.mjs): named accounts pace to an immediate
+    // horizon, skip the pace guard and the review reserve, and sort first.
+    // Empty/missing burns nothing (today's behavior bit-for-bit).
+    burnMode: normalizeBurnMode(raw.burnMode),
     smoothing: normalizeSmoothing(raw.smoothing),
     // Generic credit pools (see credits.mjs): free-grant types stay available
     // past weekly exhaustion, paced to drain; paid types only when allowed.
@@ -1700,7 +1707,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         feed: snapshot.freeResets?.[account.provider] ?? null,
         cfg: config.burnHorizon,
       });
-      const paceResetAtMs = burn?.horizonMs ?? resetAtMs;
+      // Burn mode (see burnmode.mjs): an operator-flagged account paces to
+      // min(regular reset, burn horizon, now + horizonMinutes), so its
+      // required rate is maximal and it never reads ahead of plan.
+      const burnOn = isBurnAccount(config.burnMode, account, key);
+      const paceResetAtMs = burnOn
+        ? burnPaceResetAtMs({ nowMs, resetAtMs, horizonMs: burn?.horizonMs ?? null, cfg: config.burnMode })
+        : (burn?.horizonMs ?? resetAtMs);
       const hoursToPaceReset = paceResetAtMs != null
         ? Math.max((paceResetAtMs - nowMs) / 3600000, 0.25)
         : null;
@@ -1781,6 +1794,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       let positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
         : 0;
+      // A burn account is never ahead: its plan is "spent by the horizon".
+      if (burnOn && positionError > 0) positionError = 0;
       if (credit != null) {
         // Drain pace: the fraction (else a full window) paces the required
         // rate over the credit (else weekly) horizon. There is deliberately
@@ -1941,6 +1956,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         hoursToReset,
         burnHorizonMs: burn?.horizonMs ?? null,
         burnHorizonSource: burn ? 'free-reset' : null,
+        // Burn mode rides only burn accounts, so views without it stay
+        // byte-identical to the pre-burn shape.
+        ...(burnOn ? { burnMode: true, paceResetAtMs } : {}),
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,
@@ -2439,6 +2457,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // (hook and event-time path) and /capacity all read this one verdict.
     // Disabled (enabled:false) computes nothing and holds nobody.
     const rrCfg = config.reviewReserve ?? normalizeReviewReserve(null, {});
+    const burnAccountIds = new Set(accountViews.filter(v => v.burnMode === true).map(v => v.accountId));
     const reviewAgentIdSet = new Set(rrCfg.agentIds ?? []);
     const isReviewAgent = (agentId) => typeof agentId === 'string' && reviewAgentIdSet.has(agentId);
     let reviewReserveView = {
@@ -2506,7 +2525,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // verdict carries the numbers, not the carried state.
         const { state: verdictState, ...pub } = verdict;
         perProvider[provider] = pub;
-        heldAccountIds.push(...verdict.heldAccountIds);
+        // Burn-mode accounts are never held for reviews (see burnmode.mjs).
+        heldAccountIds.push(...verdict.heldAccountIds.filter(id => !burnAccountIds.has(id)));
         for (const id of foldedNow) { seen.delete(id); seen.add(id); }
         rrNext.byProvider[provider] = {
           ...verdictState,
@@ -2963,6 +2983,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           held: !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
           planAhead: v.planAhead,
+          ...(v.burnMode === true ? { burn: true } : {}),
         })),
         {
           reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts,
@@ -3261,6 +3282,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
           planAhead: view?.planAhead ?? null,
+          ...(view?.burnMode === true ? { burn: true } : {}),
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
           ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg),
@@ -3542,6 +3564,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
+        // Burn-mode accounts (see burnmode.mjs): never capped or held.
+        burnAccounts: [...burnAccountIds],
         // Fresh starts with no decided or actual account yet are
         // deliberately outside every pool's cap (see paceInFlightByPool):
         // the count is published here so the fail-open stays visible.
