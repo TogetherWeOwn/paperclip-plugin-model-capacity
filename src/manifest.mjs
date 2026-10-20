@@ -90,6 +90,14 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.53 = BURN MODE + PER-LANE PACE GUARD + WHOLE-PERCENT RATE: config
+ *   burnMode.accounts (id, lane, feed label/email, provider:*, ! excludes)
+ *   paces named accounts to min(reset, now + horizonMinutes), never paces or
+ *   reserve-holds them and routes to them first; the pool pace guard judges
+ *   each lane on its own plan (a behind-plan lane is never throttled by a
+ *   spent sibling); a flat whole-percent meter extends its rate window to
+ *   the last tick (6h) and never reads 0 with runs in flight. No capability,
+ *   egress, secret or env-key change.
  * v0.2.52 = PENDING ARM-ID DISAMBIGUATION: the pending enforced path passes
  *   the decided served id (wouldModel) into the arm-id strip, so a dynamic
  *   arm whose served id ends in an effort word keys verbatim like its
@@ -277,7 +285,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.52';
+export const PLUGIN_VERSION = '0.2.53';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

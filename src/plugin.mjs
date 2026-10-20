@@ -3841,6 +3841,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     );
   }
 
+  /**
+   * Defer text for one paced pool. A whole pool reads as before; a pool
+   * where only ahead lanes are held (per-lane guard) names those lanes.
+   */
+  function pacedPoolText(p) {
+    if (p.paced === false && (p.pacedAccountIds?.length ?? 0) > 0) {
+      const lanes = (p.laneVerdicts ?? []).filter(l => l.paced)
+        .map(l => `${l.accountId} ${Math.round(l.planAhead * 1000) / 10}% ahead of plan`);
+      return `${p.pool} lanes ${lanes.join(', ')}; ${p.inFlight} of ${p.cap} in flight`;
+    }
+    return `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`;
+  }
+
   /** True when the run's agent serves reviews past the reserve hold. */
   function liveIsReviewAgent(live, agentId) {
     return Array.isArray(live?.reviewReserve?.agentIds) && live.reviewReserve.agentIds.includes(agentId);
@@ -4514,8 +4527,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (order.length === 0 && (reserveHeld?.length ?? 0) > 0) {
         const names = reserveHeld.map(h => h.accountId).join(', ');
         const guard = live.paceGuard ?? {};
-        const held = (paced ?? []).map(p =>
-          `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const held = (paced ?? []).map(pacedPoolText);
         const also = held.length > 0 ? `; pace guard also holds ${held.join('; ')}` : '';
         return deferred({
           kind: 'defer',
@@ -4531,7 +4543,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // real minutes-scale hold, and it is named first.
       if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
-        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const held = paced.map(pacedPoolText);
         const also = order.length > 0 ? `; ${new Set(order.map(v => v.accountId)).size} unpaced account(s) also unselectable this call` : '';
         return deferred({
           kind: 'defer',
