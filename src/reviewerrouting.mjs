@@ -134,18 +134,15 @@ export function burnModeTokens(raw) {
   return out;
 }
 
-/** True when the account matches a burn-mode token by id, lane or label. */
+/** True when the account matches burn mode, including exclusions and qualified labels. */
 export function isBurnFlagged(account, tokens) {
   if (!tokens || tokens.size === 0 || account == null) return false;
-  // Same rules as burn mode itself ('provider:*', '!' excludes, 'provider:label').
-  if ([...tokens].some((t) => t.startsWith('!') || t.endsWith(':*') || t.includes('@'))) {
-    return isBurnAccount({ accounts: [...tokens] }, { ...account, provider: account.provider ?? account.pool });
-  }
-  const id = lc(account.accountId);
-  const sep = id.indexOf(':');
-  const names = [id, sep >= 0 ? id.slice(sep + 1) : null, account.lane, account.laneKey, account.label, account.email, account.name]
-    .filter((s) => s != null && String(s).trim() !== '').map(lc);
-  return names.some((n) => tokens.has(n));
+  const identity = Object.fromEntries(Object.entries(account)
+    .map(([k, v]) => [k, typeof v === 'string' ? v.trim() : v]));
+  const id = lc(identity.accountId);
+  // Keep the legacy laneKey alias without losing accountId's provider prefix.
+  identity.provider ??= identity.pool ?? (id.includes(':') ? id.slice(0, id.indexOf(':')) : null);
+  return isBurnAccount({ accounts: [...tokens] }, identity, identity.laneKey);
 }
 
 /**
