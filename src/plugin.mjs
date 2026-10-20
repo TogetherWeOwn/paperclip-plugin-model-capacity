@@ -54,11 +54,12 @@ import {
   armTierCost, armTierCap, tierCapsByModel, tierModelKey, fleetBaselineForModels,
 } from './tiers.mjs';
 import {
-  scheduleError, stepController, stepRateController, appendUtilReading,
+  scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
+import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
+import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs } from './burnmode.mjs';
 import {
   normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
@@ -104,6 +105,7 @@ import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
+import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -230,6 +232,8 @@ export function validateConfigShape(raw) {
       }
     }
   }
+  // Burn mode: operator-flagged accounts spend ASAP (see burnmode.mjs).
+  errors.push(...validateBurnMode(raw.burnMode));
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   // Review reserve: every knob is validated so a typo fails closed at config
   // load, never as a silent full-hold or a dead reserve in the tick.
@@ -308,6 +312,7 @@ export function validateConfigShape(raw) {
       errors.push('reviewer.doerStarvationSustainMs must be a number > 0');
     }
   }
+  errors.push(...validateReviewerRouting(raw.reviewerRouting));
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
       errors.push('armMap entries need aaSlug, model, effort, family, providers');
@@ -542,6 +547,7 @@ export function resolveConfig(raw = {}) {
       // relative-only, so a legacy value here is accepted and ignored.
       rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
       rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
+      climbForSpend: raw.pacing?.climbForSpend === true,
       // Hard in-flight cap for a pool that is ahead of its linear weekly plan
       // (see paceguard.mjs); the same knobs feed the hook, the event-time
       // path and the shadow tick.
@@ -555,11 +561,28 @@ export function resolveConfig(raw = {}) {
     // Reviewer as a first-class role (see reviewer.mjs): runnable review
     // capacity from qualified providers (Claude today; others only when the
     // operator opts in) plus the hold/resume signal the review gate reads.
-    reviewer: normalizeReviewer(raw.reviewer),
+    // reviewer.providers unset falls back to reviewReserve.providers when
+    // the operator set it (both Claude and Meta reserved = both size slots).
+    reviewer: normalizeReviewer(raw.reviewer, {
+      defaultProviders: Array.isArray(raw.reviewReserve?.providers) ? raw.reviewReserve.providers : null,
+    }),
+    // Reviewer routing (see reviewerrouting.mjs): route listed review agents
+    // to the best configured arm instead of keep. Null = routing off (exact
+    // pre-routing behavior). agentIds default to reviewReserve.agentIds.
+    reviewerRouting: normalizeReviewerRouting(raw.reviewerRouting, {
+      reviewAgentIds: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }).agentIds,
+    }),
+    // Burn mode tokens (tolerant read; absent = nothing flagged): reviewer
+    // routing prefers accounts flagged here.
+    burnModeTokens: [...burnModeTokens(raw.burnMode)],
     // Burn horizon (see burnhorizon.mjs): pace to min(regular reset, expected
     // free reset) so quota is spent when a provider restore lands. Enabled by
     // default; enabled:false restores linear-to-regular-reset pacing bit-for-bit.
     burnHorizon: normalizeBurnHorizon(raw.burnHorizon),
+    // Burn mode (see burnmode.mjs): named accounts pace to an immediate
+    // horizon, skip the pace guard and the review reserve, and sort first.
+    // Empty/missing burns nothing (today's behavior bit-for-bit).
+    burnMode: normalizeBurnMode(raw.burnMode),
     smoothing: normalizeSmoothing(raw.smoothing),
     // Generic credit pools (see credits.mjs): free-grant types stay available
     // past weekly exhaustion, paced to drain; paid types only when allowed.
@@ -788,6 +811,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   const agentAdapterCache = new Map();
   const ADAPTER_TTL_MS = 10 * 60 * 1000;
   const enforceCompanies = new Set(); // companyIds with enforce: true
+  // Last reviewer-routing outcome per company (hook, memory-only), reported
+  // on /capacity reviewer.routing.last by the next tick.
+  const reviewerRouteLast = new Map();
   // companyIds with credentialReadiness.enforce: true. Written ONLY by
   // onConfigChanged (like enforceCompanies): the tick reads its config
   // before the lane fetch and publishes after it, so a stale in-flight tick
@@ -1668,6 +1694,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     // First tick with the new key only seeds (no fleet-wide wake on deploy).
     const capacityDiff = diffCapacityFeed(prevSummaries, currSummaries, { nowMs, firstTick: prevChange == null });
+    // In-flight runs per account for the rate estimate (a flat whole-percent
+    // meter with runs in flight is never "idle"). Same load the tick does
+    // below; a failed load aborts here, still before any persist.
+    const rateInFlight = inflightByAccount(await loadLedger(companyId), { nowMs, horizonMs: staleHorizonMs }).byAccount;
     const accountViews = [];
     for (let i = 0; i < snapshot.accounts.length; i++) {
       const account = snapshot.accounts[i];
@@ -1701,7 +1731,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         feed: snapshot.freeResets?.[account.provider] ?? null,
         cfg: config.burnHorizon,
       });
-      const paceResetAtMs = burn?.horizonMs ?? resetAtMs;
+      // Burn mode (see burnmode.mjs): an operator-flagged account paces to
+      // min(regular reset, burn horizon, now + horizonMinutes), so its
+      // required rate is maximal and it never reads ahead of plan.
+      const burnOn = isBurnAccount(config.burnMode, account, key);
+      const paceResetAtMs = burnOn
+        ? burnPaceResetAtMs({ nowMs, resetAtMs, horizonMs: burn?.horizonMs ?? null, cfg: config.burnMode })
+        : (burn?.horizonMs ?? resetAtMs);
       const hoursToPaceReset = paceResetAtMs != null
         ? Math.max((paceResetAtMs - nowMs) / 3600000, 0.25)
         : null;
@@ -1713,12 +1749,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // skipped, everything else accumulates -- so history grows on every
       // tick that carries genuinely new data.
       let history = rateHistories[key] ?? [];
+      // Tick log (see appendTickLog): the readings where the whole-percent
+      // meter changed, kept 6h, so a flat 60-min window can extend back to
+      // the last tick instead of reading 0%/h.
+      let tickLog = rateHistories[`tick:${key}`] ?? [];
       if (weeklyUsed != null) {
         const readingAtMs = account.signalsAtMs ?? snapshot.observedAtMs ?? nowMs;
         const dup = history.some(p => p.atMs === readingAtMs && p.usedPct === weeklyUsed);
-        if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
+        if (!dup) {
+          const lastSeenAtMs = history.length > 0 ? history[history.length - 1].atMs : null;
+          history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
+          tickLog = appendTickLog(tickLog, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs, lastSeenAtMs);
+        }
       }
       rateHistories[key] = history;
+      if (tickLog.length > 0) rateHistories[`tick:${key}`] = tickLog;
       // Credit lanes pace the CREDIT drain, not the flat weekly meter (which
       // sits at 100% while credits are spent and would read as rate 0
       // forever): track the credit fraction as its own utilization series
@@ -1738,8 +1783,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         rateHistories[`credit:${key}`] = creditHistory;
       }
+      // Whole-percent meters: a flat window extends to the last tick and
+      // never reads exactly 0 while runs are in flight (robustRatePerHour).
       let measured = weeklyUsed != null
-        ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
+        ? robustRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin, {
+          tickLog, inFlight: rateInFlight[key] ?? 0,
+        })
         : null;
       // New-account warmup : the CONTROLLER does not act on rate
       // estimates from < 60 min of data (live: a brand-new Claude account
@@ -1782,6 +1831,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       let positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
         ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
         : 0;
+      // A burn account is never ahead: its plan is "spent by the horizon".
+      if (burnOn && positionError > 0) positionError = 0;
       if (credit != null) {
         // Drain pace: the fraction (else a full window) paces the required
         // rate over the credit (else weekly) horizon. There is deliberately
@@ -1942,6 +1993,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         hoursToReset,
         burnHorizonMs: burn?.horizonMs ?? null,
         burnHorizonSource: burn ? 'free-reset' : null,
+        // Burn mode rides only burn accounts, so views without it stay
+        // byte-identical to the pre-burn shape.
+        ...(burnOn ? { burnMode: true, paceResetAtMs } : {}),
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,
@@ -1949,6 +2003,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         rateBasis: measured ? 'measured' : 'position',
         measuredRatePerHour: measured?.ratePerHour ?? null,
         rateSpanMs: measured?.spanMs ?? null,
+        ...(measured?.basis != null && measured.basis !== 'window' ? { rateEstimate: measured.basis } : {}),
         ratePoints: measured?.points ?? 0,
         rateHistoryPoints: history.length,
         warmingUp,
@@ -2469,6 +2524,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // (hook and event-time path) and /capacity all read this one verdict.
     // Disabled (enabled:false) computes nothing and holds nobody.
     const rrCfg = config.reviewReserve ?? normalizeReviewReserve(null, {});
+    const burnAccountIds = new Set(accountViews.filter(v => v.burnMode === true).map(v => v.accountId));
     const reviewAgentIdSet = new Set(rrCfg.agentIds ?? []);
     const isReviewAgent = (agentId) => typeof agentId === 'string' && reviewAgentIdSet.has(agentId);
     let reviewReserveView = {
@@ -2536,7 +2592,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // verdict carries the numbers, not the carried state.
         const { state: verdictState, ...pub } = verdict;
         perProvider[provider] = pub;
-        heldAccountIds.push(...verdict.heldAccountIds);
+        // Burn-mode accounts are never held for reviews (see burnmode.mjs).
+        heldAccountIds.push(...verdict.heldAccountIds.filter(id => !burnAccountIds.has(id)));
         for (const id of foldedNow) { seen.delete(id); seen.add(id); }
         rrNext.byProvider[provider] = {
           ...verdictState,
@@ -2690,7 +2747,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (a.creditType != null && a.creditResetAtMs != null) {
             return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
           }
-          const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
+          // A burn-mode account paces to its burn end (now + horizon), so its need -- and the fleet C* -- grow
+          // with it; pacing it alone while C* stays at plan would leave the burn starved of slots.
+          const paceEndMs = a.burnMode === true && a.paceResetAtMs != null
+            ? a.paceResetAtMs
+            : (a.burnHorizonMs ?? a.resetAtMs);
           return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
         })(),
         burnPerRunPct: burnOf(a.accountId),
@@ -2993,6 +3054,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           held: !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
           planAhead: v.planAhead,
+          ...(v.burnMode === true ? { burn: true } : {}),
         })),
         {
           reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts,
@@ -3252,6 +3314,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       doerAgentIds: config.roles.doerAgentIds,
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
+      // Reviewer routing (null = off: listed agents keep, as before) and the
+      // burn-mode tokens it prefers.
+      reviewerRouting: config.reviewerRouting ?? null,
+      burnModeTokens: config.burnModeTokens ?? [],
       // Effective exclusion tokens per role (operator list + quality and
       // outcome gates): the hook and the event-time path read these.
       excludeFamilies: roleExclusions,
@@ -3288,9 +3354,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           quality: view?.quality ?? 'unknown',
           inFlight: liveCensus.byAccount[a.accountId] ?? 0,
           resetAtMs: view?.resetAtMs ?? null,
+          hoursToReset: view?.hoursToReset ?? null,
+          action: view?.action ?? null,
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
           planAhead: view?.planAhead ?? null,
+          burn: view?.burnMode === true,
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
           ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg),
@@ -3400,17 +3469,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
-    // Reviewer as a first-class role : runnable review capacity
-    // from qualified providers plus the hold/resume signal the review gate
-    // reads. Reviewer-eligible = a non-trial arm the role can reach (thinker
-    // access first, doer as fallback); trial-only accounts never serve reviews.
+    // With routing enabled, capacity must pass the same admission as a
+    // configured reviewer. Otherwise retain the legacy non-trial role access.
+    const reviewerLive = liveViews.get(companyId);
+    const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
+    const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
+      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
         const access = roleAccess?.[v.accountId];
         const thinker = access?.thinker;
         const doer = access?.doer;
-        const eligible = (thinker?.eligible === true && thinker?.trialOnly !== true)
-          || (doer?.eligible === true && doer?.trialOnly !== true);
+        const pool = String(v.pool ?? v.provider ?? '').toLowerCase();
+        const account = reviewerAccounts.get(v.accountId);
+        const servesRoutingArm = account != null && (config.reviewerRouting?.arms ?? []).some((arm) => arm.provider === pool
+          && reviewerAdmissions.some(admit => admit(account, arm).ok === true));
+        const eligible = reviewerAdmissions.length > 0
+          ? servesRoutingArm
+          : (thinker?.eligible === true && thinker?.trialOnly !== true)
+            || (doer?.eligible === true && doer?.trialOnly !== true);
         return {
           accountId: v.accountId,
           provider: v.provider,
@@ -3429,6 +3506,34 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       cfg: config.reviewer,
       nowMs,
     });
+    // Reviewer routing decision: what a review run would get right now
+    // (preview over the live view this tick published) plus the hook's last
+    // outcome. Absent config reports enabled:false and nothing else changes.
+    {
+      const rcfg = config.reviewerRouting ?? null;
+      const liveNow = liveViews.get(companyId);
+      let preview = null;
+      if (rcfg && liveNow && rcfg.agentIds.length > 0) {
+        const { pick } = pickReviewerRoute(liveNow, companyId, rcfg.agentIds[0], null, nowMs);
+        preview = pick.none
+          ? { routed: false, fallback: config.roles.keepAgentIds.includes(rcfg.agentIds[0]) ? 'keep' : 'route', reason: pick.reason }
+          : { routed: true, provider: pick.provider, arm: pick.arm, accountId: pick.accountId, burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason };
+      }
+      reviewerView.routing = rcfg
+        ? {
+          enabled: true,
+          agentIds: rcfg.agentIds,
+          arms: rcfg.arms,
+          burnModeTokens: config.burnModeTokens ?? [],
+          provider: preview?.provider ?? null,
+          arm: preview?.arm ?? null,
+          accountId: preview?.accountId ?? null,
+          reason: preview?.reason ?? null,
+          preview,
+          last: reviewerRouteLast.get(companyId) ?? null,
+        }
+        : { enabled: false, reason: 'reviewerRouting not configured: review agents keep their configured model' };
+    }
     // Demand-aware supply signal: large unused headroom near reset while doers
     // idle means supply should scale up instead of idling. Per-provider live
     // runs keep one provider's reviewer traffic from masking another
@@ -3589,6 +3694,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
+        // Burn-mode accounts (see burnmode.mjs): never capped or held.
+        burnAccounts: [...burnAccountIds],
         // Fresh starts with no decided or actual account yet are
         // deliberately outside every pool's cap (see paceInFlightByPool):
         // the count is published here so the fail-open stays visible.
@@ -3846,6 +3953,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     );
   }
 
+  /**
+   * Defer text for one paced pool. A whole pool reads as before; a pool
+   * where only ahead lanes are held (per-lane guard) names those lanes.
+   */
+  function pacedPoolText(p) {
+    if (p.paced === false && (p.pacedAccountIds?.length ?? 0) > 0) {
+      const lanes = (p.laneVerdicts ?? []).filter(l => l.paced)
+        .map(l => `${l.accountId} ${Math.round(l.planAhead * 1000) / 10}% ahead of plan`);
+      return `${p.pool} lanes ${lanes.join(', ')}; ${p.inFlight} of ${p.cap} in flight`;
+    }
+    return `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`;
+  }
+
   /** True when the run's agent serves reviews past the reserve hold. */
   function liveIsReviewAgent(live, agentId) {
     return Array.isArray(live?.reviewReserve?.agentIds) && live.reviewReserve.agentIds.includes(agentId);
@@ -3877,6 +3997,154 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (!q?.decidedAccount) continue;
       out.set(q.decidedAccount, (out.get(q.decidedAccount) ?? 0) + 1);
     }
+    return out;
+  }
+
+  /**
+   * Reviewer-arm service check for one account (shared by the hook and the
+   * tick's /capacity preview). The arm's model must be served (feed model
+   * list or a ladder arm), its family and arm tokens must survive the
+   * role's exclusions, and a ladder arm serving it must have a closed
+   * breaker (open and half-open probes route nothing here). Returns true or
+   * a refusal string; `match` is the ladder arm used for attribution.
+   */
+  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock() } = {}) {
+    const canon = String(canonicalModelName(arm.model) ?? '').toLowerCase();
+    if (!canon) return { ok: 'model unmappable' };
+    const sameModel = (m) => String(canonicalModelName(m) ?? '').toLowerCase() === canon;
+    const matches = ladderArms.filter((x) => x != null && sameModel(x.model));
+    const listed = (account.models ?? []).some(sameModel);
+    if (matches.length === 0 && !listed) return { ok: `${arm.model} not served` };
+    const effort = arm.effort != null ? String(arm.effort).toLowerCase() : null;
+    const match = matches.find((x) => effort != null && String(x.effort ?? '').toLowerCase() === effort) ?? matches[0] ?? null;
+    // Admission belongs to the selected arm, not a sibling effort of the model.
+    if (readyArms != null && (!match || !readyArms.some((x) => x != null
+      && x.armId === match.armId && sameModel(x.model)))) {
+      return { ok: `${arm.model} has no credential-ready arm` };
+    }
+    const excluded = new Set(normalizeExcludedFamilies(roleExcluded));
+    const fam = inferFamily(canon);
+    if (fam && excluded.has(fam)) return { ok: `family ${fam} excluded for the role` };
+    if (match && (excluded.has(String(match.family ?? '').toLowerCase()) || excluded.has(armToken(match.armId)))) {
+      return { ok: 'arm excluded for the role' };
+    }
+    if (bstore && bcfg?.enabled !== false && match?.armId != null
+      && breakerState(bstore, account.accountId, match.armId, nowMs, bcfg) !== 'closed') {
+      return { ok: 'arm breaker not closed' };
+    }
+    return {
+      ok: true, match,
+      model: match?.model ?? servedIdForArm(account.models, canonicalModelName(arm.model), account.laneProvider ?? account.provider),
+    };
+  }
+
+  /** Flat arm list of a live account (grouped rungs plus ranked candidates). */
+  function liveLadderArms(a) {
+    const out = [];
+    for (const g of [...(a?.ladderRungs ?? []), ...(a?.credentialRanking?.candidates ?? [])]) {
+      if (Array.isArray(g?.arms)) out.push(...g.arms);
+      else if (g && typeof g === 'object' && g.model != null) out.push(g);
+    }
+    return out;
+  }
+
+  /** One admission policy for routed reviewer capacity, preview and hook. */
+  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock()) {
+    const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
+    const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
+    const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+    const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
+    const readiness = credentialReadinessEnforced(companyId);
+    return (a, arm) => reviewerArmCheck(a, arm, {
+      ladderArms: liveLadderArms(a),
+      readyArms: readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
+      roleExcluded, bstore, bcfg, nowMs,
+    });
+  }
+
+  /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
+  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock()) {
+    const cfg = live?.reviewerRouting;
+    const pending = pendingByAccount(live, companyId, selfId);
+    const admit = reviewerArmAdmission(live, companyId, agentId, nowMs);
+    const admissionOf = new Map();
+    const pick = selectReviewerRoute({
+      cfg,
+      accounts: live.accounts ?? [],
+      burnTokens: new Set(live.burnModeTokens ?? []),
+      inFlightOf: (a) => (a.inFlight ?? 0) + (pending.get(a.accountId) ?? 0),
+      serves: (a, arm) => {
+        const r = admit(a, arm);
+        if (r.ok === true) admissionOf.set(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`, r);
+        return r.ok;
+      },
+    });
+    return { pick, admissionOf };
+  }
+
+  /**
+   * Reviewer routing in the hook (memory-only apart from the ledger join).
+   * Returns a decide answer, or null when routing is off for the agent, the
+   * snapshot is stale, or no arm qualifies (the caller keeps / routes as
+   * before). The outcome is remembered for /capacity reviewer.routing.last.
+   */
+  async function routeReviewerRun(params, live) {
+    const cfg = live?.reviewerRouting;
+    if (!cfg || !Array.isArray(cfg.agentIds) || !cfg.agentIds.includes(params?.agentId)) return null;
+    const companyId = params.companyId;
+    const fallback = Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId) ? 'keep' : 'route';
+    const note = (out) => {
+      reviewerRouteLast.set(companyId, {
+        atMs: clock(), runId: params?.runId != null ? String(params.runId) : null,
+        agentId: params?.agentId ?? null, ...out,
+      });
+    };
+    if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000 || clock() < live.atMs) {
+      note({ routed: false, fallback, reason: `routing snapshot stale: ${fallback}` });
+      return null;
+    }
+    const ledger = await getOrLoadLedger(companyId);
+    if (!enforceCompanies.has(companyId)) return null;
+    const nowMs = clock();
+    const { pick, admissionOf } = pickReviewerRoute(live, companyId, params.agentId, params?.runId != null ? String(params.runId) : null, nowMs);
+    if (pick.none) {
+      note({ routed: false, fallback, reason: `${pick.reason}: ${fallback}` });
+      return null;
+    }
+    const arm = pick.arm;
+    const admission = admissionOf.get(`${pick.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`);
+    const match = admission?.match ?? null;
+    const emitModel = admission?.model ?? arm.model;
+    const adapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
+    const decorated = decoratedModelFor({ model: emitModel, effort: arm.effort, contextWindow: match?.contextWindow ?? null }, adapter);
+    const model = decorated ?? emitModel;
+    clearDeferred(companyId, params.runId);
+    recordDecision(ledger, {
+      runId: String(params.runId ?? 'unknown'),
+      agentId: String(params.agentId ?? 'unknown'),
+      accountId: pick.accountId,
+      armId: match?.armId ?? null,
+      effort: arm.effort ?? null,
+      enforced: true,
+      wouldModel: decorated ?? `${emitModel}(${arm.effort ?? 'default'})`,
+      rung: match?.rung ?? null,
+      family: inferFamily(canonicalModelName(arm.model)),
+      reason: pick.reason,
+    }, nowMs);
+    note({
+      routed: true, provider: pick.provider, arm: { ...arm }, accountId: pick.accountId,
+      burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason,
+    });
+    const sanitize = (x) => String(x).replace(/[^a-zA-Z0-9-]+/g, '-').slice(0, 80) || 'x';
+    const out = {
+      kind: 'decide',
+      decisionId: `mc-${sanitize(params.runId ?? 'unknown')}-${sanitize(pick.accountId)}-review-${sanitize(arm.model)}`,
+      model,
+      env: {},
+      source: 'model-capacity',
+      reason: pick.reason,
+    };
+    if (arm.effort != null) out.effort = arm.effort;
     return out;
   }
 
@@ -4391,6 +4659,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return keep();
       }
+      // Reviewer routing: listed review agents route to the best configured
+      // arm (burn mode, then the pool most behind plan); no qualifying arm
+      // falls through to keep below. Off (absent config) = unchanged.
+      const reviewRoute = await routeReviewerRun(params, live);
+      if (reviewRoute) return reviewRoute;
       // Operator-pinned agents (gating roles) always run their configured model.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
@@ -4540,8 +4813,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (order.length === 0 && (reserveHeld?.length ?? 0) > 0) {
         const names = reserveHeld.map(h => h.accountId).join(', ');
         const guard = live.paceGuard ?? {};
-        const held = (paced ?? []).map(p =>
-          `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const held = (paced ?? []).map(pacedPoolText);
         const also = held.length > 0 ? `; pace guard also holds ${held.join('; ')}` : '';
         return deferred({
           kind: 'defer',
@@ -4557,7 +4829,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // real minutes-scale hold, and it is named first.
       if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
-        const held = paced.map(p => `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`);
+        const held = paced.map(pacedPoolText);
         const also = order.length > 0 ? `; ${new Set(order.map(v => v.accountId)).size} unpaced account(s) also unselectable this call` : '';
         return deferred({
           kind: 'defer',

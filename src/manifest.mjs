@@ -90,6 +90,25 @@
  * warmup, bypass stamp restore, allocator-parity reviewer/supply, durable
  * wake seq). No capability, egress, secret or env-key change.
  *
+ * v0.2.53 = BURN MODE + PER-LANE PACE GUARD + WHOLE-PERCENT RATE: config
+ *   burnMode.accounts (id, lane, feed label/email, provider:*, ! excludes)
+ *   paces named accounts to min(reset, now + horizonMinutes), never paces or
+ *   reserve-holds them and routes to them first; the pool pace guard judges
+ *   each lane on its own plan (a behind-plan lane is never throttled by a
+ *   spent sibling); a flat whole-percent meter extends its rate window to
+ *   the last tick (6h) and never reads 0 with runs in flight. No capability,
+ *   egress, secret or env-key change.
+ * v0.2.55 = cheapest capable model: pacing never climbs to pricier rungs for spend (pacing.climbForSpend, default
+ *   false); unused quota goes to throughput.
+ * v0.2.54 = burn-mode accounts count their burn end in the fleet C* need.
+ * v0.2.53 = REVIEWER ROUTING ACROSS PROVIDERS: reviewer.providers falls back
+ *   to reviewReserve.providers (Claude AND Meta lanes size reviewer slots);
+ *   optional reviewerRouting { agentIds?, arms } routes listed review agents
+ *   to the best arm (burn-mode accounts, then the pool most behind plan)
+ *   instead of keep, falling back to keep; /capacity reviewer.routing shows
+ *   the decision. Absent config = unchanged. No capability, egress, secret
+ *   or env-key change.
+ *
  * v0.2.52 = PENDING ARM-ID DISAMBIGUATION: the pending enforced path passes
  *   the decided served id (wouldModel) into the arm-id strip, so a dynamic
  *   arm whose served id ends in an effort word keys verbatim like its
@@ -277,7 +296,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.52';
+export const PLUGIN_VERSION = '0.2.55';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -451,6 +470,7 @@ const CONFIG_SCHEMA = {
         rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
         rateWindowMin: { type: 'number', minimum: 10, default: 60 },
         rateMinSpanMin: { type: 'number', minimum: 5, default: 10 },
+        climbForSpend: { type: 'boolean', default: false, description: 'Owner rule 2026-10-20: false (default) keeps every account on its cheapest capable rung and spends unused quota through throughput; true restores the spend-driven climb to pricier rungs.' },
         guard: {
           type: 'object', additionalProperties: false,
           description: 'Pace guard: a provider pool whose lanes average above the linear weekly plan (plus marginPct) is held at max(1, ceil(paced slots)) runs in flight; further runs go to other pools or are deferred. Applies to the enforcing hook, the event-time path and the shadow tick alike. Unknown plan position, unknown share and reactive lanes fail open.',
@@ -474,6 +494,14 @@ const CONFIG_SCHEMA = {
           type: 'object', additionalProperties: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1 },
           description: 'Per-provider quantile overrides, e.g. { codex: 0.25 }.',
         },
+      },
+    },
+    burnMode: {
+      type: 'object', additionalProperties: false,
+      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, now + horizonMinutes), are never capped by the pace guard or held by the review reserve, and are preferred by routing. Empty burns nothing.',
+      properties: {
+        accounts: { type: 'array', items: { type: 'string', minLength: 1 }, default: [] },
+        horizonMinutes: { type: 'number', minimum: 1, default: 60, description: 'Pace horizon for burn accounts (minutes).' },
       },
     },
     reviewReserve: {
@@ -502,11 +530,34 @@ const CONFIG_SCHEMA = {
       type: 'object', additionalProperties: false,
       description: 'Reviewer as a first-class role: runnable review capacity from qualified providers plus the hold/resume signal the review gate reads. Claude qualifies today; other providers only after the operator opts them in.',
       properties: {
-        providers: { type: 'array', items: { type: 'string' }, default: ['claude'], description: 'Providers whose accounts may serve review runs.' },
+        providers: { type: 'array', items: { type: 'string' }, description: 'Providers whose accounts may serve review runs. Unset: reviewReserve.providers when set, else [claude].' },
         supplyHeadroomPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.30, description: 'Headroom fraction that counts as large unused supply.' },
         supplyHoursToReset: { type: 'number', exclusiveMinimum: 0, default: 120, description: 'Hours-to-reset under which unused headroom counts as close to reset.' },
         doerStarvationMarginRuns: { type: 'number', exclusiveMinimum: 0, default: 4, description: 'C*-vs-live-doer gap (runs) that counts as doer starvation.' },
         doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
+      },
+    },
+    reviewerRouting: {
+      type: 'object', additionalProperties: false,
+      anyOf: [
+        { required: ['enabled'], properties: { enabled: { const: false } } },
+        { required: ['arms'] },
+      ],
+      description: 'Reviewer routing: runs of the listed agents (default reviewReserve.agentIds) are routed to the first-ranked arm whose provider has a healthy, non-exhausted account with headroom instead of keeping the adapter model. Ranking: plan before credit headroom, burn-mode accounts, the pool most behind its pace plan, the most remaining quota per hour, then arm order. No arm qualifies: keep. Absent (or enabled:false) = keep, exactly as before. When disabled, arms may be omitted; supplied arms are still validated.',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        agentIds: { type: ['array', 'null'], items: { type: 'string', minLength: 1 }, default: null, description: 'Review-agent ids routed. Null (default) resolves to reviewReserve.agentIds.' },
+        arms: {
+          type: 'array', minItems: 1,
+          items: {
+            type: 'object', additionalProperties: false, required: ['provider', 'model'],
+            properties: {
+              provider: { type: 'string', minLength: 1, description: 'Provider pool, e.g. claude or meta.' },
+              model: { type: 'string', minLength: 1, description: 'Model id emitted for the run, e.g. muse-wonder-full-1.0-contributor.' },
+              effort: { type: 'string', minLength: 1, description: 'Effort emitted for the run, e.g. max.' },
+            },
+          },
+        },
       },
     },
     concurrency: {

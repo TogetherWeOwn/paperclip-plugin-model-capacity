@@ -146,7 +146,7 @@ function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], bas
       usage: { observedAt: new Date(now).toISOString(), epoch: 'credit-fallback', requests: 100 + step * 100 },
     }) : a),
   ];
-  const config = { enforce, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve,
+  const config = { pacing: { climbForSpend: true }, enforce, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve,
     ...(configCredits === undefined ? {} : { credits: configCredits }) };
   const io = {
     config: { get: async () => config },
@@ -372,7 +372,7 @@ function driveCreditGroup() {
       credits: [{ type: 'codex-credits', hasCredits: true, balance: 9, fraction: 0.5,
         resetsAt: new Date(T0 + 48 * 3600000).toISOString() }] },
   ];
-  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
+  const config = { pacing: { climbForSpend: true }, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
   const io = {
     config: { get: async () => config },
     state: { get: async k => state.get(JSON.stringify(k)) ?? null, set: async (k, v) => state.set(JSON.stringify(k), v) },
@@ -444,7 +444,7 @@ function driveDrain({ fractions, creditResetsAtH = 48, creditFromStep = 0, preCr
         resetsAt: new Date(T0 + creditResetsAtH * 3600000).toISOString() }] } : {}),
     }];
   };
-  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
+  const config = { pacing: { climbForSpend: true }, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
   const io = {
     config: { get: async () => config },
     state: { get: async k => state.get(JSON.stringify(k)) ?? null, set: async (k, v) => state.set(JSON.stringify(k), v) },
@@ -612,7 +612,7 @@ function driveCreditHorizons() {
     creditLane('crnofrac', { credits: [{ type: 'codex-credits', hasCredits: true, balance: 9,
       resetsAt: new Date(T0 + 48 * 3600000).toISOString() }] }),
   ];
-  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
+  const config = { pacing: { climbForSpend: true }, cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
   const io = {
     config: { get: async () => config },
     state: { get: async k => state.get(JSON.stringify(k)) ?? null, set: async (k, v) => state.set(JSON.stringify(k), v) },

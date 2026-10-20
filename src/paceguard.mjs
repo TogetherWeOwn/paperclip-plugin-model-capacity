@@ -61,14 +61,38 @@ const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
  * Per-pool verdicts over the QUALIFIED lanes (the caller has already dropped
  * unhealthy lanes and metered lanes without headroom).
  *
- * lanes: [{ planAhead (nullable), targetShare (nullable), inFlight (pooled),
+ * lanes: [{ accountId, planAhead (nullable), targetShare (nullable),
+ *   inFlight (pooled), laneInFlight (optional, this lane's own count),
  *   paceInFlight (optional override of inFlight for the cap check),
+ *   burn (optional: burn-mode lane, never paced or counted),
  *   meter/quality (reactive detection) }]
  * pacing: { enabled, marginPct, meanRunDurationHours } or null
  * Returns one entry per pool (`key` is the caller's poolKeyOf value):
- *   { key, pool, lanes, planAhead, pacedSlots, cap, inFlight, ahead, paced, state }
- * with state 'paced' | 'ahead' (over plan, under the cap) | 'on-plan' |
+ *   { key, pool, lanes, planAhead, pacedSlots, cap, inFlight, ahead, paced,
+ *     state, pacedAccountIds, burnAccountIds, laneVerdicts }
+ * with state 'paced' (every metered lane held) | 'lanes-paced' (ahead lanes
+ * held, behind-plan lanes still serve) | 'ahead' (over plan, under the cap) |
+ * 'on-plan' | 'burn' (every lane is in burn mode: unpaced) |
  * 'not-measured' (fail open) | 'off'.
+ *
+ * Per-lane plan (0.2.53): the pool used to be judged on the MEAN plan
+ * position of its lanes, so one spent lane (claude-lane-3 at 99%) hid a lane
+ * far behind its own plan (claude-lane-4 at 11% with 4.6 days left) and the
+ * whole pool capped at one run. Now each lane is judged on its OWN position:
+ *
+ *   laneSlots_i = targetShare_i x meanRunDurationHours
+ *   allowance_i = laneSlots_i            (lane ahead of its plan)
+ *               = max(1, laneSlots_i)    (lane on or behind plan: full fair share)
+ *   cap         = max(1, ceil(sum allowance_i))
+ *
+ * Only lanes ahead of their own plan are held once the pool's in-flight
+ * count reaches the cap; a lane behind its plan is never throttled by other
+ * lanes' over-use. A single-lane pool reads exactly as before (one lane:
+ * ahead -> cap max(1, ceil(slots)); on plan -> never paced).
+ *
+ * Burn mode: lanes flagged `burn` leave the aggregation entirely (their
+ * position, share and own in-flight count) and are never held. A pool whose
+ * every lane burns is unpaced (cap null, state 'burn').
  */
 export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
   const groups = new Map();
@@ -79,20 +103,32 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
   }
   const enabled = pacing?.enabled === true;
   const out = [];
-  for (const [key, members] of groups) {
-    const pool = members[0]?.pool ?? key;
+  for (const [key, all] of groups) {
+    const pool = all[0]?.pool ?? key;
+    const burners = all.filter(v => v?.burn === true);
+    const members = burners.length > 0 ? all.filter(v => v?.burn !== true) : all;
     // paceInFlight, when given, is the pooled count without the run being
     // decided (callers whose inFlight still includes it); else inFlight.
-    const inFlight = Math.max(0, ...members.map(v => {
+    const pooled = Math.max(0, ...all.map(v => {
       const n = finite(v.paceInFlight) ? v.paceInFlight : v.inFlight;
       return finite(n) ? n : 0;
     }));
+    // Burn lanes' own runs are theirs to spend: they never count against
+    // the cap of the lanes that still pace.
+    const burnInFlight = burners.reduce((s, v) => s + (finite(v.laneInFlight) && v.laneInFlight > 0 ? v.laneInFlight : 0), 0);
+    const inFlight = Math.max(0, pooled - burnInFlight);
     const entry = {
-      key, pool, lanes: members.length, planAhead: null, pacedSlots: null, cap: null,
+      key, pool, lanes: all.length, planAhead: null, pacedSlots: null, cap: null,
       inFlight, ahead: false, paced: false, state: enabled ? 'not-measured' : 'off',
+      pacedAccountIds: [],
     };
+    if (burners.length > 0) {
+      entry.burnAccountIds = burners.map(v => v.accountId);
+      entry.burnInFlight = burnInFlight;
+    }
     out.push(entry);
     if (!enabled) continue;
+    if (members.length === 0) { entry.state = 'burn'; continue; }
     if (members.some(isReactiveAccount)) continue;
     // One lane of unknown position or share makes the whole pool unmeasured:
     // leaving it out would size the cap from the other lanes alone and
@@ -101,14 +137,29 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     const shares = members.map(v => v.targetShare);
     const hours = pacing.meanRunDurationHours;
     if (!positions.every(finite) || !shares.every(s => finite(s) && s >= 0) || !(finite(hours) && hours > 0)) continue;
+    const laneVerdicts = members.map(v => {
+      const slots = v.targetShare * hours;
+      const ahead = v.planAhead > pacing.marginPct;
+      return { accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: ahead ? slots : Math.max(1, slots), ahead, paced: false };
+    });
     entry.planAhead = mean(positions);
     entry.pacedSlots = shares.reduce((s, x) => s + x, 0) * hours;
+    const single = members.length === 1;
+    const allowance = single ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
     // The epsilon keeps an exact integer of slots from rounding up on
     // float noise (0.2 x 10 is 2.0000000000000004).
-    entry.cap = Math.max(1, Math.ceil(entry.pacedSlots - 1e-9));
-    entry.ahead = entry.planAhead > pacing.marginPct;
-    entry.paced = entry.ahead && inFlight >= entry.cap;
-    entry.state = entry.paced ? 'paced' : entry.ahead ? 'ahead' : 'on-plan';
+    entry.cap = Math.max(1, Math.ceil(allowance - 1e-9));
+    entry.ahead = laneVerdicts.some(l => l.ahead);
+    const atCap = inFlight >= entry.cap;
+    if (entry.ahead && atCap) {
+      for (const l of laneVerdicts) if (l.ahead) l.paced = true;
+    }
+    entry.pacedAccountIds = laneVerdicts.filter(l => l.paced).map(l => l.accountId);
+    entry.paced = entry.pacedAccountIds.length > 0 && entry.pacedAccountIds.length === members.length;
+    if (!single) entry.laneVerdicts = laneVerdicts;
+    entry.state = entry.paced ? 'paced'
+      : entry.pacedAccountIds.length > 0 ? 'lanes-paced'
+        : entry.ahead ? 'ahead' : 'on-plan';
   }
   return out;
 }

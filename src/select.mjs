@@ -170,17 +170,24 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   const forReview = reviewReserve?.forReview === true;
   const reserveHeld = (!reviewReserve || forReview || heldIds.size === 0)
     ? []
-    : eligible.filter(v => heldIds.has(v.accountId));
-  const unheld = reserveHeld.length > 0 ? eligible.filter(v => !heldIds.has(v.accountId)) : eligible;
+    : eligible.filter(v => heldIds.has(v.accountId) && v.burn !== true);
+  // Burn-mode accounts are never reserve-held: the operator asked for them
+  // to spend as fast as possible, review or not.
+  const reserveHeldIds = new Set(reserveHeld.map(v => v.accountId));
+  const unheld = reserveHeld.length > 0 ? eligible.filter(v => !reserveHeldIds.has(v.accountId)) : eligible;
   const poolKeyOf = (v) => (v.pool != null ? `pool:${v.pool}` : `acct:${v.accountId}`);
   // The guard runs before ordering: a paced pool is not a candidate, so
   // placement scores and shortfalls below see only the pools that can serve.
   // The reserve hold applies first for the same reason: held accounts never
   // reach the guard or the sort for non-review runs.
   const verdicts = paceGuardPools(unheld, { pacing, poolKeyOf });
-  const pacedKeys = new Set(verdicts.filter(p => p.paced).map(p => p.key));
+  // Per-lane verdicts: only the lanes the guard holds leave the order (a
+  // lane behind its own plan keeps serving while an ahead sibling is held;
+  // burn lanes are never held).
+  const pacedVerdicts = verdicts.filter(p => (p.pacedAccountIds?.length ?? 0) > 0);
+  const pacedIds = new Set(pacedVerdicts.flatMap(p => p.pacedAccountIds));
   const routable = unheld.filter(v => !v.held);
-  const qualified = pacedKeys.size > 0 ? routable.filter(v => !pacedKeys.has(poolKeyOf(v))) : routable;
+  const qualified = pacedIds.size > 0 ? routable.filter(v => v.burn === true || !pacedIds.has(v.accountId)) : routable;
   // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
   // only models a qualified native also serves sorts after every need band.
   // Views without a `models` list fail open (never fallback-only), so older
@@ -220,10 +227,17 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   }
   const hasPlanHeadroom = qualified.some(v => v.creditFallback !== true
     && v.roleEligible !== false && hasUsablePlanHeadroom(v, reservePct));
+  // Burn mode first: an operator-flagged burn account wins every other
+  // ordering key (eligibility, health and headroom were applied above, so
+  // an exhausted burn account never reaches this sort). No burn flag on
+  // any view leaves this key 0 and the order exactly as before.
+  // Credits-only-after-plan still outranks burn: a burn account already on
+  // credit fallback (plan spent) never jumps ahead of plan headroom.
   const order = [...qualified].sort((a, b) =>
     (creditPriority === 'fallback' && hasPlanHeadroom
       ? Number(a.creditFallback === true) - Number(b.creditFallback === true)
       : 0) ||
+    (Number(b.burn === true) - Number(a.burn === true)) ||
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
@@ -236,5 +250,5 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   const heldPub = reserveHeld.map(v => ({
     accountId: v.accountId, pool: v.pool ?? null, headroomPct: v.headroomPct ?? null,
   }));
-  return { order, paced: verdicts.filter(p => p.paced).map(pub), pools: verdicts.map(pub), reserveHeld: heldPub };
+  return { order, paced: pacedVerdicts.map(pub), pools: verdicts.map(pub), reserveHeld: heldPub };
 }

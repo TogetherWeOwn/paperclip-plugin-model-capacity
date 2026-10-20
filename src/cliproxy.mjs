@@ -205,6 +205,12 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     accountId,
     credentialAvailability: parseCredentialAvailability(entry?.credentialAvailability, { accountId, provider: entry?.provider, nowMs }),
     lane: entry?.lane ?? null,
+    // Human identity of the credential when the feed provides one (burn
+    // mode matches on it, see burnmode.mjs). Absent fields stay absent so
+    // feeds without them parse byte-identically.
+    ...(typeof entry?.label === 'string' && entry.label ? { label: entry.label } : {}),
+    ...(typeof entry?.email === 'string' && entry.email ? { email: entry.email } : {}),
+    ...(typeof entry?.accountKey === 'string' && entry.accountKey ? { accountKey: entry.accountKey } : {}),
     provider: entry?.provider ?? null,
     pool: entry?.pool ?? null,
     health: entry?.health ?? 'unknown',

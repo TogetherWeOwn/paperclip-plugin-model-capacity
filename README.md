@@ -344,7 +344,9 @@ count 0 (`reconciledRingDropped`; the persisted ring self-heals), because
 the clamp bound includes the carry and cannot catch dead-run inflation
 itself. The rate deadband is relative-only (±15% of required, no absolute
 floor, `rateMinDeadbandPerHour` retired): a stall reads as maximum deficit
-and any real shortfall on a small-required account climbs. Accounts are
+and any real shortfall on a small-required account climbs. Since v0.2.55,
+that spend-driven climb requires `pacing.climbForSpend: true`; the default
+keeps the cheapest capable rung and uses spare quota for throughput. Accounts are
 fully feed-driven: vanished accounts get no decisions and drop out of the
 report and target, brand-new providers/models are eligible on the next
 tick with zero config, and non-healthy accounts freeze their pointer and
@@ -718,15 +720,19 @@ nobody: admission is bit-for-bit the pre-reserve behavior.
 ## Reviewer routing and capacity auto-heal
 
 The reviewer is a first-class role: the tick derives runnable review
-capacity from qualified providers (default Claude only; other providers
-only after the operator opts them in via `reviewer.providers`) and the
-review gate reads `capacity.reviewer` (`hold`, `resume`,
-`qualifiedAccountIds`, `slots`). Only accounts the allocator itself would
-serve count -- healthy, reviewer-eligible (a non-trial arm the role can
-reach), not `excluded` (e.g. weekly-exhausted), not floor-guard pinned,
-with metered headroom above the allocator's 0.05 reserve. Reactive lanes
-carry no meter and qualify on health alone. When nobody qualifies the
-signal holds reviews until a qualified provider recovers.
+capacity from qualified providers (`reviewer.providers`, falling back to
+explicit `reviewReserve.providers`, then Claude only) and the review gate
+reads `capacity.reviewer` (`hold`, `resume`, `qualifiedAccountIds`, `slots`).
+Only accounts the allocator itself would serve count -- healthy,
+reviewer-eligible, not `excluded` (e.g. weekly-exhausted), not floor-guard
+pinned, with metered headroom above the allocator's 0.05 reserve. Reactive
+lanes need no meter but must still pass the other eligibility checks.
+With routing enabled for review agents, eligibility requires an admitted
+configured reviewer arm, including its selected-effort breaker and
+credential checks; healthy ordinary arms cannot supply reviewer capacity
+on their own. Without routing, eligibility retains the non-trial arm check
+for the role. When nobody qualifies the signal holds reviews until a
+qualified provider recovers.
 
 `/capacity` also carries `capacityChange` (per-tick `added`, `removed`,
 `upwardAccountIds`, `downwardAccountIds`, `wake`) and `supplySignal`

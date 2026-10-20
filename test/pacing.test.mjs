@@ -16,7 +16,7 @@ test('schedule error is used minus linear target', () => {
 });
 
 test('deadband holds; behind climbs and ahead descends one rung', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, climbForSpend: true };
   const hold = stepController({ pointer: 1, lastMoveAtMs: 0, guardActive: false }, { error: 0.01, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 4);
   assert.equal(hold.action, 'hold');
   const climb = stepController({ pointer: 1, lastMoveAtMs: 0, guardActive: false }, { error: -0.1, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 4);
@@ -26,7 +26,7 @@ test('deadband holds; behind climbs and ahead descends one rung', () => {
 });
 
 test('cooldown allows at most one rung per window; bounds hold', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, climbForSpend: true };
   const first = stepController({ pointer: 1, lastMoveAtMs: 1000000, guardActive: false }, { error: -0.2, fiveHourUsedPct: 0.1 }, 1000000 + 60000, cfg, 4);
   assert.equal(first.action, 'hold-cooldown');
   const atFloor = stepController({ pointer: 0, lastMoveAtMs: 0, guardActive: false }, { error: 0.2, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 4);
@@ -36,7 +36,7 @@ test('cooldown allows at most one rung per window; bounds hold', () => {
 });
 
 test('5h guard floors and sheds; rejoin below the rejoin line', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, climbForSpend: true };
   const trip = stepController({ pointer: 3, lastMoveAtMs: 0, guardActive: false }, { error: -0.3, fiveHourUsedPct: 0.85 }, 5000, cfg, 4);
   assert.deepEqual([trip.action, trip.pointer, trip.guardActive], ['floor-guard', 0, true]);
   const held = stepController(trip, { error: -0.3, fiveHourUsedPct: 0.7 }, 6000, cfg, 4);
@@ -80,7 +80,7 @@ test('live case: position says climb but the rate says descend', () => {
   // claude-lane-1: 66% used with 88% elapsed => position error is
   // negative ("behind", climb). But it burns 5.6%/h against required
   // 1.7%/h, so climbing would blow the 5h window.
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, climbForSpend: true };
   const reading = {
     measuredRatePerHour: 0.056, requiredRatePerHour: 0.017,
     positionError: -0.22, fiveHourUsedPct: 0.3,
@@ -91,7 +91,7 @@ test('live case: position says climb but the rate says descend', () => {
 });
 
 test('rate deadband holds within +-15%; position breaks ties when unmeasured', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, climbForSpend: true };
   const hold = stepRateController({ pointer: 2, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0.018, requiredRatePerHour: 0.017, positionError: -0.2, fiveHourUsedPct: 0.1 }, 10 * 600000, cfg, 5);
   assert.equal(hold.action, 'hold');
@@ -102,7 +102,7 @@ test('rate deadband holds within +-15%; position breaks ties when unmeasured', (
 });
 
 test('rate guard still floors on the 5h window', () => {
-  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15 };
+  const cfg = { deadband: 0.02, cooldownMs: 600000, guardHigh: 0.8, guardRejoin: 0.5, floorRung: 0, rateDeadbandRel: 0.15, climbForSpend: true };
   const step = stepRateController({ pointer: 4, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0.001, requiredRatePerHour: 0.05, positionError: 0, fiveHourUsedPct: 0.9 }, 5000, cfg, 5);
   assert.deepEqual([step.action, step.pointer, step.guardActive], ['floor-guard', 0, true]);
@@ -113,7 +113,7 @@ test('position -> measured switch resets the cooldown so the pointer descends', 
   // the measured rate arrived showing over-burn (2.5%/h vs required 1.7%/h).
   // A fallback move 1 min ago would normally block the correction for 9
   // more minutes; the switch bypasses it exactly once.
-  const cfg = { ...DEFAULT_PACING };
+  const cfg = { ...DEFAULT_PACING, climbForSpend: true };
   const now = 10 * 600000;
   const reading = {
     measuredRatePerHour: 0.025, requiredRatePerHour: 0.017,
@@ -149,7 +149,7 @@ test('total stall reads as behind plan, never inside deadband', () => {
   // Live codex-lane-1: measured 0 vs required 0.49%/h read "inside deadband"
   // because the 0.5%/h absolute floor swallowed the whole required rate. A
   // stalled account (zero burn because it got no runs) is maximum deficit.
-  const cfg = { ...DEFAULT_PACING };
+  const cfg = { ...DEFAULT_PACING, climbForSpend: true };
   const now = 10 * 600000;
   const stalled = { measuredRatePerHour: 0, requiredRatePerHour: 0.0049, positionError: -0.05, fiveHourUsedPct: 0.1 };
   const step = stepRateController({ pointer: 1, lastMoveAtMs: 0, guardActive: false }, stalled, now, cfg, 5);
@@ -167,4 +167,18 @@ test('total stall reads as behind plan, never inside deadband', () => {
   const done = stepRateController({ pointer: 1, lastMoveAtMs: 0, guardActive: false },
     { measuredRatePerHour: 0, requiredRatePerHour: 0, positionError: 0, fiveHourUsedPct: 0.1 }, now, cfg, 5);
   assert.equal(done.action, 'hold');
+});
+
+test('owner rule 2026-10-20: default pacing never climbs for spend; a high pointer drops to the cheapest capable floor', () => {
+  const reading = { measuredRatePerHour: 0.001, requiredRatePerHour: 0.5, positionError: -0.3, fiveHourUsedPct: 0.1 };
+  const fromTop = stepRateController({ pointer: 7, lastMoveAtMs: 0, guardActive: false }, reading, 10 * 600000, DEFAULT_PACING, 7);
+  assert.equal(fromTop.pointer, 0);
+  assert.equal(fromTop.action, 'cheapest');
+  const atFloor = stepRateController({ pointer: 0, lastMoveAtMs: 0, guardActive: false }, reading, 10 * 600000, DEFAULT_PACING, 7);
+  assert.equal(atFloor.pointer, 0);
+  assert.equal(atFloor.action, 'hold-cheapest');
+  const legacy = stepRateController({ pointer: 0, lastMoveAtMs: 0, guardActive: false }, reading, 10 * 600000, { ...DEFAULT_PACING, climbForSpend: true }, 7);
+  assert.equal(legacy.action, 'climb');
+  const guard = stepRateController({ pointer: 3, lastMoveAtMs: 0, guardActive: false }, { ...reading, fiveHourUsedPct: 0.9 }, 10 * 600000, DEFAULT_PACING, 7);
+  assert.equal(guard.action, 'floor-guard');
 });

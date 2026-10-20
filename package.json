@@ -1,12 +1,28 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.2.52",
+  "version": "0.2.55",
   "description": "Shadow-by-default model-capacity routing: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.2.2 routes all providers. The default manifest holds no run.model.resolve capability; the enforce-capable variant is opt-in and its enforce flag defaults false.",
   "license": "MIT",
   "type": "module",
-  "paperclipPlugin": { "manifest": "./src/manifest.mjs", "worker": "./src/worker.mjs" },
-  "files": ["src", "test", "README.md", "LICENSE", "config.example.json"],
-  "peerDependencies": { "@paperclipai/plugin-sdk": "*" },
-  "engines": { "node": ">=24" },
-  "scripts": { "test": "node --test test/*.test.mjs", "check:public-pin": "node scripts/check-public-pin.mjs" }
+  "paperclipPlugin": {
+    "manifest": "./src/manifest.mjs",
+    "worker": "./src/worker.mjs"
+  },
+  "files": [
+    "src",
+    "test",
+    "README.md",
+    "LICENSE",
+    "config.example.json"
+  ],
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:public-pin": "node scripts/check-public-pin.mjs"
+  }
 }
