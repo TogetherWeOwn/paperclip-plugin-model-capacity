@@ -2716,7 +2716,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (a.creditType != null && a.creditResetAtMs != null) {
             return Math.max((a.creditResetAtMs - nowMs) / 3600000, 0.25);
           }
-          const paceEndMs = a.burnHorizonMs ?? a.resetAtMs;
+          // A burn-mode account paces to its burn end (now + horizon), so its need -- and the fleet C* -- grow
+          // with it; pacing it alone while C* stays at plan would leave the burn starved of slots.
+          const paceEndMs = a.burnMode === true && a.paceResetAtMs != null
+            ? a.paceResetAtMs
+            : (a.burnHorizonMs ?? a.resetAtMs);
           return paceEndMs != null ? Math.max((paceEndMs - nowMs) / 3600000, 0.25) : 168;
         })(),
         burnPerRunPct: burnOf(a.accountId),

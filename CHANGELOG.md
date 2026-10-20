@@ -1,5 +1,9 @@
 # Changelog
 
+
+## 0.2.54
+- Burn mode now raises the fleet concurrency target: a burn account's C* need uses its burn end (now + horizon), not its weekly reset.
+
 ## 0.2.53 — 2026-10-20
 
 - Burn mode per provider account: new config `burnMode: { accounts: string[], horizonMinutes?: number (default 60) }`. An entry matches an account by id (`meta:meta-lane-3`), lane/accountKey (`meta-lane-3`), the feed's `label`/`email` when present (case-insensitive), or `provider:*` (every account of a provider); a leading `!` excludes and wins over positive entries (`["codex:*", "meta:*", "!rdugger@..."]`). A burn account paces to `min(regular reset, free-reset horizon, now + horizonMinutes)` so its required rate is maximal and it never reads ahead of plan; the pool pace guard leaves burn lanes out of its aggregation and never holds them (an all-burn pool is unpaced: `cap null`, `state 'burn'`); review-reserve holds never apply; routing sorts burn accounts first among the accounts that can serve (health, headroom, breakers, exclusions and exhaustion still apply). `/capacity` shows `burnMode: true` and `paceResetAtMs` on burn accounts and `paceGuard.burnAccounts`. The lane parser keeps optional feed `label`/`email`/`accountKey`. Validation rejects a non-array `accounts`, non-string or empty entries and a horizon below one minute. Absent/empty burnMode decides bit-for-bit as before (regression test compares hook decisions, shadow log, accounts, pace pools and review reserve).

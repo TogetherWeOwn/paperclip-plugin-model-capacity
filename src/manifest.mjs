@@ -98,6 +98,7 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.54 = burn-mode accounts count their burn end in the fleet C* need.
  * v0.2.53 = REVIEWER ROUTING ACROSS PROVIDERS: reviewer.providers falls back
  *   to reviewReserve.providers (Claude AND Meta lanes size reviewer slots);
  *   optional reviewerRouting { agentIds?, arms } routes listed review agents
@@ -293,7 +294,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.53';
+export const PLUGIN_VERSION = '0.2.54';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
