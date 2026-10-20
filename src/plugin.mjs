@@ -3500,16 +3500,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
     // A fully breaker-open account has no servable arms; it contributes no
     // kept-agent pool slots until an arm recovers or its breaker cools off.
+    // Only current ladder arms count: known retains removed arms for 24h.
     const breakerUnavailableAccountIds = [];
     const breakerStore = breakerStores.get(companyId) ?? createBreakerStore();
     if (config.breakers?.enabled !== false) {
-      const armsByAccount = new Map();
-      for (const arm of Object.values(breakerStore.known ?? {})) {
-        if (!armsByAccount.has(arm.accountId)) armsByAccount.set(arm.accountId, []);
-        armsByAccount.get(arm.accountId).push(arm.armId);
-      }
       for (const account of accountViews) {
-        const arms = armsByAccount.get(account.accountId) ?? [];
+        const arms = (account.arms ?? []).map(arm => arm.armId);
         if (arms.length > 0 && arms.every(armId => breakerState(breakerStore, account.accountId, armId, nowMs, config.breakers) === 'open')) {
           breakerUnavailableAccountIds.push(account.accountId);
         }
