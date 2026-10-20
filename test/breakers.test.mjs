@@ -5,7 +5,7 @@ import {
   createBreakerStore, breakerStoreFromJSON, breakerStoreToJSON,
   breakerState, breakerAllows, breakerProbeRunId, recordArmFailure,
   startProbe, resolveProbe, breakerHousekeep, filterBreakerRungs, breakerReport,
-  noteKnownArms, breakerKey,
+  noteKnownArms, breakerKey, recordAccountBalanceExhaustion,
 } from '../src/breakers.mjs';
 import { createLedger, recordStart, recordDecision, recordTerminal, terminalRecords } from '../src/ledger.mjs';
 import { decide } from '../src/decide.mjs';
@@ -33,6 +33,7 @@ test('a 402 balance exhaustion trips its arm immediately', () => {
   const errorText = '402 Grok Build usage balance exhausted';
 
   assert.equal(classifyArmError(errorText, cfg), 'fatal');
+  assert.equal(classifyArmError(errorText, sanitizeBreakers({ fatalPatterns: [], vetoPatterns: ['balance'] })), 'fatal');
   const transition = recordArmFailure(store, 'xai:lane-1', 'grok-4.7', {
     atMs: T0, errorText,
   }, T0, cfg);
@@ -40,6 +41,31 @@ test('a 402 balance exhaustion trips its arm immediately', () => {
   assert.equal(transition?.transition, 'opened');
   assert.equal(breakerState(store, 'xai:lane-1', 'grok-4.7', T0, cfg), 'open');
   assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
+
+  const wrappedError = '503 auth_unavailable: no auth available; last upstream error: Grok Build usage balance exhausted';
+  const wrapped = recordArmFailure(store, 'xai:lane-1', 'grok-4.7-wrapped', {
+    atMs: T0, errorText: wrappedError,
+  }, T0, cfg);
+  assert.equal(wrapped?.transition, 'opened', 'the balance exhaustion survives the gateway wrapper');
+});
+
+test('a kept-run balance failure opens every known arm on its account', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [
+    { accountId: 'xai:lane-1', armId: 'grok-4.7' },
+    { accountId: 'xai:lane-1', armId: 'grok-4.7-fast' },
+    { accountId: 'meta:lane-1', armId: 'muse-spark-1.3' },
+  ], T0);
+  const errorText = '503 auth_unavailable: last upstream error: Grok Build usage balance exhausted';
+
+  const transitions = recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText,
+  }, T0, cfg);
+
+  assert.deepEqual(transitions.map(t => t.armId).sort(), ['grok-4.7', 'grok-4.7-fast']);
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7-fast', T0, cfg), false);
+  assert.equal(breakerAllows(store, 'meta:lane-1', 'muse-spark-1.3', T0, cfg), true);
 });
 
 test('generic 400-about-model trips; transients never do', () => {

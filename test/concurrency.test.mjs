@@ -1,8 +1,77 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
 
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
+
+test('kept agents spend the fleet target from their own paced pool', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 20,
+    maxTotal: 75,
+    demandFactor: 1,
+    agents: [
+      { agentId: 'reviewer', running: 0, queued: 40 },
+      { agentId: 'doer', running: 0, queued: 40 },
+    ],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }, { accountId: 'codex:1', pool: 'codex' }],
+    perAccount: [{ accountId: 'meta:1', slots: 12 }, { accountId: 'codex:1', slots: 30 }],
+    pacePools: [{ pool: 'meta', cap: 4 }],
+  });
+
+  assert.equal(out.kept[0].maxConcurrentRuns, 4);
+  assert.equal(out.routed[0].maxConcurrentRuns, 16);
+  assert.equal(out.kept[0].maxConcurrentRuns + out.routed[0].maxConcurrentRuns, 20);
+});
+
+test('breaker-exhausted kept account does not contribute pool capacity', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 20,
+    maxTotal: 75,
+    agents: [{ agentId: 'reviewer', running: 0, queued: 32 }],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }],
+    perAccount: [{ accountId: 'meta:1', slots: 12 }],
+    unavailableAccountIds: ['meta:1'],
+  });
+
+  assert.equal(out.kept[0].maxConcurrentRuns, 0);
+});
+
+test('unresolved kept pool demand remains visible as zero capacity', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 20,
+    maxTotal: 75,
+    agents: [
+      { agentId: 'reviewer', running: 0, queued: 32 },
+      { agentId: 'doer', running: 0, queued: 5 },
+    ],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: {},
+  });
+
+  assert.equal(out.kept[0].agentId, 'reviewer');
+  assert.equal(out.kept[0].maxConcurrentRuns, 0);
+  assert.equal(out.routed[0].agentId, 'doer');
+  assert.equal(out.routed[0].maxConcurrentRuns, 5);
+});
+
+test('kept-agent demand factor scales its pool capacity', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 10,
+    maxTotal: 20,
+    demandFactor: 0.5,
+    agents: [{ agentId: 'reviewer', running: 0, queued: 30 }],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }],
+    perAccount: [{ accountId: 'meta:1', slots: 12 }],
+  });
+
+  assert.equal(out.kept[0].maxConcurrentRuns, 6);
+});
 
 test('fleet mean run duration is the measured 0.186h', () => {
   assert.equal(DEFAULT_CONCURRENCY.meanRunDurationHours, 0.186);

@@ -68,8 +68,9 @@ import {
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
+  recordAccountBalanceExhaustion,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
@@ -1985,13 +1986,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         seen.add(rec.runId);
         const acct = rec.decidedAccount ?? rec.actualAccount ?? null;
         const arm = rec.armId ?? null;
-        // Only plugin-decided runs feed the breaker: without our (account,
-        // arm) attribution there is nothing to exclude.
-        if (acct == null || arm == null) continue;
-        if (rec.status === 'finished') {
-          const t = resolveProbe(breakers, acct, arm, rec.runId, 'success', null, nowMs, breakersCfg);
-          if (t) breakerTransitions.push(t);
-        } else if (rec.status === 'failed') {
+        // Balance exhaustion belongs to the serving lane, not just the arm
+        // that happened to be attributed (kept runs can have no armId).
+        if (acct == null) continue;
+        if (rec.status === 'failed') {
+          const balanceTrips = recordAccountBalanceExhaustion(breakers, acct, {
+            atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText,
+          }, nowMs, breakersCfg);
+          breakerTransitions.push(...balanceTrips);
+          if (balanceTrips.length > 0 || arm == null) continue;
           const fatal = classifyArmError(rec.errorText, breakersCfg) === 'fatal';
           if (breakerProbeRunId(breakers, acct, arm, nowMs, breakersCfg) === rec.runId) {
             const t = resolveProbe(breakers, acct, arm, rec.runId, fatal ? 'arm-fatal' : 'other', rec.errorText, nowMs, breakersCfg);
@@ -2001,6 +2004,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
               { atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText }, nowMs, breakersCfg);
             if (t) breakerTransitions.push(t);
           }
+        } else if (arm == null) {
+          continue;
+        } else if (rec.status === 'finished') {
+          const t = resolveProbe(breakers, acct, arm, rec.runId, 'success', null, nowMs, breakersCfg);
+          if (t) breakerTransitions.push(t);
         } else if (rec.status === 'cancelled') {
           const t = resolveProbe(breakers, acct, arm, rec.runId, 'other', null, nowMs, breakersCfg);
           if (t) breakerTransitions.push(t);
@@ -3468,12 +3476,30 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       seq: lastChange.seq,
       lastWakeAtMs,
     };
+    // A fully breaker-open account has no servable arms; it contributes no
+    // kept-agent pool slots until an arm recovers or its breaker cools off.
+    const breakerUnavailableAccountIds = [];
+    const breakerStore = breakerStores.get(companyId) ?? createBreakerStore();
+    if (config.breakers?.enabled !== false) {
+      const armsByAccount = new Map();
+      for (const arm of Object.values(breakerStore.known ?? {})) {
+        if (!armsByAccount.has(arm.accountId)) armsByAccount.set(arm.accountId, []);
+        armsByAccount.get(arm.accountId).push(arm.armId);
+      }
+      for (const account of accountViews) {
+        const arms = armsByAccount.get(account.accountId) ?? [];
+        if (arms.length > 0 && arms.every(armId => breakerState(breakerStore, account.accountId, armId, nowMs, config.breakers) === 'open')) {
+          breakerUnavailableAccountIds.push(account.accountId);
+        }
+      }
+    }
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
     const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
+      demandFactor: concurrency.demandFactor ?? 1,
       // Unsmoothed usable target, and the quota-only sum with no role
       // filtering (what the target used to read), so the gap stays visible.
       targetRaw: concurrency.targetRaw ?? concurrency.target,
@@ -3496,6 +3522,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       calibrationGroups,
       smoothing: { ...config.smoothing, fastUntilMs: targetStep.fastUntilMs },
       perAccount: concurrency.perAccount,
+      breakerUnavailableAccountIds,
       accounts: accountViews,
       skippedArms: skipped,
       unscored,
@@ -4245,68 +4272,44 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           queued: counts.get(agentId) ?? 0,
           overPace: runningByAgent[agentId]?.overPace === true,
         }));
-        const unheld = allocateDemandCaps(
+        // Fixed-model agents consume the same fleet target, but only from the
+        // capacity of their serving pool. Routed demand receives the remainder.
+        const allocated = allocateKeptAndRoutedCaps({
           target,
-          capInputs.filter(agent => !keptIds.has(agent.agentId)),
-          cap.maxTotal ?? 75,
-        );
-        // Kept agents cannot use the fleet's routed capacity: their model is
-        // fixed, so allocate them only against the slots of its serving pool.
-        // When the pace guard has measured that pool, its cap is an additional
-        // ceiling. An unresolved pinned model gets running-only headroom.
-        const accountPool = new Map((cap.accounts ?? []).map(account => [account.accountId, account.pool]));
-        const poolSlots = new Map();
-        for (const row of cap.perAccount ?? []) {
-          const pool = accountPool.get(row.accountId);
-          if (typeof pool !== 'string' || !Number.isFinite(row.slots)) continue;
-          poolSlots.set(pool, (poolSlots.get(pool) ?? 0) + row.slots);
-        }
-        const pacedPools = new Map((cap.paceGuard?.pools ?? []).map(pool => [pool.pool, pool]));
-        const keptByPool = new Map();
-        for (const agent of capInputs) {
-          if (!keptIds.has(agent.agentId)) continue;
-          const serving = cap.keptByAgent?.[agent.agentId];
-          const pool = serving?.accountId == null ? null : accountPool.get(serving.accountId);
-          const key = typeof pool === 'string' ? pool : '';
-          if (!keptByPool.has(key)) keptByPool.set(key, []);
-          keptByPool.get(key).push(agent);
-        }
-        for (const [pool, members] of keptByPool) {
-          const pace = pacedPools.get(pool);
-          const capacity = pool === '' ? 0 : (poolSlots.get(pool) ?? 0) * (cap.demandFactor ?? 1);
-          const boundedCapacity = Number.isFinite(pace?.cap)
-            ? Math.min(capacity, pace.cap)
-            : capacity;
-          const ceiling = boundedCapacity > 0 ? Math.max(1, Math.floor(boundedCapacity)) : 1;
-          unheld.push(...allocateDemandCaps(
-            boundedCapacity > 0 ? boundedCapacity : 0,
-            members,
-            ceiling,
-          ));
-        }
+          maxTotal: cap.maxTotal ?? 75,
+          demandFactor: cap.demandFactor ?? 1,
+          agents: capInputs,
+          keepAgentIds: [...keptIds],
+          keptByAgent: cap.keptByAgent ?? {},
+          accounts: cap.accounts ?? [],
+          perAccount: cap.perAccount ?? [],
+          pacePools: cap.paceGuard?.pools ?? [],
+          unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+        });
+        const keptCaps = allocated.kept;
+        const unheld = allocated.routed;
         // Hysteresis (#3): wants follow the instantaneous queue, so served
         // caps fall on a half-life instead of tracking every dip (increases
         // pass at once; a cap under demand would throttle real work). The
-        // hold state is advisory: if it cannot be read or written the
-        // unheld allocation is served.
+        // hold state is advisory for routed agents; kept-agent pool ceilings
+        // are hard and must not be smoothed upward.
         const nowMs = clock();
-        let agents = unheld;
+        let agents = [...keptCaps, ...unheld];
         try {
           const prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
           const held = holdCaps(unheld, prevHold, nowMs, {
             halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
             staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
-            ceiling: cap.maxTotal ?? 75,
+            ceiling: allocated.routedCeiling,
           });
-          agents = held.entries;
+          agents = [...keptCaps, ...held.entries];
           await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
-        // Reserved floors run LAST, after the allocator and the hold, so
-        // smoothing never takes a floored cap below its floor. Memory-only
-        // breaker read: while every servable arm is breaker-open (fleet-wide
-        // cooling) floors suspend and floored caps hold at running.
+        // Reserved floors run LAST, after the allocator and the hold. Floors
+        // suspend during fleet-wide breaker cooling, and a kept-agent floor
+        // above its pool ceiling is blocked rather than violating pace.
         const resolved = lastConfig.get(companyId);
         const reservedFloors = resolved?.caps?.reservedFloors ?? {};
         let floorsSuspended = false;
@@ -4318,10 +4321,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           } catch (error) {
             ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
           }
+          const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
+          const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
+          for (const agent of keptCaps) {
+            const spec = reservedFloors[agent.agentId];
+            const input = inputsByAgent.get(agent.agentId);
+            const floor = input ? computeReservedFloor(input.running, input.queued, spec) : null;
+            const poolCeiling = allocated.keptCeilings.get(agent.agentId);
+            if (floor != null && floor > poolCeiling) blockedAgentIds.add(agent.agentId);
+          }
           const floored = applyReservedFloors(agents, {
             reservedFloors,
             ceiling: cap.maxTotal ?? 75,
-            blockedAgentIds: floorsSuspended ? Object.keys(reservedFloors) : [],
+            blockedAgentIds: [...blockedAgentIds],
           });
           agents = floored.entries;
           floorSummary = floored.floors;

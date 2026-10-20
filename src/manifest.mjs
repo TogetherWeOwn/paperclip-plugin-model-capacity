@@ -563,7 +563,7 @@ const CONFIG_SCHEMA = {
     },
     breakers: {
       type: 'object', additionalProperties: false,
-      description: 'Arm circuit breaker: provider-side model errors open a per-arm breaker (cool-off, half-open single probe). enabled:false is the kill switch.',
+      description: 'Arm circuit breaker: provider-side model errors open per-arm breakers (cool-off, half-open single probe). Balance/credit exhaustion is an unconditional immediate lane-wide trip; enabled:false is the kill switch.',
       properties: {
         enabled: { type: 'boolean', default: true },
         tripCount: { type: 'integer', minimum: 1, default: 2 },
@@ -573,7 +573,7 @@ const CONFIG_SCHEMA = {
         probeTimeoutMs: { type: 'integer', minimum: 60000, default: 7200000 },
         fatalPatterns: {
           type: 'array', default: ['unknown provider for model', 'unknown provider', 'unrecognized_model', 'unrecognized model', 'auth_unavailable', 'no auth available', 'requested entity was not found', 'model_not_found', 'model not found', 'invalid model', 'unknown model', '400+model', 'model is unavailable', 'no healthy managed', '402+balance'],
-          description: 'Case-insensitive substring hits; entries with "+" need every part ("400+model") and are vetoed by transient patterns.',
+          description: 'Case-insensitive substring hits; entries with "+" need every part ("400+model") and are vetoed by transient patterns. Balance/credit exhaustion is also recognized as an unconditional immediate lane-wide trip, even when a gateway wrapper omits 402.',
           items: { type: 'string' },
         },
         vetoPatterns: {
