@@ -546,6 +546,7 @@ export function resolveConfig(raw = {}) {
       // relative-only, so a legacy value here is accepted and ignored.
       rateWindowMin: raw.pacing?.rateWindowMin ?? DEFAULT_PACING.rateWindowMin,
       rateMinSpanMin: raw.pacing?.rateMinSpanMin ?? DEFAULT_PACING.rateMinSpanMin,
+      climbForSpend: raw.pacing?.climbForSpend === true,
       // Hard in-flight cap for a pool that is ahead of its linear weekly plan
       // (see paceguard.mjs); the same knobs feed the hook, the event-time
       // path and the shadow tick.

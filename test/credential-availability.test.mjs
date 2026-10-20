@@ -33,6 +33,7 @@ async function start(accounts, rows = null, configure = () => {}) {
   const config = {
     enforce: true, credentialReadiness: { enforce: true }, cliproxy: { laneKeySecretRef: SECRET },
     trials: { maxInFlightPerAccount: 10 },
+    pacing: { climbForSpend: true },
     armMap: accounts.flatMap(a => a.models.map(model => ({
       aaSlug: model, model, effort: 'max', family: 'sol', providers: [a.provider],
     }))),
