@@ -28,6 +28,20 @@ test('live gemini-2.5-pro 400 trips; live antigravity strings trip', () => {
   assert.equal(classifyArmError('500 no healthy managed Z.ai capacity remains', cfg), 'fatal');
 });
 
+test('a 402 balance exhaustion trips its arm immediately', () => {
+  const store = createBreakerStore();
+  const errorText = '402 Grok Build usage balance exhausted';
+
+  assert.equal(classifyArmError(errorText, cfg), 'fatal');
+  const transition = recordArmFailure(store, 'xai:lane-1', 'grok-4.7', {
+    atMs: T0, errorText,
+  }, T0, cfg);
+
+  assert.equal(transition?.transition, 'opened');
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-4.7', T0, cfg), 'open');
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
+});
+
 test('generic 400-about-model trips; transients never do', () => {
   assert.equal(classifyArmError('400 Bad Request: model parameter rejected by provider', cfg), 'fatal');
   assert.equal(classifyArmError(null, cfg), null);

@@ -54,6 +54,7 @@ export const DEFAULT_BREAKERS = {
     '400+model',
     'model is unavailable',
     'no healthy managed',
+    '402+balance',
   ],
   vetoPatterns: [
     'context length',
@@ -108,9 +109,17 @@ export function sanitizeBreakers(raw) {
  * Generic transients (stream drops, 429/overload, context exhaustion) never
  * match a specific pattern and are vetoed off the generic 400 rule.
  */
+function isBalanceExhaustion(text) {
+  const t = String(text ?? '').toLowerCase();
+  return /\b402\b/.test(t)
+    && /\b(?:balance|credits?)\b/.test(t)
+    && /\b(?:exhausted|depleted|insufficient|empty)\b/.test(t);
+}
+
 export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
   const t = String(text ?? '').toLowerCase();
   if (t.length === 0) return null;
+  if (isBalanceExhaustion(t)) return 'fatal';
   const fatals = Array.isArray(cfg?.fatalPatterns) ? cfg.fatalPatterns : DEFAULT_BREAKERS.fatalPatterns;
   const vetoes = Array.isArray(cfg?.vetoPatterns) ? cfg.vetoPatterns : DEFAULT_BREAKERS.vetoPatterns;
   const vetoed = vetoes.some(p => typeof p === 'string' && p.length > 0 && t.includes(p.toLowerCase()));
@@ -342,7 +351,7 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
   // agree). The ref uses the later of now and the failure, so a re-processed
   // stale failure can neither trip nor wipe newer ones.
   e.fails = [...e.fails, atMs].filter(f => f >= cutoff).slice(-10);
-  const trip = cfg?.tripCount ?? DEFAULT_BREAKERS.tripCount;
+  const trip = isBalanceExhaustion(errorText) ? 1 : (cfg?.tripCount ?? DEFAULT_BREAKERS.tripCount);
   if (e.fails.length >= trip) {
     e.state = 'open';
     e.openedAt = Number.isFinite(nowMs) ? nowMs : atMs;

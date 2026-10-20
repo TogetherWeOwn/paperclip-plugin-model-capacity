@@ -3522,6 +3522,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
+      keepAgentIds: config.roles.keepAgentIds,
+      keptByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -4236,16 +4238,52 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // runs while the fleet idles is the failure this replaces.
         const runningByAgent = cap.agentRunning ?? {};
         const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
+        const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
+        const capInputs = [...agentIds].map(agentId => ({
+          agentId,
+          running: runningByAgent[agentId]?.running ?? 0,
+          queued: counts.get(agentId) ?? 0,
+          overPace: runningByAgent[agentId]?.overPace === true,
+        }));
         const unheld = allocateDemandCaps(
           target,
-          [...agentIds].map(agentId => ({
-            agentId,
-            running: runningByAgent[agentId]?.running ?? 0,
-            queued: counts.get(agentId) ?? 0,
-            overPace: runningByAgent[agentId]?.overPace === true,
-          })),
+          capInputs.filter(agent => !keptIds.has(agent.agentId)),
           cap.maxTotal ?? 75,
         );
+        // Kept agents cannot use the fleet's routed capacity: their model is
+        // fixed, so allocate them only against the slots of its serving pool.
+        // When the pace guard has measured that pool, its cap is an additional
+        // ceiling. An unresolved pinned model gets running-only headroom.
+        const accountPool = new Map((cap.accounts ?? []).map(account => [account.accountId, account.pool]));
+        const poolSlots = new Map();
+        for (const row of cap.perAccount ?? []) {
+          const pool = accountPool.get(row.accountId);
+          if (typeof pool !== 'string' || !Number.isFinite(row.slots)) continue;
+          poolSlots.set(pool, (poolSlots.get(pool) ?? 0) + row.slots);
+        }
+        const pacedPools = new Map((cap.paceGuard?.pools ?? []).map(pool => [pool.pool, pool]));
+        const keptByPool = new Map();
+        for (const agent of capInputs) {
+          if (!keptIds.has(agent.agentId)) continue;
+          const serving = cap.keptByAgent?.[agent.agentId];
+          const pool = serving?.accountId == null ? null : accountPool.get(serving.accountId);
+          const key = typeof pool === 'string' ? pool : '';
+          if (!keptByPool.has(key)) keptByPool.set(key, []);
+          keptByPool.get(key).push(agent);
+        }
+        for (const [pool, members] of keptByPool) {
+          const pace = pacedPools.get(pool);
+          const capacity = pool === '' ? 0 : (poolSlots.get(pool) ?? 0) * (cap.demandFactor ?? 1);
+          const boundedCapacity = Number.isFinite(pace?.cap)
+            ? Math.min(capacity, pace.cap)
+            : capacity;
+          const ceiling = boundedCapacity > 0 ? Math.max(1, Math.floor(boundedCapacity)) : 1;
+          unheld.push(...allocateDemandCaps(
+            boundedCapacity > 0 ? boundedCapacity : 0,
+            members,
+            ceiling,
+          ));
+        }
         // Hysteresis (#3): wants follow the instantaneous queue, so served
         // caps fall on a half-life instead of tracking every dip (increases
         // pass at once; a cap under demand would throttle real work). The
