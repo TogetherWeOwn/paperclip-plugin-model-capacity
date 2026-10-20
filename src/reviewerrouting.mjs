@@ -200,7 +200,8 @@ export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), ser
       if (ok !== true) { refused += 1; return; }
       cands.push({
         a, arm, armIndex, p,
-        burn: isBurnFlagged(a, burnTokens),
+        // The tick saw feed labels/email, including explicit burn exclusions.
+        burn: typeof a.burn === 'boolean' ? a.burn : isBurnFlagged(a, burnTokens),
         credit: a.creditFallback === true,
         ahead: poolAhead(p),
         perHour: poolPerHour(p),

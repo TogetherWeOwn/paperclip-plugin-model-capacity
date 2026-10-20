@@ -3328,7 +3328,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           measuredRatePerHour: view?.measuredRatePerHour ?? null,
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
           planAhead: view?.planAhead ?? null,
-          ...(view?.burnMode === true ? { burn: true } : {}),
+          burn: view?.burnMode === true,
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
           ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg),
@@ -3438,25 +3438,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
-    // Reviewer as a first-class role : runnable review capacity
-    // from qualified providers plus the hold/resume signal the review gate
-    // reads. Reviewer-eligible = a non-trial arm the role can reach (thinker
-    // access first, doer as fallback); trial-only accounts never serve reviews.
+    // With routing enabled, capacity must pass the same admission as a
+    // configured reviewer. Otherwise retain the legacy non-trial role access.
+    const reviewerLive = liveViews.get(companyId);
+    const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
+    const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
+      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
         const access = roleAccess?.[v.accountId];
         const thinker = access?.thinker;
         const doer = access?.doer;
-        // Reviewer routing: an account that serves a configured reviewer arm
-        // (same provider, model in its served list) is reviewer-eligible
-        // too -- routed reviews run that arm, not a role-ladder arm.
         const pool = String(v.pool ?? v.provider ?? '').toLowerCase();
-        const servesRoutingArm = (config.reviewerRouting?.arms ?? []).some((arm) => arm.provider === pool
-          && (v.models ?? []).some((m) => String(canonicalModelName(m) ?? '').toLowerCase()
-            === String(canonicalModelName(arm.model) ?? '').toLowerCase()));
-        const eligible = (thinker?.eligible === true && thinker?.trialOnly !== true)
-          || (doer?.eligible === true && doer?.trialOnly !== true)
-          || servesRoutingArm;
+        const account = reviewerAccounts.get(v.accountId);
+        const servesRoutingArm = account != null && (config.reviewerRouting?.arms ?? []).some((arm) => arm.provider === pool
+          && reviewerAdmissions.some(admit => admit(account, arm).ok === true));
+        const eligible = reviewerAdmissions.length > 0
+          ? servesRoutingArm
+          : (thinker?.eligible === true && thinker?.trialOnly !== true)
+            || (doer?.eligible === true && doer?.trialOnly !== true);
         return {
           accountId: v.accountId,
           provider: v.provider,
@@ -3967,24 +3967,27 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const matches = ladderArms.filter((x) => x != null && sameModel(x.model));
     const listed = (account.models ?? []).some(sameModel);
     if (matches.length === 0 && !listed) return { ok: `${arm.model} not served` };
-    // Credential readiness enforced: only a credential-ready ladder arm
-    // (the tick's readiness-filtered rungs) may serve, like normal routing.
-    if (readyArms != null && !readyArms.some((x) => x != null && sameModel(x.model))) {
+    const effort = arm.effort != null ? String(arm.effort).toLowerCase() : null;
+    const match = matches.find((x) => effort != null && String(x.effort ?? '').toLowerCase() === effort) ?? matches[0] ?? null;
+    // Admission belongs to the selected arm, not a sibling effort of the model.
+    if (readyArms != null && (!match || !readyArms.some((x) => x != null
+      && x.armId === match.armId && sameModel(x.model)))) {
       return { ok: `${arm.model} has no credential-ready arm` };
     }
     const excluded = new Set(normalizeExcludedFamilies(roleExcluded));
     const fam = inferFamily(canon);
     if (fam && excluded.has(fam)) return { ok: `family ${fam} excluded for the role` };
-    if (matches.some((x) => excluded.has(String(x.family ?? '').toLowerCase()) || excluded.has(armToken(x.armId)))) {
+    if (match && (excluded.has(String(match.family ?? '').toLowerCase()) || excluded.has(armToken(match.armId)))) {
       return { ok: 'arm excluded for the role' };
     }
-    if (bstore && bcfg?.enabled !== false
-      && matches.some((x) => x.armId != null && breakerState(bstore, account.accountId, x.armId, nowMs, bcfg) !== 'closed')) {
+    if (bstore && bcfg?.enabled !== false && match?.armId != null
+      && breakerState(bstore, account.accountId, match.armId, nowMs, bcfg) !== 'closed') {
       return { ok: 'arm breaker not closed' };
     }
-    const effort = arm.effort != null ? String(arm.effort).toLowerCase() : null;
-    const match = matches.find((x) => effort != null && String(x.effort ?? '').toLowerCase() === effort) ?? matches[0] ?? null;
-    return { ok: true, match };
+    return {
+      ok: true, match,
+      model: match?.model ?? servedIdForArm(account.models, canonicalModelName(arm.model), account.laneProvider ?? account.provider),
+    };
   }
 
   /** Flat arm list of a live account (grouped rungs plus ranked candidates). */
@@ -3997,31 +4000,38 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return out;
   }
 
+  /** One admission policy for routed reviewer capacity, preview and hook. */
+  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock()) {
+    const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
+    const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
+    const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+    const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
+    const readiness = credentialReadinessEnforced(companyId);
+    return (a, arm) => reviewerArmCheck(a, arm, {
+      ladderArms: liveLadderArms(a),
+      readyArms: readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
+      roleExcluded, bstore, bcfg, nowMs,
+    });
+  }
+
   /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
   function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock()) {
     const cfg = live?.reviewerRouting;
-    const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
-    const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
     const pending = pendingByAccount(live, companyId, selfId);
-    const bstore = breakerStores.get(companyId) ?? createBreakerStore();
-    const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
-    const matchOf = new Map();
+    const admit = reviewerArmAdmission(live, companyId, agentId, nowMs);
+    const admissionOf = new Map();
     const pick = selectReviewerRoute({
       cfg,
       accounts: live.accounts ?? [],
       burnTokens: new Set(live.burnModeTokens ?? []),
       inFlightOf: (a) => (a.inFlight ?? 0) + (pending.get(a.accountId) ?? 0),
       serves: (a, arm) => {
-        const r = reviewerArmCheck(a, arm, {
-          ladderArms: liveLadderArms(a),
-          readyArms: credentialReadinessEnforced(companyId) ? (a.ladderRungs ?? []).flatMap((g) => g?.arms ?? []) : null,
-          roleExcluded, bstore, bcfg, nowMs,
-        });
-        if (r.ok === true) matchOf.set(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`, r.match);
+        const r = admit(a, arm);
+        if (r.ok === true) admissionOf.set(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`, r);
         return r.ok;
       },
     });
-    return { pick, matchOf };
+    return { pick, admissionOf };
   }
 
   /**
@@ -4048,16 +4058,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const ledger = await getOrLoadLedger(companyId);
     if (!enforceCompanies.has(companyId)) return null;
     const nowMs = clock();
-    const { pick, matchOf } = pickReviewerRoute(live, companyId, params.agentId, params?.runId != null ? String(params.runId) : null, nowMs);
+    const { pick, admissionOf } = pickReviewerRoute(live, companyId, params.agentId, params?.runId != null ? String(params.runId) : null, nowMs);
     if (pick.none) {
       note({ routed: false, fallback, reason: `${pick.reason}: ${fallback}` });
       return null;
     }
     const arm = pick.arm;
-    const match = matchOf.get(`${pick.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`) ?? null;
+    const admission = admissionOf.get(`${pick.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`);
+    const match = admission?.match ?? null;
+    const emitModel = admission?.model ?? arm.model;
     const adapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
-    const decorated = decoratedModelFor({ model: arm.model, effort: arm.effort, contextWindow: match?.contextWindow ?? null }, adapter);
-    const model = decorated ?? arm.model;
+    const decorated = decoratedModelFor({ model: emitModel, effort: arm.effort, contextWindow: match?.contextWindow ?? null }, adapter);
+    const model = decorated ?? emitModel;
     clearDeferred(companyId, params.runId);
     recordDecision(ledger, {
       runId: String(params.runId ?? 'unknown'),
@@ -4066,7 +4078,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       armId: match?.armId ?? null,
       effort: arm.effort ?? null,
       enforced: true,
-      wouldModel: decorated ?? `${arm.model}(${arm.effort ?? 'default'})`,
+      wouldModel: decorated ?? `${emitModel}(${arm.effort ?? 'default'})`,
       rung: match?.rung ?? null,
       family: inferFamily(canonicalModelName(arm.model)),
       reason: pick.reason,
