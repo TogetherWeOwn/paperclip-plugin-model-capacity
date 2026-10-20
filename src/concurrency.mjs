@@ -369,6 +369,106 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
   }));
 }
 
+/** Allocate kept agents against their serving pools before routing the remainder. */
+export function allocateKeptAndRoutedCaps({
+  target, maxTotal = 75, demandFactor = 1, agents = [], keepAgentIds = [],
+  keptByAgent = {}, accounts = [], perAccount = [], pacePools = [], unavailableAccountIds = [],
+} = {}) {
+  const keptIds = new Set(keepAgentIds);
+  const unavailableAccounts = new Set(unavailableAccountIds);
+  const accountPool = new Map(accounts.map(account => [account.accountId, account.pool]));
+  const poolSlots = new Map();
+  for (const account of perAccount) {
+    const pool = accountPool.get(account.accountId);
+    if (unavailableAccounts.has(account.accountId)) continue;
+    if (typeof pool !== 'string' || !Number.isFinite(account.slots)) continue;
+    poolSlots.set(pool, (poolSlots.get(pool) ?? 0) + account.slots);
+  }
+  const pacedPools = new Map(pacePools.map(pool => [pool.pool, pool]));
+  const groups = new Map();
+  for (const agent of agents) {
+    if (!keptIds.has(agent.agentId)) continue;
+    const serving = keptByAgent[agent.agentId];
+    const pool = serving?.accountId == null ? '' : accountPool.get(serving.accountId);
+    const key = typeof pool === 'string' ? pool : '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(agent);
+  }
+
+  const kept = [];
+  const keptCeilings = new Map();
+  const groupInputs = [];
+  const groupById = new Map();
+  for (const [pool, members] of groups) {
+    const paced = pacedPools.get(pool);
+    const rawCapacity = pool === '' ? 0 : (poolSlots.get(pool) ?? 0) * demandFactor;
+    const boundedCapacity = Math.max(0, Math.floor(Number.isFinite(paced?.cap)
+      ? Math.min(rawCapacity, paced.cap)
+      : rawCapacity));
+    const running = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.running ?? 0)), 0);
+    const queued = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.queued ?? 0)), 0);
+    const groupId = `pool:${JSON.stringify(pool)}`;
+    if (boundedCapacity === 0) {
+      const entries = allocateDemandCaps(0, members, 1);
+      kept.push(...entries);
+      for (const entry of entries) keptCeilings.set(entry.agentId, entry.running);
+      continue;
+    }
+    groupInputs.push({
+      agentId: groupId,
+      running,
+      queued: Math.min(queued, Math.max(0, boundedCapacity - running)),
+    });
+    groupById.set(groupId, { members, ceiling: boundedCapacity });
+  }
+
+  const totalTarget = target == null ? maxTotal : target;
+  const totalCeiling = Math.max(1, Math.min(Math.floor(maxTotal), Math.round(totalTarget)));
+  const groupCaps = allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
+  for (const groupCap of groupCaps) {
+    const group = groupById.get(groupCap.agentId);
+    // The member ceiling is the group's fleet share, never the full pool
+    // ceiling: with a target below the pool cap the below-target branch
+    // would otherwise allocate up to the pool cap and overshoot the fleet
+    // target. Zero-share groups keep a zero ceiling (running is still
+    // preserved by the floor-running backstop, never granted new slots).
+    const share = Math.min(group.ceiling, groupCap.allocated);
+    const entries = allocateDemandCaps(groupCap.allocated, group.members, share);
+    kept.push(...entries);
+    // Per-agent ceilings: each member owns its allocation plus an EQUAL
+    // share of the pool's unallocated headroom. Granting every member the
+    // full headroom would let n members' ceilings (and admitted floors)
+    // stack to n*(C-G)+G past the pace cap whenever the group is
+    // target-constrained (G < C). Equal shares keep the ceiling sum at or
+    // under C, so admitted floors can never jointly exceed the pool cap;
+    // the split is conservative (some feasible floor combos are refused)
+    // and running still floors (pre-existing runs are reported, never
+    // hidden).
+    const groupAllocated = entries.reduce((sum, e) => sum + e.allocated, 0);
+    const headroomShare = entries.length === 0 ? 0
+      : Math.floor((group.ceiling - groupAllocated) / entries.length);
+    for (const entry of entries) {
+      keptCeilings.set(entry.agentId, Math.max(entry.running, entry.allocated + headroomShare));
+    }
+  }
+  const keptTotal = kept.reduce((sum, agent) => sum + agent.allocated, 0);
+  // Preserve the existing ordinary-agent allocation exactly when no kept
+  // demand is consuming capacity. Once kept agents are active, they share the
+  // fleet target and leave only its remainder for routed demand.
+  const routedTarget = keptTotal === 0
+    ? target
+    : (target == null ? null : Math.max(0, totalCeiling - keptTotal));
+  const routedCeiling = Math.max(1, Math.floor(keptTotal === 0
+    ? maxTotal
+    : Math.min(maxTotal - keptTotal, totalCeiling - keptTotal)));
+  const routed = allocateDemandCaps(
+    routedTarget,
+    agents.filter(agent => !keptIds.has(agent.agentId)),
+    routedCeiling,
+  );
+  return { kept, keptCeilings, routed, routedTarget, routedCeiling };
+}
+
 /**
  * Reserved per-agent floor: `min(demand, clamp(base + floor(queued /
  * perQueued), base, max))` with demand = running + queued. Config-only and

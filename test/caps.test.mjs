@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocateDemandCaps } from '../src/concurrency.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import {
+  createBreakerStore, breakerKey, breakerStoreFromJSON, breakerStoreToJSON,
+  noteKnownArms, recordArmFailure, sanitizeBreakers,
+} from '../src/breakers.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'capped-ceiling']);
@@ -166,10 +170,18 @@ test("a '__proto__' agentId counts in caps without polluting Object.prototype", 
 // --- /caps handler wiring: running comes from the ledger, queued from issues.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
+const MIN = 60 * 1000;
+const HOUR = 3600 * 1000;
+const REVIEWER_MODEL = 'muse-wonder-full-1.0-contributor';
+const CODEX_MODEL = 'gpt-6.1-sol';
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
 const AA_STATE_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
-const aaRows = () => ([
+const BREAKER_SKEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' };
+const LEDGER_SKEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'ledger-v1' };
+const BREAKER_CFG = sanitizeBreakers();
+const aaRows = (extra = []) => ([
   { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ...extra,
 ]);
 const laneBody = (weeklyUsed, observedAt) => ({
   observedAt,
@@ -180,19 +192,21 @@ const laneBody = (weeklyUsed, observedAt) => ({
     observedAt, quality: 'live',
   }],
 });
-const runEvent = (runId, atMs, agentId, type = 'agent.run.started') => ({
+const runEvent = (runId, atMs, agentId, type = 'agent.run.started', runFields = {}) => ({
   type, companyId: 'acme', entityId: runId,
-  payload: { run: { agentId, provider: 'claude' } },
+  payload: { run: { agentId, provider: 'claude', ...runFields } },
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
+function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows() }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
   const skey = k => JSON.stringify(k);
   let now = nowMs;
-  let lane = laneBody(laneUsed, new Date(now).toISOString());
+  let lane = accounts
+    ? { observedAt: new Date(now).toISOString(), accounts }
+    : laneBody(laneUsed, new Date(now).toISOString());
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
@@ -201,24 +215,34 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
-    agents: { get: async () => null },
+    agents: { get: async id => agentGets[id] ?? null },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  let plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
-    setLane: (used) => { lane = laneBody(used, new Date(now).toISOString()); },
+    setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
+    setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
+    seed: (k, v) => { store.set(skey(k), v); },
+    // Fresh plugin on the same io store: the next tick cold-loads persisted
+    // state (proves the persisted breaker form works, like review-breaker).
+    reboot: () => { plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false }); },
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: snapshotRows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
-    fire: (e) => handlers.get(e.type)(e),
-    api: (routeKey) => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    fire: e => handlers.get(e.type)(e),
+    hook: (runId, agentId) => plugin.onResolveRunModel({
+      runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
+      invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
+      issueOverrideModel: null, deadlineMs: 1500,
+    }),
+    api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
   };
 }
 
@@ -256,6 +280,333 @@ test('/caps exposes demand, running, allocated, reason with ledger running count
       assert.ok(a.allocated >= a.demand, `${a.agentId}: throttled below demand under target`);
     }
   }
+});
+
+test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async () => {
+  const meta = {
+    lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
+    weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const codex = {
+    lane: 'codex-1', provider: 'codex', accountKey: 'c1', health: 'healthy', models: [CODEX_MODEL],
+    weekly: { used: 0.01, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const queued = Array.from({ length: 32 }, (_, i) => ({ id: `review-${i}`, status: 'todo', assigneeAgentId: 'reviewer' }));
+  const d = drive({
+    nowMs: TICK,
+    config: {
+      enforce: true,
+      concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 },
+      roles: { keepAgentIds: ['reviewer'] },
+    },
+    accounts: [meta, codex],
+    issueLists: { todo: queued, in_progress: [] },
+    agentGets: { reviewer: { adapterConfig: { model: REVIEWER_MODEL } } },
+    snapshotRows: aaRows([
+      { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+      { slug: CODEX_MODEL, intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+    ]),
+  });
+  await d.setup();
+  await d.tick();
+  // Build the two-point caps calibration while keeping an unpaced Codex fleet available.
+  d.setNow(TICK + 10 * 60 * 1000);
+  for (let i = 1; i <= 6; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 10 * 60 * 1000, 'codex-worker', 'agent.run.started', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 20 * 60 * 1000);
+  for (let i = 1; i <= 2; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 20 * 60 * 1000, 'codex-worker', 'agent.run.finished', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 30 * 60 * 1000);
+  d.setAccounts([
+    { ...meta, observedAt: new Date(TICK + 30 * 60 * 1000).toISOString(), weekly: { ...meta.weekly, used: 0.93 } },
+    { ...codex, observedAt: new Date(TICK + 30 * 60 * 1000).toISOString(), weekly: { ...codex.weekly, used: 0.013 } },
+  ]);
+  await d.tick();
+
+  const initialCapacity = (await d.api('capacity')).body;
+  const initialPools = new Map(initialCapacity.paceGuard.pools.map(pool => [pool.pool, pool]));
+  assert.equal(initialPools.get('meta')?.cap, 4, `the ahead-of-plan Meta pool has a four-run pace cap: ${JSON.stringify(initialPools.get('meta'))}`);
+  assert.equal(initialPools.get('codex')?.state, 'on-plan', 'fresh Codex capacity is unpaced');
+  assert.equal(initialPools.get('codex')?.inFlight, 4, 'the Codex fleet remains active beside Meta');
+
+  d.setNow(TICK + 31 * 60 * 1000);
+  await d.fire(runEvent('kept-reviewer-run', TICK + 31 * 60 * 1000, 'reviewer', 'agent.run.started', {
+    provider: 'meta', model: REVIEWER_MODEL,
+  }));
+  assert.deepEqual(await d.hook('kept-reviewer-run', 'reviewer'), { kind: 'keep' });
+  d.setNow(TICK + 32 * 60 * 1000);
+  await d.tick();
+
+  const caps = await d.api('caps');
+  assert.equal(caps.status, 200);
+  const reviewer = caps.body.agents.find(agent => agent.agentId === 'reviewer');
+  assert.ok(reviewer, `kept Reviewer demand appears in /caps: ${JSON.stringify(caps.body.agents)}`);
+  assert.equal(reviewer.queued, 32, 'the Reviewer has high queued demand');
+  assert.equal(reviewer.running, 1, 'the kept Reviewer run appears in the ledger-backed running count');
+
+  const capacity = (await d.api('capacity')).body;
+  const metaPool = capacity.paceGuard.pools.find(pool => pool.pool === 'meta');
+  assert.equal(metaPool.cap, 4);
+  assert.equal(metaPool.inFlight, 1, 'the running kept Reviewer record is charged to its Meta serving pool');
+  assert.equal(capacity.paceGuard.unattributedInFlight, 0, 'the kept run is not left unattributed');
+  assert.ok(reviewer.maxConcurrentRuns <= 4,
+    `Reviewer cap ${reviewer.maxConcurrentRuns} must not borrow fresh Codex fleet capacity`);
+});
+
+test('/capacity opens every known arm on a kept-run balance failure; ambiguous text trips nothing', async () => {
+  const meta = {
+    lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
+    weekly: { used: 0.3, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const codex = {
+    lane: 'codex-1', provider: 'codex', accountKey: 'c1', health: 'healthy', models: [CODEX_MODEL],
+    weekly: { used: 0.3, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const d = drive({
+    nowMs: TICK,
+    config: {
+      enforce: true,
+      concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 },
+      roles: { keepAgentIds: ['reviewer'] },
+    },
+    accounts: [meta, codex],
+    issueLists: { todo: [], in_progress: [] },
+    agentGets: { reviewer: { adapterConfig: { model: REVIEWER_MODEL } } },
+    snapshotRows: aaRows([
+      { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+      { slug: CODEX_MODEL, intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+    ]),
+  });
+  await d.setup();
+  await d.tick();
+  const before = (await d.api('capacity')).body;
+  const metaAcct = before.accounts.find(a => a.provider === 'meta').accountId;
+  const codexAcct = before.accounts.find(a => a.provider === 'codex').accountId;
+  const metaRungs = before.accounts.find(a => a.provider === 'meta').arms.map(a => a.armId);
+  assert.ok(metaRungs.length >= 1, `meta ladder has servable arms: ${JSON.stringify(metaRungs)}`);
+
+  // A kept Reviewer run (no armId) fails with a 402 balance exhaustion; a
+  // routed run on the other account fails with ambiguous balance wording.
+  await d.fire(runEvent('kept-run-1', TICK, 'reviewer', 'agent.run.started', { provider: 'meta', model: REVIEWER_MODEL }));
+  await d.fire(runEvent('kept-run-1', TICK, 'reviewer', 'agent.run.failed', {
+    provider: 'meta', model: REVIEWER_MODEL, error: '402 usage balance exhausted',
+  }));
+  await d.fire(runEvent('doer-run-1', TICK, 'doer', 'agent.run.started', { provider: 'codex', model: CODEX_MODEL }));
+  await d.fire(runEvent('doer-run-1', TICK, 'doer', 'agent.run.failed', {
+    provider: 'codex', model: CODEX_MODEL, error: '402 balance check unavailable; retry after account verification',
+  }));
+  await d.tick();
+
+  const cap = (await d.api('capacity')).body;
+  assert.ok(cap.breakerUnavailableAccountIds.includes(metaAcct),
+    `exhausted meta account is unavailable: ${JSON.stringify(cap.breakerUnavailableAccountIds)}`);
+  assert.ok(!cap.breakerUnavailableAccountIds.includes(codexAcct),
+    `ambiguous text leaves codex available: ${JSON.stringify(cap.breakerUnavailableAccountIds)}`);
+  const metaBreakers = new Map(cap.armBreakers.filter(e => e.accountId === metaAcct).map(e => [e.armId, e.status]));
+  for (const armId of metaRungs) {
+    assert.equal(metaBreakers.get(armId), 'open', `known arm ${armId} opens on balance exhaustion`);
+  }
+  const codexOpen = cap.armBreakers.filter(e => e.accountId === codexAcct && e.status === 'open');
+  assert.deepEqual(codexOpen, [], 'ambiguous balance wording trips no codex arm');
+});
+
+test('/caps excludes only the fully breaker-open account from kept pool slots', async () => {
+  const meta = {
+    lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
+    weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const codex = {
+    lane: 'codex-1', provider: 'codex', accountKey: 'c1', health: 'healthy', models: [CODEX_MODEL],
+    weekly: { used: 0.01, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const queued = [
+    ...Array.from({ length: 8 }, (_, i) => ({ id: `a-${i}`, status: 'todo', assigneeAgentId: 'keeperA' })),
+    ...Array.from({ length: 8 }, (_, i) => ({ id: `b-${i}`, status: 'todo', assigneeAgentId: 'keeperB' })),
+  ];
+  const d = drive({
+    nowMs: TICK,
+    config: {
+      enforce: true,
+      concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 },
+      roles: { keepAgentIds: ['keeperA', 'keeperB'] },
+    },
+    accounts: [meta, codex],
+    issueLists: { todo: queued, in_progress: [] },
+    agentGets: {
+      keeperA: { adapterConfig: { model: REVIEWER_MODEL } },
+      keeperB: { adapterConfig: { model: CODEX_MODEL } },
+    },
+    snapshotRows: aaRows([
+      { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+      { slug: CODEX_MODEL, intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+    ]),
+  });
+  await d.setup();
+  await d.tick();
+  const before = (await d.api('capacity')).body;
+  const metaAcct = before.accounts.find(a => a.provider === 'meta').accountId;
+  const codexAcct = before.accounts.find(a => a.provider === 'codex').accountId;
+  const metaArms = before.accounts.find(a => a.provider === 'meta').arms.map(a => a.armId);
+  const codexArms = before.accounts.find(a => a.provider === 'codex').arms.map(a => a.armId);
+  assert.ok(metaArms.length >= 1 && codexArms.length >= 1,
+    `both ladders have servable arms: meta=${JSON.stringify(metaArms)} codex=${JSON.stringify(codexArms)}`);
+
+  // Seed breaker-v1: meta fully open (fresh), codex half-open (cool-off elapsed).
+  const seed = createBreakerStore();
+  for (const armId of metaArms) {
+    recordArmFailure(seed, metaAcct, armId, { atMs: TICK - 2 * MIN, errorText: 'auth_unavailable' }, TICK - 2 * MIN, BREAKER_CFG);
+    recordArmFailure(seed, metaAcct, armId, { atMs: TICK - MIN, errorText: 'auth_unavailable' }, TICK - MIN, BREAKER_CFG);
+  }
+  for (const armId of codexArms) {
+    recordArmFailure(seed, codexAcct, armId, { atMs: TICK - 7 * HOUR, errorText: 'auth_unavailable' }, TICK - 7 * HOUR, BREAKER_CFG);
+    recordArmFailure(seed, codexAcct, armId, { atMs: TICK - 7 * HOUR + MIN, errorText: 'auth_unavailable' }, TICK - 7 * HOUR + MIN, BREAKER_CFG);
+  }
+  noteKnownArms(seed, [
+    ...metaArms.map(armId => ({ accountId: metaAcct, armId })),
+    ...codexArms.map(armId => ({ accountId: codexAcct, armId })),
+  ], TICK);
+  // Retained history for a removed arm must not make a fully-open ladder available.
+  seed.known['stale-arm'] = { accountId: metaAcct, armId: 'meta-removed-arm', lastSeen: TICK - HOUR };
+  assert.ok(!metaArms.includes('meta-removed-arm'), 'the retained arm is not in the current Meta ladder');
+  const persisted = JSON.parse(JSON.stringify(breakerStoreToJSON(seed, { nowMs: TICK, cfg: BREAKER_CFG })));
+  const restored = breakerStoreFromJSON(persisted);
+  const staleKey = breakerKey(metaAcct, 'meta-removed-arm');
+  assert.deepEqual(restored.known[staleKey], {
+    accountId: metaAcct, armId: 'meta-removed-arm', lastSeen: TICK - HOUR,
+  }, 'the removed arm survives breaker serialization and loading');
+  assert.equal(restored.arms[staleKey], undefined, 'the removed arm has no breaker entry');
+  d.seed(BREAKER_SKEY, persisted);
+
+  // Reboot so the tick cold-loads the seed.
+  d.reboot();
+  await d.setup();
+  await d.tick();
+  const loaded = (await d.api('capacity')).body;
+  assert.ok(loaded.breakerUnavailableAccountIds.includes(metaAcct),
+    `fully-open meta is unavailable: ${JSON.stringify(loaded.breakerUnavailableAccountIds)}`);
+  assert.ok(!loaded.breakerUnavailableAccountIds.includes(codexAcct),
+    `half-open codex stays available: ${JSON.stringify(loaded.breakerUnavailableAccountIds)}`);
+  const statusOf = new Map(loaded.armBreakers.map(e => [`${e.accountId} ${e.armId}`, e.status]));
+  for (const armId of metaArms) assert.equal(statusOf.get(`${metaAcct} ${armId}`), 'open');
+  for (const armId of codexArms) assert.equal(statusOf.get(`${codexAcct} ${armId}`), 'half-open');
+
+  // Calibration dance so /caps has a target (mirrors the demand test above).
+  d.setNow(TICK + 10 * MIN);
+  for (let i = 1; i <= 6; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 10 * MIN, 'codex-worker', 'agent.run.started', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 20 * MIN);
+  for (let i = 1; i <= 2; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 20 * MIN, 'codex-worker', 'agent.run.finished', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 30 * MIN);
+  d.setAccounts([
+    { ...meta, observedAt: new Date(TICK + 30 * MIN).toISOString(), weekly: { ...meta.weekly, used: 0.93 } },
+    { ...codex, observedAt: new Date(TICK + 30 * MIN).toISOString(), weekly: { ...codex.weekly, used: 0.013 } },
+  ]);
+  await d.tick();
+
+  const cap = (await d.api('capacity')).body;
+  assert.ok(cap.breakerUnavailableAccountIds.includes(metaAcct), 'meta stays unavailable after the dance');
+  assert.ok(!cap.breakerUnavailableAccountIds.includes(codexAcct), 'codex stays available after the dance');
+
+  const caps = await d.api('caps');
+  assert.equal(caps.status, 200);
+  const byId = new Map(caps.body.agents.map(a => [a.agentId, a]));
+  const a = byId.get('keeperA');
+  const b = byId.get('keeperB');
+  assert.ok(a && b, `both keepers appear in /caps: ${JSON.stringify(caps.body.agents)}`);
+  assert.ok(a.queued > 0 && b.queued > 0, 'both keepers have demand');
+  assert.equal(a.maxConcurrentRuns, a.running, 'keeperA on the fully-open account holds running only');
+  assert.ok(b.maxConcurrentRuns >= 1, `keeperB on the half-open account keeps pool slots (got ${b.maxConcurrentRuns})`);
+});
+
+test('/capacity trips the serving account on balance exhaustion, not the shadow guess', async () => {
+  const meta = {
+    lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
+    weekly: { used: 0.3, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const codex = {
+    lane: 'codex-1', provider: 'codex', accountKey: 'c1', health: 'healthy', models: [CODEX_MODEL],
+    weekly: { used: 0.3, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const d = drive({
+    nowMs: TICK,
+    config: { enforce: false, concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 } },
+    accounts: [meta, codex],
+    issueLists: { todo: [], in_progress: [] },
+    snapshotRows: aaRows([
+      { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+      { slug: CODEX_MODEL, intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+    ]),
+  });
+  await d.setup();
+  await d.tick();
+  const before = (await d.api('capacity')).body;
+  const metaAcct = before.accounts.find(a => a.provider === 'meta').accountId;
+  const codexAcct = before.accounts.find(a => a.provider === 'codex').accountId;
+  const metaArms = before.accounts.find(a => a.provider === 'meta').arms.map(a => a.armId);
+  const codexArms = before.accounts.find(a => a.provider === 'codex').arms.map(a => a.armId);
+  assert.ok(metaArms.length >= 1 && codexArms.length >= 1, 'both ladders have servable arms');
+
+  // Two failed runs shadow-decided onto meta but served by codex: one with a
+  // backfilled actual account, one naming only its serving provider.
+  d.seed(LEDGER_SKEY, [
+    {
+      runId: 'diverged-actual', agentId: 'doer', status: 'failed', terminalAt: TICK,
+      decidedAccount: metaAcct, decidedAt: TICK, enforced: false, armId: metaArms[0],
+      actualAccount: codexAcct, actualModel: CODEX_MODEL, actualModelSource: 'run-event',
+      provider: 'codex', errorText: '402 usage balance exhausted',
+    },
+    {
+      runId: 'diverged-provider', agentId: 'doer', status: 'failed', terminalAt: TICK,
+      decidedAccount: metaAcct, decidedAt: TICK, enforced: false, armId: metaArms[0],
+      provider: 'codex', errorText: '402 usage balance exhausted',
+    },
+  ]);
+  d.reboot();
+  await d.setup();
+  await d.tick();
+
+  const cap = (await d.api('capacity')).body;
+  assert.ok(cap.breakerUnavailableAccountIds.includes(codexAcct),
+    `serving codex account is unavailable: ${JSON.stringify(cap.breakerUnavailableAccountIds)}`);
+  assert.ok(!cap.breakerUnavailableAccountIds.includes(metaAcct),
+    `shadow-guessed meta account stays available: ${JSON.stringify(cap.breakerUnavailableAccountIds)}`);
+  const codexOpen = cap.armBreakers
+    .filter(e => e.accountId === codexAcct && e.status === 'open')
+    .map(e => e.armId)
+    .sort();
+  assert.deepEqual(codexOpen, [...codexArms].sort(),
+    'every known codex arm opens and no foreign decided arm seeds state there');
+  const metaOpen = cap.armBreakers.filter(e => e.accountId === metaAcct && e.status === 'open');
+  assert.deepEqual(metaOpen, [], 'no meta arm trips on a codex-served failure');
 });
 
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {

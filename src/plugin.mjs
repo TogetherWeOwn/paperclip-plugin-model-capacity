@@ -68,8 +68,9 @@ import {
   filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
+  recordAccountBalanceExhaustion, isBalanceExhaustion,
 } from './breakers.mjs';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
@@ -1970,6 +1971,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // failed post-restart read can never wipe the saved ledger. The next
     // tick retries the load (rejected loads are not cached).
     const ledger = await loadLedger(companyId);
+    // Allocation targets and provider pools. CLIProxy round-robins lanes
+    // of the same provider onto shared credentials, so lane-level in-flight
+    // spreading is theater: pressure is real only at the provider bucket.
+    // Built here (not with the calibration block below) because the breaker
+    // scan attributes balance exhaustion through the same provider fallback.
+    const keyToProvider = new Map(stateKeys.map((k, i) =>
+      [k, String(snapshot.accounts[i]?.provider ?? String(k).split(':')[0]).toLowerCase()]));
+    const poolOfKey = (key) => keyToProvider.get(key) ?? String(key).split(':')[0].toLowerCase();
+    // Provider fallback for model-less runs: a run naming only a provider
+    // still burned that provider's quota, so calibration and the
+    // mapped/unmapped census count it under the first matching account.
+    // In-flight attribution never uses this (decided ?? actual, else
+    // unattributed) -- it is E-calibration scope only, plus the balance
+    // fan-out below (a 402 names the serving lane, not the routing guess).
+    const keyOfProvider = new Map();
+    for (const [k, p] of keyToProvider) if (p && !keyOfProvider.has(p)) keyOfProvider.set(p, k);
     // Arm circuit breaker: memory truth loaded once per worker start (like the
     // ledger); every tick reuses it and persists it below. Finished-run
     // failed events feed it here -- never in the event path, which performs
@@ -1980,18 +1997,39 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const breakerTransitions = [...breakerHousekeep(breakers, nowMs, breakersCfg)];
     {
       const seen = new Set(breakers.seen ?? []);
+      const keepAgents = new Set(config.roles?.keepAgentIds ?? []);
       for (const rec of terminalRecords(ledger)) {
         if (rec?.runId == null || seen.has(rec.runId)) continue;
         seen.add(rec.runId);
         const acct = rec.decidedAccount ?? rec.actualAccount ?? null;
         const arm = rec.armId ?? null;
-        // Only plugin-decided runs feed the breaker: without our (account,
-        // arm) attribution there is nothing to exclude.
-        if (acct == null || arm == null) continue;
-        if (rec.status === 'finished') {
-          const t = resolveProbe(breakers, acct, arm, rec.runId, 'success', null, nowMs, breakersCfg);
-          if (t) breakerTransitions.push(t);
-        } else if (rec.status === 'failed') {
+        // Balance exhaustion belongs to the serving lane, not just the arm
+        // that happened to be attributed (kept runs can have no armId).
+        if (acct == null) continue;
+        if (rec.status === 'failed') {
+          // A 402 names where the run BURNED, not where shadow guessed: a
+          // non-enforced routed pick is a guess, so the fan-out attributes
+          // actual-first (the calibration mapping). Enforced and kept
+          // decisions are authoritative -- a pinned run burns its serving
+          // account by construction -- and keep decided-first. Balance text
+          // never falls through to the per-arm path below: on an already-open
+          // account the fan-out returns no new transitions, and falling
+          // through would trip the decided arm on the wrong account.
+          if (isBalanceExhaustion(rec.errorText)) {
+            const decidedAuthoritative = rec.enforced === true || keepAgents.has(rec.agentId);
+            const balanceAcct = decidedAuthoritative
+              ? (rec.decidedAccount ?? calibrationAccount(rec, keyOfProvider) ?? acct)
+              : (calibrationAccount(rec, keyOfProvider) ?? acct);
+            const balanceTrips = recordAccountBalanceExhaustion(breakers, balanceAcct, {
+              atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText,
+              // The attributed arm belongs to the decided account; when the
+              // serving account differs it must not seed breaker state there.
+              armId: balanceAcct === acct ? arm : null,
+            }, nowMs, breakersCfg);
+            breakerTransitions.push(...balanceTrips);
+            continue;
+          }
+          if (arm == null) continue;
           const fatal = classifyArmError(rec.errorText, breakersCfg) === 'fatal';
           if (breakerProbeRunId(breakers, acct, arm, nowMs, breakersCfg) === rec.runId) {
             const t = resolveProbe(breakers, acct, arm, rec.runId, fatal ? 'arm-fatal' : 'other', rec.errorText, nowMs, breakersCfg);
@@ -2001,6 +2039,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
               { atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText }, nowMs, breakersCfg);
             if (t) breakerTransitions.push(t);
           }
+        } else if (arm == null) {
+          continue;
+        } else if (rec.status === 'finished') {
+          const t = resolveProbe(breakers, acct, arm, rec.runId, 'success', null, nowMs, breakersCfg);
+          if (t) breakerTransitions.push(t);
         } else if (rec.status === 'cancelled') {
           const t = resolveProbe(breakers, acct, arm, rec.runId, 'other', null, nowMs, breakersCfg);
           if (t) breakerTransitions.push(t);
@@ -2131,19 +2174,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // until the shadow TTL trims them, so finished runs never haunt
     // in-flight no matter how stale the rate window is.
     const terminalIds = new Set(terminalRecords(ledger).map(r => r.runId));
-    // Allocation targets and provider pools. CLIProxy round-robins lanes
-    // of the same provider onto shared credentials, so lane-level in-flight
-    // spreading is theater: pressure is real only at the provider bucket.
-    const keyToProvider = new Map(stateKeys.map((k, i) =>
-      [k, String(snapshot.accounts[i]?.provider ?? String(k).split(':')[0]).toLowerCase()]));
-    const poolOfKey = (key) => keyToProvider.get(key) ?? String(key).split(':')[0].toLowerCase();
-    // Provider fallback for model-less runs: a run naming only a provider
-    // still burned that provider's quota, so calibration and the
-    // mapped/unmapped census count it under the first matching account.
-    // In-flight attribution never uses this (decided ?? actual, else
-    // unattributed) -- it is E-calibration scope only.
-    const keyOfProvider = new Map();
-    for (const [k, p] of keyToProvider) if (p && !keyOfProvider.has(p)) keyOfProvider.set(p, k);
     // E-calibration burns calibrate where the run ACTUALLY burned
     // (model-mapped actual, provider fallback): a non-enforced shadow pick
     // is a routing guess, not observed burn. Only the enforced hook
@@ -3468,12 +3498,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       seq: lastChange.seq,
       lastWakeAtMs,
     };
+    // A fully breaker-open account has no servable arms; it contributes no
+    // kept-agent pool slots until an arm recovers or its breaker cools off.
+    // Only current ladder arms count: known retains removed arms for 24h.
+    const breakerUnavailableAccountIds = [];
+    const breakerStore = breakerStores.get(companyId) ?? createBreakerStore();
+    if (config.breakers?.enabled !== false) {
+      for (const account of accountViews) {
+        const arms = (account.arms ?? []).map(arm => arm.armId);
+        if (arms.length > 0 && arms.every(armId => breakerState(breakerStore, account.accountId, armId, nowMs, config.breakers) === 'open')) {
+          breakerUnavailableAccountIds.push(account.accountId);
+        }
+      }
+    }
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
     const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       target: concurrency.target,
+      demandFactor: concurrency.demandFactor ?? 1,
       // Unsmoothed usable target, and the quota-only sum with no role
       // filtering (what the target used to read), so the gap stays visible.
       targetRaw: concurrency.targetRaw ?? concurrency.target,
@@ -3496,6 +3540,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       calibrationGroups,
       smoothing: { ...config.smoothing, fastUntilMs: targetStep.fastUntilMs },
       perAccount: concurrency.perAccount,
+      breakerUnavailableAccountIds,
       accounts: accountViews,
       skippedArms: skipped,
       unscored,
@@ -3522,6 +3567,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
+      keepAgentIds: config.roles.keepAgentIds,
+      keptByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -4236,39 +4283,51 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // runs while the fleet idles is the failure this replaces.
         const runningByAgent = cap.agentRunning ?? {};
         const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
-        const unheld = allocateDemandCaps(
+        const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
+        const capInputs = [...agentIds].map(agentId => ({
+          agentId,
+          running: runningByAgent[agentId]?.running ?? 0,
+          queued: counts.get(agentId) ?? 0,
+          overPace: runningByAgent[agentId]?.overPace === true,
+        }));
+        // Fixed-model agents consume the same fleet target, but only from the
+        // capacity of their serving pool. Routed demand receives the remainder.
+        const allocated = allocateKeptAndRoutedCaps({
           target,
-          [...agentIds].map(agentId => ({
-            agentId,
-            running: runningByAgent[agentId]?.running ?? 0,
-            queued: counts.get(agentId) ?? 0,
-            overPace: runningByAgent[agentId]?.overPace === true,
-          })),
-          cap.maxTotal ?? 75,
-        );
+          maxTotal: cap.maxTotal ?? 75,
+          demandFactor: cap.demandFactor ?? 1,
+          agents: capInputs,
+          keepAgentIds: [...keptIds],
+          keptByAgent: cap.keptByAgent ?? {},
+          accounts: cap.accounts ?? [],
+          perAccount: cap.perAccount ?? [],
+          pacePools: cap.paceGuard?.pools ?? [],
+          unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+        });
+        const keptCaps = allocated.kept;
+        const unheld = allocated.routed;
         // Hysteresis (#3): wants follow the instantaneous queue, so served
         // caps fall on a half-life instead of tracking every dip (increases
         // pass at once; a cap under demand would throttle real work). The
-        // hold state is advisory: if it cannot be read or written the
-        // unheld allocation is served.
+        // hold state is advisory for routed agents; kept-agent pool ceilings
+        // are hard and must not be smoothed upward.
         const nowMs = clock();
-        let agents = unheld;
+        let agents = [...keptCaps, ...unheld];
         try {
           const prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
           const held = holdCaps(unheld, prevHold, nowMs, {
             halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
             staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
-            ceiling: cap.maxTotal ?? 75,
+            ceiling: allocated.routedCeiling,
           });
-          agents = held.entries;
+          agents = [...keptCaps, ...held.entries];
           await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
-        // Reserved floors run LAST, after the allocator and the hold, so
-        // smoothing never takes a floored cap below its floor. Memory-only
-        // breaker read: while every servable arm is breaker-open (fleet-wide
-        // cooling) floors suspend and floored caps hold at running.
+        // Reserved floors run LAST, after the allocator and the hold. Floors
+        // suspend during fleet-wide breaker cooling, and a kept-agent floor
+        // above its pool ceiling is blocked rather than violating pace.
         const resolved = lastConfig.get(companyId);
         const reservedFloors = resolved?.caps?.reservedFloors ?? {};
         let floorsSuspended = false;
@@ -4280,10 +4339,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           } catch (error) {
             ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
           }
+          const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
+          const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
+          for (const agent of keptCaps) {
+            const spec = reservedFloors[agent.agentId];
+            const input = inputsByAgent.get(agent.agentId);
+            const floor = input ? computeReservedFloor(input.running, input.queued, spec) : null;
+            const poolCeiling = allocated.keptCeilings.get(agent.agentId);
+            if (floor != null && floor > poolCeiling) blockedAgentIds.add(agent.agentId);
+          }
           const floored = applyReservedFloors(agents, {
             reservedFloors,
             ceiling: cap.maxTotal ?? 75,
-            blockedAgentIds: floorsSuspended ? Object.keys(reservedFloors) : [],
+            blockedAgentIds: [...blockedAgentIds],
           });
           agents = floored.entries;
           floorSummary = floored.floors;

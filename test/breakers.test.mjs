@@ -5,7 +5,7 @@ import {
   createBreakerStore, breakerStoreFromJSON, breakerStoreToJSON,
   breakerState, breakerAllows, breakerProbeRunId, recordArmFailure,
   startProbe, resolveProbe, breakerHousekeep, filterBreakerRungs, breakerReport,
-  noteKnownArms, breakerKey,
+  noteKnownArms, breakerKey, recordAccountBalanceExhaustion,
 } from '../src/breakers.mjs';
 import { createLedger, recordStart, recordDecision, recordTerminal, terminalRecords } from '../src/ledger.mjs';
 import { decide } from '../src/decide.mjs';
@@ -26,6 +26,73 @@ test('live gemini-2.5-pro 400 trips; live antigravity strings trip', () => {
   assert.equal(classifyArmError('model_not_found: claude-opus-5-5-high is not provisioned', cfg), 'fatal');
   assert.equal(classifyArmError('400 Upstream request failed: Model is unavailable.', cfg), 'fatal');
   assert.equal(classifyArmError('500 no healthy managed Z.ai capacity remains', cfg), 'fatal');
+});
+
+test('a 402 balance exhaustion trips its arm immediately', () => {
+  const store = createBreakerStore();
+  const errorText = '402 Grok Build usage balance exhausted';
+
+  assert.equal(classifyArmError(errorText, cfg), 'fatal');
+  assert.equal(classifyArmError(errorText, sanitizeBreakers({ fatalPatterns: [], vetoPatterns: ['balance'] })), 'fatal');
+  const transition = recordArmFailure(store, 'xai:lane-1', 'grok-4.7', {
+    atMs: T0, errorText,
+  }, T0, cfg);
+
+  assert.equal(transition?.transition, 'opened');
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-4.7', T0, cfg), 'open');
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
+
+  const wrappedError = '503 auth_unavailable: no auth available; last upstream error: Grok Build usage balance exhausted';
+  const wrapped = recordArmFailure(store, 'xai:lane-1', 'grok-4.7-wrapped', {
+    atMs: T0, errorText: wrappedError,
+  }, T0, cfg);
+  assert.equal(wrapped?.transition, 'opened', 'the balance exhaustion survives the gateway wrapper');
+});
+
+test('a 402 balance failure without exhaustion wording does not trip the account', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'xai:lane-1', armId: 'grok-4.7' }], T0);
+  const errorText = '402 balance check unavailable; retry after account verification';
+
+  assert.equal(classifyArmError(errorText, cfg), null);
+  assert.equal(classifyArmError('503 empty response; balance check passed', cfg), null);
+  assert.equal(classifyArmError('402 available credits are empty', cfg), 'fatal');
+  assert.deepEqual(recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText,
+  }, T0, cfg), []);
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-4.7', T0, cfg), 'closed');
+});
+
+test('a kept-run balance failure opens every known arm on its account', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [
+    { accountId: 'xai:lane-1', armId: 'grok-4.7' },
+    { accountId: 'xai:lane-1', armId: 'grok-4.7-fast' },
+    { accountId: 'meta:lane-1', armId: 'muse-spark-1.3' },
+  ], T0);
+  const errorText = '503 auth_unavailable: last upstream error: Grok Build usage balance exhausted';
+
+  const transitions = recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText,
+  }, T0, cfg);
+
+  assert.deepEqual(transitions.map(t => t.armId).sort(), ['grok-4.7', 'grok-4.7-fast']);
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
+  assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7-fast', T0, cfg), false);
+  assert.equal(breakerAllows(store, 'meta:lane-1', 'muse-spark-1.3', T0, cfg), true);
+});
+
+test('balance exhaustion also trips an attributed arm missing from the known set', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'xai:lane-1', armId: 'grok-known' }], T0);
+  const errorText = '402 Grok Build usage balance exhausted';
+
+  const transitions = recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText, armId: 'grok-new',
+  }, T0, cfg);
+
+  assert.ok(transitions.some(transition => transition.armId === 'grok-new'));
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-new', T0, cfg), 'open');
 });
 
 test('generic 400-about-model trips; transients never do', () => {

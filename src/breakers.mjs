@@ -9,14 +9,15 @@
  * it with a doubled cool-off, any other outcome frees the probe slot and
  * stays half-open.
  *
- * Classification is a configurable pattern list with sane defaults. Entries
- * WITHOUT a '+' are specific: a case-insensitive substring hit trips the
- * breaker and is veto-proof. Entries WITH a '+' are generic conjunctions
- * (every part must match, e.g. '400+model') and trip ONLY when no transient
- * (veto) pattern matches -- so a 400 that mentions the model still trips, but
- * a 400 about context length, rate limits, overload, or disconnects never
- * does. Specific knowledge beats the generic heuristic: an error matching
- * both a specific fatal pattern and a veto pattern still trips.
+ * Classification uses a configurable pattern list with sane defaults, plus
+ * an unconditional balance-exhaustion exception: balance/credit text paired
+ * with exhaustion wording opens the lane immediately, whether or not a gateway
+ * wrapper retains the 402. Entries WITHOUT a '+' are specific:
+ * a case-insensitive substring hit trips and is veto-proof. Entries WITH a
+ * '+' are generic conjunctions (every part must match, e.g. '400+model') and
+ * trip ONLY when no transient (veto) pattern matches. Specific knowledge
+ * beats the generic heuristic: an error matching both a specific fatal
+ * pattern and a veto pattern still trips.
  *
  * Pure and deterministic (the clock is always passed in). Pair keys join on
  * NUL, the same aliasing-proof convention as the ladder gate pairs.
@@ -108,9 +109,17 @@ export function sanitizeBreakers(raw) {
  * Generic transients (stream drops, 429/overload, context exhaustion) never
  * match a specific pattern and are vetoed off the generic 400 rule.
  */
+export function isBalanceExhaustion(text) {
+  const t = String(text ?? '').toLowerCase();
+  const hasBalance = /\b(?:balance|credits?)\b/.test(t);
+  const hasEmptyBalance = /\b(?:balance|credits?)\s+(?:(?:is|are)\s+)?empty\b|\bempty\s+(?:balance|credits?)\b/.test(t);
+  return hasBalance && (hasEmptyBalance || /\b(?:exhausted|depleted|insufficient)\b/.test(t));
+}
+
 export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
   const t = String(text ?? '').toLowerCase();
   if (t.length === 0) return null;
+  if (isBalanceExhaustion(t)) return 'fatal';
   const fatals = Array.isArray(cfg?.fatalPatterns) ? cfg.fatalPatterns : DEFAULT_BREAKERS.fatalPatterns;
   const vetoes = Array.isArray(cfg?.vetoPatterns) ? cfg.vetoPatterns : DEFAULT_BREAKERS.vetoPatterns;
   const vetoed = vetoes.some(p => typeof p === 'string' && p.length > 0 && t.includes(p.toLowerCase()));
@@ -342,7 +351,7 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
   // agree). The ref uses the later of now and the failure, so a re-processed
   // stale failure can neither trip nor wipe newer ones.
   e.fails = [...e.fails, atMs].filter(f => f >= cutoff).slice(-10);
-  const trip = cfg?.tripCount ?? DEFAULT_BREAKERS.tripCount;
+  const trip = isBalanceExhaustion(errorText) ? 1 : (cfg?.tripCount ?? DEFAULT_BREAKERS.tripCount);
   if (e.fails.length >= trip) {
     e.state = 'open';
     e.openedAt = Number.isFinite(nowMs) ? nowMs : atMs;
@@ -352,6 +361,40 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
     return { transition: 'opened', accountId: e.accountId, armId: e.armId, cooloffHours: e.cooloffHours, fails: e.fails.length };
   }
   return null;
+}
+
+/** Open every currently servable arm on a lane after a balance exhaustion. */
+export function recordAccountBalanceExhaustion(store, accountId, { atMs, errorText, armId } = {}, nowMs, cfg = DEFAULT_BREAKERS) {
+  if (!isBalanceExhaustion(errorText)) return [];
+  const knownArms = new Map();
+  for (const arm of Object.values(store?.known ?? {})) {
+    if (arm?.accountId === accountId && typeof arm.armId === 'string') knownArms.set(arm.armId, arm);
+  }
+  if (typeof armId === 'string' && armId.length > 0 && !knownArms.has(armId)) {
+    knownArms.set(armId, { accountId, armId });
+  }
+  const transitions = [];
+  for (const arm of knownArms.values()) {
+    const key = breakerKey(accountId, arm.armId);
+    const existing = store.arms[key];
+    if (existing && breakerState(store, accountId, arm.armId, nowMs, cfg) === 'half-open') {
+      existing.state = 'open';
+      existing.openedAt = Number.isFinite(nowMs) ? nowMs : atMs;
+      existing.cooloffHours = nextCooloffHours(existing, cfg);
+      existing.opens += 1;
+      existing.fails = [atMs];
+      existing.probe = null;
+      existing.lastError = truncError(errorText);
+      transitions.push({
+        transition: 'reopened', accountId: existing.accountId, armId: existing.armId,
+        cooloffHours: existing.cooloffHours,
+      });
+      continue;
+    }
+    const transition = recordArmFailure(store, accountId, arm.armId, { atMs, errorText }, nowMs, cfg);
+    if (transition) transitions.push(transition);
+  }
+  return transitions;
 }
 
 /**
