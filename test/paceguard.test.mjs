@@ -81,24 +81,75 @@ test('unknown plan position, unknown share, or reactive lanes fail open', () => 
   assert.deepEqual(ids(run([lane('muse:1', { pool: 'muse', meter: 'reactive', planAhead: 0.5, inFlight: 50 })])), ['muse:1']);
 });
 
-test('the pool is judged on the mean plan position of its lanes, and its slots are the lanes\' sum', () => {
-  // Lane 2 is far ahead but lane 1 is far behind: the pool as a whole is on plan.
-  const onPlan = run([
+test('each lane is judged on its own plan position; the cap sums per-lane allowances (0.2.53)', () => {
+  // Lane 2 is far ahead, lane 1 far behind. Lane 1's full fair share is
+  // max(1, 3/h x 0.2h) = 1, lane 2 contributes its 0.6 slots: cap ceil(1.6) = 2.
+  // With 9 in flight only the ahead lane is held; the behind lane serves.
+  const mixed = run([
     lane('claude:1', { planAhead: -0.4, targetShare: 3, inFlight: 9 }),
     lane('claude:2', { planAhead: 0.3, targetShare: 3, inFlight: 9 }),
   ]);
-  assert.deepEqual(ids(onPlan), ['claude:1', 'claude:2']);
-  assert.deepEqual(onPlan.paced, []);
-  // Mean +0.05 is ahead; the lanes' shares sum to 6/h x 0.2h = 1.2 slots: cap 2.
+  assert.deepEqual(ids(mixed), ['claude:1']);
+  assert.equal(mixed.paced[0].state, 'lanes-paced');
+  assert.equal(mixed.paced[0].paced, false);
+  assert.deepEqual(mixed.paced[0].pacedAccountIds, ['claude:2']);
+  assert.equal(mixed.paced[0].cap, 2);
+  // Below the cap nothing is held, even with the ahead lane in the pool.
+  const under = run([
+    lane('claude:1', { planAhead: -0.2, targetShare: 3, inFlight: 1 }),
+    lane('claude:2', { planAhead: 0.3, targetShare: 3, inFlight: 1 }),
+  ]);
+  assert.deepEqual(ids(under).sort(), ['claude:1', 'claude:2']);
+  assert.equal(under.pools[0].state, 'ahead');
+  // Every lane ahead: the pool is paced whole, cap ceil(sum slots) as before.
   const ahead = run([
-    lane('claude:1', { planAhead: -0.2, targetShare: 3, inFlight: 2 }),
+    lane('claude:1', { planAhead: 0.2, targetShare: 3, inFlight: 2 }),
     lane('claude:2', { planAhead: 0.3, targetShare: 3, inFlight: 2 }),
   ]);
   assert.deepEqual(ids(ahead), []);
   assert.equal(ahead.paced[0].cap, 2);
-  assert.ok(Math.abs(ahead.paced[0].planAhead - 0.05) < 1e-9);
+  assert.equal(ahead.paced[0].paced, true);
+  assert.ok(Math.abs(ahead.paced[0].planAhead - 0.25) < 1e-9);
   assert.ok(Math.abs(ahead.paced[0].pacedSlots - 1.2) < 1e-9);
   assert.equal(ahead.paced[0].lanes, 2);
+});
+
+test('claude example: a spent lane no longer caps a lane far behind its own plan at one run', () => {
+  // claude-lane-3 at 99% used (ahead of plan), claude-lane-4 at 11% used
+  // with 4.6 days left (elapsed 2.4/7 = 0.343 -> 23 points behind plan).
+  // The old mean (+0.30 ahead) capped the pool at ceil(0.1 + 0.8) = 1 and,
+  // with one run in flight, held BOTH lanes.
+  const elapsed = 2.4 / 7;
+  const views = [
+    lane('claude:claude-lane-3', { planAhead: 0.99 - elapsed, targetShare: 0.5, inFlight: 2, headroomPct: 0.4 }),
+    lane('claude:claude-lane-4', { planAhead: 0.11 - elapsed, targetShare: 4, inFlight: 2 }),
+  ];
+  const old = run(views.map(v => ({ ...v, inFlight: 1 })));
+  assert.ok(ids(old).includes('claude:claude-lane-4'), 'one run in flight: lane 4 serves');
+  const r = run(views);
+  assert.deepEqual(ids(r), ['claude:claude-lane-4']);
+  const pool = r.pools[0];
+  // allowance: lane-3 0.5 x 0.2 = 0.1; lane-4 max(1, 0.8) = 1 -> cap 2.
+  assert.equal(pool.cap, 2);
+  assert.deepEqual(pool.pacedAccountIds, ['claude:claude-lane-3']);
+  const l4 = pool.laneVerdicts.find(l => l.accountId === 'claude:claude-lane-4');
+  assert.equal(l4.ahead, false);
+  assert.equal(l4.paced, false);
+  // Lane 4 keeps serving however many runs the pool has in flight.
+  const busy = run(views.map(v => ({ ...v, inFlight: 7 })));
+  assert.deepEqual(ids(busy), ['claude:claude-lane-4']);
+});
+
+test('single-lane pools are unchanged by the per-lane guard', () => {
+  const one = (partial) => run([lane('codex:1', { pool: 'codex', targetShare: 3, ...partial })]);
+  const a = one({ planAhead: 0.1, inFlight: 1 });
+  assert.equal(a.pools[0].cap, 1);
+  assert.deepEqual(ids(a), []);
+  assert.equal(a.pools[0].state, 'paced');
+  assert.equal(a.pools[0].laneVerdicts, undefined);
+  const b = one({ planAhead: -0.1, inFlight: 50 });
+  assert.deepEqual(ids(b), ['codex:1']);
+  assert.equal(b.pools[0].state, 'on-plan');
 });
 
 test('a pool with any lane of unknown position or share is not measured: it fails open', () => {
@@ -198,14 +249,14 @@ test('a held lane never enters the order, but still counts toward its pool verdi
   assert.deepEqual(ids(r), ['devin:a']);
 });
 
-test('a held lane is a pool member: its plan position paces the lanes that route', () => {
-  // Pool mean (0 + 0.1) / 2 = 0.05 is ahead of the 0.02 margin; the cap is
-  // ceil(0.5 + 0.5) = 1 and one run is in flight. Without the held lane the
-  // pool reads on-plan and the routable lane keeps serving.
+test('a held lane is a pool member: its own lead paces only itself, never an on-plan sibling', () => {
+  // Pool mean (0 + 0.1) / 2 = 0.05 used to hold the on-plan routable lane
+  // through the held lane's lead. Per lane, devin:a is on plan and serves;
+  // devin:b (ahead) is the lane held at the cap (max(1, 1) + 1 = 2).
   const r = run([
-    lane('devin:a', { pool: 'devin', planAhead: 0, targetShare: 0.5, inFlight: 1 }),
-    lane('devin:b', { pool: 'devin', planAhead: 0.1, targetShare: 0.5, inFlight: 1, held: true }),
+    lane('devin:a', { pool: 'devin', planAhead: 0, targetShare: 1, inFlight: 2 }),
+    lane('devin:b', { pool: 'devin', planAhead: 0.1, targetShare: 1, inFlight: 2, held: true }),
   ], { ...PACING, meanRunDurationHours: 1 });
-  assert.deepEqual(ids(r), []);
-  assert.deepEqual(r.paced.map(p => p.pool), ['devin']);
+  assert.deepEqual(ids(r), ['devin:a']);
+  assert.deepEqual(r.paced.map(p => p.pacedAccountIds), [['devin:b']]);
 });
