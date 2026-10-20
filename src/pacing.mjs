@@ -121,6 +121,84 @@ export function measuredRatePerHour(history, nowMs = Date.now(), windowMin = 60,
   return { ratePerHour: delta / (spanMs / 3600000), spanMs, points: pts.length };
 }
 
+/**
+ * Whole-percent meters (0.2.53). Vendor meters tick in whole percents, so a
+ * 60-minute window over an account burning ~0.4%/h usually sees no tick and
+ * reads 0.00%/h: the plugin then believed the pool was idle. A compact TICK
+ * LOG per account (the readings where the meter value changed, kept 6h)
+ * lets the rate extend back to the last observed tick.
+ */
+export const METER_QUANTUM = 0.01;
+export const TICK_LOG_KEEP_MS = 6 * 3600 * 1000;
+export const TICK_LOG_CAP = 64;
+
+/**
+ * Append a reading to the tick log. Only value changes are recorded:
+ *   { atMs, usedPct, fromAtMs }   a tick (fromAtMs: last reading at the old value)
+ *   { atMs, usedPct, seed: true } the first reading, or a counter reset
+ *                                 (value went down): not a tick moment.
+ * Entries older than the keep window are pruned except the newest one, so
+ * the log always knows when the current value was first seen. Pure.
+ */
+export function appendTickLog(log, { atMs, usedPct }, nowMs = Date.now(), lastSeenAtMs = null) {
+  if (!Number.isFinite(atMs) || !Number.isFinite(usedPct)) return Array.isArray(log) ? log : [];
+  const cur = (Array.isArray(log) ? log : []).filter(e => Number.isFinite(e?.atMs) && Number.isFinite(e?.usedPct));
+  const last = cur[cur.length - 1];
+  let next = cur;
+  if (last == null) {
+    next = [{ atMs, usedPct, seed: true }];
+  } else if (atMs > last.atMs && Math.abs(usedPct - last.usedPct) > 1e-9) {
+    const entry = usedPct < last.usedPct
+      ? { atMs, usedPct, seed: true }
+      : { atMs, usedPct, fromAtMs: Number.isFinite(lastSeenAtMs) && lastSeenAtMs >= last.atMs && lastSeenAtMs < atMs ? lastSeenAtMs : last.atMs };
+    next = [...cur, entry];
+  }
+  const keepFrom = nowMs - TICK_LOG_KEEP_MS;
+  let firstKept = next.findIndex(e => e.atMs >= keepFrom);
+  if (firstKept === -1) firstKept = next.length - 1;
+  else if (firstKept > 0) firstKept -= 1; // keep the newest entry before the window
+  return next.slice(Math.max(firstKept, next.length - TICK_LOG_CAP));
+}
+
+/**
+ * Measured rate that survives whole-percent meters. When the trailing
+ * window shows a positive rate it is returned unchanged; when utilization
+ * did not change inside the window (rate exactly 0):
+ *   - last tick within maxExtendMs (6h): the window extends back to that
+ *     tick -- rate = delta / (now - fromAtMs), the delta of the tick over
+ *     the span since the last reading at the old value -- bounded by
+ *     quantum / (now - tickAt): less than one quantum burned since the tick;
+ *   - no tick in that span while runs are in flight on the account: the
+ *     bound quantum / max(time flat, maxExtendMs) -- never exactly 0;
+ *   - otherwise the window's 0 stands (an idle account reads idle).
+ * A null window rate (thin data) stays null. Returns the window shape plus
+ * `basis` ('window' | 'tick-extended' | 'tick-bound').
+ */
+export function robustRatePerHour(history, nowMs = Date.now(), windowMin = 60, minSpanMin = 20, {
+  tickLog = null, inFlight = 0, quantum = METER_QUANTUM, maxExtendMs = TICK_LOG_KEEP_MS,
+} = {}) {
+  const base = measuredRatePerHour(history, nowMs, windowMin, minSpanMin);
+  if (base == null || !(base.ratePerHour === 0)) return base == null ? null : { ...base, basis: 'window' };
+  const log = Array.isArray(tickLog) ? tickLog : [];
+  const last = log[log.length - 1];
+  const hour = 3600000;
+  if (last != null && last.seed !== true && nowMs - last.atMs <= maxExtendMs && nowMs > last.atMs) {
+    const prev = log[log.length - 2];
+    const from = Number.isFinite(last.fromAtMs) ? last.fromAtMs : (prev?.atMs ?? last.atMs);
+    const delta = prev != null ? last.usedPct - prev.usedPct : quantum;
+    const sinceTick = nowMs - last.atMs;
+    const extended = delta > 0 && nowMs > from ? delta / ((nowMs - from) / hour) : quantum / (sinceTick / hour);
+    const bound = quantum / (sinceTick / hour);
+    return { ratePerHour: Math.min(extended, bound), spanMs: nowMs - from, points: base.points, basis: 'tick-extended' };
+  }
+  if ((inFlight ?? 0) > 0) {
+    const flatSince = last != null ? Math.min(last.atMs, nowMs - base.spanMs) : nowMs - base.spanMs;
+    const flatMs = Math.max(nowMs - flatSince, maxExtendMs);
+    return { ratePerHour: quantum / (flatMs / hour), spanMs: nowMs - flatSince, points: base.points, basis: 'tick-bound' };
+  }
+  return { ...base, basis: 'window' };
+}
+
 /** Required burn rate: remaining weekly fraction per hour to land ~100% at reset. */
 export function requiredRatePerHour({ remainingPct, hoursToReset }) {
   if (!(remainingPct > 0) || !(hoursToReset > 0)) return 0;

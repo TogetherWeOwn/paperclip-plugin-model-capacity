@@ -54,7 +54,7 @@ import {
   armTierCost, armTierCap, tierCapsByModel, tierModelKey, fleetBaselineForModels,
 } from './tiers.mjs';
 import {
-  scheduleError, stepController, stepRateController, appendUtilReading,
+  scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm } from './decide.mjs';
@@ -1674,6 +1674,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     // First tick with the new key only seeds (no fleet-wide wake on deploy).
     const capacityDiff = diffCapacityFeed(prevSummaries, currSummaries, { nowMs, firstTick: prevChange == null });
+    // In-flight runs per account for the rate estimate (a flat whole-percent
+    // meter with runs in flight is never "idle"). Same load the tick does
+    // below; a failed load aborts here, still before any persist.
+    const rateInFlight = inflightByAccount(await loadLedger(companyId), { nowMs, horizonMs: staleHorizonMs }).byAccount;
     const accountViews = [];
     for (let i = 0; i < snapshot.accounts.length; i++) {
       const account = snapshot.accounts[i];
@@ -1725,12 +1729,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // skipped, everything else accumulates -- so history grows on every
       // tick that carries genuinely new data.
       let history = rateHistories[key] ?? [];
+      // Tick log (see appendTickLog): the readings where the whole-percent
+      // meter changed, kept 6h, so a flat 60-min window can extend back to
+      // the last tick instead of reading 0%/h.
+      let tickLog = rateHistories[`tick:${key}`] ?? [];
       if (weeklyUsed != null) {
         const readingAtMs = account.signalsAtMs ?? snapshot.observedAtMs ?? nowMs;
         const dup = history.some(p => p.atMs === readingAtMs && p.usedPct === weeklyUsed);
-        if (!dup) history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
+        if (!dup) {
+          const lastSeenAtMs = history.length > 0 ? history[history.length - 1].atMs : null;
+          history = appendUtilReading(history, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs);
+          tickLog = appendTickLog(tickLog, { atMs: readingAtMs, usedPct: weeklyUsed }, nowMs, lastSeenAtMs);
+        }
       }
       rateHistories[key] = history;
+      if (tickLog.length > 0) rateHistories[`tick:${key}`] = tickLog;
       // Credit lanes pace the CREDIT drain, not the flat weekly meter (which
       // sits at 100% while credits are spent and would read as rate 0
       // forever): track the credit fraction as its own utilization series
@@ -1750,8 +1763,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         rateHistories[`credit:${key}`] = creditHistory;
       }
+      // Whole-percent meters: a flat window extends to the last tick and
+      // never reads exactly 0 while runs are in flight (robustRatePerHour).
       let measured = weeklyUsed != null
-        ? measuredRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin)
+        ? robustRatePerHour(history, nowMs, config.pacing.rateWindowMin, config.pacing.rateMinSpanMin, {
+          tickLog, inFlight: rateInFlight[key] ?? 0,
+        })
         : null;
       // New-account warmup : the CONTROLLER does not act on rate
       // estimates from < 60 min of data (live: a brand-new Claude account
@@ -1966,6 +1983,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         rateBasis: measured ? 'measured' : 'position',
         measuredRatePerHour: measured?.ratePerHour ?? null,
         rateSpanMs: measured?.spanMs ?? null,
+        ...(measured?.basis != null && measured.basis !== 'window' ? { rateEstimate: measured.basis } : {}),
         ratePoints: measured?.points ?? 0,
         rateHistoryPoints: history.length,
         warmingUp,

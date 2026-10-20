@@ -93,6 +93,7 @@ function drive({ config = {}, accounts, feedExtra = {}, agentGets = {} }) {
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
+    setAccounts: a => { laneAccounts = a; },
     seed: (key, value) => { store.set(skey(key), value); },
     setup: async () => {
       await plugin.setup(io);
@@ -319,4 +320,29 @@ test('regression: absent, empty and non-matching burnMode decide bit-for-bit ide
   assert.equal(await scenario({ burnMode: { accounts: ['nobody:none'], horizonMinutes: 5 } }), absent);
   assert.equal(await scenario({ burnMode: { accounts: ['!claude:a1'] } }), absent);
   assert.doesNotMatch(absent, /burnMode|"burn"/);
+});
+
+// ------------------------------------------------ whole-percent meters
+
+test('plugin: a flat whole-percent meter with a run in flight never reports 0%/h', async () => {
+  const flat = (atMs) => [{ ...lane(0.5, 100), observedAt: new Date(atMs).toISOString() }];
+  const run = async (withRun) => {
+    const d = drive({ config: { enforce: true, reviewReserve: { enabled: false } }, accounts: flat(TICK) });
+    await d.setup();
+    await d.tick();
+    if (withRun) assert.equal((await d.hook('run-live')).kind, 'decide');
+    for (let m = 10; m <= 70; m += 10) {
+      d.setNow(TICK + m * 60000);
+      d.setAccounts(flat(TICK + m * 60000));
+      await d.tick();
+    }
+    const cap = (await d.api('capacity')).body;
+    return cap.accounts.find(a => a.accountId === 'claude:a1');
+  };
+  const busy = await run(true);
+  assert.ok(busy.measuredRatePerHour > 0, `busy rate ${busy.measuredRatePerHour}`);
+  assert.equal(busy.rateEstimate, 'tick-bound');
+  const idle = await run(false);
+  assert.equal(idle.measuredRatePerHour, 0);
+  assert.equal(idle.rateEstimate, undefined);
 });
