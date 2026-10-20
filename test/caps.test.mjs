@@ -166,10 +166,14 @@ test("a '__proto__' agentId counts in caps without polluting Object.prototype", 
 // --- /caps handler wiring: running comes from the ledger, queued from issues.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
+const HOUR = 3600 * 1000;
+const REVIEWER_MODEL = 'muse-wonder-full-1.0-contributor';
+const CODEX_MODEL = 'gpt-6.1-sol';
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
 const AA_STATE_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
-const aaRows = () => ([
+const aaRows = (extra = []) => ([
   { slug: 'claude-haiku-5-5', intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ...extra,
 ]);
 const laneBody = (weeklyUsed, observedAt) => ({
   observedAt,
@@ -180,19 +184,21 @@ const laneBody = (weeklyUsed, observedAt) => ({
     observedAt, quality: 'live',
   }],
 });
-const runEvent = (runId, atMs, agentId, type = 'agent.run.started') => ({
+const runEvent = (runId, atMs, agentId, type = 'agent.run.started', runFields = {}) => ({
   type, companyId: 'acme', entityId: runId,
-  payload: { run: { agentId, provider: 'claude' } },
+  payload: { run: { agentId, provider: 'claude', ...runFields } },
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
+function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows() }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
   const skey = k => JSON.stringify(k);
   let now = nowMs;
-  let lane = laneBody(laneUsed, new Date(now).toISOString());
+  let lane = accounts
+    ? { observedAt: new Date(now).toISOString(), accounts }
+    : laneBody(laneUsed, new Date(now).toISOString());
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
@@ -201,7 +207,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
-    agents: { get: async () => null },
+    agents: { get: async id => agentGets[id] ?? null },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -210,15 +216,21 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
     setNow: ms => { now = ms; },
-    setLane: (used) => { lane = laneBody(used, new Date(now).toISOString()); },
+    setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
+    setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: snapshotRows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
-    fire: (e) => handlers.get(e.type)(e),
-    api: (routeKey) => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    fire: e => handlers.get(e.type)(e),
+    hook: (runId, agentId) => plugin.onResolveRunModel({
+      runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
+      invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
+      issueOverrideModel: null, deadlineMs: 1500,
+    }),
+    api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
   };
 }
 
@@ -256,6 +268,87 @@ test('/caps exposes demand, running, allocated, reason with ledger running count
       assert.ok(a.allocated >= a.demand, `${a.agentId}: throttled below demand under target`);
     }
   }
+});
+
+test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async () => {
+  const meta = {
+    lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
+    weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const codex = {
+    lane: 'codex-1', provider: 'codex', accountKey: 'c1', health: 'healthy', models: [CODEX_MODEL],
+    weekly: { used: 0.01, resetsAt: new Date(TICK + 168 * HOUR).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    observedAt: new Date(TICK).toISOString(), quality: 'live',
+  };
+  const queued = Array.from({ length: 32 }, (_, i) => ({ id: `review-${i}`, status: 'todo', assigneeAgentId: 'reviewer' }));
+  const d = drive({
+    nowMs: TICK,
+    config: {
+      enforce: true,
+      concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 },
+      roles: { keepAgentIds: ['reviewer'] },
+    },
+    accounts: [meta, codex],
+    issueLists: { todo: queued, in_progress: [] },
+    agentGets: { reviewer: { adapterConfig: { model: REVIEWER_MODEL } } },
+    snapshotRows: aaRows([
+      { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+      { slug: CODEX_MODEL, intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
+    ]),
+  });
+  await d.setup();
+  await d.tick();
+  // Build the two-point caps calibration while keeping an unpaced Codex fleet available.
+  d.setNow(TICK + 10 * 60 * 1000);
+  for (let i = 1; i <= 6; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 10 * 60 * 1000, 'codex-worker', 'agent.run.started', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 20 * 60 * 1000);
+  for (let i = 1; i <= 2; i++) {
+    await d.fire(runEvent(`codex-run-${i}`, TICK + 20 * 60 * 1000, 'codex-worker', 'agent.run.finished', {
+      provider: 'codex', model: CODEX_MODEL,
+    }));
+  }
+  d.setNow(TICK + 30 * 60 * 1000);
+  d.setAccounts([
+    { ...meta, observedAt: new Date(TICK + 30 * 60 * 1000).toISOString(), weekly: { ...meta.weekly, used: 0.93 } },
+    { ...codex, observedAt: new Date(TICK + 30 * 60 * 1000).toISOString(), weekly: { ...codex.weekly, used: 0.013 } },
+  ]);
+  await d.tick();
+
+  const initialCapacity = (await d.api('capacity')).body;
+  const initialPools = new Map(initialCapacity.paceGuard.pools.map(pool => [pool.pool, pool]));
+  assert.equal(initialPools.get('meta')?.cap, 4, `the ahead-of-plan Meta pool has a four-run pace cap: ${JSON.stringify(initialPools.get('meta'))}`);
+  assert.equal(initialPools.get('codex')?.state, 'on-plan', 'fresh Codex capacity is unpaced');
+  assert.equal(initialPools.get('codex')?.inFlight, 4, 'the Codex fleet remains active beside Meta');
+
+  d.setNow(TICK + 31 * 60 * 1000);
+  await d.fire(runEvent('kept-reviewer-run', TICK + 31 * 60 * 1000, 'reviewer', 'agent.run.started', {
+    provider: 'meta', model: REVIEWER_MODEL,
+  }));
+  assert.deepEqual(await d.hook('kept-reviewer-run', 'reviewer'), { kind: 'keep' });
+  d.setNow(TICK + 32 * 60 * 1000);
+  await d.tick();
+
+  const caps = await d.api('caps');
+  assert.equal(caps.status, 200);
+  const reviewer = caps.body.agents.find(agent => agent.agentId === 'reviewer');
+  assert.ok(reviewer, `kept Reviewer demand appears in /caps: ${JSON.stringify(caps.body.agents)}`);
+  assert.equal(reviewer.queued, 32, 'the Reviewer has high queued demand');
+  assert.equal(reviewer.running, 1, 'the kept Reviewer run appears in the ledger-backed running count');
+
+  const capacity = (await d.api('capacity')).body;
+  const metaPool = capacity.paceGuard.pools.find(pool => pool.pool === 'meta');
+  assert.equal(metaPool.cap, 4);
+  assert.equal(metaPool.inFlight, 1, 'the running kept Reviewer record is charged to its Meta serving pool');
+  assert.equal(capacity.paceGuard.unattributedInFlight, 0, 'the kept run is not left unattributed');
+  assert.ok(reviewer.maxConcurrentRuns <= 4,
+    `Reviewer cap ${reviewer.maxConcurrentRuns} must not borrow fresh Codex fleet capacity`);
 });
 
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {
