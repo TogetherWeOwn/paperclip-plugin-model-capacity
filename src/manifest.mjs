@@ -502,11 +502,30 @@ const CONFIG_SCHEMA = {
       type: 'object', additionalProperties: false,
       description: 'Reviewer as a first-class role: runnable review capacity from qualified providers plus the hold/resume signal the review gate reads. Claude qualifies today; other providers only after the operator opts them in.',
       properties: {
-        providers: { type: 'array', items: { type: 'string' }, default: ['claude'], description: 'Providers whose accounts may serve review runs.' },
+        providers: { type: 'array', items: { type: 'string' }, description: 'Providers whose accounts may serve review runs. Unset: reviewReserve.providers when set, else [claude].' },
         supplyHeadroomPct: { type: 'number', exclusiveMinimum: 0, maximum: 1, default: 0.30, description: 'Headroom fraction that counts as large unused supply.' },
         supplyHoursToReset: { type: 'number', exclusiveMinimum: 0, default: 120, description: 'Hours-to-reset under which unused headroom counts as close to reset.' },
         doerStarvationMarginRuns: { type: 'number', exclusiveMinimum: 0, default: 4, description: 'C*-vs-live-doer gap (runs) that counts as doer starvation.' },
         doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
+      },
+    },
+    reviewerRouting: {
+      type: 'object', additionalProperties: false, required: ['arms'],
+      description: 'Reviewer routing: runs of the listed agents (default reviewReserve.agentIds) are routed to the first-ranked arm whose provider has a healthy, non-exhausted account with headroom instead of keeping the adapter model. Ranking: burn-mode accounts, plan before credit headroom, the pool most behind its pace plan, the most remaining quota per hour, then arm order. No arm qualifies: keep. Absent (or enabled:false) = keep, exactly as before.',
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        agentIds: { type: ['array', 'null'], items: { type: 'string', minLength: 1 }, default: null, description: 'Review-agent ids routed. Null (default) resolves to reviewReserve.agentIds.' },
+        arms: {
+          type: 'array', minItems: 1,
+          items: {
+            type: 'object', additionalProperties: false, required: ['provider', 'model'],
+            properties: {
+              provider: { type: 'string', minLength: 1, description: 'Provider pool, e.g. claude or meta.' },
+              model: { type: 'string', minLength: 1, description: 'Model id emitted for the run, e.g. muse-wonder-full-1.0-contributor.' },
+              effort: { type: 'string', minLength: 1, description: 'Effort emitted for the run, e.g. max.' },
+            },
+          },
+        },
       },
     },
     concurrency: {

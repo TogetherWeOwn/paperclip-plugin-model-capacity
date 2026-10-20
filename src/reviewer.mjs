@@ -4,8 +4,9 @@
  * signal the review gate reads. Supersedes the host reviewer_failover /
  * review-hold scripts.
  *
- * Qualification today: Claude only. Meta (or any other provider) counts only
- * after the operator opts it in via reviewer.providers -- the bar lives in
+ * Qualification: reviewer.providers, else reviewReserve.providers when the
+ * operator set it, else Claude only. Meta (or any other provider) counts
+ * only after the operator opts it in through one of those lists -- the bar lives in
  * ops/analysis/wonder-reviewer-20261014/REPORT.md and
  * ops/analysis/codex-reviewer-20261013/REPORT.md. The allowlist IS the bar
  * in code: unlisted providers never serve reviews, whatever their headroom.
@@ -47,12 +48,22 @@ export const DEFAULT_REVIEWER = Object.freeze({
 
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
 
-export function normalizeReviewer(raw) {
+/**
+ * defaultProviders: the fallback when reviewer.providers is unset -- the
+ * plugin passes reviewReserve.providers when the operator set it, so the
+ * providers whose pace is reserved for reviews are the ones whose lanes
+ * size reviewer capacity (Claude AND Meta when both are reserved). An
+ * explicit reviewer.providers still wins; neither set reads ['claude'].
+ */
+export function normalizeReviewer(raw, { defaultProviders = null } = {}) {
   const d = DEFAULT_REVIEWER;
   const r = raw != null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  const providers = Array.isArray(r.providers)
-    ? [...new Set(r.providers.filter((s) => typeof s === 'string' && s.length > 0).map((s) => s.toLowerCase()))]
-    : null;
+  const clean = (list) => (Array.isArray(list)
+    ? [...new Set(list.filter((s) => typeof s === 'string' && s.length > 0).map((s) => s.toLowerCase()))]
+    : null);
+  const explicit = clean(r.providers);
+  const fallback = clean(defaultProviders);
+  const providers = explicit && explicit.length > 0 ? explicit : fallback;
   const headroom = finite(r.supplyHeadroomPct) && r.supplyHeadroomPct > 0 && r.supplyHeadroomPct <= 1
     ? r.supplyHeadroomPct : d.supplyHeadroomPct;
   const hours = finite(r.supplyHoursToReset) && r.supplyHoursToReset > 0 ? r.supplyHoursToReset : d.supplyHoursToReset;
