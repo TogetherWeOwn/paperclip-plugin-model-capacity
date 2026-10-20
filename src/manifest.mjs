@@ -98,6 +98,8 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.55 = cheapest capable model: pacing never climbs to pricier rungs for spend (pacing.climbForSpend, default
+ *   false); unused quota goes to throughput.
  * v0.2.54 = burn-mode accounts count their burn end in the fleet C* need.
  * v0.2.53 = REVIEWER ROUTING ACROSS PROVIDERS: reviewer.providers falls back
  *   to reviewReserve.providers (Claude AND Meta lanes size reviewer slots);
@@ -294,7 +296,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.54';
+export const PLUGIN_VERSION = '0.2.55';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -468,6 +470,7 @@ const CONFIG_SCHEMA = {
         rateDeadbandRel: { type: 'number', minimum: 0, default: 0.15 },
         rateWindowMin: { type: 'number', minimum: 10, default: 60 },
         rateMinSpanMin: { type: 'number', minimum: 5, default: 10 },
+        climbForSpend: { type: 'boolean', default: false, description: 'Owner rule 2026-10-20: false (default) keeps every account on its cheapest capable rung and spends unused quota through throughput; true restores the spend-driven climb to pricier rungs.' },
         guard: {
           type: 'object', additionalProperties: false,
           description: 'Pace guard: a provider pool whose lanes average above the linear weekly plan (plus marginPct) is held at max(1, ceil(paced slots)) runs in flight; further runs go to other pools or are deferred. Applies to the enforcing hook, the event-time path and the shadow tick alike. Unknown plan position, unknown share and reactive lanes fail open.',

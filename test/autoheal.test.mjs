@@ -44,7 +44,7 @@ function drive({ lanes = [] }) {
   // that far behind now.
   let skewMs = 0;
   const io = {
-    config: { get: async () => ({ cliproxy: { laneKeySecretRef: SECRET } }) },
+    config: { get: async () => ({ cliproxy: { laneKeySecretRef: SECRET }, pacing: { climbForSpend: true } }) },
     state: {
       get: async (k) => store.get(skey(k)) ?? null,
       set: async (k, v) => { store.set(skey(k), v); },

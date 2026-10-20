@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.55
+- Cheapest capable model (owner rule 2026-10-20, every provider and account): `pacing.climbForSpend` (default false) keeps each account on its cheapest capable rung; unused quota is spent through throughput (fleet C*), never by climbing to pricier rungs. True restores the old climb.
+
 ## 0.2.54
 - Burn mode now raises the fleet concurrency target: a burn account's C* need uses its burn end (now + horizon), not its weekly reset.
 

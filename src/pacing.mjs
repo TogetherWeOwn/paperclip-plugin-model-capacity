@@ -29,6 +29,13 @@ export const DEFAULT_PACING = Object.freeze({
   rateWindowMin: 60,
   /** Minimum history span before a measured rate is trusted (~10-15 min after install). */
   rateMinSpanMin: 10,
+  /**
+   * Owner rule (2026-10-20): the cheapest capable model for the job, on every provider and account. Unused quota
+   * is spent through throughput (more concurrent runs, see the fleet C*), never by climbing to pricier rungs.
+   * False (default) pins the pointer to the floor (the role's cheapest eligible arm); true restores the
+   * spend-driven climb.
+   */
+  climbForSpend: false,
 });
 
 /** Utilization history knobs (module constants; operator knobs in DEFAULT_PACING). */
@@ -242,6 +249,14 @@ export function stepRateController(state, reading, nowMs, cfg = DEFAULT_PACING, 
   const measured = reading.measuredRatePerHour;
   const required = reading.requiredRatePerHour ?? 0;
   const measuredKnown = measured != null && Number.isFinite(measured);
+  if (c.climbForSpend !== true) {
+    const rb = measuredKnown ? 'measured' : 'position';
+    return pointer > floor
+      ? { pointer: floor, lastMoveAtMs: nowMs, guardActive: false, rateBasis: rb, action: 'cheapest',
+        reason: 'cheapest capable rung (climbForSpend off): unused quota goes to throughput, not pricier models' }
+      : { pointer: floor, lastMoveAtMs: keepStamp, guardActive: false, rateBasis: rb, action: 'hold-cheapest',
+        reason: 'cheapest capable rung (climbForSpend off)' };
+  }
   // Persisted basis ('measured' | 'position' | undefined on pre-0.2.1
   // state): when the basis switches from the position fallback to a real
   // measured rate, the cooldown resets so the correction a stale fallback
