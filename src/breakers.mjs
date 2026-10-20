@@ -10,9 +10,9 @@
  * stays half-open.
  *
  * Classification uses a configurable pattern list with sane defaults, plus
- * an unconditional balance-exhaustion exception: a 402 mentioning balance or
- * credits, or a wrapped error explicitly saying that balance/credits are
- * exhausted, opens the lane immediately. Entries WITHOUT a '+' are specific:
+ * an unconditional balance-exhaustion exception: balance/credit text paired
+ * with exhaustion wording opens the lane immediately, whether or not a gateway
+ * wrapper retains the 402. Entries WITHOUT a '+' are specific:
  * a case-insensitive substring hit trips and is veto-proof. Entries WITH a
  * '+' are generic conjunctions (every part must match, e.g. '400+model') and
  * trip ONLY when no transient (veto) pattern matches. Specific knowledge
@@ -111,8 +111,9 @@ export function sanitizeBreakers(raw) {
  */
 function isBalanceExhaustion(text) {
   const t = String(text ?? '').toLowerCase();
-  return /\b(?:balance|credits?)\b/.test(t)
-    && /\b(?:exhausted|depleted|insufficient|empty)\b/.test(t);
+  const hasBalance = /\b(?:balance|credits?)\b/.test(t);
+  const hasEmptyBalance = /\b(?:balance|credits?)\s+(?:(?:is|are)\s+)?empty\b|\bempty\s+(?:balance|credits?)\b/.test(t);
+  return hasBalance && (hasEmptyBalance || /\b(?:exhausted|depleted|insufficient)\b/.test(t));
 }
 
 export function classifyArmError(text, cfg = DEFAULT_BREAKERS) {
@@ -363,11 +364,17 @@ export function recordArmFailure(store, accountId, armId, { atMs, errorText } = 
 }
 
 /** Open every currently servable arm on a lane after a balance exhaustion. */
-export function recordAccountBalanceExhaustion(store, accountId, { atMs, errorText } = {}, nowMs, cfg = DEFAULT_BREAKERS) {
+export function recordAccountBalanceExhaustion(store, accountId, { atMs, errorText, armId } = {}, nowMs, cfg = DEFAULT_BREAKERS) {
   if (!isBalanceExhaustion(errorText)) return [];
-  const transitions = [];
+  const knownArms = new Map();
   for (const arm of Object.values(store?.known ?? {})) {
-    if (arm?.accountId !== accountId || typeof arm.armId !== 'string') continue;
+    if (arm?.accountId === accountId && typeof arm.armId === 'string') knownArms.set(arm.armId, arm);
+  }
+  if (typeof armId === 'string' && armId.length > 0 && !knownArms.has(armId)) {
+    knownArms.set(armId, { accountId, armId });
+  }
+  const transitions = [];
+  for (const arm of knownArms.values()) {
     const key = breakerKey(accountId, arm.armId);
     const existing = store.arms[key];
     if (existing && breakerState(store, accountId, arm.armId, nowMs, cfg) === 'half-open') {

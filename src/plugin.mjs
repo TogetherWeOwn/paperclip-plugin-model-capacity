@@ -1991,7 +1991,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (acct == null) continue;
         if (rec.status === 'failed') {
           const balanceTrips = recordAccountBalanceExhaustion(breakers, acct, {
-            atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText,
+            atMs: rec.terminalAt ?? nowMs, errorText: rec.errorText, armId: arm,
           }, nowMs, breakersCfg);
           breakerTransitions.push(...balanceTrips);
           if (balanceTrips.length > 0 || arm == null) continue;

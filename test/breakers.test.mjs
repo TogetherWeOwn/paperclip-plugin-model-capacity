@@ -55,6 +55,8 @@ test('a 402 balance failure without exhaustion wording does not trip the account
   const errorText = '402 balance check unavailable; retry after account verification';
 
   assert.equal(classifyArmError(errorText, cfg), null);
+  assert.equal(classifyArmError('503 empty response; balance check passed', cfg), null);
+  assert.equal(classifyArmError('402 available credits are empty', cfg), 'fatal');
   assert.deepEqual(recordAccountBalanceExhaustion(store, 'xai:lane-1', {
     atMs: T0, errorText,
   }, T0, cfg), []);
@@ -78,6 +80,19 @@ test('a kept-run balance failure opens every known arm on its account', () => {
   assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7', T0, cfg), false);
   assert.equal(breakerAllows(store, 'xai:lane-1', 'grok-4.7-fast', T0, cfg), false);
   assert.equal(breakerAllows(store, 'meta:lane-1', 'muse-spark-1.3', T0, cfg), true);
+});
+
+test('balance exhaustion also trips an attributed arm missing from the known set', () => {
+  const store = createBreakerStore();
+  noteKnownArms(store, [{ accountId: 'xai:lane-1', armId: 'grok-known' }], T0);
+  const errorText = '402 Grok Build usage balance exhausted';
+
+  const transitions = recordAccountBalanceExhaustion(store, 'xai:lane-1', {
+    atMs: T0, errorText, armId: 'grok-new',
+  }, T0, cfg);
+
+  assert.ok(transitions.some(transition => transition.armId === 'grok-new'));
+  assert.equal(breakerState(store, 'xai:lane-1', 'grok-new', T0, cfg), 'open');
 });
 
 test('generic 400-about-model trips; transients never do', () => {
