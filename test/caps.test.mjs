@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { allocateDemandCaps } from '../src/concurrency.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import {
-  createBreakerStore, breakerStoreToJSON, noteKnownArms, recordArmFailure, sanitizeBreakers,
+  createBreakerStore, breakerKey, breakerStoreFromJSON, breakerStoreToJSON,
+  noteKnownArms, recordArmFailure, sanitizeBreakers,
 } from '../src/breakers.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -482,7 +483,17 @@ test('/caps excludes only the fully breaker-open account from kept pool slots', 
     ...metaArms.map(armId => ({ accountId: metaAcct, armId })),
     ...codexArms.map(armId => ({ accountId: codexAcct, armId })),
   ], TICK);
-  d.seed(BREAKER_SKEY, breakerStoreToJSON(seed, { nowMs: TICK, cfg: BREAKER_CFG }));
+  // Retained history for a removed arm must not make a fully-open ladder available.
+  seed.known['stale-arm'] = { accountId: metaAcct, armId: 'meta-removed-arm', lastSeen: TICK - HOUR };
+  assert.ok(!metaArms.includes('meta-removed-arm'), 'the retained arm is not in the current Meta ladder');
+  const persisted = JSON.parse(JSON.stringify(breakerStoreToJSON(seed, { nowMs: TICK, cfg: BREAKER_CFG })));
+  const restored = breakerStoreFromJSON(persisted);
+  const staleKey = breakerKey(metaAcct, 'meta-removed-arm');
+  assert.deepEqual(restored.known[staleKey], {
+    accountId: metaAcct, armId: 'meta-removed-arm', lastSeen: TICK - HOUR,
+  }, 'the removed arm survives breaker serialization and loading');
+  assert.equal(restored.arms[staleKey], undefined, 'the removed arm has no breaker entry');
+  d.seed(BREAKER_SKEY, persisted);
 
   // Reboot so the tick cold-loads the seed.
   d.reboot();
