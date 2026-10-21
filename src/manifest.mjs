@@ -98,6 +98,10 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.60 = reviewer routing obeys the pace guard: held lanes are not candidates, and a review that only held lanes
+ *   could serve defers instead of keeping its pinned model unpaced.
+ * v0.2.59 = pace guard follows measured burn: an ahead lane whose measured rate exceeds its required rate has its
+ *   paced slots scaled by required/measured (floor 0.1), so expensive runs cannot outspend the plan.
  * v0.2.57 = burn accounts that the lane feed degraded only by its utilization floor (healthReason 'peak utilization')
  *   stay allocatable until weekly >= 0.995 or the five-hour bucket is full; other degraded causes stay excluded.
  * v0.2.56 = kept-agent caps: a pool pace cap bounds only its paced accounts; burn-mode accounts (exempt from
@@ -300,7 +304,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.59';
+export const PLUGIN_VERSION = '0.2.60';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.60
+- Reviewer routing obeys the pace guard (#52). Routing ranked accounts by burn and plan position without asking the pace guard, and a kept reviewer with no qualifying arm fell back to `keep` (its pinned model, never paced). Now the lanes the pace guard holds at hook time are not candidates, and when only held lanes could serve the review it defers on the pace-guard retry scale (`reviewer.routing.last.deferred: true`).
+
 ## 0.2.59 (host build: 0.2.57 + #51 only)
 - Pace guard follows the measured burn (#51). Built on 0.2.57 without #50: #50 needs the `agents.queued_counts.read` capability, which the live server (tog.21) does not provide yet.
 

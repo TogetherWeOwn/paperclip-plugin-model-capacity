@@ -4070,14 +4070,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
-  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock()) {
+  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null) {
     const cfg = live?.reviewerRouting;
     const pending = pendingByAccount(live, companyId, selfId);
     const admit = reviewerArmAdmission(live, companyId, agentId, nowMs);
     const admissionOf = new Map();
     const pick = selectReviewerRoute({
       cfg,
-      accounts: live.accounts ?? [],
+      accounts: (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId)),
       burnTokens: new Set(live.burnModeTokens ?? []),
       inFlightOf: (a) => (a.inFlight ?? 0) + (pending.get(a.accountId) ?? 0),
       serves: (a, arm) => {
@@ -4113,8 +4113,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const ledger = await getOrLoadLedger(companyId);
     if (!enforceCompanies.has(companyId)) return null;
     const nowMs = clock();
-    const { pick, admissionOf } = pickReviewerRoute(live, companyId, params.agentId, params?.runId != null ? String(params.runId) : null, nowMs);
+    const selfId = params?.runId != null ? String(params.runId) : null;
+    // Reviewer runs obey the pace guard like every other run: lanes the guard
+    // holds right now (ahead of plan, pool at its cap) are not candidates.
+    const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, params.agentId);
+    const paced = live.paceGuard?.enabled === true
+      ? (allocationOrderFromLive(live, companyId, selfId, role,
+        normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true).paced ?? [])
+      : [];
+    const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
+    const { pick, admissionOf } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds);
     if (pick.none) {
+      // Only the pace guard stood in the way: wait for a run to finish instead
+      // of falling back to keep, which would run on the held lane unpaced.
+      if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs).pick.none) {
+        const retryAfterMs = live.paceGuard?.retryAfterMs ?? 300000;
+        markDeferred(companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, retryAfterMs);
+        const reason = `pace guard: reviewer lanes held (${paced.map(pacedPoolText).join('; ')})`;
+        note({ routed: false, deferred: true, reason });
+        return { kind: 'defer', retryAfterMs, reason };
+      }
       note({ routed: false, fallback, reason: `${pick.reason}: ${fallback}` });
       return null;
     }
