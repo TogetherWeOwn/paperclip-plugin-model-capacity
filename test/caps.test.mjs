@@ -7,6 +7,7 @@ import {
   noteKnownArms, recordArmFailure, sanitizeBreakers,
 } from '../src/breakers.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { heartbeatQuery } from './heartbeat-query.mjs';
 
 const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'capped-ceiling']);
 
@@ -198,7 +199,8 @@ const runEvent = (runId, atMs, agentId, type = 'agent.run.started', runFields = 
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows() }) {
+function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows(), heartbeatRuns = null }) {
+  const heartbeatDb = heartbeatRuns == null ? null : heartbeatQuery(heartbeatRuns);
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -208,6 +210,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     ? { observedAt: new Date(now).toISOString(), accounts }
     : laneBody(laneUsed, new Date(now).toISOString());
   const io = {
+    ...(heartbeatDb ? { db: { query: heartbeatDb.query } } : {}),
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
@@ -223,6 +226,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
   };
   let plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
+    close: () => heartbeatDb?.close(),
     setNow: ms => { now = ms; },
     setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
     setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
@@ -282,7 +286,7 @@ test('/caps exposes demand, running, allocated, reason with ledger running count
   }
 });
 
-test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async () => {
+test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async t => {
   const meta = {
     lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
     weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
@@ -305,6 +309,10 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
     },
     accounts: [meta, codex],
     issueLists: { todo: queued, in_progress: [] },
+    heartbeatRuns: queued.map(issue => ({
+      id: `heartbeat-${issue.id}`, company_id: 'acme', agent_id: 'reviewer',
+      status: 'queued', invocation_source: 'on_demand',
+    })),
     agentGets: { reviewer: { adapterConfig: { model: REVIEWER_MODEL } } },
     snapshotRows: aaRows([
       { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
@@ -313,6 +321,7 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
   });
   await d.setup();
   await d.tick();
+  t.after(d.close);
   // Build the two-point caps calibration while keeping an unpaced Codex fleet available.
   d.setNow(TICK + 10 * 60 * 1000);
   for (let i = 1; i <= 6; i++) {
@@ -424,7 +433,7 @@ test('/capacity opens every known arm on a kept-run balance failure; ambiguous t
   assert.deepEqual(codexOpen, [], 'ambiguous balance wording trips no codex arm');
 });
 
-test('/caps excludes only the fully breaker-open account from kept pool slots', async () => {
+test('/caps excludes only the fully breaker-open account from kept pool slots', async t => {
   const meta = {
     lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
     weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
@@ -450,6 +459,10 @@ test('/caps excludes only the fully breaker-open account from kept pool slots', 
     },
     accounts: [meta, codex],
     issueLists: { todo: queued, in_progress: [] },
+    heartbeatRuns: queued.map(issue => ({
+      id: `heartbeat-${issue.id}`, company_id: 'acme', agent_id: issue.assigneeAgentId,
+      status: 'queued', invocation_source: 'on_demand',
+    })),
     agentGets: {
       keeperA: { adapterConfig: { model: REVIEWER_MODEL } },
       keeperB: { adapterConfig: { model: CODEX_MODEL } },
@@ -469,6 +482,7 @@ test('/caps excludes only the fully breaker-open account from kept pool slots', 
   assert.ok(metaArms.length >= 1 && codexArms.length >= 1,
     `both ladders have servable arms: meta=${JSON.stringify(metaArms)} codex=${JSON.stringify(codexArms)}`);
 
+  t.after(d.close);
   // Seed breaker-v1: meta fully open (fresh), codex half-open (cool-off elapsed).
   const seed = createBreakerStore();
   for (const armId of metaArms) {
