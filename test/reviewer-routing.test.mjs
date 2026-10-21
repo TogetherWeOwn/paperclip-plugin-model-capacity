@@ -79,6 +79,7 @@ function drive({ config = {}, accounts }) {
       issueOverrideModel: null, deadlineMs: 1500, ...extra,
     }),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    fire: e => handlers.get(e.type)(e),
   };
 }
 
@@ -332,4 +333,42 @@ test('select: burn mode never ranks credit-funded headroom above plan headroom',
   });
   assert.equal(r.accountId, 'meta:m3');
   assert.equal(r.burn, false);
+});
+
+test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when only held lanes serve)', async () => {
+  const started = (d, runId, provider, model) => d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+    payload: { run: { agentId: 'reviewer-1', provider, model } }, occurredAt: new Date(TICK).toISOString() });
+  // Claude 90% spent with 48h left: far ahead of plan, so its pace cap is 1.
+  const held = drive({
+    config: { ...BASE, reviewerRouting: { arms: [ARMS[0]] } },
+    accounts: [claudeLane(0.9, 48)],
+  });
+  await held.setup();
+  await held.tick();
+  const first = await held.hook('rev-a');
+  assert.equal(first.kind, 'decide');
+  assert.match(first.reason, /on claude:a1/);
+  await started(held, 'rev-a', 'claude', 'claude-opus-5-5');
+  // The first run fills the cap: the next review waits instead of keeping
+  // its pinned model on the held lane.
+  const second = await held.hook('rev-b');
+  assert.equal(second.kind, 'defer');
+  assert.match(second.reason, /pace guard: reviewer lanes held/);
+  await held.tick();
+  assert.equal((await held.api('capacity')).body.reviewer.routing.last.deferred, true);
+
+  // With a Meta lane behind plan available, the held Claude lane is skipped
+  // once it is full.
+  const mixed = drive({
+    config: { ...BASE, reviewerRouting: { arms: ARMS } },
+    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.1, 48)],
+  });
+  await mixed.setup();
+  await mixed.tick();
+  const a = await mixed.hook('rev-1');
+  assert.equal(a.kind, 'decide');
+  await started(mixed, 'rev-1', a.reason.includes('meta:') ? 'meta' : 'claude', a.model);
+  const b = await mixed.hook('rev-2');
+  assert.equal(b.kind, 'decide');
+  if (a.reason.includes('claude:a1')) assert.match(b.reason, /on meta:meta-lane-3/, 'the full Claude lane is skipped');
 });
