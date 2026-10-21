@@ -55,6 +55,19 @@ export function normalizePaceGuard(raw) {
 }
 
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
+
+/**
+ * required/measured when a lane is measurably burning faster than its plan
+ * allows (both rates finite and positive, measured above required), else 1.
+ * Never below MIN_RATE_CORRECTION, so one noisy reading cannot zero a lane.
+ */
+export const MIN_RATE_CORRECTION = 0.1;
+export function rateCorrection(v) {
+  const measured = v?.measuredRatePerHour;
+  const required = v?.requiredRatePerHour;
+  if (!finite(measured) || !finite(required) || required <= 0 || measured <= required) return 1;
+  return Math.max(MIN_RATE_CORRECTION, required / measured);
+}
 const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
 
 /**
@@ -138,12 +151,20 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     const hours = pacing.meanRunDurationHours;
     if (!positions.every(finite) || !shares.every(s => finite(s) && s >= 0) || !(finite(hours) && hours > 0)) continue;
     const laneVerdicts = members.map(v => {
-      const slots = v.targetShare * hours;
       const ahead = v.planAhead > pacing.marginPct;
-      return { accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: ahead ? slots : Math.max(1, slots), ahead, paced: false };
+      // targetShare prices a run at the estimated burn per run; when an ahead
+      // lane's MEASURED rate still exceeds its required rate (e.g. expensive
+      // review runs on a lane calibrated by cheap ones), shrink its slots by
+      // required/measured so the cap follows the real burn.
+      const factor = rateCorrection(v);
+      const slots = v.targetShare * hours * (ahead ? factor : 1);
+      return {
+        accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: ahead ? slots : Math.max(1, slots), ahead, paced: false,
+        ...(ahead && factor < 1 ? { rateCorrection: factor } : {}),
+      };
     });
     entry.planAhead = mean(positions);
-    entry.pacedSlots = shares.reduce((s, x) => s + x, 0) * hours;
+    entry.pacedSlots = laneVerdicts.reduce((s, l) => s + l.pacedSlots, 0);
     const single = members.length === 1;
     const allowance = single ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
     // The epsilon keeps an exact integer of slots from rounding up on

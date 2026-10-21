@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.59
+- Pace guard follows the measured burn: a lane's paced slots were priced only by its estimated burn per run (`targetShare = required / E`), so when the runs on it cost more than the estimate (max-effort reviews on lanes calibrated by cheaper doer runs) the cap stayed high while the lane burned several times faster than its plan. Live 2026-10-21: the two paced Meta lanes measured 2.1%/h against 0.55%/h required at cap 4. Now an ahead lane with measured > required has its slots scaled by required/measured (floor 0.1; `laneVerdicts[].rateCorrection` on /capacity). Lanes on or behind plan, unmeasured lanes and lanes within plan are unchanged.
+
 ## 0.2.58
 - Runnable kept/review demand: kept agents (`roles.keepAgentIds`) and routed review agents (`reviewerRouting.agentIds`) now count actual queued heartbeat runs via the host aggregate `agents.getQueuedRunCounts` (new manifest capability `agents.queued_counts.read`) instead of assigned open `todo`/`in_progress` cards. A Reviewer holding hundreds of idle chat-review cards with one run in flight has demand ~1, not hundreds, so stale review backlog can no longer claim the whole fleet target and strand routed agents at their running floors. Routed (non-review) agents keep issue demand. When the queued-run read is denied or unavailable, kept/review agents degrade to `queued 0` with `demandSource: 'heartbeat-runs-unavailable'` -- never falling back to assigned cards -- and grant no new slots. Every `/caps` entry reports `demandSource` (`issues` | `heartbeat-runs` | `heartbeat-runs-unavailable`) so consumers can see why an agent got its allocation. Requires the host capability; until the host ships it, kept/review demand reads running-only (still correct: no stale backlog claims capacity).
 
