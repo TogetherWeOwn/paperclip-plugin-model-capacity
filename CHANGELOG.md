@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.56
+- Kept-agent caps with burn mode: the pool pace cap (`paceGuard.pools[].cap`) now bounds only the pool's paced accounts. Burn-mode accounts are exempt from the pace guard, so their slots add on top (`burnAccountIds`). Before, a kept Reviewer serving from Meta burn lanes (~270 slots) was clamped to the 4-slot cap of the two paced lanes. Unavailable burn accounts still add nothing, so the cap bounds the pool again once burn lanes are spent.
+
 ## 0.2.55
 - Cheapest capable model (owner rule 2026-10-20, every provider and account): `pacing.climbForSpend` (default false) keeps each account on its cheapest capable rung; unused quota is spent through throughput (fleet C*), never by climbing to pricier rungs. True restores the old climb.
 
