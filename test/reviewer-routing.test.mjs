@@ -79,6 +79,7 @@ function drive({ config = {}, accounts }) {
       issueOverrideModel: null, deadlineMs: 1500, ...extra,
     }),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    fire: e => handlers.get(e.type)(e),
   };
 }
 
@@ -332,4 +333,72 @@ test('select: burn mode never ranks credit-funded headroom above plan headroom',
   });
   assert.equal(r.accountId, 'meta:m3');
   assert.equal(r.burn, false);
+});
+
+test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when only held lanes serve)', async () => {
+  const started = (d, runId, provider, model) => d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+    payload: { run: { agentId: 'reviewer-1', provider, model } }, occurredAt: new Date(TICK).toISOString() });
+  // Claude 90% spent with 48h left: far ahead of plan, so its pace cap is 1.
+  const held = drive({
+    config: { ...BASE, reviewerRouting: { arms: [ARMS[0]] } },
+    accounts: [claudeLane(0.9, 48)],
+  });
+  await held.setup();
+  await held.tick();
+  const first = await held.hook('rev-a');
+  assert.equal(first.kind, 'decide');
+  assert.match(first.reason, /on claude:a1/);
+  await started(held, 'rev-a', 'claude', 'claude-opus-5-5');
+  // The first run fills the cap: the next review waits instead of keeping
+  // its pinned model on the held lane.
+  const second = await held.hook('rev-b');
+  assert.equal(second.kind, 'defer');
+  assert.match(second.reason, /pace guard: reviewer lanes held/);
+  await held.tick();
+  assert.equal((await held.api('capacity')).body.reviewer.routing.last.deferred, true);
+
+  // Both lanes ahead of plan, Claude less ahead: the first review takes
+  // Claude, filling its pace cap of 1, and the next review skips the held
+  // Claude lane for Meta (without the pace guard it would stay on Claude).
+  const mixed = drive({
+    config: { ...BASE, reviewerRouting: { arms: ARMS } },
+    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.9, 72)],
+  });
+  await mixed.setup();
+  await mixed.tick();
+  const a = await mixed.hook('rev-1');
+  assert.equal(a.kind, 'decide');
+  assert.match(a.reason, /on claude:a1/);
+  await started(mixed, 'rev-1', 'claude', a.model);
+  const b = await mixed.hook('rev-2');
+  assert.equal(b.kind, 'decide');
+  assert.match(b.reason, /on meta:meta-lane-3/, 'the full Claude lane is skipped');
+
+  // Holds present but no arm can serve: the run keeps its pinned model
+  // instead of deferring on the pace retry scale. The unfiltered recheck
+  // pins this: without it the held lane alone would trigger a defer, yet
+  // releasing the hold could never make an unservable arm servable.
+  const unservableCfg = { ...BASE, reviewerRouting: { arms: [ARMS[0]] } };
+  const unservable = drive({
+    config: unservableCfg,
+    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.1, 24)],
+  });
+  await unservable.setup();
+  await unservable.tick();
+  const u1 = await unservable.hook('rev-u1');
+  assert.equal(u1.kind, 'decide');
+  assert.match(u1.reason, /on claude:a1/);
+  await started(unservable, 'rev-u1', 'claude', u1.model);
+  // Swap to a Meta-only arm for a model no lane serves; the Claude hold
+  // is still present (rev-u1 fills its cap of 1). The next tick rebuilds
+  // the live view from this same config object, keeping the ledger.
+  unservableCfg.reviewerRouting = { arms: [{ provider: 'meta', model: 'muse-not-served', effort: 'max' }] };
+  await unservable.tick();
+  const u2 = await unservable.hook('rev-u2');
+  assert.equal(u2.kind, 'keep');
+  await unservable.tick();
+  const ulast = (await unservable.api('capacity')).body.reviewer.routing.last;
+  assert.equal(ulast.routed, false);
+  assert.equal(ulast.fallback, 'keep');
+  assert.equal(ulast.deferred ?? false, false);
 });
