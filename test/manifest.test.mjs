@@ -8,16 +8,19 @@ import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.57');
-  assert.equal(PLUGIN_VERSION, '0.2.57');
+  assert.equal(manifest.version, '0.2.58');
+  assert.equal(PLUGIN_VERSION, '0.2.58');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
   assert.equal(manifest.database, undefined);
+  assert.ok(manifest.capabilities.includes('agents.queued_counts.read'),
+    'queued-run demand reads the host-aggregated seam');
   for (const cap of manifest.capabilities) {
     assert.ok(!cap.startsWith('database.'), `db capability ${cap}`);
   }
   assert.deepEqual(buildManifest({ modelResolve: false }).database, undefined);
+  assert.ok(buildManifest({ modelResolve: false }).capabilities.includes('agents.queued_counts.read'));
 });
 
 test('lane endpoint pinned to the allowlist in schema', () => {

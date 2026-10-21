@@ -546,18 +546,25 @@ deleted). The clamp backstop is retired (`clampedInFlightDropped` always
 0): single-counting is structural now.
 
 `GET /caps` splits the concurrency target across agents in proportion to
-CURRENT demand (ledger `running` + assigned `todo`/`in_progress` issues),
-never historical share. Below target every agent covers its full demand
-(idle agents keep `running + 1` headroom) while the want-sum fits the
-fleet ceiling; a wider spike shares the ceiling out by demand instead,
-so one more queued item never halves the fleet and the fleet sum stays
-within `maxTotal` (75). Every shed is running-first: each agent keeps its
-running count, then only the remaining new slots split by demand share --
-at/above target the fleet starts nothing new. No cap lands below
-`running`; only pre-existing running can hold a total over target.
-Each entry reports `demand`, `running`, `allocated`, and `reason`
-(`full-demand` | `headroom` | `proportional` | `floor-running` |
-`capped-ceiling` | `reserved-floor`). Entries with a configured floor also
+CURRENT demand (ledger `running` + queued work), never historical share.
+Queued work is runnable work: kept agents (`roles.keepAgentIds`) and routed
+review agents (`reviewerRouting.agentIds`) count actual queued heartbeat
+runs (host aggregate `agents.getQueuedRunCounts`), because assigned open
+cards overstate review demand by hundreds of idle chat-review cards; every
+other agent counts assigned `todo`/`in_progress` issues. Below target
+every agent covers its full demand (idle agents keep `running + 1`
+headroom) while the want-sum fits the fleet ceiling; a wider spike shares
+the ceiling out by demand instead, so one more queued item never halves
+the fleet and the fleet sum stays within `maxTotal` (75). Every shed is
+running-first: each agent keeps its running count, then only the remaining
+new slots split by demand share -- at/above target the fleet starts nothing
+new. No cap lands below `running`; only pre-existing running can hold a
+total over target. Each entry reports `demand`, `running`, `allocated`,
+`reason` (`full-demand` | `headroom` | `proportional` | `floor-running` |
+`capped-ceiling` | `reserved-floor`), and `demandSource` (`issues` |
+`heartbeat-runs` | `heartbeat-runs-unavailable`, the last when the
+queued-run read is denied or unavailable: the agent keeps `running` with
+`queued 0` and grants no new slots). Entries with a configured floor also
 report `floor` (and `floorBlocked: true` while suspended); the body carries
 `reservedFloors` (per-agent floor, applied, blocked) and `floorsSuspended`
 for audit. Weak calibration (no target) returns `agents: []`.

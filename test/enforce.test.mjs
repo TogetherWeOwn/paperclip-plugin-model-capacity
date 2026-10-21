@@ -269,6 +269,7 @@ test('caps: measured target spreads over queued agents weighted by count', async
   assert.deepEqual(byId.get('agent-a'), {
     agentId: 'agent-a', demand: 3, running: 0, queued: 3,
     allocated: 3, maxConcurrentRuns: 3, reason: 'full-demand',
+    demandSource: 'issues',
   });
   assert.equal(byId.get('agent-b').allocated, 2);
   assert.equal(byId.get('agent-b').reason, 'full-demand');
@@ -277,6 +278,7 @@ test('caps: measured target spreads over queued agents weighted by count', async
   assert.deepEqual(byId.get('agent-9'), {
     agentId: 'agent-9', demand: 2, running: 2, queued: 0,
     allocated: 3, maxConcurrentRuns: 3, reason: 'headroom',
+    demandSource: 'issues',
   });
 });
 

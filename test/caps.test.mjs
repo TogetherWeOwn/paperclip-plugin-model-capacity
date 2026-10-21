@@ -198,7 +198,22 @@ const runEvent = (runId, atMs, agentId, type = 'agent.run.started', runFields = 
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows() }) {
+// Host-aggregated queued-run seam: agents.getQueuedRunCounts({ companyId })
+// -> [{ agentId, queued }]. Derive the same counts from the raw fixture rows,
+// applying the predicate the host applies in prod (queued status +
+// same-company rows only) so the fixture stays honest. No real database.
+function queuedCounts(runs, companyId) {
+  const counts = new Map();
+  for (const run of runs) {
+    if (run.company_id !== companyId) continue;
+    if (run.status !== 'queued') continue;
+    if (typeof run.agent_id !== 'string' || run.agent_id.length === 0) continue;
+    counts.set(run.agent_id, (counts.get(run.agent_id) ?? 0) + 1);
+  }
+  return [...counts].map(([agentId, queued]) => ({ agentId, queued }));
+}
+
+function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows(), heartbeatRuns = null }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -215,7 +230,12 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
-    agents: { get: async id => agentGets[id] ?? null },
+    agents: {
+      get: async id => agentGets[id] ?? null,
+      ...(heartbeatRuns == null ? {} : {
+        getQueuedRunCounts: async ({ companyId } = {}) => queuedCounts(heartbeatRuns, companyId),
+      }),
+    },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -282,7 +302,7 @@ test('/caps exposes demand, running, allocated, reason with ledger running count
   }
 });
 
-test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async () => {
+test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Codex fleet', async t => {
   const meta = {
     lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
     weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
@@ -305,6 +325,10 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
     },
     accounts: [meta, codex],
     issueLists: { todo: queued, in_progress: [] },
+    heartbeatRuns: queued.map(issue => ({
+      id: `heartbeat-${issue.id}`, company_id: 'acme', agent_id: 'reviewer',
+      status: 'queued', invocation_source: 'on_demand',
+    })),
     agentGets: { reviewer: { adapterConfig: { model: REVIEWER_MODEL } } },
     snapshotRows: aaRows([
       { slug: REVIEWER_MODEL, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
@@ -424,7 +448,7 @@ test('/capacity opens every known arm on a kept-run balance failure; ambiguous t
   assert.deepEqual(codexOpen, [], 'ambiguous balance wording trips no codex arm');
 });
 
-test('/caps excludes only the fully breaker-open account from kept pool slots', async () => {
+test('/caps excludes only the fully breaker-open account from kept pool slots', async t => {
   const meta = {
     lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy', models: [REVIEWER_MODEL],
     weekly: { used: 0.9, resetsAt: new Date(TICK + 48 * HOUR).toISOString() },
@@ -450,6 +474,10 @@ test('/caps excludes only the fully breaker-open account from kept pool slots', 
     },
     accounts: [meta, codex],
     issueLists: { todo: queued, in_progress: [] },
+    heartbeatRuns: queued.map(issue => ({
+      id: `heartbeat-${issue.id}`, company_id: 'acme', agent_id: issue.assigneeAgentId,
+      status: 'queued', invocation_source: 'on_demand',
+    })),
     agentGets: {
       keeperA: { adapterConfig: { model: REVIEWER_MODEL } },
       keeperB: { adapterConfig: { model: CODEX_MODEL } },

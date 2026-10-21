@@ -975,6 +975,51 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return counts;
   }
 
+  // Runnable queued demand for kept/review agents: ACTUAL queued heartbeat
+  // runs from the host aggregate `agents.getQueuedRunCounts` (capability
+  // `agents.queued_counts.read`), grouped host-side by agent and scoped to
+  // this company. Assigned open cards are not runnable work for a review
+  // agent -- a Reviewer holding hundreds of idle chat-review cards with one
+  // run in flight has demand ~1, not hundreds; counting cards let stale
+  // backlog claim the whole fleet target and strand every routed agent at
+  // its running floor. Routed (non-review) agents keep issue demand: their
+  // queues ARE assigned cards. Behind the same short memo as the issue
+  // snapshot. A denied, missing, failed or malformed read degrades to
+  // unknown (ok: false); callers grant no new kept slots and say so via
+  // demandSource, never falling back to assigned cards. A malformed
+  // response is never cached: only a valid array census (including an
+  // empty one, a genuine zero-demand result) is memoized.
+  const queuedHeartbeatCache = new Map(); // companyId -> { atMs, counts: Map(agentId -> n) }
+  async function queuedHeartbeatsByAgent(companyId, nowMs) {
+    const hit = queuedHeartbeatCache.get(companyId);
+    if (hit && nowMs - hit.atMs >= 0 && nowMs - hit.atMs < QUEUED_TTL_MS) {
+      return { ok: true, counts: hit.counts };
+    }
+    const read = ctx.agents?.getQueuedRunCounts;
+    if (typeof read !== 'function') return { ok: false, counts: new Map() };
+    let rows;
+    try {
+      rows = await ctx.agents.getQueuedRunCounts({ companyId });
+    } catch (error) {
+      ctx.logger.error('model-capacity: queued-run read failed', { companyId, error: error?.message ?? String(error) });
+      return { ok: false, counts: new Map() };
+    }
+    if (!Array.isArray(rows)) {
+      ctx.logger.error('model-capacity: queued-run read returned a non-array', { companyId });
+      return { ok: false, counts: new Map() };
+    }
+    const counts = new Map();
+    for (const row of rows) {
+      const agentId = row?.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0) continue;
+      const queued = Number(row?.queued);
+      if (!Number.isFinite(queued) || queued <= 0) continue;
+      counts.set(agentId, (counts.get(agentId) ?? 0) + Math.floor(queued));
+    }
+    queuedHeartbeatCache.set(companyId, { atMs: nowMs, counts });
+    return { ok: true, counts };
+  }
+
   // Queued demand per role, for the target's demand bound. With no queued
   // work (or issues unreadable) every role reads zero and the bound is not
   // applied: the target then counts any capacity some role can use, instead
@@ -4557,14 +4602,30 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // cap lands below an agent's running count -- throttling existing
         // runs while the fleet idles is the failure this replaces.
         const runningByAgent = cap.agentRunning ?? {};
-        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
+        // Kept agents and routed review agents (reviewerRouting.agentIds)
+        // draw queued demand from actual queued heartbeat runs, never from
+        // assigned open cards. Every other agent keeps issue demand.
+        const reviewIds = new Set(lastConfig.get(companyId)?.reviewerRouting?.agentIds ?? []);
+        const heartbeatIds = new Set([...keptIds, ...reviewIds]);
+        const heartbeat = await queuedHeartbeatsByAgent(companyId, clock());
+        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
+        if (heartbeat.ok) {
+          for (const agentId of heartbeat.counts.keys()) {
+            if (heartbeatIds.has(agentId)) agentIds.add(agentId);
+          }
+        }
         const capInputs = [...agentIds].map(agentId => ({
           agentId,
           running: runningByAgent[agentId]?.running ?? 0,
-          queued: counts.get(agentId) ?? 0,
+          queued: heartbeatIds.has(agentId)
+            ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
+            : (counts.get(agentId) ?? 0),
           overPace: runningByAgent[agentId]?.overPace === true,
         }));
+        const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
+          heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
+        ]));
         // Fixed-model agents consume the same fleet target, but only from the
         // capacity of their serving pool. Routed demand receives the remainder.
         const allocated = allocateKeptAndRoutedCaps({
@@ -4631,6 +4692,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = floored.entries;
           floorSummary = floored.floors;
         }
+        for (const agent of agents) agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
         return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
       }
       return { status: 404, body: { error: 'unknown-route' } };

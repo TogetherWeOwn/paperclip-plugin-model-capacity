@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.58
+- Runnable kept/review demand: kept agents (`roles.keepAgentIds`) and routed review agents (`reviewerRouting.agentIds`) now count actual queued heartbeat runs via the host aggregate `agents.getQueuedRunCounts` (new manifest capability `agents.queued_counts.read`) instead of assigned open `todo`/`in_progress` cards. A Reviewer holding hundreds of idle chat-review cards with one run in flight has demand ~1, not hundreds, so stale review backlog can no longer claim the whole fleet target and strand routed agents at their running floors. Routed (non-review) agents keep issue demand. When the queued-run read is denied or unavailable, kept/review agents degrade to `queued 0` with `demandSource: 'heartbeat-runs-unavailable'` -- never falling back to assigned cards -- and grant no new slots. Every `/caps` entry reports `demandSource` (`issues` | `heartbeat-runs` | `heartbeat-runs-unavailable`) so consumers can see why an agent got its allocation. Requires the host capability; until the host ships it, kept/review demand reads running-only (still correct: no stale backlog claims capacity).
+
 ## 0.2.57
 - Burn accounts spend to exhaustion: the lane feed marks an account `degraded` once any meter passes 90% (`healthReason: 'peak utilization ...'`), and only healthy accounts allocate, so burn lanes stopped at 90% and left the rest of their week unspent. A burn account degraded ONLY by that floor now reads healthy (with `feedHealth: 'degraded'` on `/capacity`) until its weekly meter reaches 0.995 or its five-hour bucket reaches 0.99. Degraded for any other reason (recent failures, cooldowns), exhausted, unavailable and non-burn accounts are unchanged. The lane parser keeps the optional feed `healthReason`.
 
