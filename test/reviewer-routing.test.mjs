@@ -373,4 +373,32 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   const b = await mixed.hook('rev-2');
   assert.equal(b.kind, 'decide');
   assert.match(b.reason, /on meta:meta-lane-3/, 'the full Claude lane is skipped');
+
+  // Holds present but no arm can serve: the run keeps its pinned model
+  // instead of deferring on the pace retry scale. The unfiltered recheck
+  // pins this: without it the held lane alone would trigger a defer, yet
+  // releasing the hold could never make an unservable arm servable.
+  const unservableCfg = { ...BASE, reviewerRouting: { arms: [ARMS[0]] } };
+  const unservable = drive({
+    config: unservableCfg,
+    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.1, 24)],
+  });
+  await unservable.setup();
+  await unservable.tick();
+  const u1 = await unservable.hook('rev-u1');
+  assert.equal(u1.kind, 'decide');
+  assert.match(u1.reason, /on claude:a1/);
+  await started(unservable, 'rev-u1', 'claude', u1.model);
+  // Swap to a Meta-only arm for a model no lane serves; the Claude hold
+  // is still present (rev-u1 fills its cap of 1). The next tick rebuilds
+  // the live view from this same config object, keeping the ledger.
+  unservableCfg.reviewerRouting = { arms: [{ provider: 'meta', model: 'muse-not-served', effort: 'max' }] };
+  await unservable.tick();
+  const u2 = await unservable.hook('rev-u2');
+  assert.equal(u2.kind, 'keep');
+  await unservable.tick();
+  const ulast = (await unservable.api('capacity')).body.reviewer.routing.last;
+  assert.equal(ulast.routed, false);
+  assert.equal(ulast.fallback, 'keep');
+  assert.equal(ulast.deferred ?? false, false);
 });
