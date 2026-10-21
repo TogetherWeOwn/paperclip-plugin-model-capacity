@@ -98,6 +98,11 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.58 = runnable kept/review demand: kept agents and reviewerRouting agents
+ *   count actual queued heartbeat runs (new capability
+ *   agents.queued_counts.read) instead of assigned open cards, so stale
+ *   review backlog cannot claim the fleet target; /caps reports demandSource
+ *   per agent (issues | heartbeat-runs | heartbeat-runs-unavailable).
  * v0.2.57 = burn accounts that the lane feed degraded only by its utilization floor (healthReason 'peak utilization')
  *   stay allocatable until weekly >= 0.995 or the five-hour bucket is full; other degraded causes stay excluded.
  * v0.2.56 = kept-agent caps: a pool pace cap bounds only its paced accounts; burn-mode accounts (exempt from
@@ -300,7 +305,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.57';
+export const PLUGIN_VERSION = '0.2.58';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -716,12 +721,14 @@ export function buildManifest({ modelResolve = false } = {}) {
     'secrets.read-ref',
     'events.subscribe',
     'agents.read',
+    'agents.queued_counts.read',
     'issues.read',
     'api.routes.register',
     // No database capabilities: run facts come from SDK surfaces only
-    // (agent.run.* events, issues.get, agents.get). The host executes
-    // plugin SQL unchanged, so a core-table grant's tenant filter would be
-    // plugin-enforced only -- refused scope, removed in v0.2.1.
+    // (agent.run.* events, issues.get, agents.get, the host-aggregated
+    // agents.getQueuedRunCounts). The host executes plugin SQL unchanged,
+    // so a core-table grant's tenant filter would be plugin-enforced
+    // only -- refused scope, removed in v0.2.1.
   ];
   const out = {
     id: PLUGIN_ID,
