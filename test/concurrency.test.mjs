@@ -184,6 +184,51 @@ test('kept-agent demand factor scales its pool capacity', () => {
   assert.equal(out.kept[0].maxConcurrentRuns, 6);
 });
 
+test('burn-mode accounts are not clamped by the pool pace cap', () => {
+  // Live shape 2026-10-21: two paced Meta lanes (~1.5 slots each, cap 4) and
+  // burn lanes with ~50-80 slots each. The cap bounds only the paced lanes.
+  const out = allocateKeptAndRoutedCaps({
+    target: 75,
+    maxTotal: 75,
+    agents: [
+      { agentId: 'reviewer', running: 30, queued: 230 },
+      { agentId: 'doer', running: 10, queued: 10 },
+    ],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:3' } },
+    accounts: [
+      { accountId: 'meta:3', pool: 'meta' }, { accountId: 'meta:6', pool: 'meta' },
+      { accountId: 'meta:4', pool: 'meta' }, { accountId: 'meta:7', pool: 'meta' },
+    ],
+    perAccount: [
+      { accountId: 'meta:3', slots: 40.5 }, { accountId: 'meta:6', slots: 20.2 },
+      { accountId: 'meta:4', slots: 1.6 }, { accountId: 'meta:7', slots: 1.5 },
+    ],
+    pacePools: [{ pool: 'meta', cap: 4, burnAccountIds: ['meta:3', 'meta:6'] }],
+  });
+
+  // floor(min(3.1, 4) + 60.7) = 63; the fleet target leaves the rest for routed work.
+  assert.equal(out.kept[0].maxConcurrentRuns, 63);
+  assert.equal(out.keptCeilings.get('reviewer'), 63);
+  assert.equal(out.routed[0].maxConcurrentRuns, 12);
+});
+
+test('paced cap still bounds a pool once its burn lanes are unavailable', () => {
+  const out = allocateKeptAndRoutedCaps({
+    target: 75,
+    maxTotal: 75,
+    agents: [{ agentId: 'reviewer', running: 0, queued: 230 }],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:4' } },
+    accounts: [{ accountId: 'meta:3', pool: 'meta' }, { accountId: 'meta:4', pool: 'meta' }],
+    perAccount: [{ accountId: 'meta:3', slots: 40 }, { accountId: 'meta:4', slots: 12 }],
+    pacePools: [{ pool: 'meta', cap: 4, burnAccountIds: ['meta:3'] }],
+    unavailableAccountIds: ['meta:3'],
+  });
+
+  assert.equal(out.kept[0].maxConcurrentRuns, 4);
+});
+
 test('fleet mean run duration is the measured 0.186h', () => {
   assert.equal(DEFAULT_CONCURRENCY.meanRunDurationHours, 0.186);
 });

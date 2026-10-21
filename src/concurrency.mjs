@@ -377,12 +377,18 @@ export function allocateKeptAndRoutedCaps({
   const keptIds = new Set(keepAgentIds);
   const unavailableAccounts = new Set(unavailableAccountIds);
   const accountPool = new Map(accounts.map(account => [account.accountId, account.pool]));
+  // Burn-mode accounts are exempt from the pace guard, so the pool's paced cap
+  // bounds only the paced accounts' slots; burn slots add on top of it.
+  const burnAccounts = new Set(pacePools.flatMap(pool => pool?.burnAccountIds ?? []));
   const poolSlots = new Map();
   for (const account of perAccount) {
     const pool = accountPool.get(account.accountId);
     if (unavailableAccounts.has(account.accountId)) continue;
     if (typeof pool !== 'string' || !Number.isFinite(account.slots)) continue;
-    poolSlots.set(pool, (poolSlots.get(pool) ?? 0) + account.slots);
+    const slots = poolSlots.get(pool) ?? { paced: 0, burn: 0 };
+    if (burnAccounts.has(account.accountId)) slots.burn += account.slots;
+    else slots.paced += account.slots;
+    poolSlots.set(pool, slots);
   }
   const pacedPools = new Map(pacePools.map(pool => [pool.pool, pool]));
   const groups = new Map();
@@ -401,10 +407,11 @@ export function allocateKeptAndRoutedCaps({
   const groupById = new Map();
   for (const [pool, members] of groups) {
     const paced = pacedPools.get(pool);
-    const rawCapacity = pool === '' ? 0 : (poolSlots.get(pool) ?? 0) * demandFactor;
-    const boundedCapacity = Math.max(0, Math.floor(Number.isFinite(paced?.cap)
-      ? Math.min(rawCapacity, paced.cap)
-      : rawCapacity));
+    const slots = pool === '' ? { paced: 0, burn: 0 } : (poolSlots.get(pool) ?? { paced: 0, burn: 0 });
+    const pacedCapacity = slots.paced * demandFactor;
+    const boundedCapacity = Math.max(0, Math.floor((Number.isFinite(paced?.cap)
+      ? Math.min(pacedCapacity, paced.cap)
+      : pacedCapacity) + slots.burn * demandFactor));
     const running = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.running ?? 0)), 0);
     const queued = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.queued ?? 0)), 0);
     const groupId = `pool:${JSON.stringify(pool)}`;

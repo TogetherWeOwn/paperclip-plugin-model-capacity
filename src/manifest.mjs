@@ -98,6 +98,8 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.56 = kept-agent caps: a pool pace cap bounds only its paced accounts; burn-mode accounts (exempt from
+ *   the pace guard) add their slots on top, so a kept Reviewer on burn lanes is not clamped to the paced lanes.
  * v0.2.55 = cheapest capable model: pacing never climbs to pricier rungs for spend (pacing.climbForSpend, default
  *   false); unused quota goes to throughput.
  * v0.2.54 = burn-mode accounts count their burn end in the fleet C* need.
@@ -296,7 +298,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.55';
+export const PLUGIN_VERSION = '0.2.56';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
