@@ -59,7 +59,7 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
-import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs } from './burnmode.mjs';
+import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs, burnEligibleAccounts } from './burnmode.mjs';
 import {
   normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
@@ -1560,7 +1560,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       3 * (Number.isFinite(meanHours) && meanHours > 0 ? meanHours : 0.186) * 3600 * 1000,
       2 * 3600 * 1000,
     );
-    const snapshot = await readAccounts(companyId, config, nowMs);
+    const rawSnapshot = await readAccounts(companyId, config, nowMs);
+    // Burn accounts degraded only by the feed's utilization floor stay
+    // allocatable until spent (see burnEligibleAccounts). A copy, never a
+    // mutation: the lane cache keeps the feed's own verdict.
+    const snapshot = Array.isArray(rawSnapshot?.accounts)
+      ? { ...rawSnapshot, accounts: burnEligibleAccounts(config.burnMode, rawSnapshot.accounts, uniqueAccountKeys(rawSnapshot.accounts)) }
+      : rawSnapshot;
     if (snapshot.source === 'cliproxy-lane' && snapshot.servedModels == null) {
       if (!missingServedModelsWarned.has(companyId)) {
         missingServedModelsWarned.add(companyId);
@@ -1996,6 +2002,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Burn mode rides only burn accounts, so views without it stay
         // byte-identical to the pre-burn shape.
         ...(burnOn ? { burnMode: true, paceResetAtMs } : {}),
+        ...(account.feedHealth ? { feedHealth: account.feedHealth } : {}),
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,

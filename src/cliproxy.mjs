@@ -214,6 +214,9 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     provider: entry?.provider ?? null,
     pool: entry?.pool ?? null,
     health: entry?.health ?? 'unknown',
+    // Why the feed lowered health, when it says (e.g. 'peak utilization
+    // 0.9012' from the utilization floor). Absent stays absent.
+    ...(typeof entry?.healthReason === 'string' && entry.healthReason ? { healthReason: entry.healthReason } : {}),
     quality: entry?.quality ?? 'unknown',
     // Vendor-meter kind: 'reactive' = the vendor publishes no meter (the
     // account is usable but unpaced); anything else with usage numbers is
