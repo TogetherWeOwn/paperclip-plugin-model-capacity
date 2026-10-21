@@ -7,7 +7,6 @@ import {
   noteKnownArms, recordArmFailure, sanitizeBreakers,
 } from '../src/breakers.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
-import { heartbeatQuery } from './heartbeat-query.mjs';
 
 const REASONS = new Set(['full-demand', 'headroom', 'proportional', 'floor-running', 'capped-ceiling']);
 
@@ -199,8 +198,22 @@ const runEvent = (runId, atMs, agentId, type = 'agent.run.started', runFields = 
   occurredAt: new Date(atMs).toISOString(),
 });
 
+// Host-aggregated queued-run seam: agents.getQueuedRunCounts({ companyId })
+// -> [{ agentId, queued }]. Derive the same counts from the raw fixture rows,
+// applying the predicate the host applies in prod (queued status +
+// same-company rows only) so the fixture stays honest. No real database.
+function queuedCounts(runs, companyId) {
+  const counts = new Map();
+  for (const run of runs) {
+    if (run.company_id !== companyId) continue;
+    if (run.status !== 'queued') continue;
+    if (typeof run.agent_id !== 'string' || run.agent_id.length === 0) continue;
+    counts.set(run.agent_id, (counts.get(run.agent_id) ?? 0) + 1);
+  }
+  return [...counts].map(([agentId, queued]) => ({ agentId, queued }));
+}
+
 function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts = null, agentGets = {}, snapshotRows = aaRows(), heartbeatRuns = null }) {
-  const heartbeatDb = heartbeatRuns == null ? null : heartbeatQuery(heartbeatRuns);
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -210,7 +223,6 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     ? { observedAt: new Date(now).toISOString(), accounts }
     : laneBody(laneUsed, new Date(now).toISOString());
   const io = {
-    ...(heartbeatDb ? { db: { query: heartbeatDb.query } } : {}),
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
@@ -218,7 +230,12 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now) }) },
-    agents: { get: async id => agentGets[id] ?? null },
+    agents: {
+      get: async id => agentGets[id] ?? null,
+      ...(heartbeatRuns == null ? {} : {
+        getQueuedRunCounts: async ({ companyId } = {}) => queuedCounts(heartbeatRuns, companyId),
+      }),
+    },
     issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -226,7 +243,6 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
   };
   let plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
-    close: () => heartbeatDb?.close(),
     setNow: ms => { now = ms; },
     setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
     setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
@@ -321,7 +337,6 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
   });
   await d.setup();
   await d.tick();
-  t.after(d.close);
   // Build the two-point caps calibration while keeping an unpaced Codex fleet available.
   d.setNow(TICK + 10 * 60 * 1000);
   for (let i = 1; i <= 6; i++) {
@@ -482,7 +497,6 @@ test('/caps excludes only the fully breaker-open account from kept pool slots', 
   assert.ok(metaArms.length >= 1 && codexArms.length >= 1,
     `both ladders have servable arms: meta=${JSON.stringify(metaArms)} codex=${JSON.stringify(codexArms)}`);
 
-  t.after(d.close);
   // Seed breaker-v1: meta fully open (fresh), codex half-open (cool-off elapsed).
   const seed = createBreakerStore();
   for (const armId of metaArms) {

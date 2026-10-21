@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { heartbeatQuery } from './heartbeat-query.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { allocateDemandCaps } from '../src/concurrency.mjs';
 
@@ -34,17 +33,29 @@ function capacity({ running = { reviewer: 1, large: 2, small: 1 }, keepAgentIds 
   };
 }
 
-// The SDK contract is db.query(sql, params) -> raw rows, not a fabricated
-// heartbeat-list API. Execute SELECTs against actual rows so status, company,
-// grouping and aliases affect results. No real database or runtime grant is used.
+// The SDK contract is agents.getQueuedRunCounts({ companyId }) ->
+// [{ agentId, queued }], aggregated host-side. Derive the same per-agent
+// queued counts from the raw run rows, applying the predicate the host
+// applies in prod (queued status + same-company rows only) so the fixture
+// stays honest. No real database or runtime grant is used.
+function queuedCounts(runs, companyId) {
+  const counts = new Map();
+  for (const run of runs) {
+    if (run.company_id !== companyId) continue;
+    if (run.status !== 'queued') continue;
+    if (typeof run.agent_id !== 'string' || run.agent_id.length === 0) continue;
+    counts.set(run.agent_id, (counts.get(run.agent_id) ?? 0) + 1);
+  }
+  return [...counts].map(([agentId, queued]) => ({ agentId, queued }));
+}
+
 async function drive(t, {
   openIssues = [...issues(REVIEWER, 283), ...issues('large', 100), ...issues('small', 40)],
   runs = [], cap = capacity(), config = {}, failHeartbeatQuery = false, missingHeartbeatQuery = false,
 } = {}) {
-  const db = heartbeatQuery(runs);
-  t.after(() => db.close());
+  void t;
   const store = new Map([[JSON.stringify(CAPACITY_KEY), cap]]);
-  const queries = [];
+  const queuedCalls = [];
   const io = {
     state: {
       get: async key => store.get(JSON.stringify(key)) ?? null,
@@ -52,20 +63,18 @@ async function drive(t, {
     },
     issues: { list: async ({ status }) => openIssues.filter(issue => issue.status === status) },
     jobs: { register() {} }, events: { on() {} }, logger: { info() {}, error() {} },
-    db: { query: async (sql, params = []) => {
-      queries.push({ sql, params });
-      if (failHeartbeatQuery) throw new Error('private-database-host must not leak');
-      assert.match(sql.trim(), /^SELECT\b/i, 'demand collection is read-only');
-      assert.match(sql, /\bheartbeat_runs\b/i, 'read actual heartbeat runs, not wakeup requests');
-      return db.query(sql, params);
+    agents: { getQueuedRunCounts: async ({ companyId } = {}) => {
+      queuedCalls.push({ companyId });
+      if (failHeartbeatQuery) throw new Error('queued-counts-host must not leak');
+      return queuedCounts(runs, companyId);
     } },
   };
-  if (missingHeartbeatQuery) delete io.db;
+  if (missingHeartbeatQuery) delete io.agents;
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
   await plugin.setup(io);
   await plugin.onConfigChanged({ roles: { keepAgentIds: cap.keepAgentIds }, ...config }, { companyId: COMPANY });
   return {
-    queries,
+    queuedCalls,
     caps: async () => {
       const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
       assert.equal(response.status, 200);
@@ -94,19 +103,6 @@ function assertRoutedShare(body, keptCap) {
   assert.ok(actual.get('large').allocated > actual.get('small').allocated, 'unequal backlog gets unequal shares');
   assert.equal(body.agents.reduce((sum, row) => sum + row.allocated, 0), 53, 'no stale backlog consumes or invents fleet slots');
 }
-
-test('offline SQL fixture supports bound, company-scoped queued-run aggregation', async t => {
-  const db = heartbeatQuery([
-    heartbeat('yes-a'), heartbeat('yes-b'),
-    heartbeat('no-status', { status: 'scheduled_retry' }),
-    heartbeat('no-company', { company_id: 'other-company' }),
-  ]);
-  t.after(db.close);
-  assert.deepEqual(await db.query(`SELECT agent_id AS "agentId", COUNT(*)::int AS queued
-    FROM public.heartbeat_runs WHERE company_id = $1 AND status = 'queued' GROUP BY agent_id`, [COMPANY]),
-  [{ agentId: REVIEWER, queued: 2 }]);
-  await assert.rejects(db.query('DELETE FROM public.heartbeat_runs'), /must-be-read-only/);
-});
 
 test('target 53 routes its real remainder proportionally when kept demand is small', async t => {
   const d = await drive(t, { openIssues: [...issues('large', 100), ...issues('small', 40)] });
@@ -175,7 +171,8 @@ test('queued eligibility is company-scoped and excludes retries and terminal sta
   assert.equal(rows.get(REVIEWER).queued, 4, 'all and only actual queued heartbeat runs in this company count');
   assert.equal(rows.get(REVIEWER).demand, 5);
   assert.equal(rows.get('large').queued, 100, 'routed queued runs do not replace or inflate issue demand');
-  assert.ok(d.queries.length > 0, 'supported SDK read seam was used');
+  assert.ok(d.queuedCalls.length > 0, 'supported SDK read seam was used');
+  assert.ok(d.queuedCalls.every(call => call.companyId === COMPANY), 'queued census is company-scoped at the seam');
 });
 
 test('/caps carries per-agent machine-readable demandSource after allocation and smoothing', async t => {
@@ -204,7 +201,7 @@ for (const failure of ['query-denied', 'sdk-unavailable']) {
     assert.equal(reviewer.allocated, reviewer.running, 'unknown queued runs grant no new kept slots');
     assert.equal(reviewer.demandSource, 'heartbeat-runs-unavailable');
     assert.equal(rows.get('large').demandSource, 'issues');
-    assert.ok(!JSON.stringify(body).includes('private-database-host'), 'diagnostics never leak upstream query errors');
+    assert.ok(!JSON.stringify(body).includes('queued-counts-host'), 'diagnostics never leak upstream query errors');
     assertRoutedShare(body, 1);
   });
 }

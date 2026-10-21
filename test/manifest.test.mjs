@@ -14,10 +14,13 @@ test('plugin identity and version', () => {
 
 test('no database grant: no database block, no db capabilities', () => {
   assert.equal(manifest.database, undefined);
+  assert.ok(manifest.capabilities.includes('agents.queued_counts.read'),
+    'queued-run demand reads the host-aggregated seam');
   for (const cap of manifest.capabilities) {
     assert.ok(!cap.startsWith('database.'), `db capability ${cap}`);
   }
   assert.deepEqual(buildManifest({ modelResolve: false }).database, undefined);
+  assert.ok(buildManifest({ modelResolve: false }).capabilities.includes('agents.queued_counts.read'));
 });
 
 test('lane endpoint pinned to the allowlist in schema', () => {
