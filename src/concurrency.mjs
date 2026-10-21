@@ -440,7 +440,13 @@ export function allocateKeptAndRoutedCaps({
     // target. Zero-share groups keep a zero ceiling (running is still
     // preserved by the floor-running backstop, never granted new slots).
     const share = Math.min(group.ceiling, groupCap.allocated);
-    const entries = allocateDemandCaps(groupCap.allocated, group.members, share);
+    // Do not reserve idle headroom beyond a kept member's declared demand.
+    // The ordinary allocator may split spare slots past a member's want;
+    // leave those slots available to routed work instead.
+    const entries = allocateDemandCaps(groupCap.allocated, group.members, share).map(entry => {
+      if (entry.allocated <= entry.demand) return entry;
+      return { ...entry, allocated: entry.demand, maxConcurrentRuns: entry.demand, reason: 'full-demand' };
+    });
     kept.push(...entries);
     // Per-agent ceilings: each member owns its allocation plus an EQUAL
     // share of the pool's unallocated headroom. Granting every member the
