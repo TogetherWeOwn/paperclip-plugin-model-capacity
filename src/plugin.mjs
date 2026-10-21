@@ -59,7 +59,7 @@ import {
 } from './pacing.mjs';
 import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
-import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs, burnEligibleAccounts } from './burnmode.mjs';
+import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts } from './burnmode.mjs';
 import {
   normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
@@ -1738,11 +1738,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         cfg: config.burnHorizon,
       });
       // Burn mode (see burnmode.mjs): an operator-flagged account paces to
-      // min(regular reset, burn horizon, now + horizonMinutes), so its
-      // required rate is maximal and it never reads ahead of plan.
+      // min(regular reset, burn horizon, now + horizonMinutes, deadline),
+      // so its required rate is maximal and it never reads ahead of plan.
       const burnOn = isBurnAccount(config.burnMode, account, key);
+      const burnDeadlineMs = burnOn
+        ? burnDeadlineAtMs(config.burnMode, account, key, nowMs)
+        : null;
+      const burnTarget = burnOn
+        ? burnPaceTarget({ nowMs, resetAtMs, horizonMs: burn?.horizonMs ?? null, deadlineAtMs: burnDeadlineMs, cfg: config.burnMode })
+        : null;
       const paceResetAtMs = burnOn
-        ? burnPaceResetAtMs({ nowMs, resetAtMs, horizonMs: burn?.horizonMs ?? null, cfg: config.burnMode })
+        ? burnTarget.atMs
         : (burn?.horizonMs ?? resetAtMs);
       const hoursToPaceReset = paceResetAtMs != null
         ? Math.max((paceResetAtMs - nowMs) / 3600000, 0.25)
@@ -2000,8 +2006,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         burnHorizonMs: burn?.horizonMs ?? null,
         burnHorizonSource: burn ? 'free-reset' : null,
         // Burn mode rides only burn accounts, so views without it stay
-        // byte-identical to the pre-burn shape.
-        ...(burnOn ? { burnMode: true, paceResetAtMs } : {}),
+        // byte-identical to the pre-burn shape. paceTargetAt is the
+        // effective pace end (what paceResetAtMs holds) and paceTargetSource
+        // names the bound that set it: reset | horizon | deadline.
+        ...(burnOn ? { burnMode: true, paceResetAtMs, paceTargetAt: burnTarget.atMs, paceTargetSource: burnTarget.source } : {}),
         ...(account.feedHealth ? { feedHealth: account.feedHealth } : {}),
         pointer: step.pointer,
         guardActive: step.guardActive,

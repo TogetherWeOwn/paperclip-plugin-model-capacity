@@ -98,6 +98,15 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.61 = per-account burn deadlines: burnMode.deadlines maps an account
+ *   matcher (same identity semantics as accounts) to a strict ISO-8601
+ *   timestamp with an explicit Z or numeric offset; a burn account matching
+ *   a future deadline paces to
+ *   min(reset, burn horizon, now + horizonMinutes, deadline), and /capacity
+ *   reports the winning bound as paceTargetAt/paceTargetSource
+ *   (reset | horizon | deadline). Past deadlines are ignored; empty or
+ *   missing deadlines decide bit-for-bit as before. No capability, egress,
+ *   secret or env-key change.
  * v0.2.60 = reviewer routing obeys the pace guard: held lanes are not candidates, and a review that only held lanes
  *   could serve defers instead of keeping its pinned model unpaced.
  * v0.2.59 = pace guard follows measured burn: an ahead lane whose measured rate exceeds its required rate has its
@@ -304,7 +313,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.60';
+export const PLUGIN_VERSION = '0.2.61';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -506,10 +515,14 @@ const CONFIG_SCHEMA = {
     },
     burnMode: {
       type: 'object', additionalProperties: false,
-      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, now + horizonMinutes), are never capped by the pace guard or held by the review reserve, and are preferred by routing. Empty burns nothing.',
+      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, burn horizon, now + horizonMinutes, deadline), are never capped by the pace guard or held by the review reserve, and are preferred by routing. deadlines maps the same matchers to ISO-8601 UTC timestamps: a burn account matching a future deadline paces to the earliest one (past deadlines are ignored). Empty burns nothing.',
       properties: {
         accounts: { type: 'array', items: { type: 'string', minLength: 1 }, default: [] },
         horizonMinutes: { type: 'number', minimum: 1, default: 60, description: 'Pace horizon for burn accounts (minutes).' },
+        deadlines: {
+          type: 'object', additionalProperties: { type: 'string' }, default: {},
+          description: 'Per-account burn deadlines: matcher (same identity semantics as accounts) to strict ISO-8601 timestamp with an explicit Z or numeric offset (e.g. 2026-10-27T00:00:00Z). A burn account paces to the earliest future deadline it matches; past deadlines are ignored.',
+        },
       },
     },
     reviewReserve: {
