@@ -396,6 +396,16 @@ test('burn eligibility: a utilization-floored degraded burn lane stays allocatab
   assert.equal(input[0].health, 'degraded', 'never mutates the feed accounts');
   assert.equal(burnEligibleAccounts(normalizeBurnMode(undefined), input), input, 'burn mode off returns the same array');
   assert.equal(burnEligibleAccounts(cfg, [input[1]]).length, 1);
+  // Unknown weekly meter fails closed (stays degraded); an absent five-hour
+  // meter is not a full bucket, so the account is restored.
+  const noWeekly = burnEligibleAccounts(cfg, [acc('meta-lane-1', 0.9, { weekly: { utilization: null } })]);
+  assert.equal(noWeekly[0].health, 'degraded');
+  const noWeeklyObj = burnEligibleAccounts(cfg, [acc('meta-lane-1', 0.9, { weekly: undefined })]);
+  assert.equal(noWeeklyObj[0].health, 'degraded');
+  const noFive = burnEligibleAccounts(cfg, [acc('meta-lane-1', 0.9, { fiveHour: undefined })]);
+  assert.equal(noFive[0].health, 'healthy');
+  const nullFive = burnEligibleAccounts(cfg, [acc('meta-lane-1', 0.9, { fiveHour: { utilization: null } })]);
+  assert.equal(nullFive[0].health, 'healthy');
 });
 
 test('plugin: a burn lane the feed floored to degraded at 90% still allocates; without burn it is excluded', async () => {
