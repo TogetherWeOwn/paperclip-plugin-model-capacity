@@ -171,6 +171,7 @@ test('config: deadlines validate as an object of matchers to ISO-8601 timestamps
   assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T00:00:00Z' } }), []);
   assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T02:00:00+02:00' } }), [], 'explicit numeric offset is accepted');
   assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': ' 2026-10-27T00:00:00Z ' } }), [], 'padding is trimmed, like the normalizer');
+  assert.deepEqual(validateBurnMode({ deadlines: JSON.parse('{"__proto__":"2026-10-27T00:00:00Z"}') }), [], '__proto__ is a valid matcher key');
   assert.match(validateBurnMode({ deadlines: 'meta:*' }).join(), /deadlines must be an object/);
   assert.match(validateBurnMode({ deadlines: [] }).join(), /deadlines must be an object/);
   assert.match(validateBurnMode({ deadlines: { 'meta:*': 'someday' } }).join(), /ISO-8601/);
@@ -214,6 +215,15 @@ test('config: normalize lower-cases deadline keys and defaults to no deadlines',
     normalizeBurnMode({ deadlines: { 'META:*': '2026-10-29T00:00:00Z', ' meta:* ': '2026-10-27T00:00:00Z' } }).deadlines,
     { 'meta:*': '2026-10-27T00:00:00Z' },
     'colliding keys keep the earliest parseable stamp (validation rejects the collision; this is the tick-path defense)',
+  );
+  // A '__proto__' matcher survives normalization as an own data property
+  // (plain assignment would silently drop it) and binds at tick time.
+  const protoCfg = normalizeBurnMode({ accounts: ['x'], deadlines: JSON.parse('{"__proto__":"2026-10-27T00:00:00Z"}') });
+  assert.equal(Object.hasOwn(protoCfg.deadlines, '__proto__'), true);
+  assert.equal(protoCfg.deadlines['__proto__'], '2026-10-27T00:00:00Z');
+  assert.equal(
+    burnDeadlineAtMs(protoCfg, { accountId: 'x', label: '__proto__' }, null, TICK),
+    Date.parse('2026-10-27T00:00:00Z'),
   );
 });
 

@@ -136,10 +136,12 @@ export function normalizeBurnMode(raw) {
         // collision, this is only the tick-path defense.
         const nk = k.trim().toLowerCase();
         const nv = v.trim();
-        const prevMs = nk in deadlines ? parseBurnDeadlineStamp(deadlines[nk]) : null;
+        const prevMs = Object.hasOwn(deadlines, nk) ? parseBurnDeadlineStamp(deadlines[nk]) : null;
         const nextMs = parseBurnDeadlineStamp(nv);
-        if (!(nk in deadlines) || (nextMs != null && (prevMs == null || nextMs < prevMs))) {
-          deadlines[nk] = nv;
+        if (!Object.hasOwn(deadlines, nk) || (nextMs != null && (prevMs == null || nextMs < prevMs))) {
+          // defineProperty, not assignment: a '__proto__' matcher would
+          // otherwise silently not stick as an own property and never bind.
+          Object.defineProperty(deadlines, nk, { value: nv, writable: true, enumerable: true, configurable: true });
         }
       }
     }
