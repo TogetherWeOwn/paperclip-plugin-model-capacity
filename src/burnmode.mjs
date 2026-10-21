@@ -3,7 +3,7 @@
  * quota as fast as possible instead of pacing to their weekly reset.
  *
  * Config: burnMode: { accounts: string[], horizonMinutes?: number (60),
- *   deadlines?: { [matcher]: ISO-8601 UTC timestamp } }.
+ *   deadlines?: { [matcher]: strict ISO-8601 with explicit Z or offset } }.
  * An entry matches an account by
  *   - its id ('meta:meta-lane-3'),
  *   - its lane / accountKey ('meta-lane-3'),
@@ -14,6 +14,14 @@
  * '!rdugger@example.com' burns every Meta account but that one. The same
  * identity semantics select deadline entries (a leading '!' entry never
  * matches anything there: deadlines only shorten, never exclude).
+ *
+ * Stamps must be strict ISO-8601 with an explicit Z or numeric offset
+ * (e.g. '2026-10-27T00:00:00Z'): a missing zone would parse as worker-local
+ * time and pace to the wrong hour. Validation fails closed on loose stamps
+ * and on two keys that collide after trim + lower-casing (the earlier stamp
+ * would otherwise be silently overwritten); normalization keeps the earliest
+ * parseable stamp per matcher as defense for paths that normalize without
+ * validating.
  *
  * A burn account (see plugin.mjs, paceguard.mjs, select.mjs):
  *   - paces to min(regular reset, burn horizon, now + horizonMinutes,
@@ -35,6 +43,38 @@ export const DEFAULT_BURN_MODE = Object.freeze({
   horizonMinutes: 60,
   deadlines: Object.freeze({}),
 });
+
+/**
+ * Strict deadline stamp: ISO-8601 with an explicit Z or numeric offset
+ * (optional .sss), plus a calendar round-trip so impossible days V8 rolls
+ * over (Feb 30) are rejected. Returns ms, or null. Shared by validation and
+ * the tick matcher so an accepted config can never parse differently at
+ * tick time. Same shape as the strict timestamp in src/availability.mjs.
+ */
+const BURN_DEADLINE_STAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|[+-]\d{2}:?\d{2})$/;
+export function parseBurnDeadlineStamp(value) {
+  if (typeof value !== 'string') return null;
+  const v = value.trim();
+  const m = BURN_DEADLINE_STAMP.exec(v);
+  if (!m) return null;
+  const ms = Date.parse(v);
+  if (!Number.isFinite(ms)) return null;
+  // Round-trip the wall clock the stamp names: UTC ms shifted back into the
+  // stamp's own zone must reproduce the stamp, else the calendar day is
+  // impossible (Feb 30) or the fields overflow.
+  const zone = m[7];
+  const offMin = zone === 'Z' ? 0 : (() => {
+    const sign = zone[0] === '-' ? -1 : 1;
+    const digits = zone.slice(1).replace(':', '');
+    return sign * (Number(digits.slice(0, 2)) * 60 + Number(digits.slice(2, 4)));
+  })();
+  if (!Number.isFinite(offMin) || Math.abs(offMin) >= 24 * 60) return null;
+  const pad = (n) => String(n).padStart(2, '0');
+  const wall = new Date(ms + offMin * 60000);
+  const wallStr = `${wall.getUTCFullYear()}-${pad(wall.getUTCMonth() + 1)}-${pad(wall.getUTCDate())}`
+    + `T${pad(wall.getUTCHours())}:${pad(wall.getUTCMinutes())}:${pad(wall.getUTCSeconds())}`;
+  return wallStr === v.slice(0, 19) ? ms : null;
+}
 
 /** Config shape errors (strings), empty when valid or absent. */
 export function validateBurnMode(raw) {
@@ -58,12 +98,21 @@ export function validateBurnMode(raw) {
   if ('deadlines' in raw) {
     const d = raw.deadlines;
     if (d == null || typeof d !== 'object' || Array.isArray(d)) {
-      errors.push('burnMode.deadlines must be an object mapping account matchers to ISO-8601 timestamps');
-    } else for (const [k, v] of Object.entries(d)) {
-      if (typeof k !== 'string' || k.trim().length === 0) {
-        errors.push('burnMode.deadlines keys must be non-empty strings');
-      } else if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) {
-        errors.push(`burnMode.deadlines[${JSON.stringify(k)}] must be an ISO-8601 UTC timestamp`);
+      errors.push('burnMode.deadlines must be an object mapping account matchers to ISO-8601 timestamps with an explicit Z or numeric offset');
+    } else {
+      const seen = new Set();
+      for (const [k, v] of Object.entries(d)) {
+        if (typeof k !== 'string' || k.trim().length === 0) {
+          errors.push('burnMode.deadlines keys must be non-empty strings');
+          continue;
+        }
+        const nk = k.trim().toLowerCase();
+        if (seen.has(nk)) {
+          errors.push(`burnMode.deadlines has a duplicate matcher for ${JSON.stringify(nk)} (matchers are case-insensitive and trimmed)`);
+        } else seen.add(nk);
+        if (parseBurnDeadlineStamp(v) == null) {
+          errors.push(`burnMode.deadlines[${JSON.stringify(k)}] must be an ISO-8601 timestamp with an explicit Z or numeric offset (e.g. 2026-10-27T00:00:00Z)`);
+        }
       }
     }
   }
@@ -82,7 +131,16 @@ export function normalizeBurnMode(raw) {
   if (d != null && typeof d === 'object' && !Array.isArray(d)) {
     for (const [k, v] of Object.entries(d)) {
       if (typeof k === 'string' && k.trim().length > 0 && typeof v === 'string' && v.trim().length > 0) {
-        deadlines[k.trim().toLowerCase()] = v.trim();
+        // Colliding keys (same matcher after trim + lower-case) keep the
+        // earliest parseable stamp; validation fails closed on the
+        // collision, this is only the tick-path defense.
+        const nk = k.trim().toLowerCase();
+        const nv = v.trim();
+        const prevMs = nk in deadlines ? parseBurnDeadlineStamp(deadlines[nk]) : null;
+        const nextMs = parseBurnDeadlineStamp(nv);
+        if (!(nk in deadlines) || (nextMs != null && (prevMs == null || nextMs < prevMs))) {
+          deadlines[nk] = nv;
+        }
       }
     }
   }
@@ -198,8 +256,9 @@ export function burnDeadlineAtMs(cfg, account, key = null, nowMs = Date.now()) {
   for (const [matcher, stamp] of entries) {
     if (typeof matcher !== 'string' || typeof stamp !== 'string') continue;
     if (!entryMatches(matcher, ids, provider)) continue;
-    const atMs = Date.parse(stamp);
-    if (!Number.isFinite(atMs) || atMs <= nowMs) continue;
+    // Same strict grammar as validation: a loose stamp can never bind.
+    const atMs = parseBurnDeadlineStamp(stamp);
+    if (atMs == null || atMs <= nowMs) continue;
     if (best == null || atMs < best) best = atMs;
   }
   return best;

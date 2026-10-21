@@ -99,8 +99,9 @@
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
  * v0.2.61 = per-account burn deadlines: burnMode.deadlines maps an account
- *   matcher (same identity semantics as accounts) to an ISO-8601 UTC
- *   timestamp; a burn account matching a future deadline paces to
+ *   matcher (same identity semantics as accounts) to a strict ISO-8601
+ *   timestamp with an explicit Z or numeric offset; a burn account matching
+ *   a future deadline paces to
  *   min(reset, burn horizon, now + horizonMinutes, deadline), and /capacity
  *   reports the winning bound as paceTargetAt/paceTargetSource
  *   (reset | horizon | deadline). Past deadlines are ignored; empty or
@@ -525,7 +526,7 @@ const CONFIG_SCHEMA = {
         horizonMinutes: { type: 'number', minimum: 1, default: 60, description: 'Pace horizon for burn accounts (minutes).' },
         deadlines: {
           type: 'object', additionalProperties: { type: 'string' }, default: {},
-          description: 'Per-account burn deadlines: matcher (same identity semantics as accounts) to ISO-8601 UTC timestamp. A burn account paces to the earliest future deadline it matches; past deadlines are ignored.',
+          description: 'Per-account burn deadlines: matcher (same identity semantics as accounts) to strict ISO-8601 timestamp with an explicit Z or numeric offset (e.g. 2026-10-27T00:00:00Z). A burn account paces to the earliest future deadline it matches; past deadlines are ignored.',
         },
       },
     },

@@ -12,7 +12,7 @@ import { orderAccountsWithPacing } from '../src/select.mjs';
 import { paceGuardPools } from '../src/paceguard.mjs';
 import { REVIEW_RESERVE_STATE_KEY } from '../src/reviewreserve.mjs';
 import {
-  DEFAULT_BURN_MODE, normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceResetAtMs, burnPaceTarget, burnModeActive,
+  DEFAULT_BURN_MODE, normalizeBurnMode, validateBurnMode, isBurnAccount, parseBurnDeadlineStamp, burnDeadlineAtMs, burnPaceResetAtMs, burnPaceTarget, burnModeActive,
 } from '../src/burnmode.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -169,14 +169,36 @@ test('pace end: min(regular reset, free-reset horizon, now + horizon); unknown r
 test('config: deadlines validate as an object of matchers to ISO-8601 timestamps', () => {
   assert.deepEqual(validateBurnMode({ deadlines: {} }), []);
   assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T00:00:00Z' } }), []);
+  assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T02:00:00+02:00' } }), [], 'explicit numeric offset is accepted');
+  assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': ' 2026-10-27T00:00:00Z ' } }), [], 'padding is trimmed, like the normalizer');
   assert.match(validateBurnMode({ deadlines: 'meta:*' }).join(), /deadlines must be an object/);
   assert.match(validateBurnMode({ deadlines: [] }).join(), /deadlines must be an object/);
   assert.match(validateBurnMode({ deadlines: { 'meta:*': 'someday' } }).join(), /ISO-8601/);
   assert.match(validateBurnMode({ deadlines: { 'meta:*': 123 } }).join(), /ISO-8601/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T00:00:00' } }).join(), /explicit Z or numeric offset/, 'no zone would parse as worker-local time');
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '10/27/2026' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '1' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-02-30T00:00:00Z' } }).join(), /explicit Z or numeric offset/, 'impossible calendar days are rejected');
   assert.match(validateBurnMode({ deadlines: { '': '2026-10-27T00:00:00Z' } }).join(), /non-empty strings/);
+  assert.match(
+    validateBurnMode({ deadlines: { 'META:*': '2026-10-27T00:00:00Z', ' meta:* ': '2026-10-29T00:00:00Z' } }).join(),
+    /duplicate matcher/, 'colliding keys fail closed instead of silently overwriting',
+  );
   // Wired into the plugin's config validator.
   assert.ok(validateConfigShape({ burnMode: { deadlines: 'x' } }).some(e => /burnMode\.deadlines/.test(e)));
   assert.ok(!validateConfigShape({ burnMode: { accounts: ['codex:*'], deadlines: { 'meta:*': '2026-10-27T00:00:00Z' } } }).some(e => /burnMode/.test(e)));
+});
+
+test('parseBurnDeadlineStamp: strict Z/offset grammar with a calendar round-trip', () => {
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T00:00:00Z'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T02:00:00+02:00'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-26T19:00:00-05:00'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T00:00:00.500Z'), Date.parse('2026-10-27T00:00:00.500Z'));
+  assert.equal(parseBurnDeadlineStamp('  2026-10-27T00:00:00Z  '), Date.parse('2026-10-27T00:00:00Z'));
+  for (const bad of ['2026-10-27T00:00:00', '2026-10-27', '10/27/2026', '1', '2026-02-30T00:00:00Z', '2026-13-01T00:00:00Z', '2026-10-27T25:00:00Z', '', null, 123]) {
+    assert.equal(parseBurnDeadlineStamp(bad), null, JSON.stringify(bad));
+  }
 });
 
 test('config: normalize lower-cases deadline keys and defaults to no deadlines', () => {
@@ -188,6 +210,11 @@ test('config: normalize lower-cases deadline keys and defaults to no deadlines',
     'normalize coerces shape; validation reports the bad stamp, the pace math ignores it',
   );
   assert.deepEqual(resolveConfig({}).burnMode.deadlines, {});
+  assert.deepEqual(
+    normalizeBurnMode({ deadlines: { 'META:*': '2026-10-29T00:00:00Z', ' meta:* ': '2026-10-27T00:00:00Z' } }).deadlines,
+    { 'meta:*': '2026-10-27T00:00:00Z' },
+    'colliding keys keep the earliest parseable stamp (validation rejects the collision; this is the tick-path defense)',
+  );
 });
 
 test('deadlines: same identity semantics as accounts (id, lane, label/email, provider:*; case-insensitive)', () => {
@@ -209,6 +236,10 @@ test('deadlines: same identity semantics as accounts (id, lane, label/email, pro
   // Several matchers: the earliest future one wins.
   const multi = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta:*': '2026-10-29T00:00:00Z', 'meta-lane-9': '2026-10-27T00:00:00Z' } });
   assert.equal(burnDeadlineAtMs(multi, meta(), 'meta:meta-lane-9', TICK), at('2026-10-27T00:00:00Z'));
+  const offset = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta-lane-9': '2026-10-27T02:00:00+02:00' } });
+  assert.equal(burnDeadlineAtMs(offset, meta(), 'meta:meta-lane-9', TICK), at('2026-10-27T00:00:00Z'), 'offset stamps bind at their UTC instant');
+  const loose = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta-lane-9': '2026-10-27T00:00:00' } });
+  assert.equal(burnDeadlineAtMs(loose, meta(), 'meta:meta-lane-9', TICK), null, 'a loose stamp that skipped validation never binds at tick time');
   assert.deepEqual(normalizeBurnMode(undefined).deadlines, {}, 'absent deadlines match nothing');
 });
 
