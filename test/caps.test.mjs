@@ -335,7 +335,9 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
 
   const initialCapacity = (await d.api('capacity')).body;
   const initialPools = new Map(initialCapacity.paceGuard.pools.map(pool => [pool.pool, pool]));
-  assert.equal(initialPools.get('meta')?.cap, 4, `the ahead-of-plan Meta pool has a four-run pace cap: ${JSON.stringify(initialPools.get('meta'))}`);
+  // Meta burns 6%/h (0.90 -> 0.93 in 30 min) against ~0.15%/h required: the
+  // measured-rate correction (0.2.59, floor 0.1) holds the ahead pool to one run.
+  assert.equal(initialPools.get('meta')?.cap, 1, `the ahead-of-plan Meta pool is held by its measured burn: ${JSON.stringify(initialPools.get('meta'))}`);
   assert.equal(initialPools.get('codex')?.state, 'on-plan', 'fresh Codex capacity is unpaced');
   assert.equal(initialPools.get('codex')?.inFlight, 4, 'the Codex fleet remains active beside Meta');
 
@@ -356,10 +358,10 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
 
   const capacity = (await d.api('capacity')).body;
   const metaPool = capacity.paceGuard.pools.find(pool => pool.pool === 'meta');
-  assert.equal(metaPool.cap, 4);
+  assert.equal(metaPool.cap, 1);
   assert.equal(metaPool.inFlight, 1, 'the running kept Reviewer record is charged to its Meta serving pool');
   assert.equal(capacity.paceGuard.unattributedInFlight, 0, 'the kept run is not left unattributed');
-  assert.ok(reviewer.maxConcurrentRuns <= 4,
+  assert.ok(reviewer.maxConcurrentRuns <= metaPool.cap,
     `Reviewer cap ${reviewer.maxConcurrentRuns} must not borrow fresh Codex fleet capacity`);
 });
 

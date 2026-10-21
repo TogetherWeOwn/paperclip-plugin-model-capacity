@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.59 (host build: 0.2.57 + #51 only)
+- Pace guard follows the measured burn (#51). Built on 0.2.57 without #50: #50 needs the `agents.queued_counts.read` capability, which the live server (tog.21) does not provide yet.
+
 ## 0.2.57
 - Burn accounts spend to exhaustion: the lane feed marks an account `degraded` once any meter passes 90% (`healthReason: 'peak utilization ...'`), and only healthy accounts allocate, so burn lanes stopped at 90% and left the rest of their week unspent. A burn account degraded ONLY by that floor now reads healthy (with `feedHealth: 'degraded'` on `/capacity`) until its weekly meter reaches 0.995 or its five-hour bucket reaches 0.99. Degraded for any other reason (recent failures, cooldowns), exhausted, unavailable and non-burn accounts are unchanged. The lane parser keeps the optional feed `healthReason`.
 
