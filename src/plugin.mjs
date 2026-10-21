@@ -984,9 +984,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // backlog claim the whole fleet target and strand every routed agent at
   // its running floor. Routed (non-review) agents keep issue demand: their
   // queues ARE assigned cards. Behind the same short memo as the issue
-  // snapshot. A denied, missing or failed read degrades to unknown (ok:
-  // false); callers grant no new kept slots and say so via demandSource,
-  // never falling back to assigned cards.
+  // snapshot. A denied, missing, failed or malformed read degrades to
+  // unknown (ok: false); callers grant no new kept slots and say so via
+  // demandSource, never falling back to assigned cards. A malformed
+  // response is never cached: only a valid array census (including an
+  // empty one, a genuine zero-demand result) is memoized.
   const queuedHeartbeatCache = new Map(); // companyId -> { atMs, counts: Map(agentId -> n) }
   async function queuedHeartbeatsByAgent(companyId, nowMs) {
     const hit = queuedHeartbeatCache.get(companyId);
@@ -1002,15 +1004,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx.logger.error('model-capacity: queued-run read failed', { companyId, error: error?.message ?? String(error) });
       return { ok: false, counts: new Map() };
     }
+    if (!Array.isArray(rows)) {
+      ctx.logger.error('model-capacity: queued-run read returned a non-array', { companyId });
+      return { ok: false, counts: new Map() };
+    }
     const counts = new Map();
-    if (Array.isArray(rows)) {
-      for (const row of rows) {
-        const agentId = row?.agentId;
-        const queued = row?.queued;
-        if (typeof agentId !== 'string' || agentId.length === 0) continue;
-        if (!Number.isFinite(queued) || queued <= 0) continue;
-        counts.set(agentId, (counts.get(agentId) ?? 0) + Math.floor(queued));
-      }
+    for (const row of rows) {
+      const agentId = row?.agentId;
+      if (typeof agentId !== 'string' || agentId.length === 0) continue;
+      const queued = Number(row?.queued);
+      if (!Number.isFinite(queued) || queued <= 0) continue;
+      counts.set(agentId, (counts.get(agentId) ?? 0) + Math.floor(queued));
     }
     queuedHeartbeatCache.set(companyId, { atMs: nowMs, counts });
     return { ok: true, counts };
