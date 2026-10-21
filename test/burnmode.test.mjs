@@ -12,7 +12,7 @@ import { orderAccountsWithPacing } from '../src/select.mjs';
 import { paceGuardPools } from '../src/paceguard.mjs';
 import { REVIEW_RESERVE_STATE_KEY } from '../src/reviewreserve.mjs';
 import {
-  DEFAULT_BURN_MODE, normalizeBurnMode, validateBurnMode, isBurnAccount, burnPaceResetAtMs, burnModeActive,
+  DEFAULT_BURN_MODE, normalizeBurnMode, validateBurnMode, isBurnAccount, parseBurnDeadlineStamp, burnDeadlineAtMs, burnPaceResetAtMs, burnPaceTarget, burnModeActive,
 } from '../src/burnmode.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
@@ -132,10 +132,10 @@ test('config: burnMode validates arrays of strings and a horizon >= 1 minute', (
 });
 
 test('config: normalize lower-cases, dedupes, defaults the horizon to 60 minutes', () => {
-  assert.deepEqual(normalizeBurnMode(undefined), { accounts: [], horizonMinutes: 60 });
+  assert.deepEqual(normalizeBurnMode(undefined), { accounts: [], horizonMinutes: 60, deadlines: {} });
   assert.deepEqual(normalizeBurnMode({ accounts: [' Meta:Meta-Lane-3 ', 'meta:meta-lane-3', 7], horizonMinutes: -1 }),
-    { accounts: ['meta:meta-lane-3'], horizonMinutes: DEFAULT_BURN_MODE.horizonMinutes });
-  assert.deepEqual(resolveConfig({}).burnMode, { accounts: [], horizonMinutes: 60 });
+    { accounts: ['meta:meta-lane-3'], horizonMinutes: DEFAULT_BURN_MODE.horizonMinutes, deadlines: {} });
+  assert.deepEqual(resolveConfig({}).burnMode, { accounts: [], horizonMinutes: 60, deadlines: {} });
   assert.equal(resolveConfig({ burnMode: { horizonMinutes: 15 } }).burnMode.horizonMinutes, 15);
   assert.equal(burnModeActive(normalizeBurnMode({ accounts: ['!x'] })), false);
 });
@@ -164,6 +164,131 @@ test('pace end: min(regular reset, free-reset horizon, now + horizon); unknown r
   assert.equal(burnPaceResetAtMs({ nowMs: TICK, resetAtMs: TICK + 0.5 * HOUR, cfg }), TICK + 0.5 * HOUR);
   assert.equal(burnPaceResetAtMs({ nowMs: TICK, resetAtMs: null, cfg }), TICK + HOUR);
   assert.equal(burnPaceResetAtMs({ nowMs: TICK, resetAtMs: TICK + 48 * HOUR, horizonMs: TICK + 0.25 * HOUR, cfg }), TICK + 0.25 * HOUR);
+});
+
+test('config: deadlines validate as an object of matchers to ISO-8601 timestamps', () => {
+  assert.deepEqual(validateBurnMode({ deadlines: {} }), []);
+  assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T00:00:00Z' } }), []);
+  assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T02:00:00+02:00' } }), [], 'explicit numeric offset is accepted');
+  assert.deepEqual(validateBurnMode({ deadlines: { 'meta:*': ' 2026-10-27T00:00:00Z ' } }), [], 'padding is trimmed, like the normalizer');
+  assert.deepEqual(validateBurnMode({ deadlines: JSON.parse('{"__proto__":"2026-10-27T00:00:00Z"}') }), [], '__proto__ is a valid matcher key');
+  assert.match(validateBurnMode({ deadlines: 'meta:*' }).join(), /deadlines must be an object/);
+  assert.match(validateBurnMode({ deadlines: [] }).join(), /deadlines must be an object/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': 'someday' } }).join(), /ISO-8601/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': 123 } }).join(), /ISO-8601/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27T00:00:00' } }).join(), /explicit Z or numeric offset/, 'no zone would parse as worker-local time');
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-10-27' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '10/27/2026' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '1' } }).join(), /explicit Z or numeric offset/);
+  assert.match(validateBurnMode({ deadlines: { 'meta:*': '2026-02-30T00:00:00Z' } }).join(), /explicit Z or numeric offset/, 'impossible calendar days are rejected');
+  assert.match(validateBurnMode({ deadlines: { '': '2026-10-27T00:00:00Z' } }).join(), /non-empty strings/);
+  assert.match(
+    validateBurnMode({ deadlines: { 'META:*': '2026-10-27T00:00:00Z', ' meta:* ': '2026-10-29T00:00:00Z' } }).join(),
+    /duplicate matcher/, 'colliding keys fail closed instead of silently overwriting',
+  );
+  // Wired into the plugin's config validator.
+  assert.ok(validateConfigShape({ burnMode: { deadlines: 'x' } }).some(e => /burnMode\.deadlines/.test(e)));
+  assert.ok(!validateConfigShape({ burnMode: { accounts: ['codex:*'], deadlines: { 'meta:*': '2026-10-27T00:00:00Z' } } }).some(e => /burnMode/.test(e)));
+});
+
+test('parseBurnDeadlineStamp: strict Z/offset grammar with a calendar round-trip', () => {
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T00:00:00Z'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T02:00:00+02:00'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-26T19:00:00-05:00'), Date.parse('2026-10-27T00:00:00Z'));
+  assert.equal(parseBurnDeadlineStamp('2026-10-27T00:00:00.500Z'), Date.parse('2026-10-27T00:00:00.500Z'));
+  assert.equal(parseBurnDeadlineStamp('  2026-10-27T00:00:00Z  '), Date.parse('2026-10-27T00:00:00Z'));
+  for (const bad of ['2026-10-27T00:00:00', '2026-10-27', '10/27/2026', '1', '2026-02-30T00:00:00Z', '2026-13-01T00:00:00Z', '2026-10-27T25:00:00Z', '', null, 123]) {
+    assert.equal(parseBurnDeadlineStamp(bad), null, JSON.stringify(bad));
+  }
+});
+
+test('config: normalize lower-cases deadline keys and defaults to no deadlines', () => {
+  assert.deepEqual(normalizeBurnMode(undefined).deadlines, {});
+  assert.deepEqual(normalizeBurnMode({ accounts: ['x'] }), { accounts: ['x'], horizonMinutes: 60, deadlines: {} });
+  assert.deepEqual(
+    normalizeBurnMode({ deadlines: { ' PISNRZRS+META@TWO.GG ': '2026-10-27T00:00:00Z', 'meta:*': 'not-a-date' } }).deadlines,
+    { 'pisnrzrs+meta@two.gg': '2026-10-27T00:00:00Z', 'meta:*': 'not-a-date' },
+    'normalize coerces shape; validation reports the bad stamp, the pace math ignores it',
+  );
+  assert.deepEqual(resolveConfig({}).burnMode.deadlines, {});
+  assert.deepEqual(
+    normalizeBurnMode({ deadlines: { 'META:*': '2026-10-29T00:00:00Z', ' meta:* ': '2026-10-27T00:00:00Z' } }).deadlines,
+    { 'meta:*': '2026-10-27T00:00:00Z' },
+    'colliding keys keep the earliest parseable stamp (validation rejects the collision; this is the tick-path defense)',
+  );
+  // A '__proto__' matcher survives normalization as an own data property
+  // (plain assignment would silently drop it) and binds at tick time.
+  const protoCfg = normalizeBurnMode({ accounts: ['x'], deadlines: JSON.parse('{"__proto__":"2026-10-27T00:00:00Z"}') });
+  assert.equal(Object.hasOwn(protoCfg.deadlines, '__proto__'), true);
+  assert.equal(protoCfg.deadlines['__proto__'], '2026-10-27T00:00:00Z');
+  assert.equal(
+    burnDeadlineAtMs(protoCfg, { accountId: 'x', label: '__proto__' }, null, TICK),
+    Date.parse('2026-10-27T00:00:00Z'),
+  );
+});
+
+test('deadlines: same identity semantics as accounts (id, lane, label/email, provider:*; case-insensitive)', () => {
+  const at = (iso) => Date.parse(iso);
+  const cfg = normalizeBurnMode({
+    accounts: ['meta:*'],
+    deadlines: {
+      'pisnrzrs+meta@two.gg': '2026-10-27T00:00:00Z',
+      'meta-lane-4': '2026-10-28T00:00:00Z',
+      'codex:*': '2026-11-01T00:00:00Z',
+    },
+  });
+  const meta = (over = {}) => ({ accountId: 'meta:meta-lane-9', provider: 'meta', lane: 'meta-lane-9', ...over });
+  assert.equal(burnDeadlineAtMs(cfg, meta({ label: 'PISNRZRS+META@two.gg' }), 'meta:meta-lane-9', TICK), at('2026-10-27T00:00:00Z'), 'label/email match');
+  assert.equal(burnDeadlineAtMs(cfg, meta({ lane: 'META-LANE-4' }), 'meta:meta-lane-4', TICK), at('2026-10-28T00:00:00Z'), 'lane match');
+  assert.equal(burnDeadlineAtMs(cfg, meta(), 'meta:meta-lane-9', TICK), null, 'no matcher matches this account');
+  assert.equal(burnDeadlineAtMs(cfg, { accountId: 'codex:c1', provider: 'codex' }, 'codex:c1', TICK), at('2026-11-01T00:00:00Z'), 'provider:* match');
+  assert.equal(burnDeadlineAtMs(cfg, { accountId: 'claude:c1', provider: 'claude' }, 'claude:c1', TICK), null);
+  // Several matchers: the earliest future one wins.
+  const multi = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta:*': '2026-10-29T00:00:00Z', 'meta-lane-9': '2026-10-27T00:00:00Z' } });
+  assert.equal(burnDeadlineAtMs(multi, meta(), 'meta:meta-lane-9', TICK), at('2026-10-27T00:00:00Z'));
+  const offset = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta-lane-9': '2026-10-27T02:00:00+02:00' } });
+  assert.equal(burnDeadlineAtMs(offset, meta(), 'meta:meta-lane-9', TICK), at('2026-10-27T00:00:00Z'), 'offset stamps bind at their UTC instant');
+  const loose = normalizeBurnMode({ accounts: ['x'], deadlines: { 'meta-lane-9': '2026-10-27T00:00:00' } });
+  assert.equal(burnDeadlineAtMs(loose, meta(), 'meta:meta-lane-9', TICK), null, 'a loose stamp that skipped validation never binds at tick time');
+  assert.deepEqual(normalizeBurnMode(undefined).deadlines, {}, 'absent deadlines match nothing');
+});
+
+test('deadlines: a past deadline is ignored; an unparseable stamp never binds', () => {
+  const cfg = normalizeBurnMode({
+    accounts: ['x'],
+    deadlines: { 'meta-lane-9': '2026-10-01T00:00:00Z', 'meta-lane-4': 'not-a-date' },
+  });
+  const acct = { accountId: 'meta:meta-lane-9', provider: 'meta', lane: 'meta-lane-9' };
+  assert.equal(burnDeadlineAtMs(cfg, acct, 'meta:meta-lane-9', TICK), null, '10-01 is past at TICK (10-08)');
+  assert.equal(
+    burnPaceResetAtMs({ nowMs: TICK, resetAtMs: TICK + 48 * HOUR, deadlineAtMs: TICK - HOUR, cfg }),
+    TICK + HOUR, 'a past deadline passed straight through is ignored too',
+  );
+});
+
+test('pace target: a deadline before the reset shortens the target and names its source', () => {
+  const cfg = normalizeBurnMode({ accounts: ['x'], horizonMinutes: 10080 });
+  const t = (over) => burnPaceTarget({ nowMs: TICK, resetAtMs: TICK + 48 * HOUR, cfg, ...over });
+  assert.deepEqual(t({ deadlineAtMs: TICK + 24 * HOUR }), { atMs: TICK + 24 * HOUR, source: 'deadline' });
+  assert.deepEqual(t({}), { atMs: TICK + 48 * HOUR, source: 'reset' }, 'no deadline: the reset binds');
+  assert.deepEqual(t({ deadlineAtMs: TICK + 72 * HOUR }), { atMs: TICK + 48 * HOUR, source: 'reset' }, 'a deadline past the reset never binds');
+  assert.deepEqual(
+    burnPaceTarget({ nowMs: TICK, resetAtMs: null, cfg: normalizeBurnMode({ accounts: ['x'] }) }),
+    { atMs: TICK + HOUR, source: 'horizon' }, 'unknown reset: now + horizon',
+  );
+  assert.deepEqual(
+    t({ horizonMs: TICK + 12 * HOUR, deadlineAtMs: TICK + 24 * HOUR }),
+    { atMs: TICK + 12 * HOUR, source: 'horizon' }, 'an earlier burn horizon still wins over a later deadline',
+  );
+  // Bit-for-bit: a config with empty/non-matching deadlines paces exactly as without.
+  const plain = normalizeBurnMode({ accounts: ['x'], horizonMinutes: 10080 });
+  const dated = normalizeBurnMode({ accounts: ['x'], horizonMinutes: 10080, deadlines: { 'nobody:none': '2026-10-27T00:00:00Z' } });
+  for (const args of [
+    { nowMs: TICK, resetAtMs: TICK + 48 * HOUR },
+    { nowMs: TICK, resetAtMs: TICK + 0.5 * HOUR, horizonMs: TICK + 0.25 * HOUR },
+  ]) {
+    assert.equal(burnPaceResetAtMs({ ...args, cfg: dated }), burnPaceResetAtMs({ ...args, cfg: plain }));
+  }
 });
 
 // --------------------------------------------------------- guard + order
@@ -256,6 +381,86 @@ test('plugin: an ahead lane in burn mode is never paced, paces to the 60-min hor
   assert.equal(cap.paceGuard.pools.find(p => p.pool === 'claude').state, 'burn');
 });
 
+test('plugin: a future deadline before the reset shortens the pace and is reported with its source', async () => {
+  const deadline = new Date(TICK + 24 * HOUR).toISOString();
+  const d = drive({
+    config: {
+      enforce: true, reviewReserve: { enabled: false },
+      burnMode: { accounts: ['claude:a1'], horizonMinutes: 10080, deadlines: { 'claude:a1': deadline } },
+    },
+    accounts: [lane(0.9, 48)],
+  });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const a = cap.accounts.find(x => x.accountId === 'claude:a1');
+  assert.equal(a.burnMode, true);
+  assert.equal(a.paceResetAtMs, TICK + 24 * HOUR);
+  assert.equal(a.paceTargetAt, TICK + 24 * HOUR);
+  assert.equal(a.paceTargetSource, 'deadline');
+  // remaining 10% over 24 h, not 48 h and not now + 10080 min.
+  assert.ok(Math.abs(a.requiredRatePerHour - 0.1 / 24) < 1e-9);
+  for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
+});
+
+test('plugin: 10-26 simulation — fresh weeks, P1 deadline 10-27 paces at remaining/24h (owner Meta MAX plan)', async () => {
+  const NOW26 = Date.parse('2026-10-26T00:05:00Z');
+  const WEEK = Date.parse('2026-11-02T00:00:00Z');
+  const P1 = '2026-10-27T00:00:00Z';
+  const P4 = '2026-10-28T00:00:00Z';
+  const fresh = (key, used, label) => ({
+    lane: key, provider: 'meta', accountKey: key, label, health: 'healthy',
+    weekly: { used, resetsAt: new Date(WEEK).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(NOW26 + 4 * HOUR).toISOString() },
+    observedAt: new Date(NOW26).toISOString(), quality: 'live',
+    models: ['claude-opus-5-5'],
+  });
+  const d = drive({
+    config: {
+      enforce: true, reviewReserve: { enabled: false },
+      burnMode: {
+        accounts: ['meta:*'],
+        horizonMinutes: 10080,
+        deadlines: { 'pisnrzrs+meta@two.gg': P1, 'meta:meta-lane-4': P4 },
+      },
+    },
+    accounts: [fresh('meta-lane-9', 0.02, 'pisnrzrs+meta@two.gg'), fresh('meta-lane-4', 0.02, 'other@two.gg')],
+  });
+  d.setNow(NOW26);
+  d.setAccounts([fresh('meta-lane-9', 0.02, 'pisnrzrs+meta@two.gg'), fresh('meta-lane-4', 0.02, 'other@two.gg')]);
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const p1 = cap.accounts.find(x => x.accountId === 'meta:meta-lane-9');
+  assert.equal(p1.burnMode, true);
+  assert.equal(p1.paceTargetAt, Date.parse(P1), 'P1 paces to the 10-27 deadline, not the fresh week');
+  assert.equal(p1.paceTargetSource, 'deadline');
+  const remaining = 0.98;
+  assert.ok(Math.abs(p1.requiredRatePerHour - remaining / ((Date.parse(P1) - NOW26) / 3600000)) < 1e-9);
+  assert.ok(
+    Math.abs(p1.requiredRatePerHour - remaining / 24) / (remaining / 24) < 0.01,
+    `P1 required ${p1.requiredRatePerHour} ≈ remaining/24h ${remaining / 24}`,
+  );
+  const p4 = cap.accounts.find(x => x.accountId === 'meta:meta-lane-4');
+  assert.equal(p4.paceTargetAt, Date.parse(P4), 'P4 keeps its own 10-28 deadline');
+  assert.equal(p4.paceTargetSource, 'deadline');
+});
+
+test('plugin: before the reset the reset still binds (deadlines only shorten after it)', async () => {
+  // Host 10-21 ~21:00Z: reset 10-26, horizonMinutes 10080, P1 deadline 10-27.
+  const now = Date.parse('2026-10-21T21:06:00Z');
+  const reset = Date.parse('2026-10-26T00:00:00Z');
+  const cfg = normalizeBurnMode({
+    accounts: ['meta:*'], horizonMinutes: 10080, deadlines: { 'pisnrzrs+meta@two.gg': '2026-10-27T00:00:00Z' },
+  });
+  const acct = { accountId: 'meta:x', provider: 'meta', lane: 'meta-lane-9', label: 'pisnrzrs+meta@two.gg' };
+  assert.equal(burnDeadlineAtMs(cfg, acct, 'meta:x', now), Date.parse('2026-10-27T00:00:00Z'));
+  assert.deepEqual(
+    burnPaceTarget({ nowMs: now, resetAtMs: reset, deadlineAtMs: Date.parse('2026-10-27T00:00:00Z'), cfg }),
+    { atMs: reset, source: 'reset' },
+  );
+});
+
 test('plugin: routing prefers the burn account; matching by label from the feed', async () => {
   const accounts = [lane2('a1', 0.2, 100), lane2('a2', 0.6, 100, { label: 'Spare Seat' })];
   const d = drive({ config: { enforce: true, reviewReserve: { enabled: false }, burnMode: { accounts: ['SPARE SEAT'] } }, accounts });
@@ -319,6 +524,9 @@ test('regression: absent, empty and non-matching burnMode decide bit-for-bit ide
   assert.equal(await scenario({ burnMode: { accounts: [] } }), absent);
   assert.equal(await scenario({ burnMode: { accounts: ['nobody:none'], horizonMinutes: 5 } }), absent);
   assert.equal(await scenario({ burnMode: { accounts: ['!claude:a1'] } }), absent);
+  assert.equal(await scenario({ burnMode: { accounts: [], deadlines: {} } }), absent, 'empty deadlines are a no-op');
+  assert.equal(await scenario({ burnMode: { accounts: ['nobody:none'], deadlines: { 'nobody:none': '2026-10-27T00:00:00Z' } } }), absent, 'non-matching deadlines are a no-op');
+  assert.equal(await scenario({ burnMode: { deadlines: { 'claude:a1': '2026-10-01T00:00:00Z' } } }), absent, 'deadlines alone (no accounts entry, past stamp) burn nothing');
   assert.doesNotMatch(absent, /burnMode|"burn"/);
 });
 
