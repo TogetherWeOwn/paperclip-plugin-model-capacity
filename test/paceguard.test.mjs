@@ -260,3 +260,36 @@ test('a held lane is a pool member: its own lead paces only itself, never an on-
   assert.deepEqual(ids(r), ['devin:a']);
   assert.deepEqual(r.paced.map(p => p.pacedAccountIds), [['devin:b']]);
 });
+
+test('measured rate above required shrinks an ahead lane\'s slots by required/measured', () => {
+  // Live shape 2026-10-21: two paced Meta lanes, each estimated at ~1.75 slots,
+  // but measured at 2.1%/h against 0.55%/h required (review runs cost more than
+  // the per-run estimate). The cap follows the real burn: 2 x 1.75 x 0.262 = 0.92 -> 1.
+  const meta = (id, over = {}) => lane(id, {
+    pool: 'meta', targetShare: 8.75, planAhead: 0.04, inFlight: 1,
+    measuredRatePerHour: 0.021, requiredRatePerHour: 0.0055, ...over,
+  });
+  const held = run([meta('meta:4'), meta('meta:7')]);
+  assert.equal(held.pools[0].cap, 1);
+  assert.deepEqual(ids(held), []);
+  const v = held.pools[0].laneVerdicts[0];
+  assert.ok(Math.abs(v.rateCorrection - 0.0055 / 0.021) < 1e-9);
+
+  // Without measurements (or measured within plan) the estimate stands: cap 4.
+  const est = run([meta('meta:4', { measuredRatePerHour: null }), meta('meta:7', { measuredRatePerHour: 0.005 })]);
+  assert.equal(est.pools[0].cap, 4);
+  assert.equal(est.pools[0].laneVerdicts[0].rateCorrection, undefined);
+});
+
+test('rate correction never touches a lane on or behind plan, and is floored', async () => {
+  const { rateCorrection, MIN_RATE_CORRECTION } = await import('../src/paceguard.mjs');
+  // Behind plan: full fair share, even when burning fast (catch-up is allowed).
+  const behind = run([lane('claude:4', { targetShare: 10, planAhead: -0.09, inFlight: 3,
+    measuredRatePerHour: 0.04, requiredRatePerHour: 0.0068 })]);
+  assert.equal(behind.pools[0].cap, 2);
+  assert.deepEqual(ids(behind), ['claude:4']);
+  assert.equal(rateCorrection({ measuredRatePerHour: 10, requiredRatePerHour: 0.01 }), MIN_RATE_CORRECTION);
+  assert.equal(rateCorrection({ measuredRatePerHour: 0.01, requiredRatePerHour: 0 }), 1);
+  assert.equal(rateCorrection({ measuredRatePerHour: NaN, requiredRatePerHour: 0.01 }), 1);
+  assert.equal(rateCorrection({}), 1);
+});
