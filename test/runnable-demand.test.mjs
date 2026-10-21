@@ -112,7 +112,7 @@ test('target 53 routes its real remainder proportionally when kept demand is sma
   const d = await drive(t, { openIssues: [...issues('large', 100), ...issues('small', 40)] });
   const body = await d.caps();
   const reviewer = byId(body).get(REVIEWER);
-  assert.ok(reviewer.allocated <= 2);
+  assert.equal(reviewer.allocated, 1, 'no kept idle headroom beyond runnable demand');
   assertRoutedShare(body, reviewer.allocated);
 });
 
@@ -131,7 +131,7 @@ test('283 kept open cards with one running heartbeat do not consume target 53', 
   assert.equal(reviewer.running, 1);
   assert.equal(reviewer.queued, 0, 'assigned open cards are not queued review runs');
   assert.equal(reviewer.demand, 1);
-  assert.ok(reviewer.allocated <= 2, 'only runnable demand plus existing one-slot headroom');
+  assert.equal(reviewer.allocated, 1, 'only runnable demand reserves kept fleet slots');
   assertRoutedShare(body, reviewer.allocated);
 });
 

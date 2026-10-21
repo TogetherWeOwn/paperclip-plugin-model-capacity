@@ -1,8 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
+import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateDemandCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY } from '../src/concurrency.mjs';
 
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
+
+test('one runnable kept run leaves target 53 remainder proportional to routed backlog', () => {
+  const routed = [
+    { agentId: 'large', running: 2, queued: 100 },
+    { agentId: 'small', running: 1, queued: 40 },
+  ];
+  const out = allocateKeptAndRoutedCaps({
+    target: 53,
+    maxTotal: 75,
+    // Assigned review cards are not runnable input: one actual running
+    // heartbeat and no queued heartbeat must reserve exactly one slot.
+    agents: [{ agentId: 'reviewer', running: 1, queued: 0 }, ...routed],
+    keepAgentIds: ['reviewer'],
+    keptByAgent: { reviewer: { accountId: 'meta:1' } },
+    accounts: [{ accountId: 'meta:1', pool: 'meta' }, { accountId: 'codex:1', pool: 'codex' }],
+    perAccount: [{ accountId: 'meta:1', slots: 75 }, { accountId: 'codex:1', slots: 75 }],
+    pacePools: [{ pool: 'meta', cap: 75 }],
+  });
+  assert.equal(out.kept.length, 1);
+  assert.equal(out.kept[0].demand, 1);
+  assert.equal(out.kept[0].allocated, 1, 'kept agents cannot reserve idle headroom beyond runnable demand');
+  assert.equal(out.kept[0].maxConcurrentRuns, 1);
+  const expected = allocateDemandCaps(52, routed, 52);
+  const byId = new Map(out.routed.map(agent => [agent.agentId, agent]));
+  for (const agent of expected) {
+    assert.equal(byId.get(agent.agentId).allocated, agent.allocated);
+    assert.ok(byId.get(agent.agentId).allocated > agent.running, 'routed backlog receives more than running floors');
+  }
+  assert.ok(byId.get('large').allocated > byId.get('small').allocated);
+  assert.equal([...out.kept, ...out.routed].reduce((sum, agent) => sum + agent.allocated, 0), 53);
+});
 
 test('kept agents spend the fleet target from their own paced pool', () => {
   const out = allocateKeptAndRoutedCaps({
