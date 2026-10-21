@@ -357,18 +357,20 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   await held.tick();
   assert.equal((await held.api('capacity')).body.reviewer.routing.last.deferred, true);
 
-  // With a Meta lane behind plan available, the held Claude lane is skipped
-  // once it is full.
+  // Both lanes ahead of plan, Claude less ahead: the first review takes
+  // Claude, filling its pace cap of 1, and the next review skips the held
+  // Claude lane for Meta (without the pace guard it would stay on Claude).
   const mixed = drive({
     config: { ...BASE, reviewerRouting: { arms: ARMS } },
-    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.1, 48)],
+    accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.9, 72)],
   });
   await mixed.setup();
   await mixed.tick();
   const a = await mixed.hook('rev-1');
   assert.equal(a.kind, 'decide');
-  await started(mixed, 'rev-1', a.reason.includes('meta:') ? 'meta' : 'claude', a.model);
+  assert.match(a.reason, /on claude:a1/);
+  await started(mixed, 'rev-1', 'claude', a.model);
   const b = await mixed.hook('rev-2');
   assert.equal(b.kind, 'decide');
-  if (a.reason.includes('claude:a1')) assert.match(b.reason, /on meta:meta-lane-3/, 'the full Claude lane is skipped');
+  assert.match(b.reason, /on meta:meta-lane-3/, 'the full Claude lane is skipped');
 });
