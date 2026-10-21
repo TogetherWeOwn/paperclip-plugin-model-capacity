@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.57
+- Burn accounts spend to exhaustion: the lane feed marks an account `degraded` once any meter passes 90% (`healthReason: 'peak utilization ...'`), and only healthy accounts allocate, so burn lanes stopped at 90% and left the rest of their week unspent. A burn account degraded ONLY by that floor now reads healthy (with `feedHealth: 'degraded'` on `/capacity`) until its weekly meter reaches 0.995 or its five-hour bucket reaches 0.99. Degraded for any other reason (recent failures, cooldowns), exhausted, unavailable and non-burn accounts are unchanged. The lane parser keeps the optional feed `healthReason`.
+
 ## 0.2.56
 - Kept-agent caps with burn mode: the pool pace cap (`paceGuard.pools[].cap`) now bounds only the pool's paced accounts. Burn-mode accounts are exempt from the pace guard, so their slots add on top (`burnAccountIds`). Before, a kept Reviewer serving from Meta burn lanes (~270 slots) was clamped to the 4-slot cap of the two paced lanes. Unavailable burn accounts still add nothing, so the cap bounds the pool again once burn lanes are spent.
 

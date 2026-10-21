@@ -373,3 +373,57 @@ test('reviewer routing burn flag follows burn-mode rules', async () => {
   assert.equal(isBurnFlagged({ accountId: 'meta:meta-lane-1', pool: 'meta', label: 'pool-d@example.test' }, t), true);
   assert.equal(isBurnFlagged({ accountId: 'claude:claude-lane-4', pool: 'claude', label: 'owner-b@example.test' }, t), false);
 });
+
+test('burn eligibility: a utilization-floored degraded burn lane stays allocatable until spent', async () => {
+  const { burnEligibleAccounts, normalizeBurnMode } = await import('../src/burnmode.mjs');
+  const cfg = normalizeBurnMode({ accounts: ['meta:*', '!meta:owner-a@example.test'] });
+  const acc = (key, weekly, over = {}) => ({
+    accountId: `meta:${key}`, provider: 'meta', accountKey: key, health: 'degraded',
+    healthReason: `peak utilization ${weekly.toFixed(4)}`,
+    weekly: { utilization: weekly }, fiveHour: { utilization: 0.3 }, ...over,
+  });
+  const input = [
+    acc('meta-lane-1', 0.9),
+    acc('meta-lane-2', 0.995),
+    acc('meta-lane-3', 0.93, { fiveHour: { utilization: 0.99 } }),
+    acc('meta-lane-4', 0.92, { label: 'owner-a@example.test' }),
+    acc('meta-lane-6', 0.91, { healthReason: undefined }),
+    { accountId: 'meta:meta-lane-8', provider: 'meta', accountKey: 'meta-lane-8', health: 'exhausted', weekly: { utilization: 0.999 } },
+  ];
+  const out = burnEligibleAccounts(cfg, input);
+  assert.deepEqual(out.map(a => a.health), ['healthy', 'degraded', 'degraded', 'degraded', 'degraded', 'exhausted']);
+  assert.equal(out[0].feedHealth, 'degraded');
+  assert.equal(input[0].health, 'degraded', 'never mutates the feed accounts');
+  assert.equal(burnEligibleAccounts(normalizeBurnMode(undefined), input), input, 'burn mode off returns the same array');
+  assert.equal(burnEligibleAccounts(cfg, [input[1]]).length, 1);
+});
+
+test('plugin: a burn lane the feed floored to degraded at 90% still allocates; without burn it is excluded', async () => {
+  const floored = { ...lane(0.92, 48), health: 'degraded', healthReason: 'peak utilization 0.9200' };
+  const plain = drive({ config: { enforce: true, reviewReserve: { enabled: false } }, accounts: [floored] });
+  await plain.setup();
+  await plain.tick();
+  const plainView = (await plain.api('capacity')).body.accounts.find(x => x.accountId === 'claude:a1');
+  assert.equal(plainView.action, 'excluded');
+
+  const d = drive({
+    config: { enforce: true, reviewReserve: { enabled: false }, burnMode: { accounts: ['claude:a1'] } },
+    accounts: [floored],
+  });
+  await d.setup();
+  await d.tick();
+  const view = (await d.api('capacity')).body.accounts.find(x => x.accountId === 'claude:a1');
+  assert.notEqual(view.action, 'excluded');
+  assert.equal(view.health, 'healthy');
+  assert.equal(view.feedHealth, 'degraded');
+  assert.equal((await d.hook('run-1')).kind, 'decide');
+
+  const failing = drive({
+    config: { enforce: true, reviewReserve: { enabled: false }, burnMode: { accounts: ['claude:a1'] } },
+    accounts: [{ ...lane(0.92, 48), health: 'degraded' }],
+  });
+  await failing.setup();
+  await failing.tick();
+  const failView = (await failing.api('capacity')).body.accounts.find(x => x.accountId === 'claude:a1');
+  assert.equal(failView.action, 'excluded', 'degraded for another reason (no utilization floor) stays out');
+});

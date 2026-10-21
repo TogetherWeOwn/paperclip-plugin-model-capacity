@@ -122,6 +122,35 @@ export function isBurnAccount(cfg, account, key = null) {
   return on;
 }
 
+/** Weekly share at or above which a burn account is spent (matches the feed's exhausted line). */
+export const BURN_SPENT_WEEKLY = 0.995;
+/** Five-hour share at or above which the fast bucket refuses (matches the feed's floor). */
+export const BURN_SPENT_FIVE_HOUR = 0.99;
+
+/**
+ * Burn mode spends an account to exhaustion, so a lane the feed marked
+ * `degraded` ONLY by its utilization floor (healthReason 'peak utilization
+ * ...') stays allocatable until the weekly meter reaches BURN_SPENT_WEEKLY
+ * or the five-hour bucket fills. Any other degraded cause (recent failures,
+ * vendor cooldown) and every exhausted/unavailable account stay out.
+ * Returns the same array when nothing changes.
+ */
+export function burnEligibleAccounts(cfg, accounts, keys = null) {
+  if (!burnModeActive(cfg) || !Array.isArray(accounts)) return accounts;
+  let changed = false;
+  const out = accounts.map((a, i) => {
+    if (a?.health !== 'degraded' || !String(a.healthReason ?? '').startsWith('peak utilization')) return a;
+    const weekly = a.weekly?.utilization;
+    const five = a.fiveHour?.utilization;
+    if (!Number.isFinite(weekly) || weekly >= BURN_SPENT_WEEKLY) return a;
+    if (Number.isFinite(five) && five >= BURN_SPENT_FIVE_HOUR) return a;
+    if (!isBurnAccount(cfg, a, keys?.[i] ?? null)) return a;
+    changed = true;
+    return { ...a, health: 'healthy', feedHealth: 'degraded' };
+  });
+  return changed ? out : accounts;
+}
+
 /**
  * Pace end for a burn account: min(regular reset, burn horizon, now + H).
  * An unknown regular reset still burns (now + H).
