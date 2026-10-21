@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.60
+- Reviewer routing obeys the pace guard. Routing ranked accounts by burn and plan position without asking the pace guard, and a kept reviewer with no qualifying arm fell back to `keep` (its pinned model, never paced). Live 2026-10-21: five max-effort reviews held the two paced Meta lanes at ~4%/h against 0.55%/h required. Now the lanes the pace guard holds at hook time are not candidates, and when only held lanes could serve the review it defers on the pace-guard retry scale (`reviewer.routing.last.deferred: true`).
+
 ## 0.2.59
 - Pace guard follows the measured burn: a lane's paced slots were priced only by its estimated burn per run (`targetShare = required / E`), so when the runs on it cost more than the estimate (max-effort reviews on lanes calibrated by cheaper doer runs) the cap stayed high while the lane burned several times faster than its plan. Live 2026-10-21: the two paced Meta lanes measured 2.1%/h against 0.55%/h required at cap 4. Now an ahead lane with measured > required has its slots scaled by required/measured (floor 0.1; `laneVerdicts[].rateCorrection` on /capacity). Lanes on or behind plan, unmeasured lanes and lanes within plan are unchanged.
 
