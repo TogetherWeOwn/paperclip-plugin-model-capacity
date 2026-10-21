@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.61
+- Per-account burn deadlines. New optional config `burnMode.deadlines` maps an account matcher (same identity semantics as `burnMode.accounts`: id, lane/accountKey, feed label/email, `provider:*`, case-insensitive) to an ISO-8601 UTC timestamp. A burn account matching a future deadline paces to `min(regular reset, burn horizon, now + horizonMinutes, deadline)` — after the weekly reset a fresh week that must burn in 24 h paces to the deadline instead of the week — so its required rate, plan position and fleet C* need all follow the deadline. Past deadlines are ignored (a cancelled account disappears from the feed anyway). The capacity view reports each burn account's winning bound as `paceTargetAt`/`paceTargetSource` (`reset` | `horizon` | `deadline`); `paceResetAtMs` keeps its meaning (the effective pace end) and still feeds C*. Validation rejects a non-object `deadlines` and unparseable timestamps; normalization lower-cases keys. Empty or missing deadlines decide bit-for-bit as before (regression test).
+
 ## 0.2.60
 - Reviewer routing obeys the pace guard. Routing ranked accounts by burn and plan position without asking the pace guard, and a kept reviewer with no qualifying arm fell back to `keep` (its pinned model, never paced). Live 2026-10-21: five max-effort reviews held the two paced Meta lanes at ~4%/h against 0.55%/h required. Now the lanes the pace guard holds at hook time are not candidates, and when only held lanes could serve the review it defers on the pace-guard retry scale (`reviewer.routing.last.deferred: true`).
 

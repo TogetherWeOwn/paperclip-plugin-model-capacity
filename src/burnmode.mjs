@@ -2,7 +2,8 @@
  * Burn mode (pure): operator-flagged provider accounts that spend their
  * quota as fast as possible instead of pacing to their weekly reset.
  *
- * Config: burnMode: { accounts: string[], horizonMinutes?: number (60) }.
+ * Config: burnMode: { accounts: string[], horizonMinutes?: number (60),
+ *   deadlines?: { [matcher]: ISO-8601 UTC timestamp } }.
  * An entry matches an account by
  *   - its id ('meta:meta-lane-3'),
  *   - its lane / accountKey ('meta-lane-3'),
@@ -10,22 +11,29 @@
  *   - 'provider:*' (every account of that provider, e.g. 'codex:*'),
  * all case-insensitive. An entry prefixed with '!' EXCLUDES the accounts it
  * matches and wins over every positive entry, so 'meta:*' plus
- * '!rdugger@example.com' burns every Meta account but that one.
+ * '!rdugger@example.com' burns every Meta account but that one. The same
+ * identity semantics select deadline entries (a leading '!' entry never
+ * matches anything there: deadlines only shorten, never exclude).
  *
  * A burn account (see plugin.mjs, paceguard.mjs, select.mjs):
- *   - paces to min(regular reset, burn horizon, now + horizonMinutes), so
+ *   - paces to min(regular reset, burn horizon, now + horizonMinutes,
+ *     deadline), where deadline is the earliest FUTURE timestamp among the
+ *     deadlines entries it matches (past deadlines are ignored, so a
+ *     cancelled account that disappears from the feed changes nothing), so
  *     its required rate is maximal and it never reads ahead of plan;
  *   - is never capped or held by the pool pace guard;
  *   - is never held by the review reserve;
  *   - sorts first among the accounts that can serve a run (health,
  *     headroom, breakers and exclusions still apply: an exhausted burn
  *     account is never chosen).
- * Empty or missing config burns nothing: today's behavior bit-for-bit.
+ * Empty or missing config (including empty or missing deadlines) burns
+ * nothing: today's behavior bit-for-bit.
  */
 
 export const DEFAULT_BURN_MODE = Object.freeze({
   accounts: Object.freeze([]),
   horizonMinutes: 60,
+  deadlines: Object.freeze({}),
 });
 
 /** Config shape errors (strings), empty when valid or absent. */
@@ -47,19 +55,41 @@ export function validateBurnMode(raw) {
     && Number.isFinite(raw.horizonMinutes) && raw.horizonMinutes >= 1)) {
     errors.push('burnMode.horizonMinutes must be a number >= 1');
   }
+  if ('deadlines' in raw) {
+    const d = raw.deadlines;
+    if (d == null || typeof d !== 'object' || Array.isArray(d)) {
+      errors.push('burnMode.deadlines must be an object mapping account matchers to ISO-8601 timestamps');
+    } else for (const [k, v] of Object.entries(d)) {
+      if (typeof k !== 'string' || k.trim().length === 0) {
+        errors.push('burnMode.deadlines keys must be non-empty strings');
+      } else if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) {
+        errors.push(`burnMode.deadlines[${JSON.stringify(k)}] must be an ISO-8601 UTC timestamp`);
+      }
+    }
+  }
   return errors;
 }
 
-/** Coerce to { accounts: lower-cased trimmed strings, horizonMinutes }. */
+/** Coerce to { accounts: lower-cased trimmed strings, horizonMinutes, deadlines }. */
 export function normalizeBurnMode(raw) {
   const r = raw != null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const accounts = Array.isArray(r.accounts)
     ? [...new Set(r.accounts.filter(x => typeof x === 'string' && x.trim().length > 0).map(x => x.trim().toLowerCase()))]
     : [];
   const h = r.horizonMinutes;
+  const d = r.deadlines;
+  const deadlines = {};
+  if (d != null && typeof d === 'object' && !Array.isArray(d)) {
+    for (const [k, v] of Object.entries(d)) {
+      if (typeof k === 'string' && k.trim().length > 0 && typeof v === 'string' && v.trim().length > 0) {
+        deadlines[k.trim().toLowerCase()] = v.trim();
+      }
+    }
+  }
   return {
     accounts,
     horizonMinutes: typeof h === 'number' && Number.isFinite(h) && h >= 1 ? h : DEFAULT_BURN_MODE.horizonMinutes,
+    deadlines,
   };
 }
 
@@ -152,13 +182,54 @@ export function burnEligibleAccounts(cfg, accounts, keys = null) {
 }
 
 /**
- * Pace end for a burn account: min(regular reset, burn horizon, now + H).
- * An unknown regular reset still burns (now + H).
+ * Earliest FUTURE deadline (ms) among the cfg.deadlines entries this account
+ * matches (same identity semantics as the accounts list), or null when none
+ * matches. Past deadlines are ignored: a cancelled account disappears from
+ * the feed anyway. Pure matching: the caller gates on isBurnAccount.
  */
-export function burnPaceResetAtMs({ nowMs, resetAtMs = null, horizonMs = null, cfg }) {
+export function burnDeadlineAtMs(cfg, account, key = null, nowMs = Date.now()) {
+  const deadlines = cfg?.deadlines;
+  if (deadlines == null || typeof deadlines !== 'object' || Array.isArray(deadlines)) return null;
+  const entries = Object.entries(deadlines);
+  if (entries.length === 0) return null;
+  const ids = identitiesOf(account, key);
+  const provider = providerOf(account, key);
+  let best = null;
+  for (const [matcher, stamp] of entries) {
+    if (typeof matcher !== 'string' || typeof stamp !== 'string') continue;
+    if (!entryMatches(matcher, ids, provider)) continue;
+    const atMs = Date.parse(stamp);
+    if (!Number.isFinite(atMs) || atMs <= nowMs) continue;
+    if (best == null || atMs < best) best = atMs;
+  }
+  return best;
+}
+
+/**
+ * Pace end for a burn account plus which bound set it:
+ * min(regular reset, burn horizon, now + H, deadline). An unknown regular
+ * reset still burns (now + H); a past (or absent) deadline never binds.
+ * source is 'reset' | 'horizon' | 'deadline'; ties prefer the operator-set
+ * deadline, then the reset, then a horizon.
+ */
+export function burnPaceTarget({ nowMs, resetAtMs = null, horizonMs = null, deadlineAtMs = null, cfg }) {
   const h = (cfg?.horizonMinutes ?? DEFAULT_BURN_MODE.horizonMinutes) * 60000;
-  const ends = [nowMs + h];
-  if (Number.isFinite(resetAtMs)) ends.push(resetAtMs);
-  if (Number.isFinite(horizonMs)) ends.push(horizonMs);
-  return Math.min(...ends);
+  const cands = [{ atMs: nowMs + h, source: 'horizon' }];
+  if (Number.isFinite(resetAtMs)) cands.push({ atMs: resetAtMs, source: 'reset' });
+  if (Number.isFinite(horizonMs)) cands.push({ atMs: horizonMs, source: 'horizon' });
+  if (Number.isFinite(deadlineAtMs) && deadlineAtMs > nowMs) cands.push({ atMs: deadlineAtMs, source: 'deadline' });
+  const rank = { deadline: 0, reset: 1, horizon: 2 };
+  let best = cands[0];
+  for (const c of cands.slice(1)) {
+    if (c.atMs < best.atMs || (c.atMs === best.atMs && rank[c.source] < rank[best.source])) best = c;
+  }
+  return best;
+}
+
+/**
+ * Pace end for a burn account: min(regular reset, burn horizon, now + H,
+ * deadline). An unknown regular reset still burns (now + H).
+ */
+export function burnPaceResetAtMs({ nowMs, resetAtMs = null, horizonMs = null, deadlineAtMs = null, cfg }) {
+  return burnPaceTarget({ nowMs, resetAtMs, horizonMs, deadlineAtMs, cfg }).atMs;
 }
