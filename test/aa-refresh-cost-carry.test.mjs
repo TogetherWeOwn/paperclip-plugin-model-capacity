@@ -355,3 +355,55 @@ test('costless new slug with no carry source stays laddered via the median backs
   assert.ok((claudeView?.arms ?? []).every(a => a.costEstimated == null),
     'measured arms carry no estimated mark');
 });
+
+test('costless arm with a measured same-family sibling prices at the family median, not the fleet median', async () => {
+  // Plugin-level pin for the family wiring into fillCosts: only the
+  // higher-quality Muse sibling loses its costs, so the nulled xhigh arm must
+  // price at the Muse family median (1.60, the surviving sibling) instead of
+  // the fleet median (0.88 over 1.60/0.88/0.40). Nulling the higher-Q sibling
+  // keeps the nulled arm Pareto-alive: it strictly dominates its sibling at
+  // equal cost, so a missing arm here is a real regression, not dominance.
+  const accounts = [
+    rawAcct('meta-1', 'meta', 'meta-1', ['muse-spark-1.3-contributor']),
+    rawAcct('claude-1', 'claude', 'claude-1', ['claude-sonnet-5-5', 'claude-haiku-5-5']),
+  ];
+  const { store, jobs, fake, plugin, skey } = drive({});
+  await plugin.setup({
+    ...fake,
+    http: {
+      fetch: async () => {
+        const lane = { observedAt: new Date(TICK).toISOString(), accounts };
+        return { status: 200, json: async () => withSyntheticReadiness(lane, TICK) };
+      },
+    },
+  });
+  await plugin.onConfigChanged(
+    { cliproxy: { laneKeySecretRef: SECRET }, aa: { apiKeySecretRef: SECRET } },
+    { companyId: 'acme' },
+  );
+  const AA_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' };
+  const CAP_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'capacity-v1' };
+  store.set(skey(AA_KEY), {
+    fetchedAt: new Date(TICK).toISOString(),
+    rows: [
+      { ...MUSE_ROWS[0] },
+      { ...MUSE_ROWS[1], intelligenceIndexCostPerTask: null, price1mInputTokens: null, price1mOutputTokens: null },
+      ...CLAUDE_ROWS.map(r => ({ ...r })),
+    ],
+    duplicateSlugs: [],
+    leaderboardSlugs: [...ALL_SLUGS],
+    lastAttemptAt: new Date(TICK).toISOString(),
+    lastError: null,
+    lastLeaderboardError: null,
+  });
+
+  await jobs.get('shadow-tick')({});
+  const cap = store.get(skey(CAP_KEY));
+  const metaView = (cap.accounts ?? []).find(a => a.provider === 'meta');
+  const arms = metaView?.arms ?? [];
+  const nulled = arms.find(a => a.armId === 'muse-spark-1-3-xhigh');
+  assert.ok(nulled, `nulled xhigh arm stays laddered (arms: ${arms.map(a => a.armId).join(', ')})`);
+  assert.equal(nulled.costEstimated, true, 'nulled arm marked estimated');
+  assert.equal(nulled.costCarriedFrom, undefined, 'no carry source: no marker');
+  assert.equal(nulled.costBase, 1.6, 'priced at the family median (1.60), not the fleet median (0.88)');
+});
