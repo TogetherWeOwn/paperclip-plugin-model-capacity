@@ -105,8 +105,8 @@
     }
   },
   "contextCaps": {
-    "solMaxTokens": 500000,
-    "solAutoCompactTokens": 470000,
+    "solMaxTokens": 890000,
+    "solAutoCompactTokens": 870000,
     "lunaMaxTokens": 260000,
     "lunaAutoCompactTokens": 240000,
     "autoCompactEnvKey": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",

@@ -23,14 +23,20 @@ export const DEFAULT_ROLE_BANDS = Object.freeze({
 
 export const DEFAULT_CONTEXT_CAPS = Object.freeze({
   /**
-   * GPT-6.1 Sol: OpenAI's Codex default window, raised 272k -> 500k on
-   * 2026-10-11 (model max 1M), with no long-context fee when usage draws
-   * from a subscription. Compact 30k under the window.
+   * GPT-6.1 Sol: no price cap, only the real server ceiling. OpenAI charges
+   * no long-context fee on GPT-6.1 Sol when usage draws from a subscription
+   * (2026-10-11; the 272k surcharge is API pay-as-you-go only), and our Sol
+   * lanes are subscription. Measured 2026-10-22 through CLIProxy on a
+   * subscription lane: 917,354 input tokens accepted, ~941k rejected with
+   * context_too_large, so the input ceiling is ~922k (1.05M window minus
+   * 128k max output). 890000 / 870000 sit 32k / 52k under it (the same
+   * margins tiers.mjs applies), so a client compacts instead of failing on
+   * tokenizer-estimate drift.
    */
-  solMaxTokens: 500000,
-  solAutoCompactTokens: 470000,
+  solMaxTokens: 890000,
+  solAutoCompactTokens: 870000,
   /**
-   * Luna, and every other capped-family id the 500k change does not cover
+   * Luna, and every other capped-family id the Sol change does not cover
    * (Sol ids before 6.1), stays under the 272k price cliff. The legacy
    * solLunaMaxTokens / solLunaAutoCompactTokens config keys set these.
    */
@@ -91,8 +97,8 @@ export const CAPPED_CONTEXT_FAMILIES = Object.freeze(['sol', 'luna']);
 /**
  * Model ids the Sol window (solMaxTokens) covers: GPT-6.1 Sol only, in any
  * spelling the lanes serve (`gpt-6.1-sol`, Devin's `gpt-6-1-sol`, provider
- * prefixes, `(effort)` / `[1m]` decorations). OpenAI's 500k change names
- * GPT-6.1 Sol alone, so older Sol-family ids (`gpt-6-sol`, `gpt-5.6-sol`,
+ * prefixes, `(effort)` / `[1m]` decorations). OpenAI's no-long-context-fee
+ * statement names GPT-6.1 Sol alone, so older Sol-family ids (`gpt-6-sol`, `gpt-5.6-sol`,
  * legacy `model_*gpt*`) keep the 272k-cliff (Luna) caps.
  */
 const SOL_WINDOW_MODEL = /^gpt-6[.-]1-sol(?:$|-)/;
@@ -134,6 +140,8 @@ function configuredWindow(caps, maxKey, compactKey) {
  *   - GPT-6.1 Sol (isSolWindowModel): the configured Sol window
  *     (solMaxTokens / solAutoCompactTokens) is a CEILING -- a tier cap may
  *     lower it, never raise it, so no path runs Sol past solMaxTokens.
+ *     (The feed's gpt-6-1-sol ~922k window tier derives exactly the
+ *     default 890000 / 870000; a wider tier still lands on the ceiling.)
  *   - Any other arm with a tier cap: the tier cap (the feed is fresher than
  *     the static default), exactly as 0.2.61.
  *   - Other sol/luna ids without a tier cap: the Luna (272k-cliff) caps.

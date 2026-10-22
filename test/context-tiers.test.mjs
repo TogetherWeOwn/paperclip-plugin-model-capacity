@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
-import { decide, DEFAULT_CONTEXT_CAPS, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY } from '../src/decide.mjs';
+import { decide, contextCapsEnv, DEFAULT_CONTEXT_CAPS, MAX_CONTEXT_ENV_KEY, AUTO_COMPACT_ENV_KEY } from '../src/decide.mjs';
 import {
   tierModelKey, matchPricingTier, overFractionAt, overShareAt,
   quantileOverShare, blendedMultiplier,
-  expectedMultiplier, armTierCost, armTierCap, tierCapsByModel,
+  expectedMultiplier, armTierCost, armTierCap, tierCapsByModel, tierContextCap,
   fleetBaselineForModels, median,
 } from '../src/tiers.mjs';
 import { parseLaneBody } from '../src/cliproxy.mjs';
@@ -225,7 +225,7 @@ test('feasibility gate: Haiku infeasible (no cap), Sol feasible (240k/220k)', ()
   );
 });
 
-test('decide: a tier cap lowers the Sol window, never raises it; Sol without a tier gets 500k', () => {
+test('decide: a tier cap lowers the Sol window, never raises it; Sol without a tier gets 890k', () => {
   const arm = (model, family, cap) => ({
     armId: model, model, effort: 'max', family,
     contextWindow: 1000000, Q: 1, C: 1, trial: false, cap,
@@ -244,16 +244,16 @@ test('decide: a tier cap lowers the Sol window, never raises it; Sol without a t
     ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', null)),
     accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
-  assert.equal(untiered.env[MAX_CONTEXT_ENV_KEY], '500000');
-  assert.equal(untiered.env[AUTO_COMPACT_ENV_KEY], '470000');
+  assert.equal(untiered.env[MAX_CONTEXT_ENV_KEY], '890000');
+  assert.equal(untiered.env[AUTO_COMPACT_ENV_KEY], '870000');
   // A feed tier above the Sol window never raises it.
   const wide = decide({
     runId: 'r', agentId: 'a',
     ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', { maxTokens: 968000, autoCompactTokens: 948000 })),
     accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
-  assert.equal(wide.env[MAX_CONTEXT_ENV_KEY], '500000');
-  assert.equal(wide.env[AUTO_COMPACT_ENV_KEY], '470000');
+  assert.equal(wide.env[MAX_CONTEXT_ENV_KEY], '890000');
+  assert.equal(wide.env[AUTO_COMPACT_ENV_KEY], '870000');
   // Luna keeps 0.2.61 semantics: tier cap when present, else 260k/240k.
   const lunaTiered = decide({
     runId: 'r', agentId: 'a',
@@ -268,6 +268,52 @@ test('decide: a tier cap lowers the Sol window, never raises it; Sol without a t
   });
   assert.equal(legacy.env[MAX_CONTEXT_ENV_KEY], '260000');
   assert.equal(legacy.env[AUTO_COMPACT_ENV_KEY], '240000');
+});
+
+// The host feed's gpt-6-1-sol entry (ops pricing-tiers.json, 2026-10-22):
+// a multiplier-1 "window" tier at the measured subscription input ceiling.
+// Live test through CLIProxy: 917,354 input tokens accepted, ~941k rejected
+// (context_too_large) -> ~922k = 1.05M window minus 128k max output.
+const solWindowEntry = (overPromptTokens) => ({
+  family: 'gpt-6-1-sol', match: ['^gpt-6\\.1-sol', '^gpt-6[.-]1-sol'], vendor: 'openai',
+  status: 'verified', contextWindow: 1050000,
+  base: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+  tiers: [{
+    overPromptTokens, appliesTo: 'window', countsCached: null,
+    multiplier: { input: 1, cacheRead: 1, cacheWrite: 1, output: 1 },
+    pricesPerMTok: { input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
+  }],
+});
+// Live Sol prompt stats (Keeper 24 h, 2026-10-22 19:24Z).
+const liveSolStats = {
+  requests: 11295,
+  promptTokens: { p10: 60467, p50: 113302, p90: 183740, p99: 308115 },
+  fractionOver: { 100000: 0.6127, 272000: 0.0216, 500000: 0.0003 },
+};
+
+test('Sol window tier at the ~922k ceiling derives exactly the 890000/870000 defaults; never above them', () => {
+  const SOL_DEFAULT = { maxTokens: DEFAULT_CONTEXT_CAPS.solMaxTokens, autoCompactTokens: DEFAULT_CONTEXT_CAPS.solAutoCompactTokens };
+  assert.deepEqual(SOL_DEFAULT, { maxTokens: 890000, autoCompactTokens: 870000 });
+  const modelStats = { models: { 'gpt-6.1-sol': liveSolStats } };
+  const capAt = (t, model = 'gpt-6.1-sol') => armTierCap({ model, pricingTiers: [solWindowEntry(t)], modelStats });
+  // 922k: T - 32k / T - 52k = the defaults, for every served spelling.
+  assert.deepEqual(tierContextCap(solWindowEntry(922000).tiers, liveSolStats), SOL_DEFAULT);
+  for (const model of ['gpt-6.1-sol', 'GPT-6.1-Sol', 'codex/gpt-6.1-sol', 'gpt-6.1-sol(max)']) {
+    assert.deepEqual(capAt(922000, model), SOL_DEFAULT, model);
+  }
+  // Feasible at 922k (p10 60k << 0.6 x 922k), and a multiplier-1 tier prices
+  // nothing: subscription Sol pays no long-context fee.
+  const cost = armTierCost({ model: 'gpt-6.1-sol', costBase: 20, pricingTiers: [solWindowEntry(922000)], modelStats });
+  assert.equal(cost.costMultiplier, 1);
+  assert.equal(cost.tierThreshold, 922000);
+  // Through the env builder: the 922k tier, a wider tier, or the full 1.05M
+  // window all land on the ceiling; only a lower (stale 500k) tier lowers it.
+  const env = (t) => contextCapsEnv({ family: 'sol', model: 'gpt-6.1-sol', cap: capAt(t) });
+  const atCeiling = { [MAX_CONTEXT_ENV_KEY]: '890000', [AUTO_COMPACT_ENV_KEY]: '870000' };
+  assert.deepEqual(env(922000), atCeiling);
+  assert.deepEqual(env(1000000), atCeiling);
+  assert.deepEqual(env(1050000), atCeiling);
+  assert.deepEqual(env(500000), { [MAX_CONTEXT_ENV_KEY]: '468000', [AUTO_COMPACT_ENV_KEY]: '448000' });
 });
 
 test('one tiered model never caps its untiered same-family sibling', () => {

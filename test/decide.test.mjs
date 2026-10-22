@@ -32,11 +32,11 @@ test('thinker floor binds; retries escalate one rung each', () => {
   assert.equal(testFail.rung, 1);
 });
 
-test('sol carries the 500k window, luna the price-cliff caps', () => {
+test('sol carries the 890k window, luna the price-cliff caps', () => {
   const d = decide({ ...base, pointer: 1 });
   assert.equal(d.model, 'gpt-6.1-sol');
-  assert.equal(d.env[MAX_CONTEXT_ENV_KEY], '500000');
-  assert.equal(d.env[AUTO_COMPACT_ENV_KEY], '470000');
+  assert.equal(d.env[MAX_CONTEXT_ENV_KEY], '890000');
+  assert.equal(d.env[AUTO_COMPACT_ENV_KEY], '870000');
   const lunaRungs = [{ rung: 0, arms: [arm('luna-high', 'gpt-6-luna', 'high', 'luna', 1)] }];
   const luna = decide({ ...base, ladderRungs: lunaRungs, burnPerRunPct: { 'luna-high': 0.0005 } });
   assert.equal(luna.model, 'gpt-6-luna');
