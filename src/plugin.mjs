@@ -35,7 +35,7 @@ import {
   isReactiveAccount,
   CliproxyCache,
 } from './cliproxy.mjs';
-import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill } from './aa.mjs';
+import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill, carryForwardCosts } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
   canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES,
@@ -1192,6 +1192,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const fleetAlphaDoer = eeeLive ? blendAlphaForRole('doer', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
     const fleetAlphaThinker = eeeLive ? blendAlphaForRole('thinker', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
     const fleetQ = (armId, alpha) => blendQ(fleetAa.get(armId) ?? null, fleetEee?.get(armId)?.Qeee ?? null, alpha);
+    // Fleet-wide median pool for the cost backstop (2026-10-22): the
+    // per-account profile stays local, but a lane serving only a costless
+    // family still prices its arms from the fleet's measured costs instead of
+    // dropping them from the ladder. fillCosts dedupes by armId, so served
+    // arms are not double-counted.
+    const fleetCostPool = fleetArms.map(a => ({
+      armId: a.armId,
+      family: a.family ?? null,
+      cost: a.row.intelligenceIndexCostPerTask,
+    }));
     const ladders = {};
     for (let i = 0; i < accounts.length; i++) {
       const account = accounts[i];
@@ -1214,10 +1224,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const alphaThinker = eeeLive ? blendAlphaForRole('thinker', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
       const costs = fillCosts(served.map(a => ({
         armId: a.armId,
+        family: a.family ?? null,
         cost: a.row.intelligenceIndexCostPerTask,
         priceIn: a.row.price1mInputTokens,
         priceOut: a.row.price1mOutputTokens,
-      })));
+      })), { medianPool: fleetCostPool });
       const eeeByArm = new Map();
       const eligible = served.map(a => {
         const base = costs.get(a.armId)?.C ?? null;
@@ -1243,6 +1254,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // subscription lanes quota charges the tier price, not base.
           C: tier.costEffective ?? base,
           coverage: scored.get(a.armId)?.coverage ?? 0,
+          // Carried-cost provenance rides to candidates, rungs and the
+          // capacity view; absent when the row measured its own costs.
+          ...(a.row.costCarriedFrom != null ? { costCarriedFrom: a.row.costCarriedFrom } : {}),
           costBase: base,
           costMultiplier: tier.costMultiplier,
           costEffective: tier.costEffective,
@@ -2023,6 +2037,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           rung: r.rung, trial: r.trial,
           breaker: r.breaker ?? 'closed',
           cap: r.cap ?? null,
+          // Cost provenance marks ride only priced arms, so views without
+          // them stay byte-identical to the pre-carry shape.
+          ...(r.costEstimated ? { costEstimated: true } : {}),
+          ...(r.costCarriedFrom != null ? { costCarriedFrom: r.costCarriedFrom } : {}),
           costBase: r.costBase ?? null,
           costMultiplier: r.costMultiplier ?? 1,
           costEffective: r.costEffective ?? r.costBase ?? null,
@@ -4423,12 +4441,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         ? nowIso
         : (previous.leaderboardAt ?? null);
     }
+    // Cost carry (2026-10-22): a refresh can keep every row but drop the cost
+    // fields for some slugs -- the leaderboard check passes, so the keep path
+    // above never fires, yet every null-cost arm loses its ladder rungs.
+    // Carry the last known cost and prices forward per slug from the previous
+    // snapshot's merged rows (fresh values always win; carried rows are marked
+    // costCarriedFrom). The raw layer below stays raw: the next refresh
+    // carries from these merged rows again.
+    const carriedRows = carryForwardCosts(merged.rows, prevRows, previous.fetchedAt ?? 'previous-snapshot');
+    const carriedSlugs = carriedRows.filter(r => r?.costCarriedFrom != null).map(r => r.slug);
     // The raw layer carried into the next snapshot: freshly parsed rows on
     // success, the kept layer on failure (never the merged rows).
     const storedLeaderboardRows = keptPreviousLeaderboard ? keptRows : leaderboardRows;
     await ctx.state.set(scopeKey(companyId, AA_KEY), {
       fetchedAt: nowIso,
-      rows: merged.rows,
+      rows: carriedRows,
       duplicateSlugs: merged.duplicateSlugs,
       leaderboardSlugs: merged.leaderboardSlugs,
       leaderboardRows: storedLeaderboardRows,
@@ -4448,10 +4475,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         companyId, rows: merged.rows.length, leaderboardRows: leaderboardRows.length, leaderboardError,
       });
     }
+    if (carriedSlugs.length > 0) {
+      ctx.logger.error('model-capacity: AA refresh dropped cost fields; carried forward from previous snapshot', {
+        companyId, carriedSlugs,
+      });
+    }
     return {
       status: 'ok', rows: merged.rows.length,
       leaderboardRows: storedLeaderboardRows.length,
       leaderboardError, keptPreviousLeaderboard,
+      costCarriedSlugs: carriedSlugs,
     };
   }
 

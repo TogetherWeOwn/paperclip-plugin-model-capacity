@@ -495,6 +495,49 @@ export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
   return { rows: [...bySlug.values()], duplicateSlugs: duplicates, leaderboardSlugs: [...leaderboardSlugs] };
 }
 
+/**
+ * Cost fields a refresh must never silently drop per slug. On 2026-10-22 a
+ * refresh published the Muse slugs with all three null; the null-cost arms
+ * lost every ladder rung and the fleet target stalled.
+ */
+export const COST_CARRY_FIELDS = Object.freeze([
+  'intelligenceIndexCostPerTask',
+  'price1mInputTokens',
+  'price1mOutputTokens',
+]);
+
+/**
+ * Carry the last known cost fields forward per slug when a refresh drops
+ * them. Fresh values always win -- only null fields are carried from the
+ * previous snapshot's row for the same slug -- and rows that carried
+ * anything are marked `costCarriedFrom` (the source snapshot's fetchedAt)
+ * so the capacity report shows it. A stale marker on a now-complete row is
+ * stripped: the marker describes this row, not its history. Neither input is
+ * mutated.
+ */
+export function carryForwardCosts(mergedRows = [], prevRows = [], carriedFrom = null) {
+  const prevBySlug = new Map();
+  for (const row of prevRows ?? []) {
+    if (row && typeof row.slug === 'string' && !prevBySlug.has(row.slug)) prevBySlug.set(row.slug, row);
+  }
+  return (mergedRows ?? []).map(row => {
+    if (!row || typeof row.slug !== 'string') return row;
+    const { costCarriedFrom: _stale, ...fresh } = row;
+    const prev = prevBySlug.get(row.slug);
+    if (!prev) return fresh;
+    let carried = false;
+    const next = { ...fresh };
+    for (const field of COST_CARRY_FIELDS) {
+      if (next[field] == null && prev[field] != null) {
+        next[field] = prev[field];
+        carried = true;
+      }
+    }
+    if (carried) next.costCarriedFrom = carriedFrom;
+    return next;
+  });
+}
+
 /** Parse fetched text into normalized rows; null when the shape is unknown. */
 export function parseAaFreeList(text) {
   let parsed;
