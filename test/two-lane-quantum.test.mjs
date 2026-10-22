@@ -60,24 +60,31 @@ test('double-quantum replay: both moving lanes keep the group prior', () => {
 });
 
 test('double-quantum replay: moving lanes slots stay within 25% of pre-jump', () => {
-  // Pre-jump: lane 4 on the 0.0004 prior with 80% remaining over ~96h.
-  const pre = computeConcurrencyTarget({
-    accounts: [{ accountId: 'meta:lane-4', remainingPct: 0.80, hoursToReset: 96,
-      burnPerRunPct: 0.0004, measuredBurnPerRunPct: 0.0004 }],
-    meanRunDurationHours: 0.186,
-  });
-  // Post-fix replay: the rejected samples keep the 0.0004 prior (79%
-  // remaining after the quantum); without the guards the lanes would price
-  // at ~0.015 and collapse to ~3% of their slots.
-  const fixed = incidentCalibrate().get('meta:lane-4');
-  assert.equal(fixed.burnPerRunPct, 0.0004);
-  const post = computeConcurrencyTarget({
-    accounts: [{ accountId: 'meta:lane-4', remainingPct: 0.79, hoursToReset: 95.9,
-      burnPerRunPct: 0.0004, measuredBurnPerRunPct: fixed.burnPerRunPct }],
-    meanRunDurationHours: 0.186,
-  });
-  const preSlots = pre.perAccount[0].slots;
-  const postSlots = post.perAccount[0].slots;
-  assert.ok(Math.abs(postSlots - preSlots) / preSlots < 0.25,
-    `slots ${postSlots} within 25% of pre-jump ${preSlots}`);
+  // Pre-jump remaining per lane (1 - utilization at the first reading).
+  // Post-fix replay: the rejected samples keep the 0.0004 prior (one quantum
+  // of use); without the guards the lanes would price at ~0.015 and collapse
+  // to ~3% of their slots.
+  const lanes = [
+    { key: 'meta:lane-4', preRemaining: 0.80, postRemaining: 0.79 },
+    { key: 'meta:lane-7', preRemaining: 0.82, postRemaining: 0.81 },
+  ];
+  const calibrated = incidentCalibrate();
+  for (const { key, preRemaining, postRemaining } of lanes) {
+    const fixed = calibrated.get(key);
+    assert.equal(fixed.burnPerRunPct, 0.0004);
+    const pre = computeConcurrencyTarget({
+      accounts: [{ accountId: key, remainingPct: preRemaining, hoursToReset: 96,
+        burnPerRunPct: 0.0004, measuredBurnPerRunPct: 0.0004 }],
+      meanRunDurationHours: 0.186,
+    });
+    const post = computeConcurrencyTarget({
+      accounts: [{ accountId: key, remainingPct: postRemaining, hoursToReset: 95.9,
+        burnPerRunPct: 0.0004, measuredBurnPerRunPct: fixed.burnPerRunPct }],
+      meanRunDurationHours: 0.186,
+    });
+    const preSlots = pre.perAccount[0].slots;
+    const postSlots = post.perAccount[0].slots;
+    assert.ok(Math.abs(postSlots - preSlots) / preSlots < 0.25,
+      `${key} slots ${postSlots} within 25% of pre-jump ${preSlots}`);
+  }
 });
