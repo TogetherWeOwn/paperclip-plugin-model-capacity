@@ -47,17 +47,22 @@ for (const provider of ['meta', 'codex', 'claude', 'future-provider']) {
 }
 
 test('first quantized low-burn sample grants provisional weight; confidence grows with independent meter movement', () => {
-  const early = calibrate({ a: history(0.04), b: history(0.04), large: history(0.01) });
+  // Baselines 0.0003 (early) and 0.0012 (late); the prior sits within 4x of
+  // both so the guard accepts the samples and the test measures shrinkage.
+  const early = calibrate({ a: history(0.04), b: history(0.04), large: history(0.01) }, 0.0006);
   assert.ok(early.get('large').capacityWeight >= 1.9);
   assert.ok(early.get('large').capacityWeight < 4);
   assert.ok(early.get('large').confidence > 0 && early.get('large').confidence < 1);
-  const late = calibrate({ a: history(0.16), b: history(0.16), large: history(0.04) });
+  const late = calibrate({ a: history(0.16), b: history(0.16), large: history(0.04) }, 0.0006);
   assert.ok(late.get('large').confidence > early.get('large').confidence);
   assert.ok(late.get('large').capacityWeight > early.get('large').capacityWeight);
 });
 
 test('request share prevents an idle 1x account being mistaken for a larger plan', () => {
-  const r = calibrate({ a: history(0.16, 400), b: history(0.16, 400), idle: history(0.04, 100) });
+  // Baseline 0.0009; the prior agrees within 4x so the sample prices and the
+  // test measures request-share weighting, not the prior fallback.
+  const r = calibrate({ a: history(0.16, 400), b: history(0.16, 400), idle: history(0.04, 100) }, 0.001);
+  assert.equal(r.get('idle').source, 'account-weekly');
   assert.ok(Math.abs(r.get('idle').capacityWeight - 1) < 1e-9);
 });
 
@@ -96,7 +101,10 @@ test('5h meter can infer relative weight, but never treats a 5h fraction as a we
 });
 
 test('capacity weights are bounded for unusually large and small plans', () => {
-  const r = calibrate({ a: history(0.04), b: history(0.04), tiny: history(0.8), huge: history(0.04, 80000) });
+  // The huge member serves 10x the requests at 1/10th the burn per request;
+  // every member clears the attributed-runs floor and the baseline agrees
+  // with the prior, so the test measures the weight clamps, not the fallback.
+  const r = calibrate({ a: history(0.04), b: history(0.04), tiny: history(0.8), huge: history(0.04, 4000) });
   assert.equal(r.get('tiny').capacityWeight, 0.25);
   assert.equal(r.get('huge').capacityWeight, 8);
 });

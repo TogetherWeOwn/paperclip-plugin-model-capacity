@@ -98,6 +98,12 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.63 = account-weekly guards: a weekly sample prices only on >=10
+ *   attributed runs and only when its baseline agrees with the group prior
+ *   within 4x; otherwise the prior is kept and /capacity names the rejection
+ *   (calibrationRejectionReason), the attempted runs and the unattributed
+ *   request share (1 - prior/baseline) per lane and per group. No capability,
+ *   egress, secret or env-key change.
  * v0.2.62 = AA cost carry: the refresh carries the last known cost and prices
  *   forward per slug when a refresh drops them (marked costCarriedFrom), and
  *   a scored arm with no cost anywhere takes the family then fleet median
@@ -323,7 +329,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.62';
+export const PLUGIN_VERSION = '0.2.63';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
