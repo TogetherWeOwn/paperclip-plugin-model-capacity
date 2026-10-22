@@ -10,6 +10,8 @@
  * does the run-level answer stay `defer`.
  */
 
+import { canonicalModelName } from './arms.mjs';
+
 export const MAX_CONTEXT_ENV_KEY = 'CLAUDE_CODE_MAX_CONTEXT_TOKENS';
 export const AUTO_COMPACT_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
 export const MAX_OUTPUT_ENV_KEY = 'CLAUDE_CODE_MAX_OUTPUT_TOKENS';
@@ -20,17 +22,29 @@ export const DEFAULT_ROLE_BANDS = Object.freeze({
 });
 
 export const DEFAULT_CONTEXT_CAPS = Object.freeze({
-  /** Sol/Luna stay under the 272k price cliff. */
-  solLunaMaxTokens: 260000,
-  solLunaAutoCompactTokens: 240000,
+  /**
+   * GPT-6.1 Sol: OpenAI's Codex default window, raised 272k -> 500k on
+   * 2026-10-11 (model max 1M), with no long-context fee when usage draws
+   * from a subscription. Compact 30k under the window.
+   */
+  solMaxTokens: 500000,
+  solAutoCompactTokens: 470000,
+  /**
+   * Luna, and every other capped-family id the 500k change does not cover
+   * (Sol ids before 6.1), stays under the 272k price cliff. The legacy
+   * solLunaMaxTokens / solLunaAutoCompactTokens config keys set these.
+   */
+  lunaMaxTokens: 260000,
+  lunaAutoCompactTokens: 240000,
   /** Auto-compact watermark key (operator-overridable, null omits it). */
   autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
   /**
    * Tier-derived compact windows ride the chosen ARM (arm.cap, keyed by
    * model by the plugin from the live pricingTiers/modelStats feed), never
    * a family map: families group unrelated models, so a family-keyed window
-   * leaks one model's cliff onto untiered siblings. Arms without a cap keep
-   * the legacy sol/luna behavior below.
+   * leaks one model's cliff onto untiered siblings. The GPT-6.1 Sol window
+   * above is a ceiling a tier cap can only lower; every other arm takes its
+   * tier cap when it has one, else (sol/luna) the Luna caps.
    */
   /** Haiku hit the 32k output cap live; raise it to 64k on haiku arms. */
   haikuMaxOutputTokens: 64000,
@@ -42,6 +56,120 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
    */
   tierAffectsQuota: true,
 });
+
+/**
+ * Resolve config `contextCaps` over the defaults. Backward compatible: the
+ * pre-0.2.65 keys solLunaMaxTokens / solLunaAutoCompactTokens set the Luna
+ * caps (explicit lunaMaxTokens / lunaAutoCompactTokens win) and never the
+ * Sol window -- a config written for the 272k cliff must not pin GPT-6.1 Sol
+ * there, nor raise it. The legacy keys do not survive into the resolved
+ * shape. tierAffectsQuota: explicit false restores base-cost burn
+ * (rollback); anything else keeps the tier-adjusted default.
+ */
+export function normalizeContextCaps(raw) {
+  const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const { solLunaMaxTokens, solLunaAutoCompactTokens, ...rest } = r;
+  return {
+    ...DEFAULT_CONTEXT_CAPS,
+    ...rest,
+    solMaxTokens: r.solMaxTokens ?? DEFAULT_CONTEXT_CAPS.solMaxTokens,
+    solAutoCompactTokens: r.solAutoCompactTokens ?? DEFAULT_CONTEXT_CAPS.solAutoCompactTokens,
+    lunaMaxTokens: r.lunaMaxTokens ?? solLunaMaxTokens ?? DEFAULT_CONTEXT_CAPS.lunaMaxTokens,
+    lunaAutoCompactTokens: r.lunaAutoCompactTokens ?? solLunaAutoCompactTokens ?? DEFAULT_CONTEXT_CAPS.lunaAutoCompactTokens,
+    tierAffectsQuota: r.tierAffectsQuota !== false,
+  };
+}
+
+/**
+ * Families that never run without a context cap: a run on one of these
+ * always carries a window (the Sol window or the Luna cliff caps, see
+ * contextCapsEnv), and the hook's keep paths turn a keep on one of these
+ * models into a decide on the same model carrying the caps.
+ */
+export const CAPPED_CONTEXT_FAMILIES = Object.freeze(['sol', 'luna']);
+
+/**
+ * Model ids the Sol window (solMaxTokens) covers: GPT-6.1 Sol only, in any
+ * spelling the lanes serve (`gpt-6.1-sol`, Devin's `gpt-6-1-sol`, provider
+ * prefixes, `(effort)` / `[1m]` decorations). OpenAI's 500k change names
+ * GPT-6.1 Sol alone, so older Sol-family ids (`gpt-6-sol`, `gpt-5.6-sol`,
+ * legacy `model_*gpt*`) keep the 272k-cliff (Luna) caps.
+ */
+const SOL_WINDOW_MODEL = /^gpt-6[.-]1-sol(?:$|-)/;
+
+/** True when `model` is a GPT-6.1 Sol id (the Sol window applies). */
+export function isSolWindowModel(model) {
+  const canon = canonicalModelName(model);
+  return canon != null && SOL_WINDOW_MODEL.test(canon.toLowerCase());
+}
+
+/** True when a run on this family/model must never go out without caps. */
+export function needsContextCap(family, model) {
+  return CAPPED_CONTEXT_FAMILIES.includes(family) || isSolWindowModel(model);
+}
+
+const positiveInt = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
+
+/**
+ * Configured { maxTokens, autoCompactTokens } under a key pair; a missing or
+ * non-positive value falls back to the default, so a broken config can never
+ * emit an uncapped run.
+ */
+function configuredWindow(caps, maxKey, compactKey) {
+  return {
+    maxTokens: positiveInt(caps?.[maxKey]) ?? DEFAULT_CONTEXT_CAPS[maxKey],
+    autoCompactTokens: positiveInt(caps?.[compactKey]) ?? DEFAULT_CONTEXT_CAPS[compactKey],
+  };
+}
+
+/**
+ * Context/output caps env for the arm a run executes on. The ONE builder for
+ * every path that answers the host with an env (decide() -- and with it
+ * burn-mode, trial and paced picks -- routed reviews, kept/pinned agents and
+ * the stale-snapshot keep), so the paths cannot drift apart again.
+ *
+ * arm: { cap, family, model }. cap is the arm's tier-derived compact window
+ *   ({ maxTokens, autoCompactTokens }, set per model by the plugin from the
+ *   live price-tier feed via tiers.mjs).
+ *   - GPT-6.1 Sol (isSolWindowModel): the configured Sol window
+ *     (solMaxTokens / solAutoCompactTokens) is a CEILING -- a tier cap may
+ *     lower it, never raise it, so no path runs Sol past solMaxTokens.
+ *   - Any other arm with a tier cap: the tier cap (the feed is fresher than
+ *     the static default), exactly as 0.2.61.
+ *   - Other sol/luna ids without a tier cap: the Luna (272k-cliff) caps.
+ * contextCaps: the resolved config caps; null/undefined use the defaults so a
+ *   missing config can never emit an uncapped Sol run.
+ * The auto-compact watermark never sits above the max window.
+ */
+export function contextCapsEnv(arm, contextCaps = DEFAULT_CONTEXT_CAPS) {
+  const caps = contextCaps ?? DEFAULT_CONTEXT_CAPS;
+  const env = {};
+  const family = arm?.family;
+  const tierMax = positiveInt(arm?.cap?.maxTokens);
+  const tier = tierMax != null ? { maxTokens: tierMax, autoCompactTokens: positiveInt(arm.cap.autoCompactTokens) } : null;
+  let window = null;
+  if (isSolWindowModel(arm?.model)) {
+    const sol = configuredWindow(caps, 'solMaxTokens', 'solAutoCompactTokens');
+    window = {
+      maxTokens: Math.min(sol.maxTokens, tier?.maxTokens ?? Infinity),
+      autoCompactTokens: Math.min(sol.autoCompactTokens, tier?.autoCompactTokens ?? Infinity),
+    };
+  } else if (tier) {
+    window = tier;
+  } else if (CAPPED_CONTEXT_FAMILIES.includes(family)) {
+    window = configuredWindow(caps, 'lunaMaxTokens', 'lunaAutoCompactTokens');
+  }
+  if (window) {
+    env[MAX_CONTEXT_ENV_KEY] = String(window.maxTokens);
+    if (caps.autoCompactEnvKey && window.autoCompactTokens != null) {
+      env[caps.autoCompactEnvKey] = String(Math.min(window.autoCompactTokens, window.maxTokens));
+    }
+  }
+  if (family === 'haiku') {
+    env[MAX_OUTPUT_ENV_KEY] = String(caps.haikuMaxOutputTokens);
+  }
+  return env;
+}
 
 /**
  * Trial defaults: families without fleet success history route as trials
@@ -221,7 +349,8 @@ function sanitizeId(part) {
  * ladderRungs: [{ rung, arms: [{ armId, model, effort, family,
  *   contextWindow, Q, C, trial, cap, qThinker }] }] (already provider-filtered).
  *   cap is the arm's tier-derived compact window ({ maxTokens,
- *   autoCompactTokens }) or null; it overrides the legacy sol/luna caps.
+ *   autoCompactTokens }) or null; it may lower the GPT-6.1 Sol window and
+ *   otherwise wins over the Luna caps (see contextCapsEnv).
  *   qThinker is the thinker-alpha EEE blend (null when AA-only); thinkers
  *   sort on it, other roles on Q.
  * excludedFamilies: families skipped for this run's role (role-based
@@ -309,25 +438,10 @@ export function decide({
     const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
     fitting.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
-    const env = {};
-    // Tier-derived compact window rides the chosen arm (arm.cap, set per
-    // model by the plugin from measured price cliffs via tiers.mjs) and wins
-    // over the static legacy keys when present: the feed is fresher than the
-    // default. Arms without a cap -- no tier, or an infeasible cliff -- keep
-    // the legacy sol/luna behavior.
-    const cap = arm.cap;
-    if (cap && cap.maxTokens > 0) {
-      env[MAX_CONTEXT_ENV_KEY] = String(Math.floor(cap.maxTokens));
-      if (contextCaps.autoCompactEnvKey && cap.autoCompactTokens > 0) {
-        env[contextCaps.autoCompactEnvKey] = String(Math.floor(cap.autoCompactTokens));
-      }
-    } else if (arm.family === 'sol' || arm.family === 'luna') {
-      env[MAX_CONTEXT_ENV_KEY] = String(contextCaps.solLunaMaxTokens);
-      if (contextCaps.autoCompactEnvKey) env[contextCaps.autoCompactEnvKey] = String(contextCaps.solLunaAutoCompactTokens);
-    }
-    if (arm.family === 'haiku') {
-      env[MAX_OUTPUT_ENV_KEY] = String(contextCaps.haikuMaxOutputTokens);
-    }
+    // Sol window (a tier cap may only lower it), else the tier cap, else the
+    // Luna caps for sol/luna, plus the haiku output cap: the shared builder
+    // every env-carrying path uses.
+    const env = contextCapsEnv(arm, contextCaps);
     const weak = arm.trial === true || fiveHourHeadroomPct == null || burnPerRunPct[arm.armId] == null;
     return {
       kind: 'decide',

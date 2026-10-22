@@ -225,7 +225,7 @@ test('feasibility gate: Haiku infeasible (no cap), Sol feasible (240k/220k)', ()
   );
 });
 
-test('decide prefers the arm tier cap over legacy keys, keeps legacy fallback', () => {
+test('decide: a tier cap lowers the Sol window, never raises it; Sol without a tier gets 500k', () => {
   const arm = (model, family, cap) => ({
     armId: model, model, effort: 'max', family,
     contextWindow: 1000000, Q: 1, C: 1, trial: false, cap,
@@ -239,12 +239,35 @@ test('decide prefers the arm tier cap over legacy keys, keeps legacy fallback', 
   });
   assert.equal(tiered.env[MAX_CONTEXT_ENV_KEY], '240000');
   assert.equal(tiered.env[AUTO_COMPACT_ENV_KEY], '220000');
-  const legacy = decide({
+  const untiered = decide({
     runId: 'r', agentId: 'a',
     ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', null)),
     accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
   });
+  assert.equal(untiered.env[MAX_CONTEXT_ENV_KEY], '500000');
+  assert.equal(untiered.env[AUTO_COMPACT_ENV_KEY], '470000');
+  // A feed tier above the Sol window never raises it.
+  const wide = decide({
+    runId: 'r', agentId: 'a',
+    ladderRungs: rungs(arm('gpt-6.1-sol', 'sol', { maxTokens: 968000, autoCompactTokens: 948000 })),
+    accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
+  assert.equal(wide.env[MAX_CONTEXT_ENV_KEY], '500000');
+  assert.equal(wide.env[AUTO_COMPACT_ENV_KEY], '470000');
+  // Luna keeps 0.2.61 semantics: tier cap when present, else 260k/240k.
+  const lunaTiered = decide({
+    runId: 'r', agentId: 'a',
+    ladderRungs: rungs(arm('gpt-6-luna', 'luna', solo)),
+    accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
+  assert.equal(lunaTiered.env[MAX_CONTEXT_ENV_KEY], '240000');
+  const legacy = decide({
+    runId: 'r', agentId: 'a',
+    ladderRungs: rungs(arm('gpt-6-luna', 'luna', null)),
+    accountId: 'codex:1', contextCaps: DEFAULT_CONTEXT_CAPS,
+  });
   assert.equal(legacy.env[MAX_CONTEXT_ENV_KEY], '260000');
+  assert.equal(legacy.env[AUTO_COMPACT_ENV_KEY], '240000');
 });
 
 test('one tiered model never caps its untiered same-family sibling', () => {

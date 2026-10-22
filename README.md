@@ -461,10 +461,24 @@ frozen clock can never double-count.
    apply per account in every path (per-account in-flight plus decisions
    since the last tick); pooled totals order allocation only.
 
-Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
-under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
-watermark (configurable via `contextCaps.autoCompactEnvKey`; null omits
-it). Claude-* ids never get MAX_CONTEXT_TOKENS (the CLI ignores it for
+GPT-6.1 Sol runs carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=470000` (`contextCaps.solMaxTokens` /
+`solAutoCompactTokens`: OpenAI's Codex default window since 2026-10-11,
+with no long-context fee on subscription usage). Luna and pre-6.1 Sol ids
+stay under the 272k price cliff at 260000/240000
+(`contextCaps.lunaMaxTokens` / `lunaAutoCompactTokens`; the pre-0.2.65
+`solLunaMaxTokens` / `solLunaAutoCompactTokens` keys alias the Luna caps
+and never set the Sol window). The Sol window is a ceiling: an arm's
+tier cap from the price-tier feed may lower it, never raise it; other
+arms take their tier cap when they have one, else the Luna caps.
+Every path that answers the host builds this env through one helper
+(`contextCapsEnv`): `decide()` (burn-mode, trial and paced picks
+included), routed reviews, and kept/pinned agents or the stale-snapshot
+keep on a Sol/Luna model (answered as a decide on the same configured
+model carrying the caps, since a `keep` carries no env). The auto-compact
+key is configurable via `contextCaps.autoCompactEnvKey` (null omits it).
+Runs the host never sends to the hook (no issue, human assignee, issue
+model override, enforce off) cannot be capped here. Claude-* ids never get MAX_CONTEXT_TOKENS (the CLI ignores it for
 them and runs haiku at a 200k window): when the arm's AA context window is
 >= 1M and the run's adapter is `claude_local`/`claude-code`, the plugin
 emits `<model>(<effort>)[1m]` instead, which the CLI strips and runs at 1M.
