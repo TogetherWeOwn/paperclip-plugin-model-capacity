@@ -461,10 +461,16 @@ frozen clock can never double-count.
    apply per account in every path (per-account in-flight plus decisions
    since the last tick); pooled totals order allocation only.
 
-GPT-6.1 Sol runs carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` and
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW=470000` (`contextCaps.solMaxTokens` /
-`solAutoCompactTokens`: OpenAI's Codex default window since 2026-10-11,
-with no long-context fee on subscription usage). Luna and pre-6.1 Sol ids
+GPT-6.1 Sol runs carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=890000` and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=870000` (`contextCaps.solMaxTokens` /
+`solAutoCompactTokens`). There is no price cap: OpenAI charges no
+long-context fee on GPT-6.1 Sol when usage draws from a subscription
+(2026-10-11; the 272k surcharge applies to API pay-as-you-go only), and our
+Sol lanes are subscription. The only limit is the server ceiling, measured
+2026-10-22 through CLIProxy at ~922k input tokens (917,354 accepted, ~941k
+rejected with `context_too_large`; 1.05M window minus 128k max output);
+890000/870000 sit 32k/52k under it so a client compacts instead of failing.
+Luna and pre-6.1 Sol ids
 stay under the 272k price cliff at 260000/240000
 (`contextCaps.lunaMaxTokens` / `lunaAutoCompactTokens`; the pre-0.2.65
 `solLunaMaxTokens` / `solLunaAutoCompactTokens` keys alias the Luna caps

@@ -108,10 +108,11 @@
  *   missing deadlines decide bit-for-bit as before. No capability, egress,
  *   secret or env-key change.
  * v0.2.65 (host build: 0.2.61 + #57 only) = Sol/Luna context caps on every path: GPT-6.1 Sol runs at
- *   contextCaps.solMaxTokens 500000 / solAutoCompactTokens 470000 (OpenAI's
- *   Codex default window since 2026-10-11, no long-context fee on
- *   subscription usage), Luna and pre-6.1 Sol ids stay at lunaMaxTokens
- *   260000 / lunaAutoCompactTokens 240000 (legacy solLuna* keys alias Luna).
+ *   contextCaps.solMaxTokens 890000 / solAutoCompactTokens 870000 (no price
+ *   cap: no long-context fee on subscription usage, OpenAI 2026-10-11; 32k /
+ *   52k under the ~922k input ceiling measured 2026-10-22), Luna and
+ *   pre-6.1 Sol ids stay at lunaMaxTokens 260000 / lunaAutoCompactTokens
+ *   240000 (legacy solLuna* keys alias Luna).
  *   One env builder (contextCapsEnv) serves decide(), routed reviews (0.2.61
  *   emitted env {}), kept/pinned agents and the stale-snapshot keep (a keep
  *   on a Sol/Luna model answers a decide on the same model with the caps).
@@ -602,8 +603,8 @@ const CONFIG_SCHEMA = {
     contextCaps: {
       type: 'object', additionalProperties: false,
       properties: {
-        solMaxTokens: { type: 'integer', minimum: 1, default: 500000, description: 'GPT-6.1 Sol max context (CLAUDE_CODE_MAX_CONTEXT_TOKENS) on every path: decide, routed reviews, kept agents. A ceiling: a tier cap from the price-tier feed may lower it, never raise it. Default 500000 = OpenAI Codex default window (2026-10-11; no long-context fee on subscription usage).' },
-        solAutoCompactTokens: { type: 'integer', minimum: 1, default: 470000, description: 'GPT-6.1 Sol auto-compact watermark (never above solMaxTokens).' },
+        solMaxTokens: { type: 'integer', minimum: 1, default: 890000, description: 'GPT-6.1 Sol max context (CLAUDE_CODE_MAX_CONTEXT_TOKENS) on every path: decide, routed reviews, kept agents. A ceiling: a tier cap from the price-tier feed may lower it, never raise it. Default 890000 = 32k under the measured ~922k subscription input ceiling (2026-10-22: 917,354 accepted, ~941k context_too_large); no long-context fee on subscription usage (OpenAI 2026-10-11), so no price cap.' },
+        solAutoCompactTokens: { type: 'integer', minimum: 1, default: 870000, description: 'GPT-6.1 Sol auto-compact watermark (never above solMaxTokens); 52k under the ~922k ceiling.' },
         lunaMaxTokens: { type: 'integer', minimum: 1, default: 260000, description: 'Max context for Luna and pre-6.1 Sol ids without a tier cap (under the 272k price cliff); an arm tier cap from the feed wins, as before.' },
         lunaAutoCompactTokens: { type: 'integer', minimum: 1, default: 240000, description: 'Auto-compact watermark for Luna and pre-6.1 Sol ids.' },
         solLunaMaxTokens: { type: 'integer', minimum: 1, description: 'Deprecated (0.2.65): alias of lunaMaxTokens (lunaMaxTokens wins). Never sets the GPT-6.1 Sol window.' },

@@ -1,12 +1,15 @@
 /**
- * 0.2.65: GPT-6.1 Sol runs at the 500k window on every path; Luna (and
+ * 0.2.65: GPT-6.1 Sol runs at the 890k window on every path; Luna (and
  * pre-6.1 Sol ids) stay under the 272k price cliff.
  *
- * OpenAI raised GPT-6.1 Sol's Codex default context 272k -> 500k on
- * 2026-10-11 and charges no long-context fee on subscription usage. Sol:
- * CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000 / CLAUDE_CODE_AUTO_COMPACT_WINDOW=
- * 470000 (contextCaps.solMaxTokens / solAutoCompactTokens), a ceiling a
- * feed tier cap may lower, never raise. Luna: 260000/240000
+ * OpenAI charges no long-context fee on GPT-6.1 Sol subscription usage
+ * (2026-10-11; the 272k surcharge is API pay-as-you-go only), so Sol has no
+ * price cap, only the server ceiling: measured 2026-10-22 through CLIProxy,
+ * 917,354 input tokens accepted and ~941k rejected (context_too_large), so
+ * ~922k. Sol: CLAUDE_CODE_MAX_CONTEXT_TOKENS=890000 /
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW=870000 (contextCaps.solMaxTokens /
+ * solAutoCompactTokens, 32k / 52k under it), a ceiling a feed tier cap may
+ * lower, never raise. Luna: 260000/240000
  * (lunaMaxTokens / lunaAutoCompactTokens; the legacy solLuna* keys alias
  * them). 0.2.61 routed reviews with `env: {}`, so a review on a Sol arm ran
  * under the agent's base-config window, and a `keep` answer carries no env
@@ -32,10 +35,13 @@ const SOL = 'gpt-6.1-sol';
 const LUNA = 'gpt-6.1-luna';
 const WONDER = 'muse-wonder-full-1.0-contributor';
 const caps = (max, compact) => ({ [MAX_CONTEXT_ENV_KEY]: String(max), [AUTO_COMPACT_ENV_KEY]: String(compact) });
-const SOL_CAPS = caps(500000, 470000);
+const SOL_CAPS = caps(890000, 870000);
 const LUNA_CAPS = caps(260000, 240000);
-// The live feed's gpt-6-1-sol 500k "window" tier derives this (T - 32k / T - 52k).
-const SOL_FEED_CAPS = caps(468000, 448000);
+// The measured subscription input ceiling (2026-10-22) the feed's gpt-6-1-sol
+// "window" tier carries; tiers.mjs derives T - 32k / T - 52k = SOL_CAPS.
+const SOL_CEILING = 922000;
+// A stale 500k window tier (the pre-0.2.65 feed) derives this lower window.
+const SOL_500K_TIER_CAPS = caps(468000, 448000);
 
 const aaRows = () => [
   { slug: 'claude-opus-5-5', intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
@@ -84,9 +90,12 @@ const solTierFeed = ({ threshold = 272000, appliesTo = 'whole_request', mult = 2
     base: book, status: 'verified', source: 'vendor-page', verifiedAt: '2026-10-22T00:00:00Z',
   }],
 });
-// The live price-tier feed shape: a 500k "window" tier with no price
-// multiplier (subscription usage pays no long-context fee).
-const liveSolWindowFeed = () => solTierFeed({ threshold: 500000, appliesTo: 'window', mult: 1 });
+// The live price-tier feed shape: a ~922k "window" tier (the measured
+// ceiling) with no price multiplier (subscription usage pays no
+// long-context fee).
+const liveSolWindowFeed = () => solTierFeed({ threshold: SOL_CEILING, appliesTo: 'window', mult: 1 });
+// The pre-0.2.65 feed: the same window tier at 500k.
+const stale500kWindowFeed = () => solTierFeed({ threshold: 500000, appliesTo: 'window', mult: 1 });
 
 function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = aaRows() } = {}) {
   const config = {
@@ -157,16 +166,16 @@ test('isSolWindowModel: GPT-6.1 Sol in every served spelling, nothing else', () 
   assert.equal(needsContextCap('haiku', 'claude-haiku-5-5'), false);
 });
 
-test('contextCapsEnv: Sol 500k window, Luna 260k cliff caps, haiku output cap, others empty', () => {
+test('contextCapsEnv: Sol 890k window, Luna 260k cliff caps, haiku output cap, others empty', () => {
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: SOL, cap: null }), SOL_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: 'devin/gpt-6-1-sol' }), SOL_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: `${SOL}(xhigh)` }), SOL_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'luna', model: LUNA }), LUNA_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'luna', model: 'gpt-6-luna' }), LUNA_CAPS);
-  // Pre-6.1 Sol ids are not covered by the 500k change: cliff caps.
+  // Pre-6.1 Sol ids are not covered by the GPT-6.1 Sol change: cliff caps.
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: 'gpt-6-sol' }), LUNA_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: 'gpt-5.6-sol' }), LUNA_CAPS);
-  // A sol-family arm with no model id is never treated as the 500k window.
+  // A sol-family arm with no model id is never treated as the Sol window.
   assert.deepEqual(contextCapsEnv({ family: 'sol' }), LUNA_CAPS);
   assert.deepEqual(contextCapsEnv({ family: 'haiku', cap: null }), { [MAX_OUTPUT_ENV_KEY]: '64000' });
   assert.deepEqual(contextCapsEnv({ family: 'opus', model: 'claude-opus-5-5', cap: null }), {});
@@ -177,12 +186,19 @@ test('contextCapsEnv: Sol 500k window, Luna 260k cliff caps, haiku output cap, o
 
 test('contextCapsEnv: a tier cap lowers the Sol window, never raises it; other arms keep 0.2.61 tier semantics', () => {
   const sol = (cap) => contextCapsEnv({ family: 'sol', model: SOL, cap });
-  assert.deepEqual(sol({ maxTokens: 468000, autoCompactTokens: 448000 }), SOL_FEED_CAPS);
+  assert.deepEqual(sol({ maxTokens: 468000, autoCompactTokens: 448000 }), SOL_500K_TIER_CAPS);
   assert.deepEqual(sol({ maxTokens: 240000, autoCompactTokens: 220000 }), caps(240000, 220000));
-  assert.deepEqual(sol({ maxTokens: 968000, autoCompactTokens: 948000 }), SOL_CAPS, 'never raised past 500k');
+  // The 922k tier's cap equals the ceiling; anything wider stays on it.
+  assert.deepEqual(sol({ maxTokens: 890000, autoCompactTokens: 870000 }), SOL_CAPS);
+  assert.deepEqual(sol({ maxTokens: 968000, autoCompactTokens: 948000 }), SOL_CAPS, 'never raised past 890k');
+  assert.deepEqual(sol({ maxTokens: 1018000, autoCompactTokens: 998000 }), SOL_CAPS, 'a 1.05M tier never raises it');
+  assert.deepEqual(sol({ maxTokens: 1e12, autoCompactTokens: 1e12 }), SOL_CAPS);
+  assert.deepEqual(sol({ maxTokens: 890001, autoCompactTokens: 870001 }), SOL_CAPS);
   // Mixed: max lowered, compact clamped under it.
-  assert.deepEqual(sol({ maxTokens: 480000, autoCompactTokens: null }), caps(480000, 470000));
+  assert.deepEqual(sol({ maxTokens: 880000, autoCompactTokens: null }), caps(880000, 870000));
   assert.deepEqual(sol({ maxTokens: 450000, autoCompactTokens: null }), caps(450000, 450000));
+  // A wider max with a lower compact: max stays on the ceiling, compact lowers.
+  assert.deepEqual(sol({ maxTokens: 968000, autoCompactTokens: 800000 }), caps(890000, 800000));
   // Infeasible (null/zero) tier caps fall back to the window.
   assert.deepEqual(sol({ maxTokens: 0, autoCompactTokens: 0 }), SOL_CAPS);
   assert.deepEqual(sol(null), SOL_CAPS);
@@ -207,11 +223,11 @@ test('contextCapsEnv: operator caps, custom/null compact key, broken config fall
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: SOL }, { ...DEFAULT_CONTEXT_CAPS, solMaxTokens: 300000 }), caps(300000, 300000));
   assert.deepEqual(
     contextCapsEnv({ family: 'sol', model: SOL }, { ...DEFAULT_CONTEXT_CAPS, autoCompactEnvKey: null }),
-    { [MAX_CONTEXT_ENV_KEY]: '500000' },
+    { [MAX_CONTEXT_ENV_KEY]: '890000' },
   );
   assert.deepEqual(
     contextCapsEnv({ family: 'sol', model: SOL }, { ...DEFAULT_CONTEXT_CAPS, autoCompactEnvKey: 'CUSTOM_COMPACT' }),
-    { [MAX_CONTEXT_ENV_KEY]: '500000', CUSTOM_COMPACT: '470000' },
+    { [MAX_CONTEXT_ENV_KEY]: '890000', CUSTOM_COMPACT: '870000' },
   );
   // Missing caps, or non-positive values, never emit an uncapped Sol run.
   assert.deepEqual(contextCapsEnv({ family: 'sol', model: SOL }, null), SOL_CAPS);
@@ -225,8 +241,8 @@ test('contextCapsEnv: operator caps, custom/null compact key, broken config fall
 
 test('normalizeContextCaps: defaults, new keys, legacy solLuna* keys alias Luna only', () => {
   const d = normalizeContextCaps(undefined);
-  assert.equal(d.solMaxTokens, 500000);
-  assert.equal(d.solAutoCompactTokens, 470000);
+  assert.equal(d.solMaxTokens, 890000);
+  assert.equal(d.solAutoCompactTokens, 870000);
   assert.equal(d.lunaMaxTokens, 260000);
   assert.equal(d.lunaAutoCompactTokens, 240000);
   assert.equal(d.autoCompactEnvKey, AUTO_COMPACT_ENV_KEY);
@@ -239,8 +255,8 @@ test('normalizeContextCaps: defaults, new keys, legacy solLuna* keys alias Luna 
     solLunaMaxTokens: 260000, autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
     haikuMaxOutputTokens: 64000, solLunaAutoCompactTokens: 240000,
   });
-  assert.equal(live.solMaxTokens, 500000);
-  assert.equal(live.solAutoCompactTokens, 470000);
+  assert.equal(live.solMaxTokens, 890000);
+  assert.equal(live.solAutoCompactTokens, 870000);
   assert.equal(live.lunaMaxTokens, 260000);
   assert.equal(live.lunaAutoCompactTokens, 240000);
   assert.equal('solLunaMaxTokens' in live, false);
@@ -249,10 +265,10 @@ test('normalizeContextCaps: defaults, new keys, legacy solLuna* keys alias Luna 
   const legacy = normalizeContextCaps({ solLunaMaxTokens: 250000, solLunaAutoCompactTokens: 230000 });
   assert.equal(legacy.lunaMaxTokens, 250000);
   assert.equal(legacy.lunaAutoCompactTokens, 230000);
-  assert.equal(legacy.solMaxTokens, 500000);
-  assert.equal(legacy.solAutoCompactTokens, 470000);
-  const raised = normalizeContextCaps({ solLunaMaxTokens: 900000 });
-  assert.equal(raised.solMaxTokens, 500000);
+  assert.equal(legacy.solMaxTokens, 890000);
+  assert.equal(legacy.solAutoCompactTokens, 870000);
+  const raised = normalizeContextCaps({ solLunaMaxTokens: 1000000 });
+  assert.equal(raised.solMaxTokens, 890000);
   // Explicit new keys win over the legacy aliases.
   const both = normalizeContextCaps({
     solLunaMaxTokens: 250000, solLunaAutoCompactTokens: 230000,
@@ -291,7 +307,7 @@ test('manifest schema declares the new keys with the defaults and keeps the lega
 
 // ---------- 3. decide() ----------
 
-test('decide: Sol 500k/470k at every effort, Luna 260k/240k, Claude/Meta unchanged, equal to the shared helper', () => {
+test('decide: Sol 890k/870k at every effort, Luna 260k/240k, Claude/Meta unchanged, equal to the shared helper', () => {
   const arm = (model, family, effort = 'high', cap = null, extra = {}) => ({
     armId: `${model}:${effort}`, model, effort, family, contextWindow: 1000000, Q: 1, C: 1, trial: false, cap, ...extra,
   });
@@ -302,8 +318,10 @@ test('decide: Sol 500k/470k at every effort, Luna 260k/240k, Claude/Meta unchang
     [arm(LUNA, 'luna'), LUNA_CAPS],
     [arm('gpt-6-luna', 'luna', 'max'), LUNA_CAPS],
     [arm('gpt-6-sol', 'sol'), LUNA_CAPS],
-    [arm(SOL, 'sol', 'high', { maxTokens: 468000, autoCompactTokens: 448000 }), SOL_FEED_CAPS],
+    [arm(SOL, 'sol', 'high', { maxTokens: 468000, autoCompactTokens: 448000 }), SOL_500K_TIER_CAPS],
+    [arm(SOL, 'sol', 'high', { maxTokens: 890000, autoCompactTokens: 870000 }), SOL_CAPS],
     [arm(SOL, 'sol', 'high', { maxTokens: 968000, autoCompactTokens: 948000 }), SOL_CAPS],
+    [arm(SOL, 'sol', 'max', { maxTokens: 1018000, autoCompactTokens: 998000 }), SOL_CAPS],
     [arm('gpt-6-luna', 'luna', 'high', { maxTokens: 240000, autoCompactTokens: 220000 }), caps(240000, 220000)],
     [arm('gemini-3-pro', 'gemini', 'high', { maxTokens: 168000, autoCompactTokens: 148000 }), caps(168000, 148000)],
     [arm('claude-haiku-5-5', 'haiku'), { [MAX_OUTPUT_ENV_KEY]: '64000' }],
@@ -336,7 +354,7 @@ test('decide: trial Sol picks carry the window too', () => {
 
 // ---------- 4. hook: doer decide, burn mode, live config ----------
 
-test('hook decide on a Sol doer run: 500k/470k with the live 0.2.61 config (legacy keys), Luna 260k/240k', async () => {
+test('hook decide on a Sol doer run: 890k/870k with the live 0.2.61 config (legacy keys), Luna 260k/240k', async () => {
   const contextCaps = {
     solLunaMaxTokens: 260000, autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
     haikuMaxOutputTokens: 64000, solLunaAutoCompactTokens: 240000,
@@ -381,7 +399,7 @@ test('operator override of the Sol window reaches the hook', async () => {
 
 // ---------- 5. routed reviews ----------
 
-test('routed review on gpt-6.1-sol gets the 500000/470000 window (0.2.61 emitted env {})', async () => {
+test('routed review on gpt-6.1-sol gets the 890000/870000 window (0.2.61 emitted env {})', async () => {
   const d = drive({ arms: [{ provider: 'codex', model: SOL, effort: 'high' }], accounts: [codexLane()] });
   await d.start();
   const out = await d.hook('rev-sol');
@@ -427,7 +445,7 @@ test('routed Sol review served without a ladder arm still gets the window (famil
   assert.deepEqual(out.env, SOL_CAPS);
 });
 
-test('live feed shape (500k window tier): review and doer decide emit the identical lowered window', async () => {
+test('live feed shape (922k window tier): the tier cap IS the 890000/870000 ceiling on review and doer paths', async () => {
   const d = drive({
     arms: [{ provider: 'codex', model: SOL, effort: 'high' }],
     // Sol-only lane, so the doer decide below lands on the same model.
@@ -435,15 +453,46 @@ test('live feed shape (500k window tier): review and doer decide emit the identi
     feedExtra: liveSolWindowFeed(),
   });
   await d.start();
-  assert.deepEqual((await d.api('capacity')).contextTiers.caps, { [SOL]: { maxTokens: 468000, autoCompactTokens: 448000 } });
+  // tiers.mjs: T - 32k / T - 52k over the measured ceiling = the defaults.
+  assert.deepEqual((await d.api('capacity')).contextTiers.caps, {
+    [SOL]: { maxTokens: DEFAULT_CONTEXT_CAPS.solMaxTokens, autoCompactTokens: DEFAULT_CONTEXT_CAPS.solAutoCompactTokens },
+  });
   const out = await d.hook('rev-sol-tier');
   assert.equal(out.kind, 'decide');
   assert.equal(out.model, SOL);
-  assert.deepEqual(out.env, SOL_FEED_CAPS);
+  assert.deepEqual(out.env, SOL_CAPS);
   const doer = await d.hook('doer-sol', { agentId: 'agent-9' });
   assert.equal(doer.kind, 'decide');
   assert.equal(doer.model, SOL);
   assert.deepEqual(doer.env, out.env);
+});
+
+test('a stale 500k window tier still lowers review and doer paths to 468000/448000', async () => {
+  const d = drive({
+    arms: [{ provider: 'codex', model: SOL, effort: 'high' }],
+    accounts: [codexLane(0.1, 24, [SOL])],
+    feedExtra: stale500kWindowFeed(),
+  });
+  await d.start();
+  assert.deepEqual((await d.api('capacity')).contextTiers.caps, { [SOL]: { maxTokens: 468000, autoCompactTokens: 448000 } });
+  const out = await d.hook('rev-sol-stale-tier');
+  assert.deepEqual(out.env, SOL_500K_TIER_CAPS);
+  const doer = await d.hook('doer-sol-stale-tier', { agentId: 'agent-9' });
+  assert.deepEqual(doer.env, SOL_500K_TIER_CAPS);
+});
+
+test('a feed tier wider than the ceiling (the 1.05M window) never raises Sol past 890000/870000', async () => {
+  const d = drive({
+    arms: [{ provider: 'codex', model: SOL, effort: 'high' }],
+    accounts: [codexLane(0.1, 24, [SOL])],
+    feedExtra: solTierFeed({ threshold: 1050000, appliesTo: 'window', mult: 1 }),
+  });
+  await d.start();
+  // The feed derives a 1.018M cap; every emitted env stays on the ceiling.
+  assert.deepEqual((await d.api('capacity')).contextTiers.caps, { [SOL]: { maxTokens: 1018000, autoCompactTokens: 998000 } });
+  assert.deepEqual((await d.hook('rev-sol-wide')).env, SOL_CAPS);
+  assert.deepEqual((await d.hook('doer-sol-wide', { agentId: 'agent-9' })).env, SOL_CAPS);
+  assert.deepEqual((await d.hook('kept-sol-wide', { agentDefaultModel: SOL })).env, SOL_CAPS);
 });
 
 test('a 272k price-cliff tier on Sol lowers every path to 240000/220000', async () => {
@@ -526,11 +575,16 @@ test('kept Sol agent with no Sol lane in the feed still gets the window', async 
 });
 
 test('kept Sol agent takes the feed tier cap when its model carries one (lowered, never raised)', async () => {
-  const d = drive({ accounts: [codexLane()], feedExtra: liveSolWindowFeed() });
-  await d.start();
-  const out = await d.hook('kept-sol-tier', { agentDefaultModel: SOL });
+  const live = drive({ accounts: [codexLane()], feedExtra: liveSolWindowFeed() });
+  await live.start();
+  const out = await live.hook('kept-sol-tier', { agentDefaultModel: SOL });
   assert.equal(out.kind, 'decide');
-  assert.deepEqual(out.env, SOL_FEED_CAPS);
+  assert.deepEqual(out.env, SOL_CAPS);
+  const stale = drive({ accounts: [codexLane()], feedExtra: stale500kWindowFeed() });
+  await stale.start();
+  const lowered = await stale.hook('kept-sol-stale-tier', { agentDefaultModel: SOL });
+  assert.equal(lowered.kind, 'decide');
+  assert.deepEqual(lowered.env, SOL_500K_TIER_CAPS);
 });
 
 test('reviewer routing with no qualifying arm falls back to the capped configured Sol model', async () => {
