@@ -51,7 +51,9 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
     tick: async i => {
       now = T0 + i * 5 * MIN + timeOffsetMs;
       step = i;
-      if (i > 0) for (let n = 0; n < 10; n++) {
+      // Forty runs per tick clear the 10-run attributed floor from the first
+      // quantum, so the drive measures shrinkage instead of the fallback.
+      if (i > 0) for (let n = 0; n < 40; n++) {
         await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `run-${i}-${n}`,
           payload: { run: { agentId: 'eng', model } }, occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
       }

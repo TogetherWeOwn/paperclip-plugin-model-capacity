@@ -16,6 +16,16 @@ const QUANTUM = 0.01;
 const KEEP_MS = 90 * 60000;
 const MAX_AGE_MS = 5 * 60000;
 const ALIGNMENT_MS = 60000;
+// One weekly quantum on half a run priced Meta lane 8 at 29x the group prior
+// on 2026-10-22 (C* 11.6 -> 6.4): the Keeper request counters count every
+// CLIProxy request, including runs outside the ledger (kept, reviewerRouting,
+// shadow and non-Paperclip callers), while runsBetween counts only ledger
+// runs, so requestsPerRun inflates and the baseline follows it. An
+// account-weekly sample is therefore accepted only on enough attributed runs
+// and only when its baseline agrees with the group prior within a bounded
+// factor; otherwise the group prior is kept and the rejection is named.
+export const MIN_ATTRIBUTED_RUNS = 10;
+export const MAX_BASELINE_FACTOR = 4;
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const validCounter = n => Number.isSafeInteger(n) && n >= 0;
 
@@ -92,6 +102,8 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
   const medianFiveHour = medianPositive([...fiveHour.values()].map(s => s?.burnPerRequest));
   const spans = [...usage.values()];
   let requestsPerRun = null;
+  let calibrationRuns = 0;
+  let calibrationRequests = 0;
   let aligned = false;
   if (spans.every(Boolean) && spans.length > 0) {
     const start = Math.max(...spans.map(s => s.fromMs));
@@ -100,6 +112,8 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
       && Math.max(...spans.map(s => s.toMs)) - end <= ALIGNMENT_MS;
     const runs = aligned && end > start ? runsBetween(start, end) : 0;
     const requests = spans.reduce((n, s) => n + s.requests, 0);
+    calibrationRuns = runs;
+    calibrationRequests = requests;
     if (runs > 0 && requests > 0) requestsPerRun = requests / runs;
   }
   // Run conversion is only valid for a meter on the same counter span. A
@@ -115,7 +129,25 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
   // scale). Fall back to the pooled prior for the whole group instead.
   const absoluteOk = requestsPerRun > 0 && medianWeekly > 0 && allWeeklyAligned;
   const baseline = absoluteOk ? medianWeekly * requestsPerRun : groupBurnPerRunPct;
+  const prior = groupBurnPerRunPct > 0 ? groupBurnPerRunPct : null;
+  // Unattributed request share: the Keeper counters count every CLIProxy
+  // request, including runs outside the ledger, while runsBetween counts only
+  // ledger runs. When the baseline (median per-request burn x measured
+  // requests per run) exceeds the pooled prior, the excess is requests the
+  // ledger never saw: 1 - prior/baseline. 0 when the two agree, null with no
+  // scale to compare. An estimate from the prior, honestly labeled, not a
+  // count of external callers the feed cannot see.
+  const expectedRequestsPerRun = prior != null && medianWeekly > 0 ? prior / medianWeekly : null;
+  const unattributedRequestShare = expectedRequestsPerRun != null && expectedRequestsPerRun > 0 && requestsPerRun > 0
+    ? clamp(1 - expectedRequestsPerRun / requestsPerRun, 0, 1)
+    : null;
+  const diagnostics = { requestsPerRun, calibrationRuns, calibrationRequests, unattributedRequestShare };
   const out = new Map();
+  const fallback = (k, reason, attemptedAttributedRuns = null, attemptedBaseline = null) => {
+    out.set(k, { source: 'group-prior', burnPerRunPct: prior, capacityWeight: 1, confidence: 0,
+      attributedRuns: null, fiveHourBurnPerRunPct: null,
+      rejectionReason: reason, attemptedAttributedRuns, attemptedBaseline, ...diagnostics });
+  };
   for (const k of memberKeys) {
     // Weekly evidence without a run scale falls back to the pooled prior,
     // never to a 5h-relative weight: the account measured its weekly burn,
@@ -126,10 +158,11 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
     const f = wRaw ? null : fiveHour.get(k);
     const selected = w ?? f;
     const e = estimate(selected, w ? medianWeekly : medianFiveHour);
-    const prior = groupBurnPerRunPct > 0 ? groupBurnPerRunPct : null;
     if (!e || !(baseline > 0)) {
-      out.set(k, { source: 'group-prior', burnPerRunPct: prior, capacityWeight: 1, confidence: 0,
-        attributedRuns: null, fiveHourBurnPerRunPct: null });
+      const reason = !selected
+        ? (wRaw && !absoluteOk ? 'no-run-scale' : 'no-evidence')
+        : (!e ? 'no-median' : 'no-baseline');
+      fallback(k, reason);
       continue;
     }
     // 5h relative weights are expressed against the WEEKLY prior. The
@@ -137,16 +170,33 @@ export function calibrateAccounts({ memberKeys, historyOf, groupBurnPerRunPct, r
     const weeklyBaseline = w ? baseline : prior;
     if (!(weeklyBaseline > 0)) {
       out.set(k, { source: 'group-prior', burnPerRunPct: null, capacityWeight: 1, confidence: 0,
-        attributedRuns: null, fiveHourBurnPerRunPct: null });
+        attributedRuns: null, fiveHourBurnPerRunPct: null,
+        rejectionReason: 'no-baseline', attemptedAttributedRuns: null, attemptedBaseline: null, ...diagnostics });
       continue;
     }
     const attributedRuns = requestsPerRun > 0 && sameSpan(selected, usage.get(k))
       ? selected.requests / requestsPerRun : null;
+    // A weekly sample prices only on enough attributed runs and only when its
+    // baseline agrees with the group prior within a bounded factor. One
+    // quantum on half a run, or a baseline 25x the prior from unattributed
+    // requests, keeps the prior instead of repricing the lane. The 5h path
+    // prices against the prior itself, so only the weekly baseline is bounded.
+    if (w) {
+      if (!(attributedRuns != null && attributedRuns >= MIN_ATTRIBUTED_RUNS)) {
+        fallback(k, 'low-attributed-runs', attributedRuns, weeklyBaseline);
+        continue;
+      }
+      if (prior != null && (weeklyBaseline / prior > MAX_BASELINE_FACTOR || prior / weeklyBaseline > MAX_BASELINE_FACTOR)) {
+        fallback(k, 'baseline-out-of-bounds', attributedRuns, weeklyBaseline);
+        continue;
+      }
+    }
     out.set(k, { ...e, source: w ? 'account-weekly' : 'account-five-hour',
       burnPerRunPct: weeklyBaseline / e.capacityWeight,
       groupMedianBurnPerRunPct: weeklyBaseline,
       attributedRuns,
       fiveHourBurnPerRunPct: requestsPerRun > 0 && sameSpan(f, usage.get(k)) ? f.burnPerRequest * requestsPerRun : null,
+      rejectionReason: null, attemptedAttributedRuns: null, attemptedBaseline: null, ...diagnostics,
     });
   }
   return out;

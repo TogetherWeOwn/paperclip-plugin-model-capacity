@@ -2513,6 +2513,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const medianMeasuredE = medianPositive([...groupE.values()]);
     const accountE = new Map();
     const nextAccountE = new Map();
+    const currentCalibration = new Map();
     let verifiedPlanHeadroom = false;
     for (const [gid, memberKeys] of calibMembers) {
       const measured = calibrateAccounts({
@@ -2524,9 +2525,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }).length,
         nowMs,
       });
+      // Group-level request diagnostics ride the first member's sample (every
+      // member of the group shares the same run scale).
+      const firstSample = measured.get(memberKeys[0]);
+      if (calibrationGroups[gid] && firstSample) {
+        calibrationGroups[gid].requestsPerRun = firstSample.requestsPerRun ?? null;
+        calibrationGroups[gid].calibrationRuns = firstSample.calibrationRuns ?? null;
+        calibrationGroups[gid].calibrationRequests = firstSample.calibrationRequests ?? null;
+        calibrationGroups[gid].unattributedRequestShare = firstSample.unattributedRequestShare ?? null;
+      }
       for (const [key, sample] of measured) {
         const history = accountUsage.get(key);
         const last = history?.at(-1);
+        currentCalibration.set(key, sample);
         // A segmented mix epoch discards the member's old-mix individual
         // estimate: it reprices off the mix-weighted group prior until fresh
         // per-account evidence re-accumulates.
@@ -2547,8 +2558,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           : sample;
         // Missing/no-motion readings carry knowledge, not fake new evidence.
         // Epoch changes and stale knowledge discard the individual estimate.
+        // A weekly sample the guards reject (too few attributed runs or a
+        // baseline that disagrees with the prior) carries no knowledge: its
+        // evidence is present but untrustworthy, so the lane reprices off the
+        // current prior instead of the stale individual estimate.
+        const guardRejected = sample.rejectionReason === 'low-attributed-runs'
+          || sample.rejectionReason === 'baseline-out-of-bounds';
         const entry = fresh ? { ...rebased, atMs: last.atMs, epoch: last.epoch }
-          : previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
+          : !guardRejected && previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
         accountE.set(key, entry);
         if (entry.source !== 'group-prior') nextAccountE.set(key, entry);
         const view = viewByKey.get(key);
@@ -2572,11 +2589,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         view.pool = poolOfKey(key);
         view.calibrationGroup = calibGroupOf.get(key) ?? key;
         const individual = accountE.get(key);
+        // The current tick's sample names its own rejection even when the
+        // priced estimate carries a previous tick's knowledge.
+        const currentSample = currentCalibration.get(key);
         let E = individual?.burnPerRunPct ?? groupE.get(view.calibrationGroup) ?? null;
         view.capacityWeight = individual?.capacityWeight ?? 1;
         view.calibrationConfidence = individual?.confidence ?? 0;
         view.calibrationSource = individual?.source ?? 'group-prior';
         view.attributedRuns = individual?.attributedRuns ?? null;
+        view.calibrationRejectionReason = currentSample?.rejectionReason ?? individual?.rejectionReason ?? null;
+        view.attemptedAttributedRuns = currentSample?.attemptedAttributedRuns ?? individual?.attemptedAttributedRuns ?? null;
+        view.unattributedRequestShare = currentSample?.unattributedRequestShare ?? individual?.unattributedRequestShare ?? null;
         view.groupMedianBurnPerRunPct = individual?.groupMedianBurnPerRunPct ?? groupE.get(view.calibrationGroup) ?? null;
         view.fiveHourBurnPerRunPct = individual?.fiveHourBurnPerRunPct ?? null;
         view.burnCalibrated = E != null;
