@@ -57,7 +57,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, DEFAULT_ROLE_BANDS, DEFAULT_CONTEXT_CAPS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
+import { decide, contextCapsEnv, normalizeContextCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts } from './burnmode.mjs';
 import {
@@ -591,13 +591,9 @@ export function resolveConfig(raw = {}) {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
-    contextCaps: {
-      ...DEFAULT_CONTEXT_CAPS,
-      ...(raw.contextCaps ?? {}),
-      // Explicit false restores base-cost burn (rollback); anything else
-      // keeps the tier-adjusted quota default.
-      tierAffectsQuota: (raw.contextCaps ?? {}).tierAffectsQuota !== false,
-    },
+    // Sol window / Luna cliff caps over the defaults (legacy solLuna* keys
+    // set Luna only); tierAffectsQuota false restores base-cost burn.
+    contextCaps: normalizeContextCaps(raw.contextCaps),
     // Kill switch for run.model.resolve enforcement. False (default): the
     // hook answers keep and no run is ever changed.
     enforce: raw.enforce === true,
@@ -3615,10 +3611,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const liveNow = liveViews.get(companyId);
       let preview = null;
       if (rcfg && liveNow && rcfg.agentIds.length > 0) {
-        const { pick } = pickReviewerRoute(liveNow, companyId, rcfg.agentIds[0], null, nowMs);
+        const { pick, admissionOf } = pickReviewerRoute(liveNow, companyId, rcfg.agentIds[0], null, nowMs);
         preview = pick.none
           ? { routed: false, fallback: config.roles.keepAgentIds.includes(rcfg.agentIds[0]) ? 'keep' : 'route', reason: pick.reason }
-          : { routed: true, provider: pick.provider, arm: pick.arm, accountId: pick.accountId, burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason };
+          : {
+            routed: true, provider: pick.provider, arm: pick.arm, accountId: pick.accountId, burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason,
+            env: reviewerPickEmission(liveNow, pick, admissionOf).env,
+          };
       }
       reviewerView.routing = rcfg
         ? {
@@ -4184,6 +4183,72 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   /**
+   * Caps env for a run executing `model` outside decide(): the same
+   * contextCapsEnv decide() applies, keyed off the matched ladder arm when
+   * there is one (its tier cap and family), else the family inferred from
+   * the model id -- a Sol id served without a ladder arm is still Sol. The
+   * emitted model id picks the Sol window vs the Luna cliff caps.
+   */
+  function capsEnvForModel(model, match, contextCaps) {
+    return contextCapsEnv({
+      cap: match?.cap ?? null,
+      family: match?.family ?? inferFamily(canonicalModelName(model)),
+      model: match?.model ?? model,
+    }, contextCaps);
+  }
+
+  /** The live ladder arm serving `model` (first account in live order), or null. */
+  function liveArmForModel(live, model) {
+    const canon = String(canonicalModelName(model) ?? '').toLowerCase();
+    if (!canon) return null;
+    for (const a of live?.accounts ?? []) {
+      const hit = liveLadderArms(a).find((x) => x != null
+        && String(canonicalModelName(x.model) ?? '').toLowerCase() === canon);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /** Emitted model and caps env of a reviewer pick (hook and /capacity preview). */
+  function reviewerPickEmission(live, pick, admissionOf) {
+    const arm = pick.arm;
+    const admission = admissionOf.get(`${pick.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`);
+    const match = admission?.match ?? null;
+    const emitModel = admission?.model ?? arm.model;
+    return { match, emitModel, env: capsEnvForModel(emitModel, match, live?.contextCaps) };
+  }
+
+  /**
+   * A `keep` answer carries no env, so a kept run on a Sol/Luna model would
+   * execute without the context caps (or under the agent's base-config
+   * window, e.g. a Muse-sized 1M). For those families only, answer a decide
+   * on the SAME configured model string (the host's agentDefaultModel is
+   * the adapter config `model` verbatim; effort omitted: the host keeps the
+   * configured effort) carrying the caps env -- the configured Sol window /
+   * Luna cliff caps, lowered by the model's tier cap when its ladder arm has
+   * one. Every other model (or an unknown default) returns null: the caller
+   * keeps, exactly as before.
+   */
+  function keptCapsAnswer(params, live, why) {
+    const model = params?.agentDefaultModel;
+    if (typeof model !== 'string' || model.trim().length === 0) return null;
+    const match = liveArmForModel(live, model);
+    const family = match?.family ?? inferFamily(canonicalModelName(model));
+    if (!needsContextCap(family, model)) return null;
+    const env = capsEnvForModel(model, match, live?.contextCaps);
+    if (Object.keys(env).length === 0) return null;
+    const sanitize = (x) => String(x).replace(/[^a-zA-Z0-9-]+/g, '-').slice(0, 80) || 'x';
+    return {
+      kind: 'decide',
+      decisionId: `mc-${sanitize(params.runId ?? 'unknown')}-kept-${sanitize(model)}`,
+      model,
+      env,
+      source: 'model-capacity',
+      reason: `${why}: configured ${model} kept with ${family} context caps`,
+    };
+  }
+
+  /**
    * Reviewer routing in the hook (memory-only apart from the ledger join).
    * Returns a decide answer, or null when routing is off for the agent, the
    * snapshot is stale, or no arm qualifies (the caller keeps / routes as
@@ -4231,9 +4296,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return null;
     }
     const arm = pick.arm;
-    const admission = admissionOf.get(`${pick.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`);
-    const match = admission?.match ?? null;
-    const emitModel = admission?.model ?? arm.model;
+    // Same caps env decide() would emit for this arm (0.2.61 returned
+    // `env: {}`, so a review routed to Sol/Luna ran under the reviewer's
+    // base-config window, e.g. a Muse-sized one).
+    const { match, emitModel, env } = reviewerPickEmission(live, pick, admissionOf);
     const adapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
     const decorated = decoratedModelFor({ model: emitModel, effort: arm.effort, contextWindow: match?.contextWindow ?? null }, adapter);
     const model = decorated ?? emitModel;
@@ -4252,14 +4318,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }, nowMs);
     note({
       routed: true, provider: pick.provider, arm: { ...arm }, accountId: pick.accountId,
-      burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason,
+      burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason, env: { ...env },
     });
     const sanitize = (x) => String(x).replace(/[^a-zA-Z0-9-]+/g, '-').slice(0, 80) || 'x';
     const out = {
       kind: 'decide',
       decisionId: `mc-${sanitize(params.runId ?? 'unknown')}-${sanitize(pick.accountId)}-review-${sanitize(arm.model)}`,
       model,
-      env: {},
+      env,
       source: 'model-capacity',
       reason: pick.reason,
     };
@@ -4815,9 +4881,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // falls through to keep below. Off (absent config) = unchanged.
       const reviewRoute = await routeReviewerRun(params, live);
       if (reviewRoute) return reviewRoute;
-      // Operator-pinned agents (gating roles) always run their configured model.
+      // Operator-pinned agents (gating roles) always run their configured model
+      // -- with the Sol/Luna context caps when that model needs them.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
+        const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
+        if (capped) {
+          clearDeferred(params.companyId, params.runId);
+          return capped;
+        }
         return keep();
       }
       const credentialEnforced = credentialReadinessEnforced(params.companyId);
@@ -4832,7 +4904,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         || (credentialEnforced && clock() < live.atMs)) {
         return credentialEnforced
           ? deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'))
-          : { kind: 'keep' };
+          : (keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' });
       }
       // Join any ledger load before selection; no await may split admission,
       // the half-open probe claim, and the recorded/emitted decision.

@@ -378,7 +378,11 @@ test('config resolution applies documented defaults', () => {
   assert.equal(c.cliproxy.laneKeySecretRef, null);
   assert.equal(c.enforce, false);
   assert.equal(c.concurrency.maxTotal, 75);
-  assert.equal(c.contextCaps.solLunaMaxTokens, 260000);
+  assert.equal(c.contextCaps.solMaxTokens, 890000);
+  assert.equal(c.contextCaps.solAutoCompactTokens, 870000);
+  assert.equal(c.contextCaps.lunaMaxTokens, 260000);
+  assert.equal(c.contextCaps.lunaAutoCompactTokens, 240000);
+  assert.equal('solLunaMaxTokens' in c.contextCaps, false);
   assert.equal(c.armMap.length > 0, true);
 });
 

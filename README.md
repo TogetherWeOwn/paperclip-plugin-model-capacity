@@ -461,10 +461,30 @@ frozen clock can never double-count.
    apply per account in every path (per-account in-flight plus decisions
    since the last tick); pooled totals order allocation only.
 
-Sol/Luna decisions carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=260000` to stay
-under the 272k price cliff, plus the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
-watermark (configurable via `contextCaps.autoCompactEnvKey`; null omits
-it). Claude-* ids never get MAX_CONTEXT_TOKENS (the CLI ignores it for
+GPT-6.1 Sol runs carry `CLAUDE_CODE_MAX_CONTEXT_TOKENS=890000` and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=870000` (`contextCaps.solMaxTokens` /
+`solAutoCompactTokens`). There is no price cap: OpenAI charges no
+long-context fee on GPT-6.1 Sol when usage draws from a subscription
+(2026-10-11; the 272k surcharge applies to API pay-as-you-go only), and our
+Sol lanes are subscription. The only limit is the server ceiling, measured
+2026-10-22 through CLIProxy at ~922k input tokens (917,354 accepted, ~941k
+rejected with `context_too_large`; 1.05M window minus 128k max output);
+890000/870000 sit 32k/52k under it so a client compacts instead of failing.
+Luna and pre-6.1 Sol ids
+stay under the 272k price cliff at 260000/240000
+(`contextCaps.lunaMaxTokens` / `lunaAutoCompactTokens`; the pre-0.2.65
+`solLunaMaxTokens` / `solLunaAutoCompactTokens` keys alias the Luna caps
+and never set the Sol window). The Sol window is a ceiling: an arm's
+tier cap from the price-tier feed may lower it, never raise it; other
+arms take their tier cap when they have one, else the Luna caps.
+Every path that answers the host builds this env through one helper
+(`contextCapsEnv`): `decide()` (burn-mode, trial and paced picks
+included), routed reviews, and kept/pinned agents or the stale-snapshot
+keep on a Sol/Luna model (answered as a decide on the same configured
+model carrying the caps, since a `keep` carries no env). The auto-compact
+key is configurable via `contextCaps.autoCompactEnvKey` (null omits it).
+Runs the host never sends to the hook (no issue, human assignee, issue
+model override, enforce off) cannot be capped here. Claude-* ids never get MAX_CONTEXT_TOKENS (the CLI ignores it for
 them and runs haiku at a 200k window): when the arm's AA context window is
 >= 1M and the run's adapter is `claude_local`/`claude-code`, the plugin
 emits `<model>(<effort>)[1m]` instead, which the CLI strips and runs at 1M.
