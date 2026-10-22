@@ -98,6 +98,10 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.64 = double-quantum regression lock-in: the 12:31Z recurrence (two
+ *   lanes, one quantum each on under one attributed run) is replayed as a
+ *   test; both lanes keep the group prior and hold their slots. No behavior,
+ *   capability, egress, secret or env-key change.
  * v0.2.63 = account-weekly guards: a weekly sample prices only on >=10
  *   attributed runs and only when its baseline agrees with the group prior
  *   within 4x; otherwise the prior is kept and /capacity names the rejection
@@ -329,7 +333,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.63';
+export const PLUGIN_VERSION = '0.2.64';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

@@ -1,6 +1,9 @@
 # Changelog
 
 
+## 0.2.64
+- Double-quantum regression lock-in. On 2026-10-22 at 12:31Z two Meta lanes each moved one weekly quantum over under one attributed run (0.72 and 0.60, confidence 0.25) and priced at 0.0105/run against the 0.0004 group prior (C* 7.1 -> 0.72) — the same unattributed-requests inflation as the 10:06Z single-lane jump, one tick in two lanes at once. The 0.2.63 guards (≥10 attributed runs, baseline within 4x of the prior) reject this shape on both counts; this release replays it as a regression test (both lanes keep the prior with `low-attributed-runs`, slots within 25% of pre-jump) so the two-lane variant stays covered. No behavior change.
+
 ## 0.2.63
 - Account-weekly guards. On 2026-10-22 one weekly quantum on 0.5 attributed runs priced a Meta lane at 29x the group prior (C* 11.6 -> 6.4): the Keeper request counters count every CLIProxy request, including runs outside the ledger, while the run count covers only ledger runs, so requestsPerRun inflated ~25x and the baseline followed it. A weekly sample now prices only on >=10 attributed runs and only when its baseline agrees with the group prior within 4x; otherwise the prior is kept. The capacity view names the rejection per lane (`calibrationRejectionReason`: `low-attributed-runs` | `baseline-out-of-bounds` | `no-run-scale` | `no-evidence` | `no-median` | `no-baseline`), the attempted runs (`attemptedAttributedRuns`) and the unattributed request share (`unattributedRequestShare` = 1 - prior/baseline) per lane and per calibration group (`requestsPerRun`, `calibrationRuns`, `calibrationRequests`). Regression test replays the incident shape (one quantum, 0.5 runs, 50x baseline): the lane keeps the prior and its slots stay within 25% of pre-jump.
 
