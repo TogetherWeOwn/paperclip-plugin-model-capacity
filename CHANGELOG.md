@@ -6,7 +6,6 @@
 - Sol ceiling: the configured Sol window is a ceiling. An arm's tier cap from the price-tier feed may lower it, never raise it (the live feed's `gpt-6-1-sol` 500k window tier derives 468000/448000, which stays in force while the feed carries it). Every other arm keeps 0.2.61 semantics: its tier cap when it has one (live Luna 240000/220000), else the Luna caps for sol/luna ids. The auto-compact watermark never exceeds the max window.
 - Enforce off stays the kill switch (`keep`). Runs the host never sends to the hook (no issue, human assignee, issue model override) cannot be capped by the plugin.
 
-
 ## 0.2.64
 - Double-quantum regression lock-in. On 2026-10-22 at 12:31Z two Meta lanes each moved one weekly quantum over under one attributed run (0.72 and 0.60, confidence 0.25) and priced at 0.0105/run against the 0.0004 group prior (C* 7.1 -> 0.72) — the same unattributed-requests inflation as the 10:06Z single-lane jump, one tick in two lanes at once. The 0.2.63 guards (≥10 attributed runs, baseline within 4x of the prior) reject this shape on both counts; this release replays it as a regression test (both lanes keep the prior with `low-attributed-runs`, slots within 25% of pre-jump) so the two-lane variant stays covered. No behavior change.
 
