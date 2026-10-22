@@ -2558,8 +2558,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           : sample;
         // Missing/no-motion readings carry knowledge, not fake new evidence.
         // Epoch changes and stale knowledge discard the individual estimate.
+        // A weekly sample the guards reject (too few attributed runs or a
+        // baseline that disagrees with the prior) carries no knowledge: its
+        // evidence is present but untrustworthy, so the lane reprices off the
+        // current prior instead of the stale individual estimate.
+        const guardRejected = sample.rejectionReason === 'low-attributed-runs'
+          || sample.rejectionReason === 'baseline-out-of-bounds';
         const entry = fresh ? { ...rebased, atMs: last.atMs, epoch: last.epoch }
-          : previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
+          : !guardRejected && previous && previous.epoch === last?.epoch && nowMs - previous.atMs <= smoothOpts.staleMs ? previous : sample;
         accountE.set(key, entry);
         if (entry.source !== 'group-prior') nextAccountE.set(key, entry);
         const view = viewByKey.get(key);

@@ -202,3 +202,79 @@ test('capacity view names the source, the runs and the rejection reason per lane
   assert.ok(group.requestsPerRun > 0);
   assert.ok(group.unattributedRequestShare > 0.5);
 });
+
+test('guard rejection drops the stale individual estimate instead of carrying it', async () => {
+  const T0 = Date.parse('2026-10-22T09:00:00Z');
+  const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
+  const skey = stateKey => JSON.stringify({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey });
+  const state = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  let now = T0;
+  let step = 0;
+  // Same incident shape as the view test: lane 8 moves one quantum while two
+  // ledger runs face 400 counted requests, so every sample is guard-rejected.
+  const accounts = () => ['lane-4', 'lane-5', 'lane-7', 'lane-8'].map(k => ({
+    lane: k, provider: 'meta', accountKey: k, health: 'healthy', models: ['muse-spark-1.3-contributor'],
+    weekly: { used: (k === 'lane-8' ? 0.24 : 0.20) + (k === 'lane-8' ? step * 0.01 : 0),
+      resetsAt: new Date(T0 + 96 * 3600000).toISOString() },
+    fiveHour: { used: 0.1, resetsAt: new Date(T0 + 5 * 3600000).toISOString() },
+    observedAt: new Date(now).toISOString(), quality: 'live',
+    usage: { observedAt: new Date(now).toISOString(), epoch: 'keeper-1', requests: 100 + step * 100 },
+  }));
+  const config = { cliproxy: { laneKeySecretRef: SECRET }, reviewReserve: { enabled: false } };
+  const io = {
+    config: { get: async () => config },
+    state: { get: async k => state.get(JSON.stringify(k)) ?? null, set: async (k, v) => state.set(JSON.stringify(k), v) },
+    secrets: { resolve: async () => 'fixture' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: accounts() }, now) }) },
+    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (k, fn) => jobs.set(k, fn) },
+    events: { on: (k, fn) => handlers.set(k, fn) },
+    logger: { info() {}, error() {} },
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  await plugin.setup(io);
+  state.set(skey('aa-snapshot-v1'), { fetchedAt: new Date(now).toISOString(), rows: [{ slug: 'muse-spark-1-3-xhigh',
+    intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 2, price1mOutputTokens: 8 }], duplicateSlugs: [] });
+  await plugin.onConfigChanged(config, { companyId: 'acme' });
+  const tick = async (i) => {
+    now = T0 + i * 5 * MIN;
+    step = i;
+    if (i > 0) for (let n = 0; n < 2; n++) {
+      await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `lane8-carry-${i}-${n}`,
+        payload: { run: { agentId: 'eng', model: 'muse-spark-1.3-contributor' } },
+        occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
+    }
+    await jobs.get('shadow-tick')({});
+    return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
+  };
+  for (let i = 0; i <= 6; i++) await tick(i);
+  // Seed the incident estimate as the persisted individual knowledge: the same
+  // epoch, fresh within the 6h stale window, so the old carry would keep it.
+  const smooth = state.get(skey('smoothing-v1'));
+  assert.ok(smooth, 'smoothing state persists after warmup ticks');
+  state.set(skey('smoothing-v1'), {
+    ...smooth,
+    accountE: {
+      ...(smooth.accountE ?? {}),
+      'meta:lane-8': { source: 'account-weekly', burnPerRunPct: 0.0117, capacityWeight: 0.034,
+        confidence: 0.25, attributedRuns: 0.51, groupMedianBurnPerRunPct: 0.0099,
+        fiveHourBurnPerRunPct: null, rejectionReason: null,
+        attemptedAttributedRuns: null, attemptedBaseline: null,
+        epoch: 'keeper-1', atMs: now },
+    },
+  });
+  const cap = await tick(7);
+  const lane8 = cap.accounts.find(a => a.accountId === 'meta:lane-8');
+  assert.equal(lane8.calibrationRejectionReason, 'low-attributed-runs');
+  assert.equal(lane8.calibrationSource, 'group-prior');
+  assert.ok(Math.abs(lane8.effectiveBurnPerRunPct - 0.0117) > 0.005,
+    `rejected sample reprices off the prior, not the stale 0.0117 (got ${lane8.effectiveBurnPerRunPct})`);
+  // The priced burn is the pooled prior, not the seeded individual estimate.
+  assert.ok(Math.abs(lane8.effectiveBurnPerRunPct - lane8.groupMedianBurnPerRunPct) < 1e-9);
+  // The stale estimate is not re-persisted: the next tick has nothing to carry.
+  const after = state.get(skey('smoothing-v1'));
+  assert.ok(!Object.hasOwn(after?.accountE ?? {}, 'meta:lane-8'), 'guard rejection clears the persisted estimate');
+});
