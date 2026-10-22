@@ -98,6 +98,11 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.62 = AA cost carry: the refresh carries the last known cost and prices
+ *   forward per slug when a refresh drops them (marked costCarriedFrom), and
+ *   a scored arm with no cost anywhere takes the family then fleet median
+ *   (marked costEstimated) instead of losing its ladder rungs. /capacity
+ *   arms report both marks. No capability, egress, secret or env-key change.
  * v0.2.61 = per-account burn deadlines: burnMode.deadlines maps an account
  *   matcher (same identity semantics as accounts) to a strict ISO-8601
  *   timestamp with an explicit Z or numeric offset; a burn account matching
@@ -318,7 +323,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.61';
+export const PLUGIN_VERSION = '0.2.62';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

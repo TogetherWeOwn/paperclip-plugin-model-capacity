@@ -22,7 +22,9 @@ test('measured costs are kept; missing costs estimate from prices', () => {
   ]);
   assert.deepEqual(filled.get('measured'), { C: 1.0, estimated: false });
   assert.deepEqual(filled.get('estimated'), { C: 0.25 * 8, estimated: true });
-  assert.deepEqual(filled.get('priceless'), { C: null, estimated: false });
+  // No prices either: the median backstop prices it at the fleet median
+  // instead of leaving it null (a null-cost arm loses every ladder rung).
+  assert.deepEqual(filled.get('priceless'), { C: 1.0, estimated: true });
 });
 
 test('no profile without a complete arm: everything missing stays null', () => {
@@ -40,5 +42,7 @@ test('non-positive costs and prices never seed the profile', () => {
     { armId: 'good', cost: 2.0, priceIn: 2, priceOut: 6 },
     { armId: 'free', cost: null, priceIn: 0, priceOut: 0 },
   ]);
-  assert.equal(filled.get('free').C, null);
+  // Zero prices seed neither the profile nor an estimate, but the median
+  // backstop still prices the arm so it keeps its ladder rung.
+  assert.deepEqual(filled.get('free'), { C: 2.0, estimated: true });
 });
