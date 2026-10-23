@@ -98,6 +98,19 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
+ *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
+ *   never the bare id CLIProxy 400s or routes to another provider);
+ *   burnMode.floors holds a matched account at a level floor (at or below
+ *   it the account takes no runs; no bar reading = no runs), reading the
+ *   lane's regenerating bar (feed meterInfo.weeklyUsed) else its weekly
+ *   meter, and a burn account above its floor routes before other burn
+ *   accounts, so spend tracks regeneration and the bar is never full;
+ *   contextCaps.servedIds sets a context ceiling per emitted model id
+ *   (synthetic serves 524,288 tokens); a trials.roles entry 'role:family'
+ *   ('thinker:glm') opens one trial family to one role. Empty or missing
+ *   config decides exactly as before. No capability, egress or secret
+ *   change; env keys unchanged.
  * v0.2.65 = Sol/Luna context caps on every path: GPT-6.1 Sol runs at
  *   contextCaps.solMaxTokens 890000 / solAutoCompactTokens 870000 (no price
  *   cap: no long-context fee on subscription usage, OpenAI 2026-10-11; 32k /
@@ -345,7 +358,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.65';
+export const PLUGIN_VERSION = '0.2.66';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -547,13 +560,17 @@ const CONFIG_SCHEMA = {
     },
     burnMode: {
       type: 'object', additionalProperties: false,
-      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, burn horizon, now + horizonMinutes, deadline), are never capped by the pace guard or held by the review reserve, and are preferred by routing. deadlines maps the same matchers to ISO-8601 UTC timestamps: a burn account matching a future deadline paces to the earliest one (past deadlines are ignored). Empty burns nothing.',
+      description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, burn horizon, now + horizonMinutes, deadline), are never capped by the pace guard or held by the review reserve, and are preferred by routing. deadlines maps the same matchers to ISO-8601 UTC timestamps: a burn account matching a future deadline paces to the earliest one (past deadlines are ignored). floors maps the same matchers to a remaining share: a matched account at or below it takes no runs, and a burn account above it routes first. Empty burns nothing.',
       properties: {
         accounts: { type: 'array', items: { type: 'string', minLength: 1 }, default: [] },
         horizonMinutes: { type: 'number', minimum: 1, default: 60, description: 'Pace horizon for burn accounts (minutes).' },
         deadlines: {
           type: 'object', additionalProperties: { type: 'string' }, default: {},
           description: 'Per-account burn deadlines: matcher (same identity semantics as accounts) to strict ISO-8601 timestamp with an explicit Z or numeric offset (e.g. 2026-10-27T00:00:00Z). A burn account paces to the earliest future deadline it matches; past deadlines are ignored.',
+        },
+        floors: {
+          type: 'object', additionalProperties: { type: 'number', minimum: 0, exclusiveMaximum: 1 }, default: {},
+          description: 'Level floors: matcher (same identity semantics as accounts, no ! entries) to the remaining share (0 to under 1) an account keeps, e.g. {"synthetic:*": 0.8}. The reading is the lane regenerating bar (feed meterInfo.weeklyUsed) else the weekly meter. At or below its floor, or with no reading, a matched account takes no runs; a burn account above its floor routes before other burn accounts, so a regenerating bar is spent at its regeneration rate and never sits full.',
         },
       },
     },
@@ -632,6 +649,17 @@ const CONFIG_SCHEMA = {
         autoCompactEnvKey: { type: ['string', 'null'], default: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW' },
         haikuMaxOutputTokens: { type: 'integer', minimum: 1, default: 64000 },
         tierAffectsQuota: { type: 'boolean', default: true, description: 'Apply context-tier multipliers to quota burn and pressure accounting, not only ladder order. True by default (subscription lanes charge tier price); false restores base-cost burn.' },
+        servedIds: {
+          type: 'object', default: {},
+          description: 'Context ceiling per emitted model id (case-insensitive, provider prefix kept, (effort)/[1m] ignored), e.g. {"synthetic/glm-5.3": {"maxTokens": 480000, "autoCompactTokens": 450000}} for a lane that serves a smaller window than the model. Lowers the window every other rule picks, or sets one; never raises it.',
+          additionalProperties: {
+            type: 'object', additionalProperties: false, required: ['maxTokens'],
+            properties: {
+              maxTokens: { type: 'integer', minimum: 1 },
+              autoCompactTokens: { type: 'integer', minimum: 1 },
+            },
+          },
+        },
       },
     },
     enforce: {
@@ -655,7 +683,7 @@ const CONFIG_SCHEMA = {
         minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
         roles: {
           type: 'array', items: { type: 'string' }, default: ['doer', 'other'],
-          description: 'Roles that may take trial arms. Default doer + other; thinkers never take trial traffic (unmeasured by definition).',
+          description: 'Roles that may take trial arms. Default doer + other; thinkers never take trial traffic (unmeasured by definition). A role:family entry (thinker:glm) lets that role take trial arms of that family only.',
         },
         adapters: {
           type: 'object', default: { claude_local: ['*'], 'claude-code': ['*'] },

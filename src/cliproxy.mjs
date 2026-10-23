@@ -12,6 +12,7 @@
  *   { observedAt, servedModels: [exact CLIProxy /v1/models ids],
  *     accounts: [{ lane, provider, accountKey, health,
  *     weekly: { used, resetsAt }, fiveHour: { used, resetsAt },
+ *     meterInfo?: { weeklyUsed } (regenerating bar, reactive lanes),
  *     observedAt, quality, credentialAvailability: { version: 1,
  *       models: [{ model, provider, accountId, servingCredentials,
  *         readyCredentials, observedAt, expiresAt }] } }], modelStats, pricingTiers }
@@ -222,6 +223,12 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     // account is usable but unpaced); anything else with usage numbers is
     // metered. Null on feeds that predate the field (treated as metered).
     meter: entry?.meter ?? null,
+    // Regenerating credit bar (synthetic.new: one weekly bar that refills
+    // 2% every 202 min, no reset): the feed forwards it as meterInfo on a
+    // reactive lane. Its used share (0..1) is what burnMode.floors reads
+    // (see burnmode.mjs). Absent or invalid stays absent, so feeds without
+    // it parse byte-identically.
+    ...(usedRatio(entry?.meterInfo?.weeklyUsed) != null ? { regenUsed: usedRatio(entry.meterInfo.weeklyUsed) } : {}),
     models: rawModels,
     weekly: { ...weekly, resetsAtMs: msOrNull(weekly.resetsAt) },
     fiveHour: { ...fiveHour, resetsAtMs: msOrNull(fiveHour.resetsAt) },
