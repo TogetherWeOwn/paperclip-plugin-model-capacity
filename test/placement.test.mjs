@@ -235,27 +235,25 @@ function drive({ config = {} } = {}) {
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
-    hook: (runId, agentId = 'eng') => plugin.onResolveRunModel({
-      runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
-      invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
-      issueOverrideModel: null, deadlineMs: 1500,
+    propose: (runId, agentId = 'eng') => plugin.proposeRunModel({
+      runId, companyId: 'acme', agentId, adapterType: 'claude-code', agentDefaultModel: null,
     }),
     capacity: () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' }),
   };
 }
 
-test('the hook places on the stronger arm even though the weaker account has the most room', async () => {
+test('the offline planner selects the stronger arm even though the weaker account has the most room', async () => {
   const d = drive({ config: { enforce: true } });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1');
+  const h = await d.propose('run-1');
   assert.equal(h.kind, 'decide');
   assert.match(h.model, /haiku/, `placed on ${h.model}`);
   // Switching the blend off restores the old pick (Meta: most unspent allowance).
   const off = drive({ config: { enforce: true, placement: { qualityWeight: 0 } } });
   await off.setup();
   await off.tick();
-  const h0 = await off.hook('run-1');
+  const h0 = await off.propose('run-1');
   assert.match(h0.model, /muse-spark/, `placed on ${h0.model}`);
 });
 

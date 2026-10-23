@@ -97,7 +97,7 @@ const liveSolWindowFeed = () => solTierFeed({ threshold: SOL_CEILING, appliesTo:
 // The pre-0.2.65 feed: the same window tier at 500k.
 const stale500kWindowFeed = () => solTierFeed({ threshold: 500000, appliesTo: 'window', mult: 1 });
 
-function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = aaRows() } = {}) {
+function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = aaRows(), agents = [], measured = false } = {}) {
   const config = {
     enforce: true,
     credentialReadiness: { enforce: false },
@@ -111,6 +111,7 @@ function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = a
   };
   const store = new Map();
   const jobs = new Map();
+  const handlers = new Map();
   let now = TICK;
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
@@ -123,10 +124,13 @@ function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = a
       status: 200,
       json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts, ...feedExtra }, now),
     }) },
-    agents: { get: async () => null },
+    agents: {
+      get: async id => agents.find(agent => agent.id === id) ?? null,
+      list: async () => agents,
+    },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },
-    events: { on() {} },
+    events: { on: (name, fn) => { handlers.set(name, fn); } },
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
@@ -135,10 +139,28 @@ function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = a
       await plugin.setup(io);
       store.set(JSON.stringify(key('aa-snapshot-v1')), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
+      if (measured) {
+        // Measured fixture pattern from credential-readiness-parity-runner.mjs:
+        // two completed runs and a 2% hourly burn sample, not a fake /caps API.
+        store.set(JSON.stringify(key('ledger-v1')), [
+          { runId: 'calibration-1', agentId: 'reviewer-1', status: 'finished', provider: 'codex', startedAt: TICK - 50 * 60000, endedAt: TICK - 40 * 60000 },
+          { runId: 'calibration-2', agentId: 'reviewer-1', status: 'finished', provider: 'codex', startedAt: TICK - 30 * 60000, endedAt: TICK - 20 * 60000 },
+        ]);
+        store.set(JSON.stringify(key('rate-history-v1')), {
+          'codex:c1': [{ atMs: TICK - HOUR, usedPct: 0.28 }, { atMs: TICK, usedPct: 0.3 }],
+        });
+      }
       await jobs.get('shadow-tick')({ companyId: 'acme' });
     },
+    emit: event => handlers.get(event.type)(event),
     setNow: ms => { now = ms; },
     tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
+    // The planner returns selection/context only, never an actual admission record.
+    propose: (runId, extra = {}) => plugin.proposeRunModel({
+      runId, companyId: 'acme', agentId: 'reviewer-1', adapterType: 'claude_local',
+      agentDefaultModel: null, ...extra,
+    }),
+    // Preserve the actual-routing diagnostic contracts until a run-fact ingress covers them.
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'reviewer-1', issueId: 'issue-1', adapterType: 'claude_local',
       invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,
@@ -352,34 +374,35 @@ test('decide: trial Sol picks carry the window too', () => {
   assert.deepEqual(d.env, SOL_CAPS);
 });
 
-// ---------- 4. hook: doer decide, burn mode, live config ----------
+// ---------- 4. offline planner: doer selection, burn mode, live config ----------
+// These proposals prove model/effort/context policy, not actual run admission.
 
-test('hook decide on a Sol doer run: 890k/870k with the live 0.2.61 config (legacy keys), Luna 260k/240k', async () => {
+test('planner selects Sol with 890k/870k using the live 0.2.61 config (legacy keys), Luna 260k/240k', async () => {
   const contextCaps = {
     solLunaMaxTokens: 260000, autoCompactEnvKey: AUTO_COMPACT_ENV_KEY,
     haikuMaxOutputTokens: 64000, solLunaAutoCompactTokens: 240000,
   };
   const sol = drive({ accounts: [codexLane(0.1, 24, [SOL])], overrides: { contextCaps } });
   await sol.start();
-  const s = await sol.hook('doer-sol', { agentId: 'agent-9' });
+  const s = await sol.propose('doer-sol', { agentId: 'agent-9' });
   assert.equal(s.kind, 'decide');
   assert.equal(s.model, SOL);
   assert.deepEqual(s.env, SOL_CAPS);
   const luna = drive({ accounts: [codexLane(0.1, 24, [LUNA])], overrides: { contextCaps } });
   await luna.start();
-  const l = await luna.hook('doer-luna', { agentId: 'agent-9' });
+  const l = await luna.propose('doer-luna', { agentId: 'agent-9' });
   assert.equal(l.kind, 'decide');
   assert.equal(l.model, LUNA);
   assert.deepEqual(l.env, LUNA_CAPS);
 });
 
-test('hook decide on a burn-mode Sol account carries the window', async () => {
+test('planner selection on a burn-mode Sol account carries the window', async () => {
   const d = drive({
     accounts: [codexLane(0.1, 24, [SOL])],
     overrides: { burnMode: { accounts: ['codex:*'] } },
   });
   await d.start();
-  const out = await d.hook('burn-sol', { agentId: 'agent-9' });
+  const out = await d.propose('burn-sol', { agentId: 'agent-9' });
   assert.equal(out.kind, 'decide');
   assert.equal(out.model, SOL);
   assert.deepEqual(out.env, SOL_CAPS);
@@ -387,18 +410,19 @@ test('hook decide on a burn-mode Sol account carries the window', async () => {
   assert.equal(view?.burnMode, true);
 });
 
-test('operator override of the Sol window reaches the hook', async () => {
+test('operator override of the Sol window reaches the planner', async () => {
   const d = drive({
     accounts: [codexLane(0.1, 24, [SOL])],
     overrides: { contextCaps: { solMaxTokens: 400000, solAutoCompactTokens: 380000 } },
   });
   await d.start();
-  const out = await d.hook('doer-sol-400', { agentId: 'agent-9' });
+  const out = await d.propose('doer-sol-400', { agentId: 'agent-9' });
   assert.deepEqual(out.env, caps(400000, 380000));
 });
 
 // ---------- 5. routed reviews ----------
 
+// Actual-route diagnostic assertion retained unchanged, not rewritten as a preview.
 test('routed review on gpt-6.1-sol gets the 890000/870000 window (0.2.61 emitted env {})', async () => {
   const d = drive({ arms: [{ provider: 'codex', model: SOL, effort: 'high' }], accounts: [codexLane()] });
   await d.start();
@@ -418,13 +442,13 @@ test('routed review on gpt-6.1-sol gets the 890000/870000 window (0.2.61 emitted
 test('routed Sol review at max effort, and a luna review arm, are capped too', async () => {
   const max = drive({ arms: [{ provider: 'codex', model: SOL, effort: 'max' }], accounts: [codexLane()] });
   await max.start();
-  const m = await max.hook('rev-sol-max');
+  const m = await max.propose('rev-sol-max');
   assert.equal(m.kind, 'decide');
   assert.equal(m.effort, 'max');
   assert.deepEqual(m.env, SOL_CAPS);
   const luna = drive({ arms: [{ provider: 'codex', model: LUNA, effort: 'high' }], accounts: [codexLane()] });
   await luna.start();
-  const l = await luna.hook('rev-luna');
+  const l = await luna.propose('rev-luna');
   assert.equal(l.kind, 'decide');
   assert.equal(l.model, LUNA);
   assert.deepEqual(l.env, LUNA_CAPS);
@@ -439,7 +463,7 @@ test('routed Sol review served without a ladder arm still gets the window (famil
     rows: aaRows().filter(r => !r.slug.startsWith('gpt-')),
   });
   await d.start();
-  const out = await d.hook('rev-sol-listed');
+  const out = await d.propose('rev-sol-listed');
   assert.equal(out.kind, 'decide');
   assert.equal(out.model, SOL);
   assert.deepEqual(out.env, SOL_CAPS);
@@ -457,11 +481,11 @@ test('live feed shape (922k window tier): the tier cap IS the 890000/870000 ceil
   assert.deepEqual((await d.api('capacity')).contextTiers.caps, {
     [SOL]: { maxTokens: DEFAULT_CONTEXT_CAPS.solMaxTokens, autoCompactTokens: DEFAULT_CONTEXT_CAPS.solAutoCompactTokens },
   });
-  const out = await d.hook('rev-sol-tier');
+  const out = await d.propose('rev-sol-tier');
   assert.equal(out.kind, 'decide');
   assert.equal(out.model, SOL);
   assert.deepEqual(out.env, SOL_CAPS);
-  const doer = await d.hook('doer-sol', { agentId: 'agent-9' });
+  const doer = await d.propose('doer-sol', { agentId: 'agent-9' });
   assert.equal(doer.kind, 'decide');
   assert.equal(doer.model, SOL);
   assert.deepEqual(doer.env, out.env);
@@ -475,9 +499,9 @@ test('a stale 500k window tier still lowers review and doer paths to 468000/4480
   });
   await d.start();
   assert.deepEqual((await d.api('capacity')).contextTiers.caps, { [SOL]: { maxTokens: 468000, autoCompactTokens: 448000 } });
-  const out = await d.hook('rev-sol-stale-tier');
+  const out = await d.propose('rev-sol-stale-tier');
   assert.deepEqual(out.env, SOL_500K_TIER_CAPS);
-  const doer = await d.hook('doer-sol-stale-tier', { agentId: 'agent-9' });
+  const doer = await d.propose('doer-sol-stale-tier', { agentId: 'agent-9' });
   assert.deepEqual(doer.env, SOL_500K_TIER_CAPS);
 });
 
@@ -490,9 +514,9 @@ test('a feed tier wider than the ceiling (the 1.05M window) never raises Sol pas
   await d.start();
   // The feed derives a 1.018M cap; every emitted env stays on the ceiling.
   assert.deepEqual((await d.api('capacity')).contextTiers.caps, { [SOL]: { maxTokens: 1018000, autoCompactTokens: 998000 } });
-  assert.deepEqual((await d.hook('rev-sol-wide')).env, SOL_CAPS);
-  assert.deepEqual((await d.hook('doer-sol-wide', { agentId: 'agent-9' })).env, SOL_CAPS);
-  assert.deepEqual((await d.hook('kept-sol-wide', { agentDefaultModel: SOL })).env, SOL_CAPS);
+  assert.deepEqual((await d.propose('rev-sol-wide')).env, SOL_CAPS);
+  assert.deepEqual((await d.propose('doer-sol-wide', { agentId: 'agent-9' })).env, SOL_CAPS);
+  assert.deepEqual((await d.propose('kept-sol-wide', { agentDefaultModel: SOL })).env, SOL_CAPS);
 });
 
 test('a 272k price-cliff tier on Sol lowers every path to 240000/220000', async () => {
@@ -502,8 +526,8 @@ test('a 272k price-cliff tier on Sol lowers every path to 240000/220000', async 
     feedExtra: solTierFeed(),
   });
   await d.start();
-  const review = await d.hook('rev-sol-cliff');
-  const doer = await d.hook('doer-sol-cliff', { agentId: 'agent-9' });
+  const review = await d.propose('rev-sol-cliff');
+  const doer = await d.propose('doer-sol-cliff', { agentId: 'agent-9' });
   assert.deepEqual(review.env, caps(240000, 220000));
   assert.deepEqual(doer.env, caps(240000, 220000));
 });
@@ -511,7 +535,7 @@ test('a 272k price-cliff tier on Sol lowers every path to 240000/220000', async 
 test('Meta and Claude review arms are unchanged (no env keys)', async () => {
   const meta = drive({ arms: [{ provider: 'meta', model: WONDER, effort: 'max' }], accounts: [metaLane()] });
   await meta.start();
-  const m = await meta.hook('rev-meta');
+  const m = await meta.propose('rev-meta');
   assert.deepEqual(Object.keys(m).sort(), ['decisionId', 'effort', 'env', 'kind', 'model', 'reason', 'source']);
   assert.equal(m.kind, 'decide');
   assert.equal(m.model, WONDER);
@@ -519,7 +543,7 @@ test('Meta and Claude review arms are unchanged (no env keys)', async () => {
   assert.deepEqual(m.env, {});
   const claude = drive({ arms: [{ provider: 'claude', model: 'claude-opus-5-5', effort: 'high' }], accounts: [claudeLane()] });
   await claude.start();
-  const c = await claude.hook('rev-claude');
+  const c = await claude.propose('rev-claude');
   assert.equal(c.kind, 'decide');
   assert.equal(c.model, 'claude-opus-5-5');
   assert.deepEqual(c.env, {});
@@ -531,7 +555,7 @@ test('Meta and Claude review arms are unchanged (no env keys)', async () => {
   ];
   const mixed = drive({ arms, accounts: [metaLane(0.9, 24), claudeLane(0.9, 24), codexLane(0.1, 24)] });
   await mixed.start();
-  const x = await mixed.hook('rev-mixed');
+  const x = await mixed.propose('rev-mixed');
   assert.equal(x.kind, 'decide');
   assert.equal(x.model, SOL, 'the pool most behind plan (codex) wins');
   assert.deepEqual(x.env, SOL_CAPS);
@@ -542,7 +566,7 @@ test('Meta and Claude review arms are unchanged (no env keys)', async () => {
 test('kept agent pinned to Sol runs its configured model WITH the window; other kept agents keep', async () => {
   const d = drive({ accounts: [codexLane(), metaLane()] });
   await d.start();
-  const sol = await d.hook('kept-sol', { agentDefaultModel: SOL });
+  const sol = await d.propose('kept-sol', { agentDefaultModel: SOL });
   assert.equal(sol.kind, 'decide');
   assert.equal(sol.model, SOL, 'exact configured model string');
   assert.equal('effort' in sol, false, 'effort omitted: the host keeps the configured effort');
@@ -551,25 +575,25 @@ test('kept agent pinned to Sol runs its configured model WITH the window; other 
   assert.match(sol.reason, /kept: .*context caps/);
   // Decorated/prefixed configured ids keep their exact string.
   for (const model of [`codex/${SOL}`, 'devin/gpt-6-1-sol', `${SOL}(xhigh)`]) {
-    const out = await d.hook(`kept-${model}`, { agentDefaultModel: model });
+    const out = await d.propose(`kept-${model}`, { agentDefaultModel: model });
     assert.equal(out.model, model);
     assert.deepEqual(out.env, SOL_CAPS, model);
   }
-  const luna = await d.hook('kept-luna', { agentDefaultModel: LUNA });
+  const luna = await d.propose('kept-luna', { agentDefaultModel: LUNA });
   assert.equal(luna.model, LUNA);
   assert.deepEqual(luna.env, LUNA_CAPS);
   // Non-Sol/Luna kept agents and unknown defaults keep exactly as before.
-  assert.deepEqual(await d.hook('kept-meta', { agentDefaultModel: WONDER }), { kind: 'keep' });
-  assert.deepEqual(await d.hook('kept-opus', { agentDefaultModel: 'claude-opus-5-5' }), { kind: 'keep' });
-  assert.deepEqual(await d.hook('kept-haiku', { agentDefaultModel: 'claude-haiku-5-5' }), { kind: 'keep' });
-  assert.deepEqual(await d.hook('kept-none', { agentDefaultModel: null }), { kind: 'keep' });
-  assert.deepEqual(await d.hook('kept-blank', { agentDefaultModel: '  ' }), { kind: 'keep' });
+  assert.deepEqual(await d.propose('kept-meta', { agentDefaultModel: WONDER }), { kind: 'keep' });
+  assert.deepEqual(await d.propose('kept-opus', { agentDefaultModel: 'claude-opus-5-5' }), { kind: 'keep' });
+  assert.deepEqual(await d.propose('kept-haiku', { agentDefaultModel: 'claude-haiku-5-5' }), { kind: 'keep' });
+  assert.deepEqual(await d.propose('kept-none', { agentDefaultModel: null }), { kind: 'keep' });
+  assert.deepEqual(await d.propose('kept-blank', { agentDefaultModel: '  ' }), { kind: 'keep' });
 });
 
 test('kept Sol agent with no Sol lane in the feed still gets the window', async () => {
   const d = drive({ accounts: [metaLane()] });
   await d.start();
-  const out = await d.hook('kept-sol-nolane', { agentDefaultModel: SOL });
+  const out = await d.propose('kept-sol-nolane', { agentDefaultModel: SOL });
   assert.equal(out.kind, 'decide');
   assert.deepEqual(out.env, SOL_CAPS);
 });
@@ -577,16 +601,18 @@ test('kept Sol agent with no Sol lane in the feed still gets the window', async 
 test('kept Sol agent takes the feed tier cap when its model carries one (lowered, never raised)', async () => {
   const live = drive({ accounts: [codexLane()], feedExtra: liveSolWindowFeed() });
   await live.start();
-  const out = await live.hook('kept-sol-tier', { agentDefaultModel: SOL });
+  const out = await live.propose('kept-sol-tier', { agentDefaultModel: SOL });
   assert.equal(out.kind, 'decide');
   assert.deepEqual(out.env, SOL_CAPS);
   const stale = drive({ accounts: [codexLane()], feedExtra: stale500kWindowFeed() });
   await stale.start();
-  const lowered = await stale.hook('kept-sol-stale-tier', { agentDefaultModel: SOL });
+  const lowered = await stale.propose('kept-sol-stale-tier', { agentDefaultModel: SOL });
   assert.equal(lowered.kind, 'decide');
   assert.deepEqual(lowered.env, SOL_500K_TIER_CAPS);
 });
 
+// Legacy host fallback/staleness/kill-switch contracts remain explicit admission
+// gaps. The offline planner cannot qualify them or replace their assertions.
 test('reviewer routing with no qualifying arm falls back to the capped configured Sol model', async () => {
   const d = drive({
     arms: [{ provider: 'meta', model: 'muse-not-served', effort: 'max' }],
@@ -622,3 +648,90 @@ test('enforce off stays the kill switch: keep, even for Sol', async () => {
   assert.deepEqual(await d.hook('off-sol', { agentDefaultModel: SOL }), { kind: 'keep' });
   assert.deepEqual(await d.hook('off-sol-doer', { agentId: 'agent-9', agentDefaultModel: SOL }), { kind: 'keep' });
 });
+
+// ---------- 7. official offline planner regressions ----------
+
+const proposalAgent = model => ({
+  id: 'reviewer-1', companyId: 'acme', adapterType: 'claude_local', status: 'idle',
+  adapterConfig: { model, effort: 'max', env: { UNOWNED_ENV: 'synthetic-private-env' } },
+  runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 }, session: { marker: 'synthetic-private-runtime' } },
+});
+
+test('explicit reviewer proposal carries Sol caps without recording an actual reviewer route', async () => {
+  const d = drive({ arms: [{ provider: 'codex', model: SOL, effort: 'high' }], accounts: [codexLane()] });
+  await d.start();
+  assert.equal((await d.api('capacity')).reviewer.routing.last, null);
+  const out = await d.propose('preview-only-review');
+  assert.equal(out.kind, 'decide');
+  assert.equal(out.model, SOL);
+  assert.equal(out.effort, 'high');
+  assert.deepEqual(out.env, SOL_CAPS);
+  assert.match(out.reason, /reviewer routing: gpt-6\.1-sol\(high\) on codex:c1/);
+  await d.tick();
+  const routing = (await d.api('capacity')).reviewer.routing;
+  assert.equal(routing.last, null, 'proposal trace must not become an actual routed run');
+  assert.deepEqual(routing.preview.env, SOL_CAPS);
+});
+
+test('offline reviewer fallback keeps configured Sol caps without recording an actual fallback', async () => {
+  const d = drive({
+    arms: [{ provider: 'meta', model: 'muse-not-served', effort: 'max' }],
+    accounts: [metaLane(), codexLane()],
+  });
+  await d.start();
+  const out = await d.propose('preview-fallback', { agentDefaultModel: SOL });
+  assert.equal(out.kind, 'decide');
+  assert.equal(out.model, SOL);
+  assert.deepEqual(out.env, SOL_CAPS);
+  assert.deepEqual(await d.propose('preview-fallback-meta', { agentDefaultModel: WONDER }), { kind: 'keep' });
+  await d.tick();
+  assert.equal((await d.api('capacity')).reviewer.routing.last, null);
+});
+
+const startedReview = model => ({
+  type: 'agent.run.started', companyId: 'acme', entityId: 'actual-review-run',
+  payload: { run: { agentId: 'reviewer-1', adapterType: 'claude_local', provider: 'codex', model } },
+  occurredAt: new Date(TICK).toISOString(),
+});
+
+test('minute-job reviewer proposals never become the last actual route on a later tick', async () => {
+  const d = drive({
+    arms: [{ provider: 'codex', model: SOL, effort: 'high' }], accounts: [codexLane(0.3)],
+    agents: [proposalAgent('claude-opus-5-5')], measured: true,
+  });
+  await d.start();
+  await d.emit(startedReview(SOL));
+  for (let i = 0; i < 2; i += 1) {
+    await d.tick();
+    const proposals = await d.api('proposals');
+    const proposal = proposals.agents.find(agent => agent.agentId === 'reviewer-1');
+    assert.ok(proposal, `real minute job evaluated the enumerated reviewer: ${JSON.stringify({ proposals, caps: await d.api('caps') })}`);
+    assert.equal(proposal.status, 'proposed');
+    assert.equal(proposal.model, SOL);
+    assert.deepEqual(proposal.env, { ...SOL_CAPS, [MAX_OUTPUT_ENV_KEY]: null });
+    assert.equal((await d.api('capacity')).reviewer.routing.last, null,
+      'minute-job pseudo-runs must not overwrite actual reviewer routing evidence');
+  }
+});
+
+for (const [model, expected] of [[SOL, SOL_CAPS], [`codex/${SOL}`, SOL_CAPS], [LUNA, LUNA_CAPS]]) {
+  test(`minute-job kept ${model} proposal uses configured model caps without copying private config`, async () => {
+    const current = proposalAgent(model);
+    const before = structuredClone(current);
+    const d = drive({ accounts: [codexLane(0.3)], agents: [current], measured: true });
+    await d.start();
+    await d.emit(startedReview(model));
+    await d.tick();
+    const proposals = await d.api('proposals');
+    const proposal = proposals.agents.find(agent => agent.agentId === current.id);
+    assert.ok(proposal, 'real minute job evaluated the enumerated kept agent');
+    assert.equal(proposal.status, 'proposed', JSON.stringify(proposal));
+    assert.equal(proposal.model, null, 'no model change: the configured model is kept');
+    assert.deepEqual(proposal.env, { ...expected, [MAX_OUTPUT_ENV_KEY]: null });
+    assert.equal(proposal.effort, null, 'a context-only proposal preserves configured effort');
+    const evidence = JSON.stringify(proposals);
+    assert.ok(!evidence.includes('synthetic-private-env'));
+    assert.ok(!evidence.includes('synthetic-private-runtime'));
+    assert.deepEqual(current, before, 'offline evaluation does not mutate the configured agent');
+  });
+}

@@ -7,6 +7,8 @@ import { withSyntheticReadiness, syntheticAvailability } from './synthetic-readi
 // Eligibility from data, end to end: the Q minimum and the measured-outcome
 // gate keep Muse off doers WITHOUT a hand-written ban, the emergency
 // override still works and warns, and /capacity shows why every arm is in or out.
+// propose() tests selection policy only, including readiness filtering; it does
+// not admit/defer a host run. The pinned-run pressure contract stays below.
 
 const TICK = Date.parse('2026-10-08T23:00:00Z');
 const HOUR = 3600 * 1000;
@@ -90,6 +92,10 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
     },
     advance: (ms) => { nowMs += ms; },
     tick: () => jobs.get('shadow-tick')({}),
+    // Offline selection only; actual pinned-run pressure below is not a preview claim.
+    propose: (runId, agentId) => plugin.proposeRunModel({
+      runId, companyId: 'acme', agentId, adapterType: 'claude-code', agentDefaultModel: null,
+    }),
     hook: (runId, agentId) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId, issueId: null,
       adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,
@@ -110,7 +116,7 @@ test('control: with the gates off and no ban, the biggest-deficit account (Muse)
   const d = drive({ config: { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES } } });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide');
   assert.match(h.model, /muse-spark/);
 });
@@ -119,7 +125,7 @@ test('quality minimum: default config keeps Muse off a doer with no excludeFamil
   const d = drive({ config: { enforce: true, roles: ROLES_CFG } });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide');
   assert.match(h.model, /claude/);
   const cap = await d.capacity();
@@ -153,13 +159,13 @@ test('the per-role minimum is per role: a lower doer floor lets Muse back in, th
   const d = drive({ config: { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, minQuality: { doer: -3, thinker: 0 }, outcomeGate: { enabled: false } } } });
   await d.setup();
   await d.tick();
-  assert.match((await d.hook('run-d', 'eng-doer')).model, /muse-spark/);
+  assert.match((await d.propose('run-d', 'eng-doer')).model, /muse-spark/);
   const cap = await d.capacity();
   assert.deepEqual(cap.roleExclusionsEffective.doer, []);
   // Thinker floor is fleet average: Muse and the two below-average Haiku arms are out.
   assert.deepEqual(cap.roleExclusionsEffective.thinker.sort(),
     ['arm:claude-haiku-5-5', 'arm:claude-haiku-5-5-xhigh', 'arm:muse-spark-1-3-xhigh']);
-  const t = await d.hook('run-t', 'planner');
+  const t = await d.propose('run-t', 'planner');
   assert.equal(t.kind, 'decide');
   assert.doesNotMatch(t.model, /haiku|muse/);
 });
@@ -180,7 +186,7 @@ test('outcome gate: Muse runs that did not do the job take it off doers, with th
   const d = drive({ config: cfg, ledger: seedLedger() });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide');
   assert.match(h.model, /claude/);
   const cap = await d.capacity();
@@ -223,7 +229,7 @@ test('emergency override still applies, warns while non-empty, and logs at most 
   const d = drive({ config: cfg, warnings });
   await d.setup();
   await d.tick();
-  assert.match((await d.hook('run-1', 'eng-doer')).model, /claude/);
+  assert.match((await d.propose('run-1', 'eng-doer')).model, /claude/);
   const cap = await d.capacity();
   assert.deepEqual(cap.roleExclusions.doer, ['muse']);
   assert.deepEqual(cap.roleExclusionsEffective.doer, ['muse']);
@@ -252,7 +258,7 @@ test('an all-cooling lane never lifts the operator ban: the doer defers through 
   const d = drive({ config: cfg, coolingClaude: true });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'defer', 'doer defers while Claude is all-cooling');
   const cap = await d.capacity();
   assert.deepEqual(cap.eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
@@ -271,14 +277,14 @@ test('off mode still lifts the operator ban onto an all-cooling lane: the doer d
   const off = drive({ config: { ...base, credentialReadiness: { enforce: false } }, metaOnly: true, coolingMeta: true });
   await off.setup();
   await off.tick();
-  const h = await off.hook('run-1', 'eng-doer');
+  const h = await off.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide', 'off mode admits the cooling lane like legacy');
   assert.match(h.model, /muse-spark/);
   assert.deepEqual((await off.capacity()).eligibility.roles.doer.suspendedManual, ['muse'], 'the ban lifts: legacy parity');
   const on = drive({ config: { ...base, credentialReadiness: { enforce: true } }, metaOnly: true, coolingMeta: true });
   await on.setup();
   await on.tick();
-  assert.equal((await on.hook('run-1', 'eng-doer')).kind, 'defer', 'on mode refuses the all-cooling lane');
+  assert.equal((await on.propose('run-1', 'eng-doer')).kind, 'defer', 'on mode refuses the all-cooling lane');
   assert.deepEqual((await on.capacity()).eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
 });
 
@@ -295,7 +301,7 @@ test('a logger without warn falls back to info instead of throwing', async () =>
   const d = drive({ config: cfg });
   await d.setup();
   await d.tick();
-  assert.match((await d.hook('run-1', 'eng-doer')).model, /claude/);
+  assert.match((await d.propose('run-1', 'eng-doer')).model, /claude/);
 });
 
 test('config: defaults, normalization and validation of roles.minQuality and roles.outcomeGate', () => {
@@ -335,7 +341,7 @@ test('a role the gates would empty is suspended, never a defer loop', async () =
   const d = drive({ config: cfg });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed');
   const cap = await d.capacity();
   assert.equal(cap.eligibility.roles.doer.suspended, true);
@@ -353,7 +359,7 @@ test('an unhealthy account cannot strand a role in defer: the guard reads only a
   const d = drive({ config: { enforce: true, roles: ROLES_CFG }, unhealthyClaude: true });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed, never deferred');
   assert.match(h.model, /muse-spark/);
   const cap = await d.capacity();
@@ -370,7 +376,7 @@ test('a weekly-spent account cannot strand a role in defer: the guard skips it l
   const d = drive({ config: { enforce: true, roles: ROLES_CFG }, spentClaude: true });
   await d.setup();
   await d.tick();
-  const h = await d.hook('run-1', 'eng-doer');
+  const h = await d.propose('run-1', 'eng-doer');
   assert.equal(h.kind, 'decide', 'gate suspended for the role: the run is placed, never deferred');
   assert.match(h.reason, /rung 0 on meta:m1/);
   const cap = await d.capacity();
@@ -381,8 +387,8 @@ test('a pinned agent keeps its configured model under enforce; other agents are 
   const d = drive({ config: { enforce: true, roles: { ...ROLES_CFG, keepAgentIds: ['planner'] } } });
   await d.setup();
   await d.tick();
-  assert.deepEqual(await d.hook('run-1', 'planner'), { kind: 'keep' });
-  assert.equal((await d.hook('run-2', 'eng-doer')).kind, 'decide');
+  assert.deepEqual(await d.propose('run-1', 'planner'), { kind: 'keep' });
+  assert.equal((await d.propose('run-2', 'eng-doer')).kind, 'decide');
 });
 
 test('pinned runs count against their serving account at once, before the next tick', async () => {
