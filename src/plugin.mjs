@@ -4343,6 +4343,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const load = (() => { try { return loadSample(); } catch { return null; } })();
     report.load = load;
     const holds = new Set(u.holdAgentIds);
+    const capHolds = new Set(u.caps.holdAgentIds);
     const keepIds = new Set(config.roles.keepAgentIds);
     const reviewIds = new Set([...(config.reviewerRouting?.agentIds ?? []), ...(config.reviewReserve?.agentIds ?? [])]);
     const doerIds = new Set(config.roles.doerAgentIds);
@@ -4367,7 +4368,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const desired = held || (proposal.kind === 'keep' && !stored) ? null : desiredRoutingConfig(base, proposal);
       const changes = diffRoutingConfig(current, desired);
       let cap = null;
-      if (!held && capWant.has(agent.id) && current.wakeOnDemand) {
+      if (!held && !capHolds.has(agent.id) && capWant.has(agent.id) && current.wakeOnDemand) {
         cap = planCapChange({
           current: current.maxConcurrentRuns, want: capWant.get(agent.id),
           isReview: reviewIds.has(agent.id), isPinned: keepIds.has(agent.id), isDoer: doerIds.has(agent.id),

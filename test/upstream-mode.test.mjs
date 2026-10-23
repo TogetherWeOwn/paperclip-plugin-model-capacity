@@ -65,7 +65,7 @@ function redact(a) {
   return copy;
 }
 
-function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(), accounts = [lane('a1'), lane('a2')], loadSample = () => ({ load5: 4, cpus: 32 }), agentsListError = null } = {}) {
+function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(), accounts = [lane('a1'), lane('a2')], loadSample = () => ({ load5: 4, cpus: 32 }), agentsListError = null, issueLists = {} } = {}) {
   const config = {
     enforce: mode !== 'enforce',
     credentialReadiness: { enforce: false },
@@ -118,7 +118,8 @@ function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(
           }
         }
         calls.laneFetches += 1;
-        return { status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts }, now) };
+        const at = new Date(now).toISOString();
+        return { status: 200, json: async () => withSyntheticReadiness({ observedAt: at, accounts: accounts.map(a => ({ ...a, observedAt: at })) }, now) };
       },
     },
     agents: {
@@ -129,7 +130,7 @@ function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(
         return [...byId.values()].map(a => JSON.parse(JSON.stringify(a)));
       },
     },
-    issues: { get: async () => null, list: async () => [] },
+    issues: { get: async () => null, list: async ({ status } = {}) => issueLists[status] ?? [] },
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
@@ -143,6 +144,11 @@ function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     setNow: ms => { now = ms; },
+    setLaneUsed: used => { for (const a of accounts) a.weekly = { ...a.weekly, used }; },
+    fire: (runId, agentId, atMs) => handlers.get('agent.run.started')({
+      type: 'agent.run.started', companyId: 'acme', entityId: runId,
+      payload: { run: { agentId, provider: 'claude' } }, occurredAt: new Date(atMs).toISOString(),
+    }),
     tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
     hook: (agentId, extra = {}) => {
       const a = byId.get(agentId);
@@ -357,6 +363,48 @@ test('shadow: a failing agents.list never fails the tick and is reported', async
   assert.deepEqual(r.errors, [{ step: 'agents.list', error: 'host down' }]);
   // The hook still answers normally.
   assert.equal((await d.hook('doer-1')).kind, 'decide');
+});
+
+test('caps.holdAgentIds: model still routed, run cap never planned', async () => {
+  const d = await start({ mode: 'shadow', upstream: { caps: { holdAgentIds: ['kept-1'] } } });
+  const r = await d.api('upstream');
+  const kept = r.agents.find(a => a.agentId === 'kept-1');
+  assert.equal(kept.held, false);
+  assert.ok(kept.changes.length > 0);
+  assert.equal(kept.cap, null);
+  assert.ok(validateConfigShape({ upstream: { caps: { holdAgentIds: 'x' } } }).some(e => /caps.holdAgentIds/.test(e)));
+});
+
+test('caps: measured /caps allocation planned per agent; operator cap holds skipped', async () => {
+  const todo = [
+    { id: 'i1', status: 'todo', assigneeAgentId: 'doer-1' },
+    { id: 'i2', status: 'todo', assigneeAgentId: 'doer-1' },
+    { id: 'i3', status: 'todo', assigneeAgentId: 'doer-1' },
+    { id: 'i4', status: 'todo', assigneeAgentId: 'doer-1' },
+    { id: 'i5', status: 'todo', assigneeAgentId: 'doer-1' },
+    { id: 'i6', status: 'todo', assigneeAgentId: 'thinker-1' },
+  ];
+  const d = drive({ mode: 'shadow', accounts: [lane('a1', { weekly: { used: 0.3, resetsAt: '2026-10-15T22:59:00Z' } })], issueLists: { todo }, upstream: { caps: { holdAgentIds: ['thinker-1'] } } });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 10 * 60000);
+  await d.fire('run-a', 'doer-1', TICK + 10 * 60000);
+  d.setNow(TICK + 20 * 60000);
+  await d.fire('run-b', 'doer-1', TICK + 20 * 60000);
+  d.setNow(TICK + 30 * 60000);
+  d.setLaneUsed(0.3002);
+  await d.tick();
+  const caps = await d.api('caps');
+  assert.ok(caps.agents.length > 0, 'measured target with queued agents');
+  const r = await d.api('upstream');
+  const doer = r.agents.find(a => a.agentId === 'doer-1');
+  const want = caps.agents.find(a => a.agentId === 'doer-1').maxConcurrentRuns;
+  assert.equal(doer.cap.from, 2);
+  assert.equal(doer.cap.want, want);
+  assert.equal(doer.cap.to, Math.min(want, 2 + 4));
+  assert.equal(r.agents.find(a => a.agentId === 'thinker-1').cap, null, 'cap held by operator');
+  assert.equal(r.caps.agents, caps.agents.length);
+  assert.deepEqual(r.load, { load5: 4, cpus: 32 });
 });
 
 test('holdAgentIds: proposed, never diffed', async () => {

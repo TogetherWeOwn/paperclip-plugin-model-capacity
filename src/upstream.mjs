@@ -40,6 +40,7 @@ export const UPSTREAM_DEFAULTS = Object.freeze({
     loadHoldPerCpu: 0.75,
     loadShedPerCpu: 1.15,
     burnFloor: null,
+    holdAgentIds: Object.freeze([]),
   }),
 });
 
@@ -88,6 +89,9 @@ export function validateUpstream(mode, raw, { allowlist = [], enforceHook = fals
       if ('burnFloor' in c && c.burnFloor !== null && !(Number.isInteger(c.burnFloor) && c.burnFloor >= 1 && c.burnFloor <= 50)) {
         errors.push('upstream.caps.burnFloor must be null or an integer in [1, 50]');
       }
+      if ('holdAgentIds' in c && !(Array.isArray(c.holdAgentIds) && c.holdAgentIds.every(x => typeof x === 'string' && x.length > 0))) {
+        errors.push('upstream.caps.holdAgentIds must be an array of agent ids');
+      }
     }
   }
   // One actuator at a time: the per-run hook and the agent writer must never
@@ -116,6 +120,7 @@ export function normalizeUpstream(mode, raw, { allowlist = [] } = {}) {
       loadHoldPerCpu: typeof c.loadHoldPerCpu === 'number' ? c.loadHoldPerCpu : d.caps.loadHoldPerCpu,
       loadShedPerCpu: typeof c.loadShedPerCpu === 'number' ? c.loadShedPerCpu : d.caps.loadShedPerCpu,
       burnFloor: Number.isInteger(c.burnFloor) ? c.burnFloor : null,
+      holdAgentIds: Array.isArray(c.holdAgentIds) ? c.holdAgentIds.filter(x => typeof x === 'string') : [],
     },
   };
 }

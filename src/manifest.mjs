@@ -694,6 +694,7 @@ const CONFIG_SCHEMA = {
             loadHoldPerCpu: { type: 'number', exclusiveMinimum: 0, default: 0.75, description: 'Up moves hold while the 5-min load average is at or above this x CPUs (review agents climb until the shed line).' },
             loadShedPerCpu: { type: 'number', exclusiveMinimum: 0, default: 1.15, description: 'At or above this x CPUs non-review agents shed one run per tick (a quarter of the cap at 1.5 x CPUs).' },
             burnFloor: { type: ['integer', 'null'], minimum: 1, maximum: 50, default: null, description: 'Burn windows: doer caps floored at this value above the plugin\'s want (null = off).' },
+            holdAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents whose run cap is held by an operator decision: their model is still routed, their maxConcurrentRuns is never changed.' },
           },
         },
       },
