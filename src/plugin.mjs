@@ -4439,13 +4439,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const body = buildAgentPatch(apiAgent, row._desired, row.cap && row.cap.to !== row.cap.from ? row.cap.to : null);
         if (!body) continue;
         if (!row._stored) {
-          // Persisted BEFORE the write: a rollback can always restore it.
-          const before = agentRoutingConfig(apiAgent);
-          baseStore[row.agentId] = {
-            model: before.model, effort: before.effort, env: before.env,
-            maxConcurrentRuns: before.maxConcurrentRuns, atMs: report.atMs,
-          };
-          await ctx.state.set(scopeKey(companyId, UPSTREAM_BASE_KEY), baseStore);
+          // Refresh before each write: another tick may have captured a base
+          // since our agent list was read. Never replace its original config.
+          const latest = (await ctx.state.get(scopeKey(companyId, UPSTREAM_BASE_KEY))) ?? {};
+          Object.assign(baseStore, latest);
+          if (!baseStore[row.agentId]) {
+            // Persisted BEFORE the write: a rollback can always restore it.
+            const before = agentRoutingConfig(apiAgent);
+            baseStore[row.agentId] = {
+              model: before.model, effort: before.effort, env: before.env,
+              maxConcurrentRuns: before.maxConcurrentRuns, atMs: report.atMs,
+            };
+            await ctx.state.set(scopeKey(companyId, UPSTREAM_BASE_KEY), baseStore);
+          }
         }
         await api.patchAgent(row.agentId, body);
         report.applied.push({ agentId: row.agentId, fields: [...Object.keys(body.adapterConfig ?? {}).map(k => `adapterConfig.${k}`), ...(body.runtimeConfig ? ['runtimeConfig.heartbeat.maxConcurrentRuns'] : [])] });
@@ -5128,8 +5134,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const persisted = agreementFromJSON(await ctx.state.get(scopeKey(companyId, UPSTREAM_AGREEMENT_KEY)), nowMs);
         const delta = upstreamAgreement.get(companyId);
         const merged = delta ? mergeAgreement(persisted, delta) : persisted;
-        const hours = Math.min(Math.max(Number(input.query?.hours ?? 24) || 24, 1), 48);
-        const limit = Math.min(Math.max(Number(input.query?.disagreements ?? 20) || 20, 0), 100);
+        const rawHours = Number(input.query?.hours ?? 24);
+        const rawLimit = Number(input.query?.disagreements ?? 20);
+        const hours = Math.min(Math.max(Number.isFinite(rawHours) ? rawHours : 24, 1), 48);
+        const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 20, 0), 100);
         return {
           status: 200,
           body: {

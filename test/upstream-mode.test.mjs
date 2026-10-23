@@ -478,7 +478,42 @@ test('enforce: API errors are reported per agent, never thrown into the tick', a
   d.byId.set('kept-1-shadow', listed);
   await d.tick(); // resolves: the upstream step never fails the tick
   const r = await d.api('upstream');
-  assert.ok(Array.isArray(r.errors));
+  assert.ok(r.errors.some(e => e.step === 'patch' && e.agentId === 'kept-1' && /upstream-api-get-404/.test(e.error)));
+  assert.equal(r.applied.some(a => a.agentId === 'kept-1'), false);
+});
+
+test('upstream report preserves zero query values and defaults non-finite inputs', async () => {
+  const d = await start({ mode: 'shadow' });
+  const persisted = createAgreement(TICK);
+  persisted.disagreements = [{ runId: 'old-mismatch' }];
+  d.store.set(JSON.stringify(key('upstream-agreement-v1')), persisted);
+  const zero = await d.api('upstream', { hours: '0', disagreements: '0' });
+  assert.equal(zero.agreement.windowHours, 1);
+  assert.deepEqual(zero.disagreements, []);
+  const invalid = await d.api('upstream', { hours: 'Infinity', disagreements: 'NaN' });
+  assert.equal(invalid.agreement.windowHours, 24);
+  assert.equal(invalid.disagreements.length, 1);
+});
+
+test('enforce preserves bases captured after the agent list was read', async () => {
+  const d = drive({ mode: 'enforce' });
+  await d.setup();
+  const ioKey = JSON.stringify(key('upstream-base-v1'));
+  const sentinel = { model: 'original-model', effort: 'high', env: {}, maxConcurrentRuns: 4, atMs: TICK - 60000 };
+  const realGet = d.byId.get.bind(d.byId);
+  // A concurrent tick records an original base during the first API GET.
+  let injected = false;
+  d.byId.get = (id) => {
+    if (!injected) {
+      injected = true;
+      d.store.set(ioKey, { 'kept-1': sentinel, 'outside-agent': sentinel });
+    }
+    return realGet(id);
+  };
+  await d.tick();
+  const bases = d.store.get(ioKey);
+  assert.deepEqual(bases['kept-1'], sentinel);
+  assert.deepEqual(bases['outside-agent'], sentinel);
 });
 
 // ------------------------------------------------------------ pure parts
