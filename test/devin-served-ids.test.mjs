@@ -90,6 +90,13 @@ test('servedIdForArm keeps native alias-only accounts on the bare emission', () 
   // Prefixed-only providers emit the alias even fail-open (no served list).
   assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-5-5', 'devin', null), 'devin/gpt-5-5');
   assert.equal(servedIdForArm(['opencode-go/hy3-preview'], 'hy3-preview', 'opencode-go', null), 'opencode-go/hy3-preview');
+  // synthetic.new lanes are prefixed-only: never the bare id (unknown to CLIProxy, or another provider's model).
+  assert.equal(servedIdForArm(['synthetic/deepseek-v4.1-flash-1017'], 'deepseek-v4.1-flash-1017', 'synthetic', null),
+    'synthetic/deepseek-v4.1-flash-1017');
+  assert.equal(servedIdForArm(['synthetic/kimi-k3'], 'kimi-k3', 'synthetic', new Set(['kimi-k3', 'synthetic/kimi-k3'])),
+    'synthetic/kimi-k3');
+  assert.equal(servedIdForArm(['synthetic-infinite/deepseek-v4.1-flash'], 'deepseek-v4.1-flash', 'synthetic-infinite', null),
+    'synthetic-infinite/deepseek-v4.1-flash');
   // Native fail-open (no served list) stays byte-identical to base: bare.
   assert.equal(servedIdForArm(['openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex', null), 'gpt-6.1-sol');
   assert.equal(servedIdForArm(['claude/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude', null), 'claude-sonnet-5-5');

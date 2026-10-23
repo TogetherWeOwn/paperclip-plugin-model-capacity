@@ -84,8 +84,11 @@ export function canonicalModelName(model) {
  * bare id). A `devin/<id>` lane 400s the bare id as unknown provider, so the
  * prefixed emission is required even when the served list is absent
  * (fail-open old feeds). Native lanes keep byte-identical bare emission.
+ * synthetic / synthetic-infinite (synthetic.new, 2026-10-23): CLIProxy serves
+ * them only as `synthetic/<id>` and `synthetic-infinite/<id>`; the bare id is
+ * unknown to CLIProxy or, for kimi-k3 / glm-5.3, belongs to another provider.
  */
-export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go']);
+export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go', 'synthetic', 'synthetic-infinite']);
 
 /**
  * Exact model id to emit for an arm on one account. The account's feed
