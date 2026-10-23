@@ -730,6 +730,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // agreement counts scored since the last persist.
   const upstreamProposals = new Map(); // companyId -> { atMs, mode, maxAgeMs, byAgent: Map(agentId -> proposal) }
   const upstreamAgreement = new Map(); // companyId -> agreement delta (see upstream.mjs)
+  const upstreamConfigGenerations = new Map(); // only configChanged advances this mutation fence
+  const upstreamWriteCursors = new Map(); // fair bounded traversal across failing/no-op agents
   // Closure-private marker for the upstream step's own /caps read: the
   // shadow must not advance the cap-hold state the host cap helper reads.
   const INTERNAL_CAPS = Symbol('upstream-internal-caps');
@@ -1642,6 +1644,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   async function runShadowTick(companyId, job) {
+    const upstreamGeneration = upstreamConfigGenerations.get(companyId) ?? 0;
     const nowMs = clock();
     const raw = await ctx.config.get(companyId);
     const config = resolveConfig(raw);
@@ -1684,7 +1687,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Trial family counters drive which families route as trials; the fresh
     // resolved config feeds the memory-only event-time path (see setup).
     const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
-    lastConfig.set(companyId, config);
+    if ((upstreamConfigGenerations.get(companyId) ?? 0) === upstreamGeneration) lastConfig.set(companyId, config);
     // Arm circuit breaker: memory truth loaded once per worker start (like the
     // ledger); every tick reuses it and persists it below. Finished-run
     // failed events feed it after the ledger load -- never in the event path,
@@ -3897,7 +3900,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Upstream mode (0.2.67): off by default; never fails the tick.
     if (config.upstream?.mode && config.upstream.mode !== 'off') {
       try {
-        await runUpstreamStep(companyId, config, nowMs);
+        await runUpstreamStep(companyId, config, nowMs, upstreamGeneration);
       } catch (error) {
         ctx.logger.error('model-capacity: upstream step failed', { companyId, error: error?.message ?? String(error) });
       }
@@ -4307,7 +4310,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * (enforce) the diff. Never throws into the tick: failures are reported on
    * /upstream and logged.
    */
-  async function runUpstreamStep(companyId, config, nowMs) {
+  async function runUpstreamStep(companyId, config, nowMs, generation) {
+    if ((upstreamConfigGenerations.get(companyId) ?? 0) !== generation) return null;
     const u = config.upstream;
     if (!u || u.mode === 'off') {
       upstreamProposals.delete(companyId);
@@ -4334,7 +4338,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           companyId, routeKey: 'caps', query: {}, [INTERNAL_CAPS]: { persistHold: u.mode === 'enforce' },
         });
         const body = res?.body ?? {};
-        capWant = new Map((body.agents ?? []).map(a => [a.agentId, Number(a.maxConcurrentRuns)]));
+        if (res?.status !== 200 || body.capsError) {
+          report.errors.push({ step: 'caps', error: typeof body.capsError === 'string' ? body.capsError : 'caps-unavailable' });
+        } else {
+          capWant = new Map((body.agents ?? []).map(a => [a.agentId, Number(a.maxConcurrentRuns)]));
+        }
         report.caps = { calibration: body.calibration ?? null, target: body.target ?? null, agents: capWant.size };
       } catch (error) {
         report.errors.push({ step: 'caps', error: error?.message ?? String(error) });
@@ -4356,7 +4364,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         : { model: current.model, effort: current.effort, env: { ...current.env } };
       let proposal;
       try {
-        proposal = { ...proposeAgentRouting(companyId, live, agent, base), atMs: nowMs };
+        proposal = { ...proposeAgentRouting(companyId, live, agent, base), base, atMs: nowMs };
       } catch (error) {
         proposal = { kind: 'hold', reason: 'proposal failed', path: 'error', atMs: nowMs };
         report.errors.push({ step: 'propose', agentId: agent.id, error: error?.message ?? String(error) });
@@ -4393,9 +4401,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         _stored: stored != null,
       });
     }
+    if ((upstreamConfigGenerations.get(companyId) ?? 0) !== generation) return null;
     upstreamProposals.set(companyId, { atMs: nowMs, mode: u.mode, maxAgeMs: u.proposalMaxAgeMs, byAgent });
     if (u.mode === 'enforce') {
-      await applyUpstream(companyId, u, report, baseStore);
+      // Account for the model actually configured, not the next proposed pick.
+      live.upstreamByAgent = new Map(agents.map(a => [a.id, upstreamAppliedRoute(live, agentRoutingConfig(a).model)]));
+      await applyUpstream(companyId, u, report, baseStore, generation);
     }
     for (const row of report.agents) {
       delete row._desired;
@@ -4408,6 +4419,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       report.errors.push({ step: 'agreement', error: error?.message ?? String(error) });
     }
     report.agreement = agreement;
+    if ((upstreamConfigGenerations.get(companyId) ?? 0) !== generation) {
+      report.mode = lastConfig.get(companyId)?.upstream?.mode ?? 'off';
+      report.invalidated = true;
+    }
     await ctx.state.set(scopeKey(companyId, UPSTREAM_KEY), report);
     if (report.errors.length > 0) {
       ctx.logger.error('model-capacity: upstream step errors', { companyId, mode: u.mode, errors: report.errors.slice(0, 5) });
@@ -4422,30 +4437,55 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * pre-actuator config is saved before its first write so a keep, a hold or
    * a rollback can restore it.
    */
-  async function applyUpstream(companyId, u, report, baseStore) {
+  function upstreamAppliedRoute(live, model, preferredAccount = null) {
+    if (!model) return null;
+    const canon = canonicalModelName(model);
+    const serves = a => [...(a.models ?? []), ...(a.ladderRungs ?? []).map(r => r.model)].some(m => canonicalModelName(m) === canon);
+    const account = (live?.accounts ?? []).find(a => a.accountId === preferredAccount && serves(a))
+      ?? (live?.accounts ?? []).find(serves);
+    return account ? { model, accountId: account.accountId } : null;
+  }
+
+  async function applyUpstream(companyId, u, report, baseStore, generation) {
+    const currentGeneration = () => (upstreamConfigGenerations.get(companyId) ?? 0) === generation;
     const todo = report.agents.filter(r => r.changes.length > 0 || (r.cap && r.cap.to !== r.cap.from));
-    if (todo.length === 0) return;
+    if (todo.length === 0 || !currentGeneration()) return;
     let api;
     try {
       const key = await ctx.secrets.resolve(u.apiKeySecretRef, { companyId, configPath: 'upstream.apiKeySecretRef' });
+      if (!currentGeneration()) return;
       api = createUpstreamApi({ fetch: (url, init) => ctx.http.fetch(url, init), baseUrl: u.apiBaseUrl, apiKey: key });
     } catch (error) {
       report.errors.push({ step: 'api-key', error: error?.message ?? String(error) });
       return;
     }
-    for (const row of todo.slice(0, u.maxPatchesPerTick)) {
+    // Bound reads as well as writes, but rotate past failures and fresh-read
+    // no-ops. A broken leading agent cannot consume every tick's write slot.
+    const start = (upstreamWriteCursors.get(companyId) ?? 0) % todo.length;
+    const readLimit = Math.min(todo.length, Math.max(12, u.maxPatchesPerTick * 2));
+    let attempts = 0;
+    for (let offset = 0; offset < readLimit && attempts < u.maxPatchesPerTick; offset += 1) {
+      if (!currentGeneration()) break;
+      const index = (start + offset) % todo.length;
+      const row = todo[index];
+      upstreamWriteCursors.set(companyId, index + 1);
       try {
         const apiAgent = await api.getAgent(row.agentId);
-        const body = buildAgentPatch(apiAgent, row._desired, row.cap && row.cap.to !== row.cap.from ? row.cap.to : null);
+        if (!currentGeneration()) break;
+        // Only the authorized SDK read carries original plain env values;
+        // REST GET redacts every env entry, including non-secret routing caps.
+        const actual = await agentGet(row.agentId, companyId);
+        if (!currentGeneration()) break;
+        if (!actual || !actuatableAgent(actual, CLAUDE_CLI_ADAPTERS)) continue;
+        const before = agentRoutingConfig(actual);
+        const body = buildAgentPatch(apiAgent, row._desired, row.cap && row.cap.to !== row.cap.from ? row.cap.to : null, before);
         if (!body) continue;
         if (!row._stored) {
-          // Refresh before each write: another tick may have captured a base
-          // since our agent list was read. Never replace its original config.
           const latest = (await ctx.state.get(scopeKey(companyId, UPSTREAM_BASE_KEY))) ?? {};
+          if (!currentGeneration()) break;
           Object.assign(baseStore, latest);
           if (!baseStore[row.agentId]) {
             // Persisted BEFORE the write: a rollback can always restore it.
-            const before = agentRoutingConfig(apiAgent);
             baseStore[row.agentId] = {
               model: before.model, effort: before.effort, env: before.env,
               maxConcurrentRuns: before.maxConcurrentRuns, atMs: report.atMs,
@@ -4453,7 +4493,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             await ctx.state.set(scopeKey(companyId, UPSTREAM_BASE_KEY), baseStore);
           }
         }
+        // ConfigChanged runs independently of jobs. Every awaited read/write
+        // above may have crossed an off/shadow/hold transition.
+        if (!currentGeneration()) break;
+        attempts += 1;
         await api.patchAgent(row.agentId, body);
+        const live = liveViews.get(companyId);
+        live?.upstreamByAgent?.set(row.agentId, upstreamAppliedRoute(live, row._desired ? row._desired.model : before.model, row.proposal.accountId));
         report.applied.push({ agentId: row.agentId, fields: [...Object.keys(body.adapterConfig ?? {}).map(k => `adapterConfig.${k}`), ...(body.runtimeConfig ? ['runtimeConfig.heartbeat.maxConcurrentRuns'] : [])] });
       } catch (error) {
         report.errors.push({ step: 'patch', agentId: row.agentId, error: error?.message ?? String(error) });
@@ -4773,6 +4819,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     if (run?.runId != null) {
       if (ledgers.get(companyId)?.get(String(run.runId))?.decidedAccount != null) return null;
     }
+    // Upstream enforce changes agent defaults, including reviewer agents
+    // that are also kept. Attribute the applied default, never a fresh pick or
+    // the pre-PATCH kept mapping published earlier in the tick.
+    if (config.upstream?.mode === 'enforce') {
+      const applied = live.upstreamByAgent?.get(run?.agentId);
+      const actual = upstreamAppliedRoute(live, run?.eventModel ?? applied?.model, applied?.accountId);
+      if (actual && run?.runId != null) {
+        const ledger = await getOrLoadLedger(companyId);
+        recordDecision(ledger, {
+          runId: String(run.runId), agentId: String(run.agentId), accountId: actual.accountId,
+          armId: null, enforced: true, wouldModel: actual.model,
+          family: inferFamily(canonicalModelName(actual.model)), reason: 'upstream: applied agent default',
+        }, clock());
+      }
+      return null;
+    }
     // Pinned agents never get a routed decision: record the kept model so the
     // run counts against its serving account before the next tick.
     if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(run?.agentId)) {
@@ -5079,6 +5141,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         ctx.logger.error('model-capacity: config rejected', { companyId, errors });
         throw new Error('invalid-config');
       }
+      upstreamConfigGenerations.set(companyId, (upstreamConfigGenerations.get(companyId) ?? 0) + 1);
+      upstreamProposals.delete(companyId);
       configured.add(companyId);
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).

@@ -10,6 +10,7 @@ import {
   normalizeUpstream, UPSTREAM_DEFAULTS,
 } from '../src/upstream.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { createBreakerStore, breakerStoreToJSON, sanitizeBreakers, recordArmFailure } from '../src/breakers.mjs';
 
 // Upstream mode (0.2.67). All IO is in memory: no provider, host or real
 // secret is used. The API origin is the public placeholder pin.
@@ -61,6 +62,8 @@ function redact(a) {
   const copy = JSON.parse(JSON.stringify(a));
   for (const [k, v] of Object.entries(copy.adapterConfig?.env ?? {})) {
     if (v?.type === 'secret_ref') copy.adapterConfig.env[k] = { ...v, secretId: REDACTED };
+    else if (v?.type === 'plain') copy.adapterConfig.env[k] = { ...v, value: REDACTED };
+    else if (typeof v === 'string') copy.adapterConfig.env[k] = REDACTED;
   }
   return copy;
 }
@@ -109,7 +112,7 @@ function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(
               const next = { ...a.adapterConfig, ...body.adapterConfig };
               // Server restores redacted placeholders from the stored env.
               for (const [k, v] of Object.entries(next.env ?? {})) {
-                if (v?.secretId === REDACTED) next.env[k] = a.adapterConfig.env[k];
+                if (v?.secretId === REDACTED || v?.value === REDACTED || v === REDACTED) next.env[k] = a.adapterConfig.env[k];
               }
               a.adapterConfig = next;
             }
@@ -137,7 +140,7 @@ function drive({ mode = 'shadow', overrides = {}, upstream = {}, agents = fleet(
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false, loadSample });
   return {
-    config, store, calls, byId, plugin,
+    config, store, calls, byId, plugin, io,
     setup: async () => {
       await plugin.setup(io);
       store.set(JSON.stringify(key('aa-snapshot-v1')), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
@@ -346,12 +349,64 @@ test('shadow agreement: pinned, stale, deferred and disagreeing answers are clas
   assert.equal(r.agreement.window.issuePinned, 1);
 });
 
-test('shadow: the internal /caps read does not advance the cap-hold state the host helper reads', async () => {
-  const d = await start({ mode: 'shadow' });
-  const before = d.store.get(JSON.stringify(key('caps-hold-v1')));
-  d.setNow(TICK + 60000);
+async function measuredShadow() {
+  const todo = Array.from({ length: 5 }, (_, i) => ({ id: `i${i}`, status: 'todo', assigneeAgentId: 'doer-1' }));
+  const d = drive({ mode: 'shadow', accounts: [lane('a1', { weekly: { used: 0.3, resetsAt: '2026-10-15T22:59:00Z' } })], issueLists: { todo } });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 10 * 60000);
+  await d.fire('run-a', 'doer-1', TICK + 10 * 60000);
+  d.setNow(TICK + 20 * 60000);
+  await d.fire('run-b', 'doer-1', TICK + 20 * 60000);
+  d.setNow(TICK + 30 * 60000);
+  d.setLaneUsed(0.3002);
+  await d.tick();
+  return d;
+}
+
+test('shadow: measured internal /caps read does not advance real cap-hold state', async () => {
+  const d = await measuredShadow();
+  const caps = await d.api('caps'); // external read intentionally persists hold
+  assert.ok(caps.agents.some(a => a.agentId === 'doer-1'));
+  const before = structuredClone(d.store.get(JSON.stringify(key('caps-hold-v1'))));
+  assert.ok(before?.agents?.['doer-1']);
+  d.setNow(TICK + 31 * 60000);
   await d.tick();
   assert.deepEqual(d.store.get(JSON.stringify(key('caps-hold-v1'))), before);
+});
+
+test('shadow surfaces the real caps issues-unavailable error, not healthy empty allocation', async () => {
+  const d = await measuredShadow();
+  d.io.issues.list = async () => { throw new Error('issue store down'); };
+  d.setNow(TICK + 31 * 60000);
+  await d.tick();
+  const r = await d.api('upstream');
+  assert.ok(r.errors.some(e => e.step === 'caps' && e.error === 'issues-unavailable'));
+  assert.equal(r.caps.agents, 0);
+  assert.ok(r.agents.every(a => a.cap == null));
+});
+
+test('shadow rejects whole-agent half-open routing without claiming the reachable hook probe', async () => {
+  const d = drive({ mode: 'shadow', accounts: [lane('a1')], upstream: { caps: { enabled: false } } });
+  await d.setup();
+  const seed = createBreakerStore();
+  const cfg = sanitizeBreakers();
+  const arms = ['claude-haiku-5-5', 'claude-haiku-5-5-xhigh', 'claude-sonnet-5-5-high', 'claude-opus-5-5'];
+  for (const arm of arms) {
+    const at = arm === arms[0] ? TICK - 7 * HOUR : TICK - 120000;
+    recordArmFailure(seed, 'claude:a1', arm, { atMs: at, errorText: 'auth_unavailable' }, at, cfg);
+    recordArmFailure(seed, 'claude:a1', arm, { atMs: at + 60000, errorText: 'auth_unavailable' }, at + 60000, cfg);
+  }
+  d.store.set(JSON.stringify(key('breaker-v1')), breakerStoreToJSON(seed, { nowMs: TICK, cfg }));
+  await d.tick();
+  const r = await d.api('upstream');
+  assert.equal(r.agents.find(a => a.agentId === 'doer-1').proposal.kind, 'hold');
+  const breaker = (await d.api('capacity')).armBreakers.find(b => b.armId === arms[0]);
+  assert.equal(breaker.status, 'half-open');
+  assert.equal(breaker.probeRunId, null);
+  const answer = await d.hook('doer-1', { runId: 'one-real-probe' });
+  assert.equal(answer.kind, 'decide', 'control proves the half-open arm is reachable by the hook');
+  assert.equal(answer.model, arms[0]);
 });
 
 test('shadow: a failing agents.list never fails the tick and is reported', async () => {
@@ -442,6 +497,21 @@ test('enforce: PATCHes only changed fields through the pinned origin, secrets ro
   assert.deepEqual(r.errors, []);
 });
 
+test('enforce attributes kept reviewer starts to the applied cross-provider model', async () => {
+  const d = await start({
+    mode: 'enforce', agents: [agent('reviewer-1')],
+    accounts: [lane('a1', { models: ['claude-sonnet-5-5'] }), lane('a2', { provider: 'openai', models: ['gpt-6.1-sol'] })],
+    overrides: { reviewerRouting: { agentIds: ['reviewer-1'], arms: [{ provider: 'openai', model: 'gpt-6.1-sol', effort: 'high' }] } },
+  });
+  assert.equal(d.byId.get('reviewer-1').adapterConfig.model, 'gpt-6.1-sol');
+  await d.fire('run-applied-sol', 'reviewer-1', TICK);
+  // Inspect the memory-only event decision before the next tick can repair it.
+  d.store.delete(JSON.stringify(key('ledger-v1')));
+  const entry = (await d.api('shadow')).entries.find(r => r.runId === 'run-applied-sol');
+  assert.equal(entry.accountId, 'openai:a2');
+  assert.equal(entry.wouldModel, 'gpt-6.1-sol');
+});
+
 test('enforce: converged agents are not written again (PATCH only on change)', async () => {
   const d = await start({ mode: 'enforce' });
   const first = d.calls.api.filter(c => c.method === 'PATCH').length;
@@ -457,6 +527,32 @@ test('enforce: at most maxPatchesPerTick writes per tick', async () => {
   const d = await start({ mode: 'enforce', upstream: { maxPatchesPerTick: 1 } });
   assert.equal(d.calls.api.filter(c => c.method === 'PATCH').length, 1);
 });
+
+for (const leading of ['404', 'fresh-noop']) {
+  test(`enforce leading ${leading} does not starve a later agent at a one-PATCH budget`, async () => {
+    const control = await start({ mode: 'shadow', agents: [agent('doer-1'), agent('thinker-1')] });
+    const decision = await control.hook('doer-1');
+    const d = drive({ mode: 'enforce', agents: [agent('doer-1'), agent('thinker-1')], upstream: { maxPatchesPerTick: 1 } });
+    await d.setup();
+    const fetch = d.io.http.fetch;
+    d.io.http.fetch = async (url, init) => {
+      if (url.endsWith('/api/agents/doer-1') && init.method === 'GET') {
+        if (leading === '404') return { status: 404, json: async () => ({}) };
+        // Another writer converges this agent between list and fresh GET.
+        const out = decision;
+        const a = d.byId.get('doer-1');
+        a.adapterConfig.model = out.model;
+        for (const [k, v] of Object.entries(out.env ?? {})) a.adapterConfig.env[k] = plain(v);
+        if (out.effort != null) a.adapterConfig.effort = out.effort;
+      }
+      return fetch(url, init);
+    };
+    await d.tick();
+    const patches = d.calls.api.filter(c => c.method === 'PATCH');
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].id, 'thinker-1');
+  });
+}
 
 test('enforce: a kept agent the actuator never touched is left exactly as is', async () => {
   const d = await start({
@@ -500,20 +596,92 @@ test('enforce preserves bases captured after the agent list was read', async () 
   await d.setup();
   const ioKey = JSON.stringify(key('upstream-base-v1'));
   const sentinel = { model: 'original-model', effort: 'high', env: {}, maxConcurrentRuns: 4, atMs: TICK - 60000 };
-  const realGet = d.byId.get.bind(d.byId);
-  // A concurrent tick records an original base during the first API GET.
+  const fetch = d.io.http.fetch;
+  // Interleave only after runUpstreamStep read its base-store snapshot;
+  // earlier SDK reads during the main tick cannot inject this sentinel.
   let injected = false;
-  d.byId.get = (id) => {
-    if (!injected) {
+  d.io.http.fetch = async (url, init) => {
+    if (!injected && url.startsWith(`${ORIGIN}/api/agents/`) && init.method === 'GET') {
       injected = true;
       d.store.set(ioKey, { 'kept-1': sentinel, 'outside-agent': sentinel });
     }
-    return realGet(id);
+    return fetch(url, init);
   };
   await d.tick();
   const bases = d.store.get(ioKey);
   assert.deepEqual(bases['kept-1'], sentinel);
   assert.deepEqual(bases['outside-agent'], sentinel);
+});
+
+test('enforce restores original plain routing env through fully redacted REST reads', async () => {
+  const d = await start({ mode: 'enforce', agents: [agent('doer-1')] });
+  const base = d.store.get(JSON.stringify(key('upstream-base-v1')))['doer-1'];
+  assert.equal(base.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '1000000');
+  d.config.roles.keepAgentIds.push('doer-1');
+  await d.plugin.onConfigChanged(d.config, { companyId: 'acme' });
+  d.setNow(TICK + 60000);
+  await d.tick();
+  assert.equal(d.byId.get('doer-1').adapterConfig.model, base.model);
+  // A kept Sonnet can receive context caps, so disable those to exercise a
+  // literal keep and restoration of the pre-actuator env.
+  d.config.contextCaps = { enabled: false };
+  await d.plugin.onConfigChanged(d.config, { companyId: 'acme' });
+  await d.tick();
+  assert.equal(d.byId.get('doer-1').adapterConfig.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS.value, '1000000');
+  assert.deepEqual((await d.api('upstream')).errors, []);
+});
+
+test('enforce clears a model that was originally unset when a keep restores its base', async () => {
+  const d = await start({ mode: 'enforce', agents: [agent('doer-1', { adapterConfig: { env: {} } })] });
+  assert.ok(d.byId.get('doer-1').adapterConfig.model);
+  d.config.roles.keepAgentIds.push('doer-1');
+  await d.plugin.onConfigChanged(d.config, { companyId: 'acme' });
+  await d.tick();
+  assert.equal(d.byId.get('doer-1').adapterConfig.model, null);
+  assert.ok(d.calls.api.some(c => c.method === 'PATCH' && c.body.adapterConfig?.model === null));
+  await d.tick();
+  assert.equal((await d.api('upstream')).wouldPatch, 0);
+});
+
+for (const transition of ['off', 'shadow', 'hold', 'cap-hold']) {
+  test(`enforce fences a delayed GET after config changes to ${transition}`, async () => {
+    const d = drive({ mode: 'enforce' });
+    await d.setup();
+    const fetch = d.io.http.fetch;
+    let release, entered;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    d.io.http.fetch = async (url, init) => {
+      if (url.startsWith(`${ORIGIN}/api/agents/`) && init.method === 'GET') {
+        entered();
+        await new Promise(resolve => { release = resolve; });
+      }
+      return fetch(url, init);
+    };
+    const ticking = d.tick();
+    await waiting;
+    if (transition === 'hold') d.config.upstream.holdAgentIds = ['doer-1'];
+    else if (transition === 'cap-hold') d.config.upstream.caps = { holdAgentIds: ['doer-1'] };
+    else d.config.upstreamMode = transition;
+    await d.plugin.onConfigChanged(d.config, { companyId: 'acme' });
+    release();
+    await ticking;
+    assert.equal(d.calls.api.filter(c => c.method === 'PATCH').length, 0);
+    const report = await d.api('upstream');
+    assert.equal(report.invalidated, true);
+    assert.equal(report.mode, transition === 'off' || transition === 'shadow' ? transition : 'enforce');
+  });
+}
+
+test('shadow agreement detects env-only drift and compares the effective merged env', () => {
+  const s = createAgreement(TICK);
+  const base = { model: 'm', effort: null, env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000' } };
+  const input = { nowMs: TICK, params: {}, maxAgeMs: 150000,
+    answer: { kind: 'decide', model: 'm', env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '890000' } },
+    proposal: { kind: 'decide', model: 'm', base, env: {}, atMs: TICK } };
+  assert.equal(scoreHookAnswer(s, input), 'disagree');
+  assert.equal(s.disagreements[0].hook.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '890000');
+  assert.equal(s.disagreements[0].proposal.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '1000000');
+  assert.equal(scoreHookAnswer(s, { ...input, answer: { kind: 'decide', model: 'm', env: base.env } }), 'agree');
 });
 
 // ------------------------------------------------------------ pure parts

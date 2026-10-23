@@ -252,13 +252,16 @@ export function planCapChange({ current, want, isReview = false, isPinned = fals
  * server, so it is sent whole with only heartbeat.maxConcurrentRuns edited.
  * Returns null when nothing would change.
  */
-export function buildAgentPatch(apiAgent, desired, nextCap = null) {
+export function buildAgentPatch(apiAgent, desired, nextCap = null, current = null) {
   const ac = adapterConfigOf(apiAgent);
-  const cur = agentRoutingConfig(apiAgent);
+  // REST redacts even plain env values. The actuator supplies the authorized
+  // SDK routing slice for comparisons; untouched env entries stay redacted
+  // placeholders in the PATCH, which the server restores from stored config.
+  const cur = current ?? agentRoutingConfig(apiAgent);
   const body = {};
   if (desired) {
     const adapterConfig = {};
-    if ((cur.model ?? null) !== (desired.model ?? null) && desired.model != null) adapterConfig.model = desired.model;
+    if ((cur.model ?? null) !== (desired.model ?? null)) adapterConfig.model = desired.model ?? null;
     if ((cur.effort ?? null) !== (desired.effort ?? null)) adapterConfig.effort = desired.effort ?? null;
     const envChanged = ROUTING_ENV_KEYS.some(k => (cur.env[k] ?? null) !== (desired.env?.[k] ?? null));
     if (envChanged) {
@@ -327,8 +330,8 @@ export function createAgreement(nowMs) {
  *   issue-pinned run                 -> issuePinned (native precedence, not scored)
  *   no fresh proposal for the agent  -> noProposal
  *   hook defer                       -> deferred (a defer is a cap/quota hold upstream)
- *   hook decide/keep                 -> agree when the emitted model (and effort,
- *                                       when the hook set one) equals the proposal's
+ *   hook decide/keep                 -> agree when model, effective effort and
+ *                                       owned routing env match the proposal
  * Returns the outcome; mutates `state`.
  */
 export function scoreHookAnswer(state, { nowMs, params, answer, proposal, maxAgeMs }) {
@@ -348,15 +351,22 @@ export function scoreHookAnswer(state, { nowMs, params, answer, proposal, maxAge
     const propModel = proposal.kind === 'decide' ? proposal.model ?? null
       : proposal.kind === 'keep' ? (params?.agentDefaultModel ?? proposal.model ?? null) : null;
     const propEffort = proposal.kind === 'decide' ? proposal.effort ?? null : null;
-    const same = hookModel != null && hookModel === propModel && (hookEffort == null || hookEffort === propEffort);
+    const base = proposal.base ?? { model: params?.agentDefaultModel ?? null, effort: null, env: {} };
+    const hookRouting = desiredRoutingConfig(base, answer);
+    const propRouting = desiredRoutingConfig(base, proposal);
+    const hookEnv = hookRouting?.env ?? {};
+    const propEnv = propRouting?.env ?? {};
+    const sameEnv = ROUTING_ENV_KEYS.every(k => (hookEnv[k] ?? null) === (propEnv[k] ?? null));
+    const same = hookModel != null && hookModel === propModel
+      && (hookRouting?.effort ?? null) === (propRouting?.effort ?? null) && sameEnv;
     outcome = same ? 'agree' : 'disagree';
     if (!same) {
       detail = {
         atMs: nowMs,
         runId: params?.runId != null ? String(params.runId) : null,
         agentId: params?.agentId ?? null,
-        hook: { kind: answer?.kind ?? null, model: hookModel, effort: hookEffort, reason: String(answer?.reason ?? '').slice(0, 160) },
-        proposal: { kind: proposal.kind, model: propModel, effort: propEffort, ageMs: nowMs - proposal.atMs, reason: String(proposal.reason ?? '').slice(0, 160) },
+        hook: { kind: answer?.kind ?? null, model: hookModel, effort: hookEffort, env: hookEnv, reason: String(answer?.reason ?? '').slice(0, 160) },
+        proposal: { kind: proposal.kind, model: propModel, effort: propEffort, env: propEnv, ageMs: nowMs - proposal.atMs, reason: String(proposal.reason ?? '').slice(0, 160) },
       };
     }
   }
