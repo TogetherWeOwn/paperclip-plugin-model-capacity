@@ -98,6 +98,15 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.67 = upstream mode: `upstreamMode` off (default) | shadow | enforce
+ *   moves model choice onto the agent for a stock Paperclip host, which has
+ *   no run.model.resolve hook: per-agent proposals (model, effort, context
+ *   caps, maxConcurrentRuns) from the hook's own selection code, recorded and
+ *   scored against live hook answers in shadow, applied with PATCH
+ *   /api/agents/:id on the build-pinned public origin in enforce. New
+ *   `upstreamManifest` variant declares only capabilities v2026.1012.0
+ *   knows. New /upstream route. No new capability; egress to the pinned
+ *   origin only in enforce; env keys unchanged.
  * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
  *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
  *   never the bare id CLIProxy 400s or routes to another provider);
@@ -356,9 +365,10 @@
 
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
+import { PAPERCLIP_API_BASE_URLS } from './api-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.66';
+export const PLUGIN_VERSION = '0.2.67';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -662,6 +672,32 @@ const CONFIG_SCHEMA = {
         },
       },
     },
+    upstreamMode: {
+      type: 'string', enum: ['off', 'shadow', 'enforce'], default: 'off',
+      description: 'Upstream mode (0.2.67): run model choice without the fork-only run.model.resolve hook. off (default): nothing new runs. shadow: every tick proposes each agent\'s model, effort, context-cap env and maxConcurrentRuns, records the would-PATCH diff and scores every live hook answer against it (GET /upstream); nothing is written. enforce: applies the proposals through PATCH /api/agents/:id on the pinned public API origin (requires enforce false and upstream.apiKeySecretRef).',
+    },
+    upstream: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        apiBaseUrl: { type: 'string', enum: [...PAPERCLIP_API_BASE_URLS], description: 'Public Paperclip origin the actuator calls (pinned at build time; plugin fetches refuse loopback). Defaults to the first pinned origin.' },
+        apiKeySecretRef: { ...SECRET_REF, description: 'Paperclip secret holding a company-scoped board API key with agent configuration rights (enforce only; shadow sends nothing).' },
+        maxPatchesPerTick: { type: 'integer', minimum: 1, maximum: 50, default: 12 },
+        holdAgentIds: { type: 'array', default: [], items: { type: 'string' }, description: 'Agents the actuator never writes (operator holds on model or run cap).' },
+        proposalMaxAgeMs: { type: 'integer', minimum: 60000, default: 150000, description: 'A hook answer is scored only against a proposal at most this old.' },
+        caps: {
+          type: 'object', additionalProperties: false,
+          description: 'Per-agent heartbeat.maxConcurrentRuns from the plugin\'s /caps allocation, step-limited and load-guarded (the interim host cap helper\'s algorithm, moved into the plugin).',
+          properties: {
+            enabled: { type: 'boolean', default: true },
+            maxStepUp: { type: 'integer', minimum: 1, maximum: 50, default: 4 },
+            maxStepDown: { type: 'integer', minimum: 1, maximum: 50, default: 1 },
+            loadHoldPerCpu: { type: 'number', exclusiveMinimum: 0, default: 0.75, description: 'Up moves hold while the 5-min load average is at or above this x CPUs (review agents climb until the shed line).' },
+            loadShedPerCpu: { type: 'number', exclusiveMinimum: 0, default: 1.15, description: 'At or above this x CPUs non-review agents shed one run per tick (a quarter of the cap at 1.5 x CPUs).' },
+            burnFloor: { type: ['integer', 'null'], minimum: 1, maximum: 50, default: null, description: 'Burn windows: doer caps floored at this value above the plugin\'s want (null = off).' },
+          },
+        },
+      },
+    },
     enforce: {
       type: 'boolean', default: false,
       description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
@@ -788,7 +824,16 @@ const CONFIG_SCHEMA = {
  * enforcement variant: it holds the `run.model.resolve` capability plus the
  * modelRouting envKeys declaration the host requires with it.
  */
-export function buildManifest({ modelResolve = false } = {}) {
+/**
+ * Capabilities only the TogetherWeOwn fork host knows. A stock Paperclip host
+ * validates manifests with z.enum(PLUGIN_CAPABILITIES) and refuses to load a
+ * plugin declaring any of these, so the upstream variant drops them (the
+ * worker already degrades when the matching host call is absent).
+ */
+export const FORK_ONLY_CAPABILITIES = Object.freeze(['run.model.resolve', 'agents.queued_counts.read']);
+
+export function buildManifest({ modelResolve = false, upstream = false } = {}) {
+  if (modelResolve && upstream) throw new Error('manifest variant: modelResolve and upstream are exclusive');
   const capabilities = [
     'jobs.schedule',
     'plugin.state.read',
@@ -870,12 +915,28 @@ export function buildManifest({ modelResolve = false } = {}) {
         checkoutPolicy: 'none',
         companyResolution: { from: 'query', key: 'companyId' },
       },
+      {
+        routeKey: 'upstream',
+        method: 'GET',
+        path: '/upstream',
+        auth: 'board-or-agent',
+        capability: 'api.routes.register',
+        checkoutPolicy: 'none',
+        companyResolution: { from: 'query', key: 'companyId' },
+      },
     ],
   };
   if (modelResolve) {
     out.capabilities = [...capabilities, 'run.model.resolve'];
     out.displayName = 'Model Capacity';
     out.modelRouting = { envKeys: [...MODEL_ROUTING_ENV_KEYS] };
+  }
+  if (upstream) {
+    // Stock-host variant (0.2.67): no per-run hook; model choice runs through
+    // upstreamMode (agent config via the public API) instead.
+    out.capabilities = capabilities.filter(c => !FORK_ONLY_CAPABILITIES.includes(c));
+    out.displayName = 'Model Capacity';
+    out.description = 'Model-capacity routing for a stock Paperclip host: paced per-account Pareto ladders from AA quality and CLIProxy burn data, applied per agent (model, effort, context caps, maxConcurrentRuns) through the public API when upstreamMode is enforce. Shadow only by default.';
   }
   return out;
 }
@@ -885,4 +946,7 @@ export const manifest = buildManifest();
 
 /** Opt-in enforce-capable manifest (runtime-gated by the `enforce: false` default). */
 export const enforceManifest = buildManifest({ modelResolve: true });
+
+/** Stock-host manifest (0.2.67): only capabilities upstream Paperclip knows; pair with upstreamMode. */
+export const upstreamManifest = buildManifest({ upstream: true });
 export default manifest;

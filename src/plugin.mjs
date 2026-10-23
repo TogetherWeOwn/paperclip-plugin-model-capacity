@@ -106,6 +106,13 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
+import { PAPERCLIP_API_BASE_URLS } from './api-host.mjs';
+import {
+  validateUpstream, normalizeUpstream, actuatableAgent, agentRoutingConfig, desiredRoutingConfig, diffRoutingConfig,
+  planCapChange, buildAgentPatch, createUpstreamApi, createAgreement, scoreHookAnswer, summarizeAgreement,
+  agreementFromJSON, mergeAgreement,
+} from './upstream.mjs';
+import { loadavg as osLoadavg, availableParallelism as osParallelism } from 'node:os';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -121,6 +128,10 @@ const CAPACITY_CHANGE_KEY = 'capacity-change-v1';
 const SMOOTH_KEY = 'smoothing-v1';
 /** Per-agent cap hysteresis state (written by GET /caps). */
 const CAPS_HOLD_KEY = 'caps-hold-v1';
+/** Upstream mode (0.2.67): last proposals + would-PATCH report, shadow agreement, agents' base config. */
+const UPSTREAM_KEY = 'upstream-v1';
+const UPSTREAM_AGREEMENT_KEY = 'upstream-agreement-v1';
+const UPSTREAM_BASE_KEY = 'upstream-base-v1';
 
 /**
  * Run ledger persisted per company: one record per runId (starts, decisions,
@@ -456,6 +467,11 @@ export function validateConfigShape(raw) {
       }
     }
   }
+  // Upstream mode (see upstream.mjs): the API origin is pinned at build time
+  // like the lane host, because the actuator's key travels to it.
+  errors.push(...validateUpstream(raw.upstreamMode, raw.upstream, {
+    allowlist: PAPERCLIP_API_BASE_URLS, enforceHook: raw.enforce === true,
+  }));
   return errors;
 }
 
@@ -654,6 +670,9 @@ export function resolveConfig(raw = {}) {
     caps: {
       reservedFloors: sanitizeReservedFloors(raw.caps?.reservedFloors),
     },
+    // Upstream mode (0.2.67, see upstream.mjs): off (default) | shadow |
+    // enforce. Off runs nothing new.
+    upstream: normalizeUpstream(raw.upstreamMode, raw.upstream, { allowlist: PAPERCLIP_API_BASE_URLS }),
   };
 }
 
@@ -678,6 +697,17 @@ function sanitizeReservedFloors(raw) {
 // Weekly window length for schedule-error math (the lane reports `used`
 // fractions plus reset timestamps; the host owns staleness/live-pull).
 const WEEKLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
+
+/** 5-min load average and CPU count for the upstream cap planner; null when unreadable. */
+function defaultLoadSample() {
+  try {
+    const load5 = osLoadavg()[1];
+    const cpus = osParallelism();
+    return Number.isFinite(load5) && Number.isFinite(cpus) && cpus > 0 ? { load5, cpus } : null;
+  } catch {
+    return null;
+  }
+}
 // Rolling 5h meter window for the review reserve's five-hour allowance.
 const FIVE_HOUR_WINDOW_MS = 5 * 3600 * 1000;
 // A reset reported this far past one window still reads as a window that has
@@ -693,8 +723,16 @@ function windowStartMs(resetsAtMs) {
 // read against the public placeholder pin with a fake http client. The
 // worker entry never passes it, so every deployed plugin refuses to read
 // the lane key unless the build pinned a real host.
-export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true } = {}) {
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, loadSample = defaultLoadSample } = {}) {
   let ctx;
+  // Upstream mode (0.2.67, see upstream.mjs): the last tick's per-agent
+  // proposals (memory, read by the hook's agreement scoring) and the
+  // agreement counts scored since the last persist.
+  const upstreamProposals = new Map(); // companyId -> { atMs, mode, maxAgeMs, byAgent: Map(agentId -> proposal) }
+  const upstreamAgreement = new Map(); // companyId -> agreement delta (see upstream.mjs)
+  // Closure-private marker for the upstream step's own /caps read: the
+  // shadow must not advance the cap-hold state the host cap helper reads.
+  const INTERNAL_CAPS = Symbol('upstream-internal-caps');
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
   const ledgerReady = new Set(); // companyIds whose memory ledger absorbed persisted state
@@ -3856,6 +3894,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // pollers and restarts (a gap that closes resets to null).
       doerStarvationSinceMs: doerStarvation.sinceMs,
     });
+    // Upstream mode (0.2.67): off by default; never fails the tick.
+    if (config.upstream?.mode && config.upstream.mode !== 'off') {
+      try {
+        await runUpstreamStep(companyId, config, nowMs);
+      } catch (error) {
+        ctx.logger.error('model-capacity: upstream step failed', { companyId, error: error?.message ?? String(error) });
+      }
+    } else {
+      upstreamProposals.delete(companyId);
+    }
     ctx.logger.info('model-capacity: shadow tick', {
       companyId, accounts: accountViews.length, target: concurrency.target,
       calibration: concurrency.calibration, observed, runs: ledger.size, runsSource: 'events',
@@ -4065,6 +4113,345 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         creditPriority: live.creditPriority ?? 'fallback',
       },
     );
+  }
+
+  /**
+   * The hook's routed selection, shared with the upstream-mode proposal
+   * (0.2.67) so both answer from one code path. Pure over the frozen live
+   * view and the memory ledger/breakers: the only side effect is
+   * `claimProbe`, which the hook uses to occupy a half-open probe slot
+   * (startProbe) and the proposal answers false to (a whole agent is never
+   * steered onto a single-run probe). Returns { pick: { d, roleRungs,
+   * emitAdapter } | null, order, paced, reserveHeld }.
+   */
+  function selectRoutedDecision(live, companyId, params, { claimProbe }) {
+    const role = roleOf({ roles: {
+      thinkerAgentIds: live.thinkerAgentIds,
+      doerAgentIds: live.doerAgentIds,
+    } }, params.agentId);
+    const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
+    // Same water-filling order as the shadow tick: need band first, then
+    // largest (targetShare - pooled in-flight). Metered accounts without
+    // headroom never qualify; healthy reactive accounts qualify without
+    // headroom (no vendor meter exists). The reactive cap compares
+    // PER-ACCOUNT in-flight (live per-account counts plus queued
+    // decisions per account, both deduped) -- the pooled value on the
+    // ordered views drives ordering only. Trial budgets are consumed
+    // from a per-call copy, so bursts within one tick stay bounded.
+    // Own-run exclusion: the host fires agent.run.started at claim before
+    // this hook resolves, so a queued shadow entry for THIS runId must not
+    // count against it in ordering, caps, or budgets.
+    const selfId = params?.runId != null ? String(params.runId) : null;
+    // Review runs admit past the reserve hold (the reserve holds quota FOR
+    // them); other work defers while its only account is held, and the
+    // reason says so -- not a generic no-headroom.
+    const forReview = liveIsReviewAgent(live, params.agentId);
+    const { order, paced, reserveHeld } = withDuplicatePass(duplicates => allocationOrderFromLive(
+      live, companyId, selfId, role, roleExcluded, duplicates, forReview,
+    ));
+    const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
+    const acctPending = pendingByAccount(live, companyId, selfId);
+    const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
+    const budget = effectiveTrialBudget(live, companyId, selfId);
+    // Breaker state live at call time (not the tick-frozen view): a probe
+    // occupied after the tick published must exclude the arm here, or N
+    // enforced runs would pile onto one half-open probe slot.
+    const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+    const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
+    const bnow = clock();
+    for (const view of order) {
+      if (!view || view.ladderRungs.length === 0) continue;
+      if (!view.reactive && !view.remainingKnown) continue;
+      if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
+      // Role-based family exclusions use the tick-frozen live view (the
+      // hook performs zero I/O): ineligible accounts are skipped, never
+      // deferred on.
+      const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
+      if (!rungsHaveEligibleArms(roleRungs)) continue;
+      const d = decide({
+        runId: params.runId,
+        agentId: params.agentId,
+        role,
+        ladderRungs: filterBreakerRungs(roleRungs, bstore, view.accountId, bnow, bcfg),
+        excludedFamilies: roleExcluded,
+        pointer: view.pointer,
+        retryCount: 0,
+        failureClass: 'none',
+        contextTokens: null,
+        fiveHourHeadroomPct: view.headroomPct,
+        burnPerRunPct: view.burnPerRunPct,
+        reservePct: 0.05,
+        accountId: view.accountId,
+        roleBands: live.roleBands,
+        contextCaps: live.contextCaps,
+        adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
+        trialBudget: budget,
+        trialAdapters: live.trialAdapters ?? {},
+        trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
+      });
+      if (d.kind !== 'decide') continue;
+      if (!decisionCredentialReady(d, roleRungs, companyId)) continue;
+      if (d.armId != null
+        && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
+        && !claimProbe(bstore, d, bnow, bcfg)) {
+        continue;
+      }
+      const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
+      return { pick: { d, roleRungs, emitAdapter }, order, paced, reserveHeld };
+    }
+    return { pick: null, order, paced, reserveHeld };
+  }
+
+  // ---------------------------------------------------------------------
+  // Upstream mode (0.2.67): per-agent proposals, the shadow comparison and
+  // the API actuator. See upstream.mjs for the modes and the merge rules.
+  // ---------------------------------------------------------------------
+
+  /**
+   * What the hook would answer for a fresh run of `agent` right now, from the
+   * same frozen live view and with no side effects (no ledger write, no probe
+   * claim, no deferred mark, no reviewer-route note). Branch order is the
+   * hook's: reviewer routing, kept agents, routed selection. Independent of
+   * the `enforce` flag: on a stock host there is no hook to enforce.
+   * Returns { kind: 'decide' | 'keep' | 'hold', model, effort, env, reason,
+   * accountId, path }.
+   */
+  function proposeAgentRouting(companyId, live, agent, base) {
+    const agentId = agent.id;
+    const adapterType = agent.adapterType ?? agent.adapter_type ?? null;
+    if (!live || !Number.isFinite(live.atMs)) return { kind: 'hold', reason: 'no routing snapshot', path: 'none' };
+    const params = {
+      companyId, agentId, runId: null, adapterType,
+      agentDefaultModel: base.model, issueOverrideModel: null,
+    };
+    const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
+    const rr = live.reviewerRouting;
+    if (rr && Array.isArray(rr.agentIds) && rr.agentIds.includes(agentId)) {
+      const nowMs = clock();
+      const paced = live.paceGuard?.enabled === true
+        ? (allocationOrderFromLive(live, companyId, null, role,
+          normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true).paced ?? [])
+        : [];
+      const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
+      const { pick, admissionOf } = pickReviewerRoute(live, companyId, agentId, null, nowMs, pacedIds);
+      if (!pick.none) {
+        const { match, emitModel, env } = reviewerPickEmission(live, pick, admissionOf);
+        const decorated = decoratedModelFor({ model: emitModel, effort: pick.arm.effort, contextWindow: match?.contextWindow ?? null }, adapterType);
+        return {
+          kind: 'decide', model: decorated ?? emitModel, effort: pick.arm.effort ?? null, env: { ...env },
+          reason: pick.reason, accountId: pick.accountId, path: 'reviewer',
+        };
+      }
+      if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, agentId, null, nowMs).pick.none) {
+        return { kind: 'hold', reason: `pace guard: reviewer lanes held (${paced.map(pacedPoolText).join('; ')})`, path: 'reviewer' };
+      }
+    }
+    if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(agentId)) {
+      const why = 'kept: agent pinned to its configured model (roles.keepAgentIds)';
+      const capped = keptCapsAnswer(params, live, why);
+      return capped
+        ? { kind: 'decide', model: capped.model, effort: null, env: { ...capped.env }, reason: capped.reason, accountId: live.keptByAgent?.[agentId]?.accountId ?? null, path: 'kept' }
+        : { kind: 'keep', model: base.model, effort: base.effort, env: {}, reason: why, accountId: live.keptByAgent?.[agentId]?.accountId ?? null, path: 'kept' };
+    }
+    const { pick, order, paced, reserveHeld } = selectRoutedDecision(live, companyId, params, { claimProbe: () => false });
+    if (pick) {
+      const { d } = pick;
+      const decorated = decoratedModelFor(d, pick.emitAdapter);
+      return {
+        kind: 'decide', model: decorated ?? d.model, effort: d.effort ?? null, env: { ...(d.env ?? {}) },
+        reason: d.reason, accountId: d.accountId, path: 'routed',
+      };
+    }
+    const reason = order.length === 0 && (reserveHeld?.length ?? 0) > 0
+      ? `review reserve: ${reserveHeld.map(h => h.accountId).join(', ')} held for review runs`
+      : paced.length > 0 ? `pace guard: ${paced.map(pacedPoolText).join('; ')}` : 'no account has headroom right now';
+    return { kind: 'hold', reason, path: 'routed' };
+  }
+
+  /** Score one live hook answer against its agent's proposal (memory-only). */
+  function observeHookAnswer(params, answer) {
+    const companyId = params?.companyId;
+    const p = companyId ? upstreamProposals.get(companyId) : null;
+    if (!p || p.mode === 'off') return;
+    let state = upstreamAgreement.get(companyId);
+    if (!state) {
+      state = createAgreement(clock());
+      upstreamAgreement.set(companyId, state);
+    }
+    scoreHookAnswer(state, {
+      nowMs: clock(), params, answer, proposal: p.byAgent.get(params?.agentId) ?? null, maxAgeMs: p.maxAgeMs,
+    });
+  }
+
+  /** Persist the agreement scored since the last tick (memory delta merged into state). */
+  async function persistUpstreamAgreement(companyId, nowMs) {
+    const delta = upstreamAgreement.get(companyId) ?? createAgreement(nowMs);
+    upstreamAgreement.set(companyId, createAgreement(nowMs));
+    try {
+      const persisted = agreementFromJSON(await ctx.state.get(scopeKey(companyId, UPSTREAM_AGREEMENT_KEY)), delta.sinceMs);
+      const merged = mergeAgreement(persisted, delta);
+      await ctx.state.set(scopeKey(companyId, UPSTREAM_AGREEMENT_KEY), merged);
+      return merged;
+    } catch (error) {
+      // Put the counts back so the next tick persists them.
+      const cur = upstreamAgreement.get(companyId);
+      upstreamAgreement.set(companyId, cur ? mergeAgreement(delta, cur) : delta);
+      throw error;
+    }
+  }
+
+  /**
+   * One upstream-mode step, run at the end of every tick (after the live view
+   * and /capacity are published). Proposes per agent, plans caps from the
+   * plugin's own /caps allocation, and either records (shadow) or applies
+   * (enforce) the diff. Never throws into the tick: failures are reported on
+   * /upstream and logged.
+   */
+  async function runUpstreamStep(companyId, config, nowMs) {
+    const u = config.upstream;
+    if (!u || u.mode === 'off') {
+      upstreamProposals.delete(companyId);
+      return null;
+    }
+    const live = liveViews.get(companyId);
+    const report = { atMs: nowMs, mode: u.mode, agents: [], wouldPatch: 0, applied: [], errors: [], caps: null };
+    let agents = [];
+    try {
+      agents = await ctx.agents.list({ companyId });
+      if (!Array.isArray(agents)) throw new Error('agents-list-not-array');
+    } catch (error) {
+      report.errors.push({ step: 'agents.list', error: error?.message ?? String(error) });
+      agents = [];
+    }
+    // Agents' pre-actuator config (written by enforce before an agent's
+    // first PATCH; shadow only reads it, so a shadow after an enforce period
+    // still diffs against what each agent had of its own).
+    const baseStore = (await ctx.state.get(scopeKey(companyId, UPSTREAM_BASE_KEY))) ?? {};
+    let capWant = new Map();
+    if (u.caps.enabled) {
+      try {
+        const res = await plugin.onApiRequest({
+          companyId, routeKey: 'caps', query: {}, [INTERNAL_CAPS]: { persistHold: u.mode === 'enforce' },
+        });
+        const body = res?.body ?? {};
+        capWant = new Map((body.agents ?? []).map(a => [a.agentId, Number(a.maxConcurrentRuns)]));
+        report.caps = { calibration: body.calibration ?? null, target: body.target ?? null, agents: capWant.size };
+      } catch (error) {
+        report.errors.push({ step: 'caps', error: error?.message ?? String(error) });
+      }
+    }
+    const load = (() => { try { return loadSample(); } catch { return null; } })();
+    report.load = load;
+    const holds = new Set(u.holdAgentIds);
+    const keepIds = new Set(config.roles.keepAgentIds);
+    const reviewIds = new Set([...(config.reviewerRouting?.agentIds ?? []), ...(config.reviewReserve?.agentIds ?? [])]);
+    const doerIds = new Set(config.roles.doerAgentIds);
+    const byAgent = new Map();
+    for (const agent of agents) {
+      if (!actuatableAgent(agent, CLAUDE_CLI_ADAPTERS)) continue;
+      const current = agentRoutingConfig(agent);
+      const stored = baseStore[agent.id];
+      const base = stored ? { model: stored.model ?? null, effort: stored.effort ?? null, env: { ...(stored.env ?? {}) } }
+        : { model: current.model, effort: current.effort, env: { ...current.env } };
+      let proposal;
+      try {
+        proposal = { ...proposeAgentRouting(companyId, live, agent, base), atMs: nowMs };
+      } catch (error) {
+        proposal = { kind: 'hold', reason: 'proposal failed', path: 'error', atMs: nowMs };
+        report.errors.push({ step: 'propose', agentId: agent.id, error: error?.message ?? String(error) });
+      }
+      byAgent.set(agent.id, proposal);
+      const held = holds.has(agent.id);
+      // A keep restores the agent's own (pre-actuator) config only when the
+      // actuator changed it; an untouched kept agent is left exactly as is.
+      const desired = held || (proposal.kind === 'keep' && !stored) ? null : desiredRoutingConfig(base, proposal);
+      const changes = diffRoutingConfig(current, desired);
+      let cap = null;
+      if (!held && capWant.has(agent.id) && current.wakeOnDemand) {
+        cap = planCapChange({
+          current: current.maxConcurrentRuns, want: capWant.get(agent.id),
+          isReview: reviewIds.has(agent.id), isPinned: keepIds.has(agent.id), isDoer: doerIds.has(agent.id),
+          load, cfg: u.caps,
+        });
+      }
+      const capChange = cap != null && cap.to !== cap.from;
+      if (changes.length > 0 || capChange) report.wouldPatch += 1;
+      report.agents.push({
+        agentId: agent.id,
+        name: typeof agent.name === 'string' ? agent.name.slice(0, 80) : null,
+        role: roleOf(config, agent.id),
+        held,
+        proposal: {
+          kind: proposal.kind, path: proposal.path, model: proposal.model ?? null, effort: proposal.effort ?? null,
+          env: proposal.env ?? {}, accountId: proposal.accountId ?? null, reason: String(proposal.reason ?? '').slice(0, 200),
+        },
+        current: { model: current.model, effort: current.effort, env: current.env, maxConcurrentRuns: current.maxConcurrentRuns },
+        changes,
+        cap,
+        _desired: desired,
+        _stored: stored != null,
+      });
+    }
+    upstreamProposals.set(companyId, { atMs: nowMs, mode: u.mode, maxAgeMs: u.proposalMaxAgeMs, byAgent });
+    if (u.mode === 'enforce') {
+      await applyUpstream(companyId, u, report, baseStore);
+    }
+    for (const row of report.agents) {
+      delete row._desired;
+      delete row._stored;
+    }
+    let agreement = null;
+    try {
+      agreement = summarizeAgreement(await persistUpstreamAgreement(companyId, nowMs), nowMs);
+    } catch (error) {
+      report.errors.push({ step: 'agreement', error: error?.message ?? String(error) });
+    }
+    report.agreement = agreement;
+    await ctx.state.set(scopeKey(companyId, UPSTREAM_KEY), report);
+    if (report.errors.length > 0) {
+      ctx.logger.error('model-capacity: upstream step errors', { companyId, mode: u.mode, errors: report.errors.slice(0, 5) });
+    }
+    return report;
+  }
+
+  /**
+   * Enforce: apply each changed agent through the public API, at most
+   * maxPatchesPerTick per tick. Each PATCH is built from a fresh API read (env
+   * secrets arrive redacted and the server restores them), and the agent's
+   * pre-actuator config is saved before its first write so a keep, a hold or
+   * a rollback can restore it.
+   */
+  async function applyUpstream(companyId, u, report, baseStore) {
+    const todo = report.agents.filter(r => r.changes.length > 0 || (r.cap && r.cap.to !== r.cap.from));
+    if (todo.length === 0) return;
+    let api;
+    try {
+      const key = await ctx.secrets.resolve(u.apiKeySecretRef, { companyId, configPath: 'upstream.apiKeySecretRef' });
+      api = createUpstreamApi({ fetch: (url, init) => ctx.http.fetch(url, init), baseUrl: u.apiBaseUrl, apiKey: key });
+    } catch (error) {
+      report.errors.push({ step: 'api-key', error: error?.message ?? String(error) });
+      return;
+    }
+    for (const row of todo.slice(0, u.maxPatchesPerTick)) {
+      try {
+        const apiAgent = await api.getAgent(row.agentId);
+        const body = buildAgentPatch(apiAgent, row._desired, row.cap && row.cap.to !== row.cap.from ? row.cap.to : null);
+        if (!body) continue;
+        if (!row._stored) {
+          // Persisted BEFORE the write: a rollback can always restore it.
+          const before = agentRoutingConfig(apiAgent);
+          baseStore[row.agentId] = {
+            model: before.model, effort: before.effort, env: before.env,
+            maxConcurrentRuns: before.maxConcurrentRuns, atMs: report.atMs,
+          };
+          await ctx.state.set(scopeKey(companyId, UPSTREAM_BASE_KEY), baseStore);
+        }
+        await api.patchAgent(row.agentId, body);
+        report.applied.push({ agentId: row.agentId, fields: [...Object.keys(body.adapterConfig ?? {}).map(k => `adapterConfig.${k}`), ...(body.runtimeConfig ? ['runtimeConfig.heartbeat.maxConcurrentRuns'] : [])] });
+      } catch (error) {
+        report.errors.push({ step: 'patch', agentId: row.agentId, error: error?.message ?? String(error) });
+      }
+    }
   }
 
   /**
@@ -4591,7 +4978,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
   }
 
-  return {
+  const plugin = {
     multiCompanyConfig: true,
 
     async setup(context) {
@@ -4731,6 +5118,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const limit = Math.min(Number(input.query?.limit ?? 100) || 100, 500);
         return { status: 200, body: { entries: shadowEntries(view, { limit }), size: decidedCount(view) } };
       }
+      if (input.routeKey === 'upstream') {
+        // Upstream mode report: the last tick's proposals and would-PATCH
+        // diff, plus the shadow agreement (persisted counts + this tick's
+        // unpersisted delta) and the latest disagreements.
+        const nowMs = clock();
+        const report = (await ctx.state.get(scopeKey(companyId, UPSTREAM_KEY))) ?? { mode: lastConfig.get(companyId)?.upstream?.mode ?? 'off', agents: [] };
+        const persisted = agreementFromJSON(await ctx.state.get(scopeKey(companyId, UPSTREAM_AGREEMENT_KEY)), nowMs);
+        const delta = upstreamAgreement.get(companyId);
+        const merged = delta ? mergeAgreement(persisted, delta) : persisted;
+        const hours = Math.min(Math.max(Number(input.query?.hours ?? 24) || 24, 1), 48);
+        const limit = Math.min(Math.max(Number(input.query?.disagreements ?? 20) || 20, 0), 100);
+        return {
+          status: 200,
+          body: {
+            ...report,
+            agreement: summarizeAgreement(merged, nowMs, hours),
+            disagreements: limit > 0 ? merged.disagreements.slice(-limit) : [],
+          },
+        };
+      }
       if (input.routeKey === 'ladder') {
         return { status: 200, body: (await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} } };
       }
@@ -4819,7 +5226,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ceiling: allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
-          await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+          if (input[INTERNAL_CAPS]?.persistHold !== false) {
+            await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+          }
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
@@ -4926,116 +5335,49 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Config changes can land while the ledger load yields, even when the
       // tick cannot refresh the live view. Enforce off is an immediate kill switch.
       if (!enforceCompanies.has(params.companyId)) return keep();
-      const role = roleOf({ roles: {
-        thinkerAgentIds: live.thinkerAgentIds,
-        doerAgentIds: live.doerAgentIds,
-      } }, params.agentId);
-      const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
-      // Same water-filling order as the shadow tick: need band first, then
-      // largest (targetShare - pooled in-flight). Metered accounts without
-      // headroom never qualify; healthy reactive accounts qualify without
-      // headroom (no vendor meter exists). The reactive cap compares
-      // PER-ACCOUNT in-flight (live per-account counts plus queued
-      // decisions per account, both deduped) -- the pooled value on the
-      // ordered views drives ordering only. Trial budgets are consumed
-      // from a per-call copy, so bursts within one tick stay bounded.
-      // Own-run exclusion: the host fires agent.run.started at claim before
-      // this hook resolves, so a queued shadow entry for THIS runId must not
-      // count against it in ordering, caps, or budgets.
-      const selfId = params?.runId != null ? String(params.runId) : null;
-      // Review runs admit past the reserve hold (the reserve holds quota FOR
-      // them); other work defers while its only account is held, and the
-      // reason says so -- not a generic no-headroom.
-      const forReview = liveIsReviewAgent(live, params.agentId);
-      const { order, paced, reserveHeld } = withDuplicatePass(duplicates => allocationOrderFromLive(
-        live, params.companyId, selfId, role, roleExcluded, duplicates, forReview,
-      ));
-      const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
-      const acctPending = pendingByAccount(live, params.companyId, selfId);
-      const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
-      const budget = effectiveTrialBudget(live, params.companyId, selfId);
-      // Breaker state live at call time (not the tick-frozen view): a probe
-      // occupied after the tick published must exclude the arm here, or N
-      // enforced runs would pile onto one half-open probe slot.
-      const bstore = breakerStores.get(params.companyId) ?? createBreakerStore();
-      const bcfg = lastConfig.get(params.companyId)?.breakers ?? DEFAULT_BREAKERS;
-      const bnow = clock();
-      for (const view of order) {
-        if (!view || view.ladderRungs.length === 0) continue;
-        if (!view.reactive && !view.remainingKnown) continue;
-        if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
-        // Role-based family exclusions use the tick-frozen live view (the
-        // hook performs zero I/O): ineligible accounts are skipped, never
-        // deferred on.
-        const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
-        if (!rungsHaveEligibleArms(roleRungs)) continue;
-        const d = decide({
-          runId: params.runId,
-          agentId: params.agentId,
-          role,
-          ladderRungs: filterBreakerRungs(roleRungs, bstore, view.accountId, bnow, bcfg),
-          excludedFamilies: roleExcluded,
-          pointer: view.pointer,
-          retryCount: 0,
-          failureClass: 'none',
-          contextTokens: null,
-          fiveHourHeadroomPct: view.headroomPct,
-          burnPerRunPct: view.burnPerRunPct,
-          reservePct: 0.05,
-          accountId: view.accountId,
-          roleBands: live.roleBands,
-          contextCaps: live.contextCaps,
-          adapterType: params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null,
-          trialBudget: budget,
-          trialAdapters: live.trialAdapters ?? {},
-          trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
-        });
-        if (d.kind === 'decide') {
-          // Straight into the ledger via the shared helper: the enforced
-          // (hook) decision overwrites any event-time entry for this runId
-          // (host order: started fires before the hook resolves), so the run
-          // counts exactly once, and it survives a load in flight.
-          // Memory-only here; the next tick persists it.
-          // Half-open probe: only enforced runs route real traffic, so only
-          // the hook occupies the probe slot (shadow picks never do). The
-          // pre-filter above already excluded occupied slots, and everything
-          // from the filter through this claim is synchronous, so the claim
-          // cannot lose -- but if it ever does, skip to the next account
-          // rather than piling a second enforced run onto one probe.
-          // Slipped runs cannot occur: with the slot claimed, every later
-          // hook filters the arm out until its terminal resolves.
-          if (!decisionCredentialReady(d, roleRungs, params.companyId)) continue;
-          if (d.armId != null && params?.runId != null
-            && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
-            && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
-            continue;
-          }
-          clearDeferred(params.companyId, params.runId);
-          const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
-          const decorated = decoratedModelFor(d, emitAdapter);
-          recordDecision(hookLedger, {
-            runId: String(params.runId ?? 'unknown'),
-            agentId: String(params.agentId ?? 'unknown'),
-            accountId: d.accountId,
-            armId: d.armId ?? null,
-            effort: d.effort ?? null,
-            enforced: true,
-            wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
-            rung: d.rung,
-            trial: d.trial === true,
-            family: inferFamily(canonicalModelName(d.model)),
-            reason: d.reason,
-          }, clock());
-          return {
-            kind: 'decide',
-            decisionId: d.decisionId,
-            model: decorated ?? d.model,
-            effort: d.effort,
-            env: d.env,
-            source: d.source,
-            reason: d.reason,
-          };
-        }
+      // Half-open probe: only enforced runs route real traffic, so only
+      // the hook occupies the probe slot (shadow picks never do). The
+      // selection's pre-filter already excluded occupied slots, and
+      // everything from the filter through this claim is synchronous, so the
+      // claim cannot lose -- but if it ever does, the selection skips to the
+      // next account rather than piling a second enforced run onto one probe.
+      // Slipped runs cannot occur: with the slot claimed, every later hook
+      // filters the arm out until its terminal resolves.
+      const { pick, order, paced, reserveHeld } = selectRoutedDecision(live, params.companyId, params, {
+        claimProbe: (bstore, d, bnow, bcfg) => params?.runId == null
+          || startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg),
+      });
+      if (pick) {
+        const { d } = pick;
+        // Straight into the ledger via the shared helper: the enforced
+        // (hook) decision overwrites any event-time entry for this runId
+        // (host order: started fires before the hook resolves), so the run
+        // counts exactly once, and it survives a load in flight.
+        // Memory-only here; the next tick persists it.
+        clearDeferred(params.companyId, params.runId);
+        const decorated = decoratedModelFor(d, pick.emitAdapter);
+        recordDecision(hookLedger, {
+          runId: String(params.runId ?? 'unknown'),
+          agentId: String(params.agentId ?? 'unknown'),
+          accountId: d.accountId,
+          armId: d.armId ?? null,
+          effort: d.effort ?? null,
+          enforced: true,
+          wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
+          rung: d.rung,
+          trial: d.trial === true,
+          family: inferFamily(canonicalModelName(d.model)),
+          reason: d.reason,
+        }, clock());
+        return {
+          kind: 'decide',
+          decisionId: d.decisionId,
+          model: decorated ?? d.model,
+          effort: d.effort,
+          env: d.env,
+          source: d.source,
+          reason: d.reason,
+        };
       }
       if (credentialReadinessEnforced(params.companyId)
         && !(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a, clock(), true)))) {
@@ -5077,4 +5419,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
     },
   };
+
+  // Upstream shadow (0.2.67): every live hook answer is scored against the
+  // proposal the last tick made for its agent. Memory-only and fail-safe:
+  // the answer is returned unchanged whatever the scoring does.
+  const resolveRunModel = plugin.onResolveRunModel;
+  plugin.onResolveRunModel = async function onResolveRunModel(params) {
+    const answer = await resolveRunModel.call(plugin, params);
+    try {
+      observeHookAnswer(params, answer);
+    } catch (error) {
+      ctx?.logger?.error?.('model-capacity: upstream agreement scoring failed', { error: error?.message ?? String(error) });
+    }
+    return answer;
+  };
+  return plugin;
 }

@@ -830,6 +830,21 @@ so a typo fails closed at config load. Each account row also reports
 `warmingUp` tells when control still falls back to position), `action` and
 `reason`.
 
+## Upstream mode (stock Paperclip host)
+
+Stock Paperclip has no per-run model hook (`run.model.resolve` exists only on a patched host), and its manifest validator rejects capabilities it does not know. Upstream applies a run's model from the agent's `adapterConfig` at run start (an issue's `assigneeAdapterOverrides` pin wins), so on a stock host the plugin steers the agent instead of the run.
+
+| `upstreamMode` | What runs |
+|---|---|
+| `off` (default) | Nothing new. |
+| `shadow` | Every tick: per active Claude-CLI agent, the proposal (model, effort, context-cap env, `maxConcurrentRuns`) and the would-PATCH diff; every live hook answer is scored against its agent's proposal. Nothing is written. `GET /upstream`. |
+| `enforce` | The proposals are applied with `PATCH /api/agents/:id` on the pinned public origin, only on change, at most `upstream.maxPatchesPerTick` per tick. Requires `enforce: false` and `upstream.apiKeySecretRef` (a company-scoped board API key). |
+
+- The proposal is what the hook would answer for a fresh run of the agent now, from the same tick state and the same selection code, without side effects. Defers have no per-agent form: the run cap and the provider's own quota retry take their place.
+- Run caps come from the plugin's `/caps` allocation, planned per agent (step-limited, deadbanded, load-guarded; see `upstream.caps`).
+- Install on a stock host with `paperclipPlugin.manifest` = `./src/manifest.upstream.mjs`, and pin the public origin by replacing `src/api-host.mjs` at build time (same rule as the lane host pin below).
+- Cut over in one config write: `enforce: false` and `upstreamMode: enforce`. Roll back with `upstreamMode: shadow` (writes stop at once); agents keep the last applied config, and the saved pre-actuator config per agent is in plugin state `upstream-base-v1`.
+
 ## Configuration
 
 `placement.qualityWeight` (default 1) and `placement.allowanceWeight`

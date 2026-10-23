@@ -8,8 +8,8 @@ import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.66');
-  assert.equal(PLUGIN_VERSION, '0.2.66');
+  assert.equal(manifest.version, '0.2.67');
+  assert.equal(PLUGIN_VERSION, '0.2.67');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -83,7 +83,7 @@ test('jobs and API routes are declared', () => {
   assert.equal(jobs.get('aa-refresh'), '17 4 * * *');
   assert.equal(jobs.get('shadow-tick'), '* * * * *');
   const routes = new Map(manifest.apiRoutes.map(r => [r.routeKey, r.path]));
-  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'shadow']);
+  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'shadow', 'upstream']);
   assert.equal(routes.get('caps'), '/caps');
 });
 
