@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { manifest, enforceManifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } from '../src/manifest.mjs';
+import * as manifests from '../src/manifest.mjs';
+import official from './fixtures/official-plugin-capabilities.json' with { type: 'json' };
+const { manifest, buildManifest, PLUGIN_ID, PLUGIN_VERSION, MODEL_ROUTING_ENV_KEYS, LANE_BASE_URL_ALLOWLIST } = manifests;
 import { validateConfigShape } from '../src/plugin.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer } from '../src/reviewer.mjs';
 import { LANE_BASE_URLS } from '../src/lane-host.mjs';
@@ -14,13 +16,13 @@ test('plugin identity and version', () => {
 
 test('no database grant: no database block, no db capabilities', () => {
   assert.equal(manifest.database, undefined);
-  assert.ok(manifest.capabilities.includes('agents.queued_counts.read'),
-    'queued-run demand reads the host-aggregated seam');
+  assert.ok(!manifest.capabilities.includes('agents.queued_counts.read'),
+    'the official host has no queued-count plugin capability');
   for (const cap of manifest.capabilities) {
     assert.ok(!cap.startsWith('database.'), `db capability ${cap}`);
   }
   assert.deepEqual(buildManifest({ modelResolve: false }).database, undefined);
-  assert.ok(buildManifest({ modelResolve: false }).capabilities.includes('agents.queued_counts.read'));
+  assert.ok(!buildManifest({ modelResolve: false }).capabilities.includes('agents.queued_counts.read'));
 });
 
 test('lane endpoint pinned to the allowlist in schema', () => {
@@ -42,20 +44,29 @@ test('default manifest is shadow-only: no run.model.resolve, no modelRouting', (
   assert.deepEqual(manifest, buildManifest());
 });
 
-test('opt-in enforceManifest holds run.model.resolve with the exact env keys', () => {
-  assert.ok(enforceManifest.capabilities.includes('run.model.resolve'));
-  // Exactly the env keys decide may set: nothing more, nothing less.
+test('every installable manifest is accepted by the pinned official capability boundary', () => {
+  // Offline snapshot of PLUGIN_CAPABILITIES, not the fork's installed SDK.
+  const allowed = new Set(official.capabilities);
+  const variants = [manifest, buildManifest(), buildManifest({ modelResolve: false }),
+    buildManifest({ modelResolve: true }), manifests.enforceManifest].filter(Boolean);
+  for (const variant of variants) {
+    assert.deepEqual(variant.capabilities.filter(cap => !allowed.has(cap)), [],
+      `unsupported on ${official.version} (${official.commit})`);
+    assert.ok(!variant.capabilities.includes('run.model.resolve'));
+    assert.ok(!variant.capabilities.includes('agents.queued_counts.read'));
+    assert.equal(variant.modelRouting, undefined);
+    for (const forbidden of ['agents.managed', 'agents.pause', 'agents.resume']) {
+      assert.ok(!variant.capabilities.includes(forbidden), `proposals do not grant ${forbidden}`);
+    }
+  }
+});
+
+test('proposal context ownership retains exactly the established env keys', () => {
   assert.deepEqual(MODEL_ROUTING_ENV_KEYS, [
     'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
     'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
   ]);
-  assert.deepEqual(enforceManifest.modelRouting.envKeys, MODEL_ROUTING_ENV_KEYS);
-  // The only capability the enforce variant adds over the default.
-  assert.deepEqual(
-    enforceManifest.capabilities.filter(c => !manifest.capabilities.includes(c)),
-    ['run.model.resolve'],
-  );
 });
 
 test('enforce kill switch defaults false in schema', () => {
