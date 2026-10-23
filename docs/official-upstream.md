@@ -42,7 +42,8 @@ The owned environment keys are:
 The candidate removes obsolete owned caps when selection no longer emits them.
 It preserves unrelated env bindings and heartbeat/runtime siblings. Concurrency
 is at `runtimeConfig.heartbeat.maxConcurrentRuns`, clamped to **1..50**.
-A missing/non-finite or below-one allocation is a **hold with no PATCH**.
+A missing/non-finite or nonpositive allocation is a **hold with no PATCH**.
+Positive fractional allocations floor and clamp to at least one.
 Zero is not an off switch. A positive cap is a proposed default, not a strict
 fleet quota, and cannot express a total stop on the official host. No
 pause/resume or external pacer is substituted.
@@ -61,11 +62,13 @@ Historical enforced records remain readable; no state or history is erased.
 
 Official `PluginIssuesClient.create` accepts `assigneeAdapterOverrides`;
 `PluginIssuesClient.update` does not. Callers creating an issue can use
-`buildIssueModelOverrides({model, effort}, existingOverrides)` to construct
-`{adapterConfig: {model, effort}}` defaults. Explicit existing issue model and
-effort values take precedence. This helper does not create or update an issue
-and adds no issue-write capability. The host's native issue overrides take
-precedence over agent defaults at run start.
+`buildIssueModelOverrides({model, effort}, existingOverrides.adapterConfig)`
+to construct the inner adapter-config defaults. Pass that result as
+`assigneeAdapterOverrides.adapterConfig` on `issues.create`, preserving other
+outer override fields separately. Explicit existing model and effort values
+take precedence; decision env and unrelated decision fields are not forwarded.
+This helper does not create or update an issue and adds no issue-write capability.
+The host's native issue overrides take precedence over agent defaults at run start.
 
 ## Actuator is NOT QUALIFIED
 

@@ -29,7 +29,7 @@ export function buildAgentProposal({ agent, decision, cap } = {}) {
     agentId: agent?.id ?? null, companyId: agent?.companyId ?? null, status, patch, reason,
   });
   if (!agent?.id || !agent?.companyId) return result('hold', 'agent-context-required');
-  if (!Number.isFinite(cap) || cap < 1) return result('hold', 'cap-below-one-is-not-off');
+  if (!Number.isFinite(cap) || cap <= 0) return result('hold', 'nonpositive-cap-is-not-off');
   if (!decision || !['decide', 'keep'].includes(decision.kind)) {
     return result('hold', decision?.kind === 'defer' ? 'selection-deferred' : 'selection-unavailable');
   }
@@ -46,10 +46,11 @@ export function buildAgentProposal({ agent, decision, cap } = {}) {
     if (typeof decision.model !== 'string' || !decision.model.trim() || /[\r\n]/.test(decision.model)) {
       return result('hold', 'invalid-selected-model');
     }
-    if (!record(decision.env ?? {}) || Object.keys(decision.env ?? {}).some(key => !OWNED_ENV_KEYS.includes(key))) {
-      return result('hold', 'unowned-env-key');
-    }
-    if (Object.values(decision.env ?? {}).some(value => typeof value !== 'string' || !/^\d+$/.test(value) || Number(value) <= 0)) {
+    if (!record(decision.env ?? {})) return result('hold', 'invalid-context-cap');
+    const ownedEnv = Object.fromEntries(OWNED_ENV_KEYS
+      .filter(key => Object.hasOwn(decision.env ?? {}, key))
+      .map(key => [key, decision.env[key]]));
+    if (Object.values(ownedEnv).some(value => typeof value !== 'string' || !/^\d+$/.test(value) || Number(value) <= 0)) {
       return result('hold', 'invalid-context-cap');
     }
     const next = {};
@@ -64,7 +65,7 @@ export function buildAgentProposal({ agent, decision, cap } = {}) {
     // Preserve all unrelated bindings in memory; summaries expose owned keys only.
     const env = { ...(adapter.env ?? {}) };
     for (const key of OWNED_ENV_KEYS) delete env[key];
-    Object.assign(env, decision.env ?? {});
+    Object.assign(env, ownedEnv);
     if (!isDeepStrictEqual(env, adapter.env ?? {})) next.env = env;
     if (Object.keys(next).length > 0) patch.adapterConfig = next;
   }
@@ -94,9 +95,8 @@ export function summarizeAgentProposal(proposal) {
 
 /** Existing per-card model/effort pins always outrank the proposed defaults. */
 export function buildIssueModelOverrides({ model, effort } = {}, existingOverrides = {}) {
-  const adapterConfig = { ...(model == null ? {} : { model }), ...(effort == null ? {} : { effort }),
-    ...(existingOverrides?.adapterConfig ?? {}) };
-  return { ...(existingOverrides ?? {}), adapterConfig };
+  return { ...(model == null ? {} : { model }), ...(effort == null ? {} : { effort }),
+    ...(existingOverrides ?? {}) };
 }
 
 /** No credential resolution, HTTP, managed-agent substitution or pause/unpause. */
