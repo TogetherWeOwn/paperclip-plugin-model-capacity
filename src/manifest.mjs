@@ -1,11 +1,7 @@
 /**
- * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
- * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
- * DEFAULT: the default export holds NO `run.model.resolve` capability and no
- * modelRouting; it observes and records only. The enforce-capable variant
- * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
- * ships only after security sign-off; even then the `enforce` config flag
- * (default false) keeps the hook answering `keep` until the operator flips it.
+ * v0.3.0 targets official upstream: supported capabilities only, no model
+ * resolver, and no write-enabled actuator. Both manifest exports are identical.
+ * The v0.2 notes below describe historical policy development, not a live hook.
  *
  * v0.2.19 = USABLE TARGET + POOLED CALIBRATION + SMOOTHING + QUALITY-AWARE
  * PLACEMENT: the concurrency target counts only capacity some role can use
@@ -356,9 +352,10 @@
 
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
+import { assertOfficialManifest } from './upstream.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.66';
+export const PLUGIN_VERSION = '0.3.0';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -664,7 +661,7 @@ const CONFIG_SCHEMA = {
     },
     enforce: {
       type: 'boolean', default: false,
-      description: 'Kill switch for run.model.resolve enforcement. False (default): the hook answers keep and nothing changes. True: the hook decides from cached tick state.',
+      description: 'Deprecated compatibility flag. Ignored in official-upstream mode; this release always stays propose-only.',
     },
     credentialReadiness: {
       type: 'object', required: ['enforce'], additionalProperties: false,
@@ -783,12 +780,10 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. Defaults to the shadow-only variant (no resolve
- * capability, no modelRouting). Pass `{ modelResolve: true }` for the
- * enforcement variant: it holds the `run.model.resolve` capability plus the
- * modelRouting envKeys declaration the host requires with it.
+ * Build the single official-upstream manifest and reject unknown capabilities.
+ * Legacy options cannot restore a resolver or activate agent writes.
  */
-export function buildManifest({ modelResolve = false } = {}) {
+export function buildManifest() {
   const capabilities = [
     'jobs.schedule',
     'plugin.state.read',
@@ -797,23 +792,16 @@ export function buildManifest({ modelResolve = false } = {}) {
     'secrets.read-ref',
     'events.subscribe',
     'agents.read',
-    'agents.queued_counts.read',
     'issues.read',
     'api.routes.register',
-    // No database capabilities: run facts come from SDK surfaces only
-    // (agent.run.* events, issues.get, agents.get, the host-aggregated
-    // agents.getQueuedRunCounts). The host executes plugin SQL unchanged,
-    // so a core-table grant's tenant filter would be plugin-enforced
-    // only -- refused scope, removed in v0.2.1.
+    // Run facts come from supported agent.run.* events, never core-table SQL.
   ];
   const out = {
     id: PLUGIN_ID,
     apiVersion: 1,
     version: PLUGIN_VERSION,
-    displayName: modelResolve ? 'Model Capacity' : 'Model Capacity (Shadow)',
-    description: modelResolve
-      ? 'Model-capacity routing: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Enforces run models only when the `enforce` config flag is true (default false: hook answers keep).'
-      : 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Observes only; it changes no runs and holds no resolve capability.',
+    displayName: 'Model Capacity (Propose Only)',
+    description: 'Official-upstream model and concurrency proposals from AA quality and CLIProxy burn data. Run events remain observational. Agent writes are disabled in this release.',
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
@@ -834,6 +822,15 @@ export function buildManifest({ modelResolve = false } = {}) {
       },
     ],
     apiRoutes: [
+      {
+        routeKey: 'proposals',
+        method: 'GET',
+        path: '/proposals',
+        auth: 'board-or-agent',
+        capability: 'api.routes.register',
+        checkoutPolicy: 'none',
+        companyResolution: { from: 'query', key: 'companyId' },
+      },
       {
         routeKey: 'capacity',
         method: 'GET',
@@ -872,17 +869,13 @@ export function buildManifest({ modelResolve = false } = {}) {
       },
     ],
   };
-  if (modelResolve) {
-    out.capabilities = [...capabilities, 'run.model.resolve'];
-    out.displayName = 'Model Capacity';
-    out.modelRouting = { envKeys: [...MODEL_ROUTING_ENV_KEYS] };
-  }
+  assertOfficialManifest(out);
   return out;
 }
 
 /** Default (and installed-by-default) manifest: shadow only, no resolve capability. */
 export const manifest = buildManifest();
 
-/** Opt-in enforce-capable manifest (runtime-gated by the `enforce: false` default). */
-export const enforceManifest = buildManifest({ modelResolve: true });
+/** Compatibility export only: this is the same non-actuating official manifest. */
+export const enforceManifest = manifest;
 export default manifest;

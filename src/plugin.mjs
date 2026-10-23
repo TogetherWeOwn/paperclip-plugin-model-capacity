@@ -11,15 +11,10 @@
  * decisions are recorded event-time from agent.run.started when the
  * resolver is absent, and run->account mapping uses resolved actual models.
  *
- * v0.2.1 = ENFORCE-CAPABLE. The worker refreshes AA data daily, reads
- * CLIProxy burn from the host-published lane endpoint (one GET, short
- * in-memory cache), steps per-account pacing pointers, and records what it
- * WOULD have decided for recently started runs. `onResolveRunModel` is
- * memory-only by construction -- it reads the in-memory live view the tick
- * populated and never touches config, state, network, or db (the host
- * deadline is 1.5s). It answers `keep` unless the `enforce` config flag is
- * true for the company. Every enforced decision is recorded in the ledger
- * (flagged `enforced:true`); the next tick persists the same records.
+ * v0.3.0 = OFFICIAL-UPSTREAM PROPOSE ONLY. The supported tick produces
+ * per-agent defaults from the existing selection policy. There is no run
+ * resolver and no agent-configuration actuator. Proposals are separate from
+ * the event ledger and never occupy a run, trial budget or breaker probe.
  */
 
 import {
@@ -66,7 +61,7 @@ import {
 import {
   BREAKER_KEY, BREAKER_MAX_SEEN, BREAKER_ERROR_TEXT_MAX, DEFAULT_BREAKERS,
   sanitizeBreakers, classifyArmError, breakerState,
-  filterBreakerRungs, breakerProbeRunId, recordArmFailure, startProbe,
+  filterBreakerRungs, breakerProbeRunId, recordArmFailure,
   resolveProbe, breakerHousekeep, breakerReport, breakerStoreFromJSON,
   breakerStoreToJSON, breakerSuspendsFloors, createBreakerStore, noteKnownArms,
   recordAccountBalanceExhaustion, isBalanceExhaustion,
@@ -102,6 +97,7 @@ import {
   isLedgerTerminal as isTerminalStatus, TRIAL_WINDOW_MS, LEDGER_CAP,
 } from './ledger.mjs';
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
+import { buildAgentProposal, summarizeAgentProposal, applyAgentProposal, OFFICIAL_TARGET } from './upstream.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
@@ -808,7 +804,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // keeps deferring with its stable reason meanwhile.
   const agentAdapterCache = new Map();
   const ADAPTER_TTL_MS = 10 * 60 * 1000;
-  const enforceCompanies = new Set(); // companyIds with enforce: true
+  // This release is propose-only, irrespective of legacy enforce config.
   // Last reviewer-routing outcome per company (hook, memory-only), reported
   // on /capacity reviewer.routing.last by the next tick.
   const reviewerRouteLast = new Map();
@@ -987,35 +983,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // demandSource, never falling back to assigned cards. A malformed
   // response is never cached: only a valid array census (including an
   // empty one, a genuine zero-demand result) is memoized.
-  const queuedHeartbeatCache = new Map(); // companyId -> { atMs, counts: Map(agentId -> n) }
-  async function queuedHeartbeatsByAgent(companyId, nowMs) {
-    const hit = queuedHeartbeatCache.get(companyId);
-    if (hit && nowMs - hit.atMs >= 0 && nowMs - hit.atMs < QUEUED_TTL_MS) {
-      return { ok: true, counts: hit.counts };
-    }
-    const read = ctx.agents?.getQueuedRunCounts;
-    if (typeof read !== 'function') return { ok: false, counts: new Map() };
-    let rows;
-    try {
-      rows = await ctx.agents.getQueuedRunCounts({ companyId });
-    } catch (error) {
-      ctx.logger.error('model-capacity: queued-run read failed', { companyId, error: error?.message ?? String(error) });
-      return { ok: false, counts: new Map() };
-    }
-    if (!Array.isArray(rows)) {
-      ctx.logger.error('model-capacity: queued-run read returned a non-array', { companyId });
-      return { ok: false, counts: new Map() };
-    }
-    const counts = new Map();
-    for (const row of rows) {
-      const agentId = row?.agentId;
-      if (typeof agentId !== 'string' || agentId.length === 0) continue;
-      const queued = Number(row?.queued);
-      if (!Number.isFinite(queued) || queued <= 0) continue;
-      counts.set(agentId, (counts.get(agentId) ?? 0) + Math.floor(queued));
-    }
-    queuedHeartbeatCache.set(companyId, { atMs: nowMs, counts });
-    return { ok: true, counts };
+  async function queuedHeartbeatsByAgent() {
+    // Official stable has no queued-heartbeat census in the plugin SDK.
+    // Unknown is not zero, nor permission to substitute stale assigned cards.
+    return { ok: false, counts: new Map() };
   }
 
   // Queued demand per role, for the target's demand bound. With no queued
@@ -4274,6 +4245,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const companyId = params.companyId;
     const fallback = Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId) ? 'keep' : 'route';
     const note = (out) => {
+      if (params.proposalOnly === true) return;
       reviewerRouteLast.set(companyId, {
         atMs: clock(), runId: params?.runId != null ? String(params.runId) : null,
         agentId: params?.agentId ?? null, ...out,
@@ -4283,8 +4255,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       note({ routed: false, fallback, reason: `routing snapshot stale: ${fallback}` });
       return null;
     }
-    const ledger = await getOrLoadLedger(companyId);
-    if (!enforceCompanies.has(companyId)) return null;
+    await getOrLoadLedger(companyId);
+    if (!configured.has(companyId)) return null;
     const nowMs = clock();
     const selfId = params?.runId != null ? String(params.runId) : null;
     // Reviewer runs obey the pace guard like every other run: lanes the guard
@@ -4301,7 +4273,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // of falling back to keep, which would run on the held lane unpaced.
       if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs).pick.none) {
         const retryAfterMs = live.paceGuard?.retryAfterMs ?? 300000;
-        markDeferred(companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, retryAfterMs);
         const reason = `pace guard: reviewer lanes held (${paced.map(pacedPoolText).join('; ')})`;
         note({ routed: false, deferred: true, reason });
         return { kind: 'defer', retryAfterMs, reason };
@@ -4317,19 +4288,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const adapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
     const decorated = decoratedModelFor({ model: emitModel, effort: arm.effort, contextWindow: match?.contextWindow ?? null }, adapter);
     const model = decorated ?? emitModel;
-    clearDeferred(companyId, params.runId);
-    recordDecision(ledger, {
-      runId: String(params.runId ?? 'unknown'),
-      agentId: String(params.agentId ?? 'unknown'),
-      accountId: pick.accountId,
-      armId: match?.armId ?? null,
-      effort: arm.effort ?? null,
-      enforced: true,
-      wouldModel: decorated ?? `${emitModel}(${arm.effort ?? 'default'})`,
-      rung: match?.rung ?? null,
-      family: inferFamily(canonicalModelName(arm.model)),
-      reason: pick.reason,
-    }, nowMs);
+    // Proposals are not runs: do not occupy probes or add ledger pressure.
     note({
       routed: true, provider: pick.provider, arm: { ...arm }, accountId: pick.accountId,
       burn: pick.burn, poolPlanAhead: pick.poolPlanAhead, reason: pick.reason, env: { ...env },
@@ -4591,7 +4550,55 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
   }
 
-  return {
+  async function runProposalTick(companyId) {
+    const atMs = clock();
+    const key = scopeKey(companyId, 'agent-proposals-v1');
+    const hold = async reason => {
+      const output = { atMs, target: OFFICIAL_TARGET, mode: 'propose-only', writeEnabled: false,
+        status: 'hold', reason, agents: [] };
+      await ctx.state.set(key, output);
+      return output;
+    };
+    const live = liveViews.get(companyId);
+    if (!live || !Number.isFinite(live.atMs) || atMs < live.atMs || atMs - live.atMs > 120000) {
+      return hold('selection-snapshot-unavailable');
+    }
+    if (typeof ctx.agents?.list !== 'function') return hold('agents-list-unavailable');
+    const caps = await plugin.onApiRequest({ companyId, routeKey: 'caps' });
+    if (caps.status !== 200 || caps.body?.target == null || caps.body?.capsError
+      || caps.body?.atMs !== live.atMs) return hold('caps-unavailable');
+    const capsByAgent = new Map((caps.body.agents ?? []).map(agent => [agent.agentId, agent.maxConcurrentRuns]));
+    const agents = [];
+    try {
+      for (let offset = 0; ; offset += 100) {
+        const page = await ctx.agents.list({ companyId, limit: 100, offset });
+        if (!Array.isArray(page) || page.some(agent => !agent?.id || agent.companyId !== companyId)) {
+          return hold('agents-list-invalid');
+        }
+        agents.push(...page);
+        if (page.length < 100) break;
+        if (offset >= 9900) return hold('agents-list-limit');
+      }
+    } catch {
+      return hold('agents-list-unavailable');
+    }
+    const summaries = [];
+    for (const agent of agents.sort((a, b) => a.id.localeCompare(b.id))) {
+      if (['paused', 'terminated', 'pending_approval'].includes(agent.status)) continue;
+      const decision = await plugin.proposeRunModel({ companyId, agentId: agent.id,
+        adapterType: agent.adapterType, agentDefaultModel: agent.adapterConfig?.model ?? null,
+        runId: `proposal:${agent.id}:${atMs}` });
+      const proposal = buildAgentProposal({ agent, decision, cap: capsByAgent.get(agent.id) });
+      const application = await applyAgentProposal({ companyId, proposal });
+      summaries.push({ ...summarizeAgentProposal(proposal), application });
+    }
+    const output = { atMs, target: OFFICIAL_TARGET, mode: 'propose-only', writeEnabled: false,
+      status: 'proposed', agents: summaries };
+    await ctx.state.set(key, output);
+    return output;
+  }
+
+  const plugin = {
     multiCompanyConfig: true,
 
     async setup(context) {
@@ -4602,7 +4609,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       });
       ctx.jobs.register('shadow-tick', async job => {
         const results = await Promise.allSettled([...configured].sort().map(companyId =>
-          runShadowTick(companyId, job).catch(error => {
+          runShadowTick(companyId, job).then(() => runProposalTick(companyId)).catch(error => {
             ctx.logger.error('model-capacity: shadow tick failed', { companyId, error: error?.message ?? String(error) });
             throw error;
           })));
@@ -4689,8 +4696,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).
       lastConfig.set(companyId, resolveConfig(raw));
-      if (raw?.enforce === true) enforceCompanies.add(companyId);
-      else enforceCompanies.delete(companyId);
       if (raw?.credentialReadiness?.enforce === true) credentialEnforceCompanies.add(companyId);
       else credentialEnforceCompanies.delete(companyId);
     },
@@ -4701,23 +4706,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     },
 
     async onHealth() {
-      const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
       // A build that did not pin a real lane host cannot read the feed.
       const laneHostPinned = !isPlaceholderLaneHost();
       return {
         status: configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok',
         message: !laneHostPinned
           ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
-          : enforcing > 0
-            ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
-            : 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id },
+          : 'Official-upstream propose-only; no runs or agent settings are changed.',
+        details: { configuredCompanies: configured.size, enforcingCompanies: 0,
+          writeEnabled: false, target: OFFICIAL_TARGET, laneHostPinned, manifest: manifest.id },
       };
     },
 
     async onApiRequest(input) {
       const companyId = input.companyId;
       if (!configured.has(companyId)) return { status: 404, body: { error: 'company-not-configured' } };
+      if (input.routeKey === 'proposals') {
+        return { status: 200, body: (await ctx.state.get(scopeKey(companyId, 'agent-proposals-v1')))
+          ?? { target: OFFICIAL_TARGET, mode: 'propose-only', writeEnabled: false, status: 'hold', reason: 'no-proposal-tick', agents: [] } };
+      }
       if (input.routeKey === 'capacity') {
         return { status: 200, body: (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null } };
       }
@@ -4860,72 +4867,38 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return { status: 404, body: { error: 'unknown-route' } };
     },
 
-    /**
-     * v0.2.1 enforcement hook. MEMORY-ONLY: it reads the in-memory live view
-     * the last tick published and performs zero I/O -- no config, state,
-     * network, or db reads. The host's RPC deadline is 1.5s; no latency
-     * guarantee is implied by synthetic tests. Fail-safe order: unknown company, enforce off, human
-     * operator overrides answer `keep` (the agent default runs). Enforced
-     * When credential-readiness admission is enabled, stale snapshots or
-     * unavailable credentials defer (~60s retry); when it is off, stale
-     * snapshots answer `keep` and readiness does not filter candidates. A
-     * pace-guard hold answers `defer` with pacing.guard.retryAfterMs. No
-     * headroom still defers. Every enforced decision is recorded in the
-     * ledger with `enforced:true` (memory-only; the next tick persists it).
-     *
-     * Note: ResolveRunModelParams carries no retry/context signals, so each
-     * call is decided fresh (retryCount 0, failureClass none, contextTokens
-     * null) -- determinism comes from the cached tick state, which is
-     * identical for identical params until the next tick moves it.
-     */
-    async onResolveRunModel(params) {
-      // A run the hook keeps executes on its default model whatever it was
-      // told before: it is no longer waiting, so the pace guard counts it.
-      const keep = () => {
-        clearDeferred(params?.companyId, params?.runId);
-        return { kind: 'keep' };
-      };
+    /** Internal proposal evaluator, not a host hook. Never creates a run decision. */
+    async proposeRunModel(params) {
+      const keep = () => ({ kind: 'keep' });
       const live = params?.companyId ? liveViews.get(params.companyId) : null;
-      if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return keep();
+      if (!live || !configured.has(params.companyId)) return { kind: 'defer', reason: 'selection-unavailable' };
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return keep();
       }
       // Reviewer routing: listed review agents route to the best configured
       // arm (burn mode, then the pool most behind plan); no qualifying arm
       // falls through to keep below. Off (absent config) = unchanged.
-      const reviewRoute = await routeReviewerRun(params, live);
+      const reviewRoute = await routeReviewerRun({ ...params, proposalOnly: true }, live);
       if (reviewRoute) return reviewRoute;
       // Operator-pinned agents (gating roles) always run their configured model
       // -- with the Sol/Luna context caps when that model needs them.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
-        await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
         const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
         if (capped) {
-          clearDeferred(params.companyId, params.runId);
           return capped;
         }
         return keep();
       }
       const credentialEnforced = credentialReadinessEnforced(params.companyId);
-      // Every defer below leaves the run waiting, not executing: the pace
-      // guard stops counting it as in flight while its mark is fresh (see
-      // the retry-lifespan bound on deferredRuns).
-      const deferred = (out) => {
-        markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, out?.retryAfterMs);
-        return out;
-      };
+      // A deferred proposal is a hold, not a host admission or retry request.
+      const deferred = out => out;
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
         || (credentialEnforced && clock() < live.atMs)) {
-        return credentialEnforced
-          ? deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'))
-          : (keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' });
+        return deferred({ kind: 'defer', reason: 'routing snapshot stale or invalid' });
       }
-      // Join any ledger load before selection; no await may split admission,
-      // the half-open probe claim, and the recorded/emitted decision.
-      const hookLedger = await getOrLoadLedger(params.companyId);
-      // Config changes can land while the ledger load yields, even when the
-      // tick cannot refresh the live view. Enforce off is an immediate kill switch.
-      if (!enforceCompanies.has(params.companyId)) return keep();
+      // Join the ledger load before reading counters. Proposals never write it.
+      await getOrLoadLedger(params.companyId);
+      if (!configured.has(params.companyId)) return { kind: 'defer', reason: 'selection-unavailable' };
       const role = roleOf({ roles: {
         thinkerAgentIds: live.thinkerAgentIds,
         doerAgentIds: live.doerAgentIds,
@@ -4991,41 +4964,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
         });
         if (d.kind === 'decide') {
-          // Straight into the ledger via the shared helper: the enforced
-          // (hook) decision overwrites any event-time entry for this runId
-          // (host order: started fires before the hook resolves), so the run
-          // counts exactly once, and it survives a load in flight.
-          // Memory-only here; the next tick persists it.
-          // Half-open probe: only enforced runs route real traffic, so only
-          // the hook occupies the probe slot (shadow picks never do). The
-          // pre-filter above already excluded occupied slots, and everything
-          // from the filter through this claim is synchronous, so the claim
-          // cannot lose -- but if it ever does, skip to the next account
-          // rather than piling a second enforced run onto one probe.
-          // Slipped runs cannot occur: with the slot claimed, every later
-          // hook filters the arm out until its terminal resolves.
           if (!decisionCredentialReady(d, roleRungs, params.companyId)) continue;
-          if (d.armId != null && params?.runId != null
-            && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open'
-            && !startProbe(bstore, d.accountId, d.armId, params.runId, bnow, bcfg)) {
-            continue;
-          }
-          clearDeferred(params.companyId, params.runId);
+          // Propose-only cannot claim a half-open probe for a future run.
+          if (d.armId != null && breakerState(bstore, d.accountId, d.armId, bnow, bcfg) === 'half-open') continue;
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
-          recordDecision(hookLedger, {
-            runId: String(params.runId ?? 'unknown'),
-            agentId: String(params.agentId ?? 'unknown'),
-            accountId: d.accountId,
-            armId: d.armId ?? null,
-            effort: d.effort ?? null,
-            enforced: true,
-            wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
-            rung: d.rung,
-            trial: d.trial === true,
-            family: inferFamily(canonicalModelName(d.model)),
-            reason: d.reason,
-          }, clock());
+          // A proposed agent default is not a run decision. Only events write the run ledger.
           return {
             kind: 'decide',
             decisionId: d.decisionId,
@@ -5077,4 +5021,5 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
     },
   };
+  return plugin;
 }

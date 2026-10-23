@@ -1,23 +1,32 @@
-# Model Capacity plugin (v0.2.48, all-providers)
+# Model Capacity plugin (v0.3.0, official-upstream propose-only)
 
-Picks the model (and effort) for every run and sets how many agent runs
-should run in parallel, so every account's allowance is used before it
-resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
-free-API quality data. Purely deterministic -- no classifiers, no vetoes.
+Computes deterministic per-agent model, effort, context-cap and concurrency
+proposals from CLIProxy capacity and Artificial Analysis quality data.
+**This release does not write agent configuration or intercept runs.**
+The existing cheapest-capable selection policy and `agent.run.*` ledger
+remain; proposals never masquerade as actual or enforced run decisions.
 
-**v0.2.5 = SHADOW BY DEFAULT, enforce-capable opt-in.** The default
-manifest (`manifest`, the one `package.json` points at) holds NO
-`run.model.resolve` capability and no `modelRouting`: the plugin observes
-and changes nothing. Every minute the tick records what it *would* have
-decided (`GET /shadow`), the concurrency target (`GET /capacity`),
-per-account ladders (`GET /ladder`), and the per-agent cap spread
-(`GET /caps`); decisions are recorded event-time from `agent.run.started`.
-The enforce-capable variant is `enforceManifest` (= `buildManifest({
-modelResolve: true })`): it adds `run.model.resolve` with a minimal
-`modelRouting.envKeys` list (only the context-ceiling keys `decide` ever
-sets) and is installed only after security sign-off. Even then the hook is
-gated by the `enforce` config flag (default `false`): with enforcement off
-it answers `keep` and nothing changes.
+Target: official Paperclip `v2026.1012.0`, commit
+`bba6a45f0d364cfd962ac59b3bdf2426a8222adb`. The manifest is checked against
+that commit's exact `PLUGIN_CAPABILITIES` list (vendored with provenance in
+`src/official-capabilities.json`). Neither `run.model.resolve` nor
+`agents.queued_counts.read` is requested. The worker registers no run-model
+resolver. `enforceManifest` remains only as an alias of the same safe manifest;
+legacy `enforce: true` cannot turn on writes.
+
+Every minute the supported job records shadow decisions (`GET /shadow`),
+the target (`GET /capacity`), ladders (`GET /ladder`), caps (`GET /caps`) and
+sanitized per-agent proposals (`GET /proposals`). The last endpoint reports
+`mode: "propose-only"`, `writeEnabled: false` and the exact upstream target.
+Unknown demand, weak calibration, missing agent reads or a stale selection
+snapshot produce a hold, not fabricated slots. Official stable has no
+SDK queued-heartbeat census; kept/review demand stays explicitly unknown.
+
+See [the official-upstream contract](docs/official-upstream.md) for the
+PATCH/no-op proposal semantics, issue-pin precedence and the unresolved
+actuator authority boundary. A proposal is **not** an install, security,
+shadow-agreement or deployment qualification. Do not use the historical
+v0.2 resolver/enforcement instructions below on an official host.
 
 ## Automatic account plan sizing
 

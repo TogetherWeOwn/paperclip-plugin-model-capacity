@@ -1,7 +1,7 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.2.66",
-  "description": "Shadow-by-default model-capacity routing: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.2.2 routes all providers. The default manifest holds no run.model.resolve capability; the enforce-capable variant is opt-in and its enforce flag defaults false.",
+  "version": "0.3.0",
+  "description": "Official-upstream model and concurrency proposals from Artificial Analysis quality and CLIProxy burn data. Propose-only: no run resolver hook or write-enabled actuator.",
   "license": "MIT",
   "type": "module",
   "paperclipPlugin": {
@@ -11,6 +11,7 @@
   "files": [
     "src",
     "test",
+    "docs",
     "README.md",
     "LICENSE",
     "config.example.json"
