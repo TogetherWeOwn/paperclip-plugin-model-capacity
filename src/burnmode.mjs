@@ -384,6 +384,7 @@ export function floorBarUsed(account) {
 }
 
 const pct = (v) => `${Math.round(v * 1000) / 10}%`;
+const FLOOR_EPSILON = 1e-9;
 
 /**
  * Apply burnMode.floors to the feed accounts (a copy, never a mutation).
@@ -409,7 +410,9 @@ export function applyBurnFloors(cfg, accounts, keys = null) {
         burnFloor: { floor, remaining: null, reason: `burn floor ${pct(floor)} set but the bar has no reading (fail closed)` } };
     }
     const remaining = Math.max(0, 1 - used);
-    if (remaining <= floor) {
+    // Tolerance: 1 - 0.7 is 0.30000000000000004, which must still read as
+    // AT a 0.3 floor.
+    if (remaining <= floor + FLOOR_EPSILON) {
       return { ...a, health: 'exhausted', feedHealth,
         burnFloor: { floor, remaining, reason: `burn floor ${pct(floor)} reached (${pct(remaining)} left)` } };
     }

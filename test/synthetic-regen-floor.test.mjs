@@ -99,6 +99,9 @@ test('applyBurnFloors: above the floor stays allocatable and is marked; at or be
   assert.equal(at.health, 'exhausted', 'exactly at the floor takes no runs');
   assert.equal(at.feedHealth, 'healthy');
   assert.equal(at.burnFloor.reason, 'burn floor 80% reached (80% left)');
+  // Floating point: 1 - 0.7 = 0.30000000000000004 still reads as AT a 0.3 floor.
+  assert.equal(applyBurnFloors(normalizeBurnMode({ floors: { 'synthetic:*': 0.3 } }), [synAcct({ regenUsed: 0.7 })])[0].health, 'exhausted');
+  assert.equal(applyBurnFloors(normalizeBurnMode({ floors: { 'synthetic:*': 0.3 } }), [synAcct({ regenUsed: 0.69 })])[0].health, 'healthy');
   const [below] = applyBurnFloors(cfg, [synAcct({ regenUsed: 0.206 })]);
   assert.equal(below.health, 'exhausted');
   assert.equal(below.burnFloor.reason, 'burn floor 80% reached (79.4% left)');

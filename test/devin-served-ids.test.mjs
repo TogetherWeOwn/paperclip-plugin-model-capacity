@@ -97,6 +97,12 @@ test('servedIdForArm keeps native alias-only accounts on the bare emission', () 
     'synthetic/kimi-k3');
   assert.equal(servedIdForArm(['synthetic-infinite/deepseek-v4.1-flash'], 'deepseek-v4.1-flash', 'synthetic-infinite', null),
     'synthetic-infinite/deepseek-v4.1-flash');
+  // A prefixed-only account that ALSO lists the bare id still emits its own prefixed alias.
+  assert.equal(servedIdForArm(['kimi-k3', 'synthetic/kimi-k3'], 'kimi-k3', 'synthetic', new Set(['kimi-k3', 'synthetic/kimi-k3'])),
+    'synthetic/kimi-k3');
+  assert.equal(servedIdForArm(['gpt-5-5', 'devin/gpt-5-5'], 'gpt-5-5', 'devin', null), 'devin/gpt-5-5');
+  // ... but only its OWN prefix: a foreign alias never beats the listed bare id.
+  assert.equal(servedIdForArm(['kimi-k3', 'other/kimi-k3'], 'kimi-k3', 'synthetic', null), 'kimi-k3');
   // Native fail-open (no served list) stays byte-identical to base: bare.
   assert.equal(servedIdForArm(['openai/gpt-6.1-sol'], 'gpt-6.1-sol', 'codex', null), 'gpt-6.1-sol');
   assert.equal(servedIdForArm(['claude/claude-sonnet-5-5'], 'claude-sonnet-5-5', 'claude', null), 'claude-sonnet-5-5');

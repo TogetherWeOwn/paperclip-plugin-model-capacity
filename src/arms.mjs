@@ -95,7 +95,8 @@ export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go', 's
  * `models` list is authoritative, with one native-emission guard: when the
  * account lists the bare id, it is emitted unchanged (bare lanes never take
  * a prefixed alias, so a native account listing both forms stays on its own
- * route). When the account lists ONLY a prefixed alias, the bare id is still
+ * route) -- except on a prefixed-only provider, whose own `provider/<id>`
+ * alias always wins when listed. When the account lists ONLY a prefixed alias, the bare id is still
  * emitted whenever it is served (or the served list is unknown and the
  * provider is not prefixed-only) -- base emitted bare for every native
  * account, and credential readiness stays keyed on the bare id. The listed
@@ -128,6 +129,10 @@ export function servedIdForArm(accountModels, armModel, provider = null, servedI
       providerHit ??= raw;
     }
   }
+  // A prefixed-only provider never emits a bare id, even one its account
+  // also lists: its own `provider/<id>` alias wins (the bare id is unknown
+  // to CLIProxy or names another provider's model).
+  if (providerHit && wantProvider && PREFIXED_ONLY_PROVIDERS.includes(wantProvider)) return providerHit;
   if (bareHit) return bareHit;
   if (!prefixedHit && !providerHit) return armModel;
   if (wantProvider && PREFIXED_ONLY_PROVIDERS.includes(wantProvider)) {
