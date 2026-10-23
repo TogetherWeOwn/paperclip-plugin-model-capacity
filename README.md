@@ -417,7 +417,8 @@ frozen clock can never double-count.
    test-fail +1, rate-limit reroutes, context-window filter. Trial arms
    (families without fleet success: gemini, kimi, grok, claude-4-6, ...)
    take only the `trials.roles` roles (default doer and other; thinkers
-   never), need an opted-in `adapterType` (`trials.adapters`;
+   never; a `role:family` entry such as `thinker:glm` opens one family
+   to one role), need an opted-in `adapterType` (`trials.adapters`;
    unlisted adapters get no trial arms), a free per-family in-flight slot
    (`trials.maxInFlightPerFamily`, default 2), and bypass the burn check
    (their burn is unmeasured by definition; the in-flight cap bounds the
@@ -489,6 +490,34 @@ them and runs haiku at a 200k window): when the arm's AA context window is
 >= 1M and the run's adapter is `claude_local`/`claude-code`, the plugin
 emits `<model>(<effort>)[1m]` instead, which the CLI strips and runs at 1M.
 `decide` returns model/effort first-class and sets nothing else.
+
+`contextCaps.servedIds` sets a ceiling per emitted model id, for lanes that
+serve a model under a smaller window than the model's own: synthetic.new
+serves GLM-5.3, DeepSeek V4.1 Flash 1017 and Kimi K3 at 524,288 tokens, so
+`{"synthetic/glm-5.3": {"maxTokens": 480000, "autoCompactTokens": 450000}}`
+keeps a long run compacting instead of failing with a 400. Keys match the
+emitted id case-insensitively (provider prefix kept, `(effort)`/`[1m]`
+ignored). The ceiling lowers whatever window the rules above pick, or sets
+one when they pick none; it never raises one.
+
+### Level floors (regenerating bars)
+
+`burnMode.floors` maps an account matcher (same identity semantics as
+`burnMode.accounts`) to the remaining share the account keeps, e.g.
+`{"synthetic:*": 0.8}`. The reading is the lane's regenerating bar when the
+feed carries one (`meterInfo.weeklyUsed`), else the weekly meter. At or
+below its floor a matched account takes no runs (health `exhausted`,
+`/capacity` reason `excluded: burn floor 80% reached (79.4% left)`); with no
+reading it takes none either (fail closed). A burn account above its floor
+routes before every other burn account.
+
+synthetic.new sells one weekly credit bar that refills 2% every 202 min and
+never resets. As a reactive burn lane it used to be drained to the feed's
+5% reserve within hours. With a floor, each regeneration tick lifts the bar
+over the floor, the next one or two eligible runs go to the lane, and the
+bar drops back under it: spend equals regeneration, the bar is never full
+(nothing regenerates into a full bar) and never falls further below the
+floor than the runs already in flight (`trials.maxInFlightPerAccount`).
 
 ### Context-tier quota burn
 

@@ -57,9 +57,9 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, contextCapsEnv, normalizeContextCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
+import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
-import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts } from './burnmode.mjs';
+import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts, applyBurnFloors } from './burnmode.mjs';
 import {
   normalizeCredits, usableCredit, WEEKLY_EXHAUSTED_PCT, hasUsablePlanHeadroom, planConcurrencyRoles, gateCreditConcurrencyRoles,
 } from './credits.mjs';
@@ -234,6 +234,8 @@ export function validateConfigShape(raw) {
   }
   // Burn mode: operator-flagged accounts spend ASAP (see burnmode.mjs).
   errors.push(...validateBurnMode(raw.burnMode));
+  // Per-emitted-id context ceilings (see decide.mjs servedIdKey).
+  errors.push(...validateServedIdCaps(raw.contextCaps?.servedIds));
   if (concurrency && !(concurrency.maxTotal >= 1)) errors.push('concurrency.maxTotal must be >= 1');
   // Review reserve: every knob is validated so a typo fails closed at config
   // load, never as a silent full-hold or a dead reserve in the tick.
@@ -383,7 +385,7 @@ export function validateConfigShape(raw) {
       errors.push('trials.adapters must be an object of adapter type to families');
     }
     if ('roles' in raw.trials && (!Array.isArray(raw.trials.roles) || raw.trials.roles.some(r => typeof r !== 'string'))) {
-      errors.push('trials.roles must be an array of role names');
+      errors.push('trials.roles must be an array of role names (or role:family entries)');
     }
   }
   if (raw.modelAaOverrides != null && (typeof raw.modelAaOverrides !== 'object' || Array.isArray(raw.modelAaOverrides))) {
@@ -1617,10 +1619,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     );
     const rawSnapshot = await readAccounts(companyId, config, nowMs);
     // Burn accounts degraded only by the feed's utilization floor stay
-    // allocatable until spent (see burnEligibleAccounts). A copy, never a
-    // mutation: the lane cache keeps the feed's own verdict.
+    // allocatable until spent (see burnEligibleAccounts); level floors
+    // (burnMode.floors) then take accounts at or below their floor out of
+    // allocation (see applyBurnFloors). A copy, never a mutation: the lane
+    // cache keeps the feed's own verdict.
     const snapshot = Array.isArray(rawSnapshot?.accounts)
-      ? { ...rawSnapshot, accounts: burnEligibleAccounts(config.burnMode, rawSnapshot.accounts, uniqueAccountKeys(rawSnapshot.accounts)) }
+      ? (() => {
+        const keys = uniqueAccountKeys(rawSnapshot.accounts);
+        return { ...rawSnapshot, accounts: applyBurnFloors(config.burnMode, burnEligibleAccounts(config.burnMode, rawSnapshot.accounts, keys), keys) };
+      })()
       : rawSnapshot;
     if (snapshot.source === 'cliproxy-lane' && snapshot.servedModels == null) {
       if (!missingServedModelsWarned.has(companyId)) {
@@ -1966,7 +1973,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           guardActive: false,
           rateBasis: prev.rateBasis ?? null,
           action: 'excluded',
-          reason: `excluded: health is ${account.health ?? 'unknown'} -- only healthy accounts allocate`,
+          reason: account.burnFloor?.reason
+            ? `excluded: ${account.burnFloor.reason} -- takes runs again once the bar is above the floor`
+            : `excluded: health is ${account.health ?? 'unknown'} -- only healthy accounts allocate`,
         };
       }
       // The bypass zeroes the stamp for the step only: when the step moves
@@ -2070,6 +2079,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // names the bound that set it: reset | horizon | deadline.
         ...(burnOn ? { burnMode: true, paceResetAtMs, paceTargetAt: burnTarget.atMs, paceTargetSource: burnTarget.source } : {}),
         ...(account.feedHealth ? { feedHealth: account.feedHealth } : {}),
+        // Level floor (burnMode.floors) on matched accounts only, so other
+        // views stay byte-identical: { floor, remaining, reason? }.
+        ...(account.burnFloor ? { burnFloor: account.burnFloor } : {}),
         pointer: step.pointer,
         guardActive: step.guardActive,
         action: step.action,
@@ -3152,6 +3164,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates),
           planAhead: v.planAhead,
           ...(v.burnMode === true ? { burn: true } : {}),
+          ...(v.burnMode === true && v.burnFloor != null ? { burnFirst: true } : {}),
         })),
         {
           reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts,
@@ -3457,6 +3470,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           requiredRatePerHour: view?.requiredRatePerHour ?? null,
           planAhead: view?.planAhead ?? null,
           burn: view?.burnMode === true,
+          ...(view?.burnMode === true && view?.burnFloor != null ? { burnFirst: true } : {}),
           // Breaker-filtered like the tick loop, so the hook and the
           // event-time path never pick an arm the tick would skip.
           ladderRungs: filterBreakerRungs(credentialGroupsFor(ladder, nowMs, config.credentialReadiness.enforce), breakers, a.accountId, nowMs, breakersCfg),

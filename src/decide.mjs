@@ -74,10 +74,13 @@ export const DEFAULT_CONTEXT_CAPS = Object.freeze({
  */
 export function normalizeContextCaps(raw) {
   const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  const { solLunaMaxTokens, solLunaAutoCompactTokens, ...rest } = r;
+  const { solLunaMaxTokens, solLunaAutoCompactTokens, servedIds: rawServedIds, ...rest } = r;
+  const servedIds = normalizeServedIdCaps(rawServedIds);
   return {
     ...DEFAULT_CONTEXT_CAPS,
     ...rest,
+    // Present only when set, so configs without it resolve exactly as before.
+    ...(Object.keys(servedIds).length > 0 ? { servedIds } : {}),
     solMaxTokens: r.solMaxTokens ?? DEFAULT_CONTEXT_CAPS.solMaxTokens,
     solAutoCompactTokens: r.solAutoCompactTokens ?? DEFAULT_CONTEXT_CAPS.solAutoCompactTokens,
     lunaMaxTokens: r.lunaMaxTokens ?? solLunaMaxTokens ?? DEFAULT_CONTEXT_CAPS.lunaMaxTokens,
@@ -115,6 +118,59 @@ export function needsContextCap(family, model) {
 }
 
 const positiveInt = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
+
+/**
+ * Per-emitted-id context ceilings (contextCaps.servedIds):
+ * { '<emitted model id>': { maxTokens, autoCompactTokens? } }. A lane can
+ * serve a model under a smaller window than the model's own: synthetic.new
+ * serves GLM-5.3, DeepSeek V4.1 Flash and Kimi K3 at 524,288 tokens while
+ * agents run with a 1M window, so a long run would hit a 400 instead of
+ * compacting. The arm (and its AA window) cannot tell lanes apart; the
+ * emitted id can (`synthetic/glm-5.3`). Keys match case-insensitively with
+ * the `(effort)` / `[1m]` emission decorations stripped; the provider
+ * prefix stays, it names the lane.
+ */
+export function servedIdKey(model) {
+  if (typeof model !== 'string') return null;
+  let id = model.trim().toLowerCase();
+  if (id.endsWith('[1m]')) id = id.slice(0, -4);
+  if (id.endsWith(')') && id.includes('(')) id = id.slice(0, id.lastIndexOf('('));
+  return id.length > 0 ? id : null;
+}
+
+/** Normalized servedIds table (invalid entries dropped; colliding keys keep the lower ceiling). */
+export function normalizeServedIdCaps(raw) {
+  const out = {};
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    const key = servedIdKey(k);
+    const maxTokens = positiveInt(v?.maxTokens);
+    if (key == null || maxTokens == null) continue;
+    if (Object.hasOwn(out, key) && out[key].maxTokens <= maxTokens) continue;
+    const autoCompactTokens = positiveInt(v?.autoCompactTokens);
+    Object.defineProperty(out, key, {
+      value: autoCompactTokens != null ? { maxTokens, autoCompactTokens } : { maxTokens },
+      writable: true, enumerable: true, configurable: true,
+    });
+  }
+  return out;
+}
+
+/** Config shape errors for contextCaps.servedIds (strings), empty when valid or absent. */
+export function validateServedIdCaps(raw) {
+  if (raw == null) return [];
+  if (typeof raw !== 'object' || Array.isArray(raw)) return ['contextCaps.servedIds must be an object of emitted model id to { maxTokens, autoCompactTokens? }'];
+  const errors = [];
+  for (const [k, v] of Object.entries(raw)) {
+    const isInt = (x) => Number.isInteger(x) && x >= 1;
+    if (servedIdKey(k) == null) errors.push('contextCaps.servedIds keys must be non-empty model ids');
+    else if (v == null || typeof v !== 'object' || Array.isArray(v) || !isInt(v.maxTokens)
+      || ('autoCompactTokens' in v && !isInt(v.autoCompactTokens))) {
+      errors.push(`contextCaps.servedIds[${JSON.stringify(k)}] must be { maxTokens: integer >= 1, autoCompactTokens?: integer >= 1 }`);
+    }
+  }
+  return errors;
+}
 
 /**
  * Configured { maxTokens, autoCompactTokens } under a key pair; a missing or
@@ -167,6 +223,16 @@ export function contextCapsEnv(arm, contextCaps = DEFAULT_CONTEXT_CAPS) {
   } else if (CAPPED_CONTEXT_FAMILIES.includes(family)) {
     window = configuredWindow(caps, 'lunaMaxTokens', 'lunaAutoCompactTokens');
   }
+  // Served-id ceiling (contextCaps.servedIds): lowers whatever window the
+  // rules above chose, or sets one when they chose none. Never raises.
+  const servedKey = caps.servedIds != null ? servedIdKey(arm?.model) : null;
+  const served = servedKey != null ? normalizeServedIdCaps(caps.servedIds)[servedKey] : null;
+  if (served) {
+    const lower = (a, b) => (a == null ? b ?? null : b == null ? a : Math.min(a, b));
+    window = window
+      ? { maxTokens: Math.min(window.maxTokens, served.maxTokens), autoCompactTokens: lower(window.autoCompactTokens, served.autoCompactTokens) }
+      : { maxTokens: served.maxTokens, autoCompactTokens: served.autoCompactTokens ?? null };
+  }
   if (window) {
     env[MAX_CONTEXT_ENV_KEY] = String(window.maxTokens);
     if (caps.autoCompactEnvKey && window.autoCompactTokens != null) {
@@ -198,9 +264,24 @@ export const DEFAULT_TRIALS = Object.freeze({
   // roles.doerAgentIds is set (absent that config every non-thinker is a
   // doer, so the default is bit-identical to the old doer-only gate).
   // Thinkers stay excluded by default: trial traffic is unmeasured by
-  // definition and never belongs on the thinker blend.
+  // definition and never belongs on the thinker blend. A 'role:family'
+  // entry ('thinker:glm') opens one family to a role (see roleTakesTrial).
   roles: Object.freeze(['doer', 'other']),
 });
+
+/**
+ * True when `role` may take trial arms of `family`. A trials.roles entry is
+ * a role ('doer': trial arms of every family) or 'role:family'
+ * ('thinker:glm': that role takes trial arms of that family only, so one
+ * family can be opened to a role without opening every unproven family).
+ */
+export function roleTakesTrial(trialRoles, role, family) {
+  const list = Array.isArray(trialRoles) ? trialRoles : [];
+  if (list.includes(role)) return true;
+  if (typeof family !== 'string' || family.length === 0) return false;
+  const want = `${role}:${family}`.toLowerCase();
+  return list.some(e => typeof e === 'string' && e.trim().toLowerCase() === want);
+}
 
 /** True when the adapter type may run trial arms of the family. */
 export function adapterAllowsTrial(trialAdapters, adapterType, family) {
@@ -304,7 +385,7 @@ export function roleLadderAccess(ladderRungs, {
   }
   if (reachable.length === 0) return { eligible: false, trialOnly: false };
   if (reachable.some(a => a?.trial !== true)) return { eligible: true, trialOnly: false };
-  const trialOk = (Array.isArray(trialRoles) ? trialRoles : []).includes(role);
+  const trialOk = reachable.some(a => roleTakesTrial(trialRoles, role, a?.family));
   return trialOk ? { eligible: true, trialOnly: true } : { eligible: false, trialOnly: false };
 }
 
@@ -327,7 +408,6 @@ export function placementArm(ladderRungs, {
   const groups = ladderRungs ?? [];
   const { floor, ceiling } = roleRungWindow(roleBands[role] ?? roleBands.doer, groups.length);
   const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
-  const trialOk = (Array.isArray(trialRoles) ? trialRoles : []).includes(role);
   const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
   // Same walk as decide(): pointer down to the floor, then up to the ceiling.
   const target = clamp(pointer ?? floor, floor, ceiling);
@@ -337,7 +417,7 @@ export function placementArm(ladderRungs, {
   for (const rung of order) {
     const entry = groups.find(g => g.rung === rung);
     const arms = (entry?.arms ?? []).filter(a =>
-      !armExcluded(a, excluded) && (a?.trial !== true || trialOk));
+      !armExcluded(a, excluded) && (a?.trial !== true || roleTakesTrial(trialRoles, role, a?.family)));
     if (arms.length === 0) continue;
     arms.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = arms[0];
@@ -367,7 +447,8 @@ function sanitizeId(part) {
  *   missing entries mean uncalibrated: the arm is skipped when headroom is
  *   known, allowed (flagged weak) when headroom is unknown.
  * Trial arms (trial: true) are exploration traffic: only roles listed in
- * trialRoles (default doer + other; thinkers never), the adapter must
+ * trialRoles (default doer + other; thinkers never; a 'role:family' entry
+ * opens one family to that role, see roleTakesTrial), the adapter must
  * allow the family, and the family needs a free in-flight slot in
  * trialBudget. Trial picks bypass the burn check (their burn is
  * unmeasured by definition; the in-flight cap bounds the blast radius)
@@ -412,7 +493,7 @@ export function decide({
 
   const trialOk = (arm) => {
     if (!arm.trial) return true;
-    if (!(Array.isArray(trialRoles) ? trialRoles : []).includes(role)) return false;
+    if (!roleTakesTrial(trialRoles, role, arm.family)) return false;
     if (!adapterAllowsTrial(trialAdapters, adapterType, arm.family)) return false;
     return (trialBudget?.[arm.family] ?? 0) > 0;
   };

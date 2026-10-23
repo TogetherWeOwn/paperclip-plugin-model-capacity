@@ -112,7 +112,8 @@ export function allowanceOf(shortfall, poolShare) {
  *   derived: an aggregator serving only models a qualified native also
  *   serves), creditFallback (optional: credit-funded headroom, placed after
  *   plan headroom when `creditPriority: 'fallback'`), roleEligible (optional:
- *   whether the account can serve the current role) }]
+ *   whether the account can serve the current role), burn / burnFirst
+ *   (optional: burn mode, and a burn account above its level floor) }]
  * Unhealthy accounts and metered accounts without headroom are dropped;
  * healthy reactive accounts qualify without headroom.
  *
@@ -233,11 +234,16 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // any view leaves this key 0 and the order exactly as before.
   // Credits-only-after-plan still outranks burn: a burn account already on
   // credit fallback (plan spent) never jumps ahead of plan headroom.
+  // A burn account above a level floor (burnFirst, see burnmode.mjs floors)
+  // sorts before every other burn account: it can only spend what its bar
+  // holds above the floor, and a regenerating bar nothing spends wastes its
+  // regeneration once full. No burnFirst flag leaves the order unchanged.
+  const burnRank = (v) => (v.burn === true ? (v.burnFirst === true ? 2 : 1) : 0);
   const order = [...qualified].sort((a, b) =>
     (creditPriority === 'fallback' && hasPlanHeadroom
       ? Number(a.creditFallback === true) - Number(b.creditFallback === true)
       : 0) ||
-    (Number(b.burn === true) - Number(a.burn === true)) ||
+    (burnRank(b) - burnRank(a)) ||
     bandCmp(a, b) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||

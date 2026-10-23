@@ -36,12 +36,27 @@
  *     account is never chosen).
  * Empty or missing config (including empty or missing deadlines) burns
  * nothing: today's behavior bit-for-bit.
+ *
+ * Level floors (floors?: { [matcher]: remaining share in [0, 1) }, same
+ * identity semantics as deadlines; '!' matchers are rejected): a matched
+ * account whose bar reading leaves `floor` or less of its quota is not
+ * allocatable (health 'exhausted', the same path as a feed-exhausted lane),
+ * whether or not it burns. The reading is the regenerating bar (meterInfo,
+ * see cliproxy.mjs) when the feed has one, else the weekly meter; a matched
+ * account with no reading is not allocatable either (fail closed). A burn
+ * account above its floor sorts before every other burn account (see
+ * select.mjs): it can only spend what its bar holds above the floor, and a
+ * regenerating bar that nothing spends wastes its regeneration once full.
+ * So spend tracks regeneration and the bar holds at the floor, never full
+ * and never lower than the runs already in flight. Empty or missing floors
+ * change nothing.
  */
 
 export const DEFAULT_BURN_MODE = Object.freeze({
   accounts: Object.freeze([]),
   horizonMinutes: 60,
   deadlines: Object.freeze({}),
+  floors: Object.freeze({}),
 });
 
 /**
@@ -116,10 +131,40 @@ export function validateBurnMode(raw) {
       }
     }
   }
+  if ('floors' in raw) {
+    const f = raw.floors;
+    if (f == null || typeof f !== 'object' || Array.isArray(f)) {
+      errors.push('burnMode.floors must be an object mapping account matchers to the remaining share (0 to under 1) at or below which the account takes no runs');
+    } else {
+      const seen = new Set();
+      for (const [k, v] of Object.entries(f)) {
+        if (k.trim().length === 0) {
+          errors.push('burnMode.floors keys must be non-empty strings');
+          continue;
+        }
+        const nk = k.trim().toLowerCase();
+        if (nk.startsWith('!')) errors.push(`burnMode.floors[${JSON.stringify(k)}]: a floor matcher cannot exclude (drop the leading !)`);
+        if (seen.has(nk)) {
+          errors.push(`burnMode.floors has a duplicate matcher for ${JSON.stringify(nk)} (matchers are case-insensitive and trimmed)`);
+        } else seen.add(nk);
+        if (!isFloorValue(v)) {
+          errors.push(`burnMode.floors[${JSON.stringify(k)}] must be a number from 0 to under 1 (the remaining share the account keeps, e.g. 0.8)`);
+        }
+      }
+    }
+  }
   return errors;
 }
 
-/** Coerce to { accounts: lower-cased trimmed strings, horizonMinutes, deadlines }. */
+const isFloorValue = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1;
+
+/**
+ * Coerce to { accounts: lower-cased trimmed strings, horizonMinutes,
+ * deadlines, floors? }. A floor value that is not a number in [0, 1) reads
+ * as 1 (never allocatable): validation rejects it, this is the tick-path
+ * defense, and a broken floor must fail closed. Colliding matchers keep the
+ * higher floor.
+ */
 export function normalizeBurnMode(raw) {
   const r = raw != null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const accounts = Array.isArray(r.accounts)
@@ -146,10 +191,24 @@ export function normalizeBurnMode(raw) {
       }
     }
   }
+  const floors = {};
+  const fl = r.floors;
+  if (fl != null && typeof fl === 'object' && !Array.isArray(fl)) {
+    for (const [k, v] of Object.entries(fl)) {
+      const nk = k.trim().toLowerCase();
+      if (nk.length === 0 || nk.startsWith('!')) continue;
+      const nv = isFloorValue(v) ? v : 1;
+      if (!Object.hasOwn(floors, nk) || nv > floors[nk]) {
+        Object.defineProperty(floors, nk, { value: nv, writable: true, enumerable: true, configurable: true });
+      }
+    }
+  }
   return {
     accounts,
     horizonMinutes: typeof h === 'number' && Number.isFinite(h) && h >= 1 ? h : DEFAULT_BURN_MODE.horizonMinutes,
     deadlines,
+    // Present only when set, so configs without floors resolve exactly as before.
+    ...(Object.keys(floors).length > 0 ? { floors } : {}),
   };
 }
 
@@ -293,4 +352,68 @@ export function burnPaceTarget({ nowMs, resetAtMs = null, horizonMs = null, dead
  */
 export function burnPaceResetAtMs({ nowMs, resetAtMs = null, horizonMs = null, deadlineAtMs = null, cfg }) {
   return burnPaceTarget({ nowMs, resetAtMs, horizonMs, deadlineAtMs, cfg }).atMs;
+}
+
+/**
+ * The level floor (remaining share in [0, 1]) for this account: the highest
+ * among the cfg.floors entries it matches, or null when none matches. A
+ * non-numeric value reads as 1 (fail closed).
+ */
+export function burnFloorFor(cfg, account, key = null) {
+  const floors = cfg?.floors;
+  if (floors == null || typeof floors !== 'object' || Array.isArray(floors)) return null;
+  const entries = Object.entries(floors);
+  if (entries.length === 0) return null;
+  const ids = identitiesOf(account, key);
+  const provider = providerOf(account, key);
+  let best = null;
+  for (const [matcher, value] of entries) {
+    const m = matcher.trim().toLowerCase();
+    if (m.length === 0 || m.startsWith('!') || !entryMatches(m, ids, provider)) continue;
+    const f = typeof value === 'number' && Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 1;
+    if (best == null || f > best) best = f;
+  }
+  return best;
+}
+
+/** Used share (0..1) of the bar a floor reads: the regenerating bar, else the weekly meter; null when unknown. */
+export function floorBarUsed(account) {
+  if (Number.isFinite(account?.regenUsed)) return account.regenUsed;
+  const weekly = account?.weekly?.utilization;
+  return Number.isFinite(weekly) ? weekly : null;
+}
+
+const pct = (v) => `${Math.round(v * 1000) / 10}%`;
+
+/**
+ * Apply burnMode.floors to the feed accounts (a copy, never a mutation).
+ * A healthy matched account gets `burnFloor: { floor, remaining }`; at or
+ * below its floor, or with no reading, it also leaves allocation: health
+ * 'exhausted' (or 'unavailable' without a reading) with the feed's verdict
+ * kept as feedHealth and the cause in burnFloor.reason. Accounts the feed
+ * already marked unhealthy keep the feed's verdict. Returns the same array
+ * when no floor matches.
+ */
+export function applyBurnFloors(cfg, accounts, keys = null) {
+  if (!Array.isArray(accounts) || cfg?.floors == null || Object.keys(cfg.floors).length === 0) return accounts;
+  let changed = false;
+  const out = accounts.map((a, i) => {
+    if (a?.health !== 'healthy') return a;
+    const floor = burnFloorFor(cfg, a, keys?.[i] ?? null);
+    if (floor == null) return a;
+    changed = true;
+    const used = floorBarUsed(a);
+    const feedHealth = a.feedHealth ?? a.health;
+    if (used == null) {
+      return { ...a, health: 'unavailable', feedHealth,
+        burnFloor: { floor, remaining: null, reason: `burn floor ${pct(floor)} set but the bar has no reading (fail closed)` } };
+    }
+    const remaining = Math.max(0, 1 - used);
+    if (remaining <= floor) {
+      return { ...a, health: 'exhausted', feedHealth,
+        burnFloor: { floor, remaining, reason: `burn floor ${pct(floor)} reached (${pct(remaining)} left)` } };
+    }
+    return { ...a, burnFloor: { floor, remaining } };
+  });
+  return changed ? out : accounts;
 }
