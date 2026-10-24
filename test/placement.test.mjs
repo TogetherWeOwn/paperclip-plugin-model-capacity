@@ -176,10 +176,13 @@ test('trial arms are placed only for trial roles', () => {
 // --- config
 
 test('placement config: defaults, overrides, validation', () => {
-  assert.deepEqual(resolveConfig({}).placement, { qualityWeight: 1, allowanceWeight: 0.35 });
-  assert.deepEqual(resolveConfig({ placement: { qualityWeight: 0 } }).placement, { qualityWeight: 0, allowanceWeight: 0.35 });
+  assert.deepEqual(resolveConfig({}).placement, { qualityWeight: 1, allowanceWeight: 0.35, freeCostProviders: [] });
+  assert.deepEqual(resolveConfig({ placement: { qualityWeight: 0 } }).placement, { qualityWeight: 0, allowanceWeight: 0.35, freeCostProviders: [] });
+  assert.deepEqual(resolveConfig({ placement: { freeCostProviders: ['nvidia-nim'] } }).placement,
+    { qualityWeight: 1, allowanceWeight: 0.35, freeCostProviders: ['nvidia-nim'] });
   assert.deepEqual(validateConfigShape({ placement: { qualityWeight: 2, allowanceWeight: 0.1 } }), []);
-  for (const bad of [{ placement: 'x' }, { placement: { qualityWeight: -1 } }, { placement: { allowanceWeight: 'a' } }]) {
+  for (const bad of [{ placement: 'x' }, { placement: { qualityWeight: -1 } }, { placement: { allowanceWeight: 'a' } },
+    { placement: { freeCostProviders: 'nvidia-nim' } }, { placement: { freeCostProviders: [''] } }]) {
     assert.ok(validateConfigShape(bad).length > 0, JSON.stringify(bad));
   }
 });

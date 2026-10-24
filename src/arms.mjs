@@ -87,8 +87,11 @@ export function canonicalModelName(model) {
  * synthetic / synthetic-infinite (synthetic.new, 2026-10-23): CLIProxy serves
  * them only as `synthetic/<id>` and `synthetic-infinite/<id>`; the bare id is
  * unknown to CLIProxy or, for kimi-k3 / glm-5.3, belongs to another provider.
+ * nvidia-nim (NVIDIA NIM free lane, 2026-10-24): CLIProxy serves it only as
+ * `nvidia-nim/<id>`; the bare id is unknown to CLIProxy or names another
+ * provider's model.
  */
-export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go', 'synthetic', 'synthetic-infinite']);
+export const PREFIXED_ONLY_PROVIDERS = Object.freeze(['devin', 'opencode-go', 'synthetic', 'synthetic-infinite', 'nvidia-nim']);
 
 /**
  * Exact model id to emit for an arm on one account. The account's feed

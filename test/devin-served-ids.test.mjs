@@ -90,6 +90,14 @@ test('servedIdForArm keeps native alias-only accounts on the bare emission', () 
   // Prefixed-only providers emit the alias even fail-open (no served list).
   assert.equal(servedIdForArm(['devin/gpt-5-5'], 'gpt-5-5', 'devin', null), 'devin/gpt-5-5');
   assert.equal(servedIdForArm(['opencode-go/hy3-preview'], 'hy3-preview', 'opencode-go', null), 'opencode-go/hy3-preview');
+  // nvidia-nim lanes are prefixed-only: never the bare id (unknown to
+  // CLIProxy or another provider's model).
+  assert.equal(servedIdForArm(['nvidia-nim/step-5-preview-nim'], 'step-5-preview-nim', 'nvidia-nim', null),
+    'nvidia-nim/step-5-preview-nim');
+  assert.equal(servedIdForArm(['step-5-preview-nim', 'nvidia-nim/step-5-preview-nim'], 'step-5-preview-nim', 'nvidia-nim', null),
+    'nvidia-nim/step-5-preview-nim');
+  assert.equal(servedIdForArm(['step-5-preview-nim', 'other/step-5-preview-nim'], 'step-5-preview-nim', 'nvidia-nim', null),
+    'step-5-preview-nim');
   // synthetic.new lanes are prefixed-only: never the bare id (unknown to CLIProxy, or another provider's model).
   assert.equal(servedIdForArm(['synthetic/deepseek-v4.1-flash-1017'], 'deepseek-v4.1-flash-1017', 'synthetic', null),
     'synthetic/deepseek-v4.1-flash-1017');

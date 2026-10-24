@@ -378,6 +378,19 @@ export function validateConfigShape(raw) {
     for (const k of ['maxInFlightPerAccount', 'maxInFlightPerFamily', 'minRuns']) {
       if (k in raw.trials && !(raw.trials[k] >= 1)) errors.push(`trials.${k} must be >= 1`);
     }
+    if ('maxInFlightPerAccountByProvider' in raw.trials) {
+      const byProvider = raw.trials.maxInFlightPerAccountByProvider;
+      if (byProvider == null || typeof byProvider !== 'object' || Array.isArray(byProvider)) {
+        errors.push('trials.maxInFlightPerAccountByProvider must be an object of provider to integer >= 1');
+      } else {
+        for (const [provider, cap] of Object.entries(byProvider)) {
+          if (typeof provider !== 'string' || provider.trim().length === 0 || !Number.isInteger(cap) || cap < 1) {
+            errors.push('trials.maxInFlightPerAccountByProvider must be an object of provider to integer >= 1');
+            break;
+          }
+        }
+      }
+    }
     if ('minSuccessRate' in raw.trials && (typeof raw.trials.minSuccessRate !== 'number' || raw.trials.minSuccessRate < 0 || raw.trials.minSuccessRate > 1)) {
       errors.push('trials.minSuccessRate must be a number in [0, 1]');
     }
@@ -398,6 +411,12 @@ export function validateConfigShape(raw) {
       for (const k of ['qualityWeight', 'allowanceWeight']) {
         if (k in raw.placement && !(typeof raw.placement[k] === 'number' && raw.placement[k] >= 0)) {
           errors.push(`placement.${k} must be a non-negative number`);
+        }
+      }
+      if ('freeCostProviders' in raw.placement) {
+        const list = raw.placement.freeCostProviders;
+        if (!Array.isArray(list) || list.some(p => typeof p !== 'string' || p.trim().length === 0)) {
+          errors.push('placement.freeCostProviders must be an array of non-empty provider names');
         }
       }
     }
@@ -613,6 +632,12 @@ export function resolveConfig(raw = {}) {
       minSuccessRate: raw.trials?.minSuccessRate ?? DEFAULT_TRIALS.minSuccessRate,
       adapters: raw.trials?.adapters ?? DEFAULT_TRIALS.adapters,
       roles: (Array.isArray(raw.trials?.roles) ? raw.trials.roles : [...DEFAULT_TRIALS.roles]).filter(r => typeof r === 'string'),
+      // Provider-scoped in-flight cap: { provider -> integer >= 1 } (keys
+      // lower-cased). Overrides maxInFlightPerAccount only for that
+      // provider's accounts; every other provider keeps the global value.
+      // Empty (default) keeps every provider on the global cap, exactly as
+      // before. Malformed entries are dropped, never promoted.
+      maxInFlightPerAccountByProvider: normalizeTrialCapByProvider(raw.trials?.maxInFlightPerAccountByProvider),
     },
     // Operator extensions to the AA-slug override table (CLIProxy model
     // id -> AA slug or { slug, effort }); merged over the built-in table.
@@ -634,6 +659,12 @@ export function resolveConfig(raw = {}) {
     placement: {
       qualityWeight: raw.placement?.qualityWeight ?? DEFAULT_PLACEMENT.qualityWeight,
       allowanceWeight: raw.placement?.allowanceWeight ?? DEFAULT_PLACEMENT.allowanceWeight,
+      // Free-cost providers: a 'free'-plan account whose provider is listed
+      // here places at zero monetary cost (costEffective 0, ladder cost 0).
+      // Quota/burn accounting, quality bars and climbForSpend are unchanged;
+      // the feed's usage numbers (if any) are not rewritten. Empty
+      // (default) prices every account from AA, exactly as before.
+      freeCostProviders: normalizeFreeCostProviders(raw.placement?.freeCostProviders),
     },
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
@@ -673,6 +704,94 @@ function sanitizeReservedFloors(raw) {
     kept.push([agentId, { base: spec.base, perQueued: spec.perQueued, max: spec.max }]);
   }
   return Object.fromEntries(kept);
+}
+
+/**
+ * Normalize the provider-scoped in-flight cap map: { provider -> int >= 1 }
+ * with lower-cased provider keys. Malformed entries are dropped (the
+ * validator reports them); an absent or malformed map reads as {} so every
+ * provider keeps the global trials.maxInFlightPerAccount.
+ */
+export function normalizeTrialCapByProvider(raw) {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [provider, cap] of Object.entries(raw)) {
+    if (typeof provider !== 'string' || provider.trim().length === 0) continue;
+    if (!Number.isInteger(cap) || cap < 1) continue;
+    const key = provider.trim().toLowerCase();
+    if (!Object.hasOwn(out, key)) out[key] = cap;
+  }
+  return out;
+}
+
+/**
+ * Effective per-account reactive in-flight cap for a provider: the scoped
+ * override when the (case-insensitive) provider is listed, else the global
+ * trials.maxInFlightPerAccount. A resolved trials object without the map
+ * behaves exactly as before.
+ */
+export function trialInflightCapFor(trials, provider) {
+  const global = trials?.maxInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount;
+  const key = typeof provider === 'string' && provider ? provider.toLowerCase() : null;
+  if (key == null) return global;
+  const scoped = trials?.maxInFlightPerAccountByProvider?.[key];
+  return Number.isInteger(scoped) && scoped >= 1 ? scoped : global;
+}
+
+/**
+ * Normalize the free-cost provider list: lower-cased provider names.
+ * Malformed entries are dropped (the validator reports them); absent reads
+ * as [] so every account prices from AA, exactly as before.
+ */
+export function normalizeFreeCostProviders(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const p of raw) {
+    if (typeof p !== 'string' || p.trim().length === 0) continue;
+    const key = p.trim().toLowerCase();
+    if (!out.includes(key)) out.push(key);
+  }
+  return out;
+}
+
+/**
+ * True when the account rides free: its feed plan is 'free'
+ * (case-insensitive) and its provider is operator-listed in
+ * placement.freeCostProviders. Only the monetary placement cost reads zero;
+ * quality bars, quota/burn accounting and climbForSpend are untouched.
+ */
+export function isFreeCostAccount(account, freeCostProviders) {
+  if (!Array.isArray(freeCostProviders) || freeCostProviders.length === 0) return false;
+  const plan = typeof account?.plan === 'string' ? account.plan.trim().toLowerCase() : null;
+  if (plan !== 'free') return false;
+  const provider = typeof account?.provider === 'string' ? account.provider.toLowerCase() : null;
+  return provider != null && freeCostProviders.includes(provider);
+}
+
+/**
+ * Effective per-account reactive in-flight cap for one frozen live-view
+ * account: the scoped trials.maxInFlightPerAccountByProvider override when
+ * any of the view's provider identities (lane provider, pool, account-id
+ * prefix) matches a listed provider (case-insensitive), else the published
+ * scalar maxTrialInFlightPerAccount. A live view without the map behaves
+ * exactly as before.
+ */
+export function liveTrialInflightCapFor(live, view) {
+  const fallback = live?.maxTrialInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount;
+  const byProvider = live?.maxTrialInFlightPerAccountByProvider;
+  if (byProvider == null || typeof byProvider !== 'object' || Array.isArray(byProvider)) return fallback;
+  const candidates = [
+    view?.laneProvider,
+    view?.provider,
+    view?.pool,
+    typeof view?.accountId === 'string' ? view.accountId.split(':')[0] : null,
+  ];
+  for (const c of candidates) {
+    if (typeof c !== 'string' || c.length === 0) continue;
+    const hit = byProvider[c.toLowerCase()];
+    if (Number.isInteger(hit) && hit >= 1) return hit;
+  }
+  return fallback;
 }
 
 // Weekly window length for schedule-error math (the lane reports `used`
@@ -1228,6 +1347,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         priceOut: a.row.price1mOutputTokens,
       })), { medianPool: fleetCostPool });
       const eeeByArm = new Map();
+      // Free-cost lane: a 'free'-plan account on an operator-listed provider
+      // (placement.freeCostProviders) places at zero monetary cost. Quality,
+      // quota/burn accounting and climbForSpend are unchanged; only C and
+      // costEffective read 0 (costBase keeps the measured AA cost for audit).
+      const freeCost = isFreeCostAccount(account, config.placement.freeCostProviders);
       const eligible = served.map(a => {
         const base = costs.get(a.armId)?.C ?? null;
         const tier = tierCostOf(a, base);
@@ -1250,14 +1374,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // below uses the same effective cost while
           // contextCaps.tierAffectsQuota holds (default true): on
           // subscription lanes quota charges the tier price, not base.
-          C: tier.costEffective ?? base,
+          C: freeCost ? 0 : (tier.costEffective ?? base),
           coverage: scored.get(a.armId)?.coverage ?? 0,
           // Carried-cost provenance rides to candidates, rungs and the
           // capacity view; absent when the row measured its own costs.
           ...(a.row.costCarriedFrom != null ? { costCarriedFrom: a.row.costCarriedFrom } : {}),
           costBase: base,
           costMultiplier: tier.costMultiplier,
-          costEffective: tier.costEffective,
+          costEffective: freeCost ? 0 : tier.costEffective,
+          ...(freeCost ? { costFree: true } : {}),
           tierSource: tier.tierSource,
           statsRequests: tier.statsRequests,
         };
@@ -1323,9 +1448,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // headroom (decide burn check), concurrency and target shares all see
       // the effective cost. False restores base-cost burn.
       const quotaAffects = config.contextCaps?.tierAffectsQuota !== false;
-      const burnCostOf = (e) => quotaAffects
-        ? (e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null)
-        : (costs.get(e.armId)?.C ?? null);
+      const burnCostOf = (e) => {
+        if (!quotaAffects) return costs.get(e.armId)?.C ?? null;
+        // Free-cost lanes place at zero but still consume quota/rate while
+        // metered: pace their burn at the measured tier cost, never at the
+        // zero placement cost, so pacing never treats their runs as free.
+        if (e.costFree) {
+          const m = e.costMultiplier ?? 1;
+          return e.costBase != null ? e.costBase * m : (costs.get(e.armId)?.C ?? null);
+        }
+        return e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null;
+      };
       ladders[keyOf(account, i)] = {
         ...admitted,
         rankingRungs: ranking.rungs,
@@ -2878,6 +3011,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       roleDemand: demand.byRole,
       roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
+      // Provider-scoped trial caps reach the concurrency target too, so a
+      // trial-only account on a capped provider never publishes more slots
+      // than its cap permits. Absent overrides read as the global cap.
+      trialSlotCapFor: (accountId) => trialInflightCapFor(config.trials, viewById.get(accountId)?.provider),
     };
     let concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });
     if (config.credits.priority === 'fallback') {
@@ -3275,11 +3412,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (!view || !ladder) continue;
         // Reactive accounts qualify without a remaining fraction; metered
         // accounts need one. Reactive lanes are capped in flight per account
-        // (default 2): no vendor meter means no burn signal, so the count of
-        // running runs is the only backpressure.
+        // (default 2, operator-overridable per provider via
+        // trials.maxInFlightPerAccountByProvider): no vendor meter means no
+        // burn signal, so the count of running runs is the only backpressure.
         if (!view.reactive && view.remainingPct == null) continue;
         const pressure = freshPressure().byAccount;
-        if (view.reactive && (pressure[sel.accountId] ?? 0) >= config.trials.maxInFlightPerAccount) continue;
+        if (view.reactive && (pressure[sel.accountId] ?? 0) >= trialInflightCapFor(config.trials, view.provider ?? sel.provider)) continue;
         // Role-based family exclusions: accounts with no eligible arm for
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
@@ -3440,6 +3578,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       trialAdapters: config.trials.adapters,
       trialRoles: config.trials.roles,
       maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
+      // Provider-scoped overrides (lower-cased provider keys); the hook and
+      // event-time paths resolve per viewed account, falling back to the
+      // scalar above. Empty (default) keeps every provider on the scalar.
+      maxTrialInFlightPerAccountByProvider: config.trials.maxInFlightPerAccountByProvider ?? {},
       accounts: ordered.map(a => {
         const view = viewById.get(a.accountId);
         const ladder = ladders[a.accountId];
@@ -4398,12 +4540,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // per-account cap starves multi-lane providers.
     const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
     const acctPending = pendingByAccount(live, companyId);
-    const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
     const budget = effectiveTrialBudget(live, companyId);
     for (const view of order) {
       if (!view || !view.ladderRungs || view.ladderRungs.length === 0) continue;
       if (!view.reactive && !view.remainingKnown) continue;
-      if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
+      // Provider-scoped reactive cap (nvidia-nim 1, others on the global).
+      if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= liveTrialInflightCapFor(live, view)) continue;
       const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
       if (!rungsHaveEligibleArms(roleRungs)) continue;
       const d = decide({
@@ -4952,7 +5094,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ));
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
-      const maxPerAccount = live.maxTrialInFlightPerAccount ?? 2;
       const budget = effectiveTrialBudget(live, params.companyId, selfId);
       // Breaker state live at call time (not the tick-frozen view): a probe
       // occupied after the tick published must exclude the arm here, or N
@@ -4963,7 +5104,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       for (const view of order) {
         if (!view || view.ladderRungs.length === 0) continue;
         if (!view.reactive && !view.remainingKnown) continue;
-        if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= maxPerAccount) continue;
+        // Provider-scoped reactive cap (nvidia-nim 1, others on the global).
+        if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= liveTrialInflightCapFor(live, view)) continue;
         // Role-based family exclusions use the tick-frozen live view (the
         // hook performs zero I/O): ineligible accounts are skipped, never
         // deferred on.
