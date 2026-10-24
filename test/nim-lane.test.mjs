@@ -12,6 +12,7 @@ import {
   isFreeCostAccount,
   liveTrialInflightCapFor,
 } from '../src/plugin.mjs';
+import { computeConcurrencyTarget } from '../src/concurrency.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 const NOW = Date.parse('2026-10-24T04:00:00Z');
@@ -133,6 +134,7 @@ test('free NIM lane emits the exact alias at zero placement cost', async () => {
   const rows = [
     { slug: 'step-5', intelligenceIndex: 72, intelligenceIndexCostPerTask: 9, price1mInputTokens: 1, price1mOutputTokens: 4 },
     { slug: 'gpt-5-5', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'claude-haiku-5-5', intelligenceIndex: 50, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
   ];
   const config = {
     enforce: true,
@@ -186,6 +188,10 @@ test('free NIM lane emits the exact alias at zero placement cost', async () => {
   assert.equal(nimRung.model, ALIAS, 'ladder emits the exact alias');
   assert.equal(nimRung.C, 0, 'ladder orders on zero monetary cost');
   assert.equal(nimRung.costEffective, 0, 'ladder carries zero effective cost');
+  // Quota burn still prices the measured tier cost: placement zero must never
+  // read as zero quota consumption.
+  const nimBurn = ladder.body.ladders['nvidia-nim:nvidia-nim-lane-1']?.burnPerRunPct?.[BARE];
+  assert.ok((nimBurn ?? 0) > 0, `free lane still burns measured cost, got ${nimBurn}`);
 
   const hook = await plugin.onResolveRunModel({
     runId: 'run-nim-1', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
@@ -193,6 +199,27 @@ test('free NIM lane emits the exact alias at zero placement cost', async () => {
   });
   assert.equal(hook.kind, 'decide');
   assert.ok(hook.model === ALIAS || String(hook.model).startsWith(`${ALIAS}(`), `expected NIM alias, got ${hook.model}`);
+});
+
+// The concurrency target honors the provider-scoped trial cap: a trial-only
+// NIM account publishes at most 1 slot while a trial-only sibling keeps 2.
+test('concurrency target honors the provider-scoped trial cap', () => {
+  const accounts = [
+    { accountId: 'nvidia-nim:1', remainingPct: 1, hoursToReset: 168, burnPerRunPct: 0.0005, measuredBurnPerRunPct: 0.0005, guardActive: false },
+    { accountId: 'codex:1', remainingPct: 1, hoursToReset: 168, burnPerRunPct: 0.0005, measuredBurnPerRunPct: 0.0005, guardActive: false },
+  ];
+  const trialOnly = Object.fromEntries(['doer', 'thinker', 'other'].map(r => [r, { eligible: true, trialOnly: true }]));
+  const roleAccess = { 'nvidia-nim:1': trialOnly, 'codex:1': trialOnly };
+  const base = { accounts, meanRunDurationHours: 0.186, maxTotal: 75, roleAccess, trialSlotCap: 2 };
+  const unscoped = computeConcurrencyTarget(base);
+  assert.equal(unscoped.perAccount.find(a => a.accountId === 'nvidia-nim:1').usableSlots, 2);
+  const scoped = computeConcurrencyTarget({
+    ...base,
+    trialSlotCapFor: (accountId) => (String(accountId).startsWith('nvidia-nim') ? 1 : 2),
+  });
+  assert.equal(scoped.perAccount.find(a => a.accountId === 'nvidia-nim:1').usableSlots, 1);
+  assert.equal(scoped.perAccount.find(a => a.accountId === 'codex:1').usableSlots, 2,
+    'sibling provider keeps the global cap in the target too');
 });
 
 // Gate (3) end to end: the NIM-scoped cap of 1 holds after one in-flight run

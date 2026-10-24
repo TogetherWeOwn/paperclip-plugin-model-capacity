@@ -90,6 +90,9 @@ export function medianPositive(values) {
  *     Absent (or all zero) reads exactly as today.
  *   trialSlotCap: a trial-only account sustains at most this many runs in
  *     flight (the trial cap), whatever its quota says.
+ *   trialSlotCapFor: optional per-account override
+ *     `(accountId) => cap`; when absent every trial-only account uses
+ *     trialSlotCap, exactly as before.
  * Uncalibrated (anchor) burn estimates never dominate: an anchor-fallback
  * account's burn is floored at the median MEASURED per-run burn, so a
  * guessed-cheap anchor cannot mint more slots than a measured peer.
@@ -97,7 +100,11 @@ export function medianPositive(values) {
 export function computeConcurrencyTarget({
   accounts, meanRunDurationHours, demandFactor = 1, maxTotal = 75,
   roleAccess = null, roleDemand = null, roleRunning = null, trialSlotCap = 2,
+  trialSlotCapFor = null,
 } = {}) {
+  // Per-account trial cap (provider-scoped overrides); absent reads as the
+  // global trialSlotCap for every account, exactly as before.
+  const capFor = typeof trialSlotCapFor === 'function' ? trialSlotCapFor : () => trialSlotCap;
   const D = meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours;
   const list = accounts ?? [];
   // Guard decides slots (zero), not knowledge: a guard-capped account with a
@@ -178,11 +185,11 @@ export function computeConcurrencyTarget({
     // Trial-only: every eligible role can only reach trial arms.
     row.trialOnly = eligibleRoles.length > 0 && eligibleRoles.every(r => accessOf(row.accountId, r).trialOnly);
     let usable = row.slots * weight;
-    if (row.trialOnly) usable = Math.min(usable, Math.max(0, trialSlotCap));
+    if (row.trialOnly) usable = Math.min(usable, Math.max(0, capFor(row.accountId)));
     row.usableSlots = usable;
     for (const r of eligibleRoles) {
       if (!(row.slots > 0)) continue;
-      const cap = accessOf(row.accountId, r).trialOnly ? Math.max(0, trialSlotCap) : Infinity;
+      const cap = accessOf(row.accountId, r).trialOnly ? Math.max(0, capFor(row.accountId)) : Infinity;
       roleSlots[r].slots += Math.min(row.slots, cap);
       roleSlots[r].accounts += 1;
     }

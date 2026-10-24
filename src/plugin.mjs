@@ -1448,9 +1448,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // headroom (decide burn check), concurrency and target shares all see
       // the effective cost. False restores base-cost burn.
       const quotaAffects = config.contextCaps?.tierAffectsQuota !== false;
-      const burnCostOf = (e) => quotaAffects
-        ? (e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null)
-        : (costs.get(e.armId)?.C ?? null);
+      const burnCostOf = (e) => {
+        if (!quotaAffects) return costs.get(e.armId)?.C ?? null;
+        // Free-cost lanes place at zero but still consume quota/rate while
+        // metered: pace their burn at the measured tier cost, never at the
+        // zero placement cost, so pacing never treats their runs as free.
+        if (e.costFree) {
+          const m = e.costMultiplier ?? 1;
+          return e.costBase != null ? e.costBase * m : (costs.get(e.armId)?.C ?? null);
+        }
+        return e.costEffective ?? e.costBase ?? costs.get(e.armId)?.C ?? null;
+      };
       ladders[keyOf(account, i)] = {
         ...admitted,
         rankingRungs: ranking.rungs,
@@ -3003,6 +3011,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       roleDemand: demand.byRole,
       roleRunning,
       trialSlotCap: config.trials.maxInFlightPerAccount,
+      // Provider-scoped trial caps reach the concurrency target too, so a
+      // trial-only account on a capped provider never publishes more slots
+      // than its cap permits. Absent overrides read as the global cap.
+      trialSlotCapFor: (accountId) => trialInflightCapFor(config.trials, viewById.get(accountId)?.provider),
     };
     let concurrency = computeConcurrencyTarget({ ...concurrencyOptions, roleAccess: concurrencyRoleAccess });
     if (config.credits.priority === 'fallback') {
