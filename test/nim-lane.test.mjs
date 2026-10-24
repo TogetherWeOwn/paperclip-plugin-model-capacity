@@ -284,3 +284,159 @@ test('NIM-scoped cap holds at one; other providers keep two', async () => {
   assert.equal((await globalHook('run-nim-cap-1')).kind, 'decide');
   assert.equal((await globalHook('run-nim-cap-2')).kind, 'decide', 'global cap 2 still takes two');
 });
+
+// --- Tick/event-time/concurrency-target pins for the provider-scoped cap ---
+//
+// The reviewer mutants: reverting any one of the three non-hook scoped-cap
+// wirings (concurrency target, tick shadow loop, event-time shadow) keeps the
+// suite green, so each site gets its own driving test here. The hook site is
+// pinned by the end-to-end cap test above.
+
+const MIN = 60 * 1000;
+const T0 = Date.parse('2026-10-24T04:00:00Z');
+
+function nimDrive({ scoped, metered = false }) {
+  const store = new Map();
+  const jobs = new Map();
+  const handlers = new Map();
+  const key = k => JSON.stringify(k);
+  let now = T0;
+  const RESET = new Date(T0 + 4 * 24 * 60 * MIN).toISOString();
+  let weeklyUsed = 0.05;
+  const account = () => ({
+    lane: 'nvidia-nim-lane-1', provider: 'nvidia-nim', accountKey: 'nvidia-nim-lane-1',
+    health: 'healthy',
+    ...(metered
+      ? { meter: 'metered', quality: 'live', plan: 'free' }
+      : { meter: 'reactive', quality: 'reactive', plan: 'free' }),
+    models: [ALIAS],
+    weekly: metered ? { used: weeklyUsed, resetsAt: RESET } : { used: null, resetsAt: null },
+    fiveHour: { used: 0.1, resetsAt: new Date(now + 4 * MIN).toISOString() },
+    observedAt: new Date(now).toISOString(),
+  });
+  const laneBody = () => ({
+    observedAt: new Date(now).toISOString(),
+    servedModels: [ALIAS],
+    accounts: [account()],
+  });
+  const rows = [
+    { slug: 'step-5', intelligenceIndex: 72, intelligenceIndexCostPerTask: 9, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'claude-haiku-5-5', intelligenceIndex: 50, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ];
+  const config = {
+    enforce: true,
+    cliproxy: { laneKeySecretRef: SECRET },
+    roles: { minQuality: { doer: null, other: null, thinker: null }, doerAgentIds: ['eng'] },
+    modelAaOverrides: { [BARE]: { slug: 'step-5', effort: 'max' } },
+    placement: { freeCostProviders: ['nvidia-nim'] },
+    ...(scoped ? { trials: { maxInFlightPerAccountByProvider: { 'nvidia-nim': 1 } } } : {}),
+  };
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  const io = {
+    config: { get: async () => config },
+    state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    secrets: { resolve: async () => 'lane-key' },
+    http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(laneBody(), now, { emitted: { 'nvidia-nim': [BARE] } }) }) },
+    agents: { get: async () => ({ adapterType: 'claude-code' }) },
+    issues: { get: async () => null, list: async () => [] },
+    jobs: { register: (n, fn) => { jobs.set(n, fn); } },
+    events: { on: (n, fn) => { handlers.set(n, fn); } },
+    logger: { info() {}, error() {}, warn() {} },
+  };
+  const started = (runId, atMs) => ({
+    type: 'agent.run.started', companyId: 'acme', entityId: runId,
+    payload: { run: { agentId: 'eng', adapterType: 'claude-code', model: ALIAS } },
+    occurredAt: new Date(atMs).toISOString(),
+  });
+  const finished = (runId, atMs) => ({
+    type: 'agent.run.finished', companyId: 'acme', entityId: runId,
+    payload: { run: { agentId: 'eng' } }, occurredAt: new Date(atMs).toISOString(),
+  });
+  return {
+    setup: async () => {
+      await plugin.setup(io);
+      store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
+        { fetchedAt: new Date(T0).toISOString(), rows, duplicateSlugs: [] });
+      await plugin.onConfigChanged(config, { companyId: 'acme' });
+    },
+    tick: async (at) => { now = at; await jobs.get('shadow-tick')({ companyId: 'acme' }); },
+    fire: async (e) => { await handlers.get(e.type)(e); },
+    started,
+    finished,
+    setWeekly: (u) => { weeklyUsed = u; },
+    shadow: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' })).body.entries,
+    capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+  };
+}
+
+// Tick shadow loop: the tick counts every non-terminal run attributed to the
+// account as pressure -- including the candidate's own start. A finished
+// undecided run is terminal, so it leaves pressure without joining the
+// candidates: with run-tick-1 finished, run-tick-2 faces pressure 1 and the
+// scoped cap holds it while the global cap routes it. Events fire before the
+// first tick so no live view exists yet and the event-time path stays out of
+// it -- this pass isolates the tick loop.
+test('tick shadow loop enforces the NIM-scoped cap', async () => {
+  for (const scoped of [true, false]) {
+    const d = nimDrive({ scoped });
+    await d.setup();
+    await d.fire(d.started('run-tick-1', T0 + MIN));
+    await d.fire(d.finished('run-tick-1', T0 + MIN));
+    await d.fire(d.started('run-tick-2', T0 + MIN));
+    await d.tick(T0 + 2 * MIN);
+    const entries = (await d.shadow()).filter(e => e.runId === 'run-tick-2' && e.wouldModel);
+    if (scoped) {
+      assert.equal(entries.length, 0, 'scoped cap 1 holds the second run at pressure 1');
+    } else {
+      assert.equal(entries.length, 1, 'global cap 2 routes the second run at pressure 1');
+      assert.ok(String(entries[0].wouldModel).startsWith(ALIAS), `NIM alias, got ${entries[0].wouldModel}`);
+    }
+  }
+});
+
+// Event-time shadow: a run starting while one NIM run is already decided
+// event-time defers under the scoped cap; without the map both decide.
+// (Event-time decisions are memory-only until the next tick persists them,
+// so the shadow route is read after a closing tick. That tick also
+// re-offers the still-undecided run, which must defer again under the cap.)
+test('event-time shadow enforces the NIM-scoped cap', async () => {
+  for (const scoped of [true, false]) {
+    const d = nimDrive({ scoped });
+    await d.setup();
+    await d.tick(T0);
+    await d.fire(d.started('run-evt-1', T0 + MIN));
+    await d.fire(d.started('run-evt-2', T0 + MIN));
+    await d.tick(T0 + 2 * MIN);
+    const entries = (await d.shadow()).filter(e => ['run-evt-1', 'run-evt-2'].includes(e.runId) && e.wouldModel);
+    if (scoped) {
+      assert.equal(entries.length, 1, 'scoped cap 1 decides exactly one event-time run');
+      assert.ok(String(entries[0].wouldModel).startsWith(ALIAS), `NIM alias, got ${entries[0].wouldModel}`);
+    } else {
+      assert.equal(entries.length, 2, 'global cap 2 decides both event-time runs');
+    }
+  }
+});
+
+// Concurrency target: a measured metered NIM lane publishes at most 1 trial
+// slot under the scoped cap while the same lane publishes 2 without it.
+test('tick concurrency target honors the NIM-scoped trial cap', async () => {
+  for (const scoped of [true, false]) {
+    const d = nimDrive({ scoped, metered: true });
+    await d.setup();
+    await d.tick(T0);
+    for (let i = 0; i < 6; i++) await d.fire(d.started(`run-cal-${i}`, T0 + MIN + i * MIN));
+    d.setWeekly(0.05 + 0.003);
+    for (let i = 0; i < 6; i++) await d.fire(d.finished(`run-cal-${i}`, T0 + 14 * MIN + i * MIN));
+    await d.tick(T0 + 24 * MIN);
+    const cap = await d.capacity();
+    const row = cap.perAccount.find(a => a.accountId === 'nvidia-nim:nvidia-nim-lane-1');
+    assert.ok(row, 'NIM target row present');
+    assert.equal(row.trialOnly, true, 'lane is trial-only');
+    assert.ok((row.slots ?? 0) > 2, `quota allows more than the cap (slots ${row.slots})`);
+    if (scoped) {
+      assert.ok((row.usableSlots ?? 99) <= 1 + 1e-9, `scoped target clamps to 1 slot, got ${row.usableSlots}`);
+    } else {
+      assert.ok((row.usableSlots ?? 0) <= 2 + 1e-9 && (row.usableSlots ?? 0) > 1, `global target clamps to 2 slots, got ${row.usableSlots}`);
+    }
+  }
+});
