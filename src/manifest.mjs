@@ -358,7 +358,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.66';
+export const PLUGIN_VERSION = '0.2.67';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -678,6 +678,11 @@ const CONFIG_SCHEMA = {
       description: 'Trial lanes for model families without fleet success history (roles-gated, adapter-gated, in-flight-capped until measured success graduates them).',
       properties: {
         maxInFlightPerAccount: { type: 'integer', minimum: 1, default: 2 },
+        maxInFlightPerAccountByProvider: {
+          type: 'object', default: {},
+          description: 'Provider-scoped reactive in-flight cap per account (lower-cased provider name to integer >= 1, e.g. {"nvidia-nim": 1}). Overrides maxInFlightPerAccount only for that provider; every other provider keeps the global value. Empty (default) keeps every provider on the global cap.',
+          additionalProperties: { type: 'integer', minimum: 1 },
+        },
         maxInFlightPerFamily: { type: 'integer', minimum: 1, default: 2 },
         minRuns: { type: 'integer', minimum: 1, default: 10 },
         minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
@@ -733,6 +738,11 @@ const CONFIG_SCHEMA = {
       properties: {
         qualityWeight: { type: 'number', minimum: 0, default: 1 },
         allowanceWeight: { type: 'number', minimum: 0, default: 0.35 },
+        freeCostProviders: {
+          type: 'array', default: [],
+          description: "Providers whose 'free'-plan accounts place at zero monetary cost (e.g. [\"nvidia-nim\"]): costEffective and ladder cost read 0 while quality bars, quota/burn accounting and climbForSpend stay unchanged. Empty (default) prices every account from Artificial Analysis, exactly as before.",
+          items: { type: 'string', minLength: 1 },
+        },
       },
     },
     caps: {

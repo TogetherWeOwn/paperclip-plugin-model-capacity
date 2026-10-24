@@ -8,8 +8,8 @@ import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.66');
-  assert.equal(PLUGIN_VERSION, '0.2.66');
+  assert.equal(manifest.version, '0.2.67');
+  assert.equal(PLUGIN_VERSION, '0.2.67');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -98,6 +98,8 @@ test('v0.2.13 schema declares trials and modelAaOverrides', () => {
   assert.equal(props.trials.properties.minRuns.default, 10);
   assert.equal(props.trials.properties.minSuccessRate.default, 0.8);
   assert.deepEqual(props.trials.properties.adapters.default, { claude_local: ['*'], 'claude-code': ['*'] });
+  assert.deepEqual(props.trials.properties.maxInFlightPerAccountByProvider.default, {});
+  assert.deepEqual(props.placement.properties.freeCostProviders.default, []);
   assert.deepEqual(props.modelAaOverrides.default, {});
   assert.deepEqual(buildManifest({ modelResolve: false }).instanceConfigSchema.properties.trials, props.trials);
 });

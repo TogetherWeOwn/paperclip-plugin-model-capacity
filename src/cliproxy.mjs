@@ -223,6 +223,11 @@ export function parseLaneAccount(entry, nowMs = Date.now()) {
     // account is usable but unpaced); anything else with usage numbers is
     // metered. Null on feeds that predate the field (treated as metered).
     meter: entry?.meter ?? null,
+    // Feed plan (e.g. 'free' on creditless lanes). Carried so placement can
+    // price a listed free provider at zero monetary cost (see
+    // placement.freeCostProviders). Absent stays absent, so feeds without it
+    // parse byte-identically.
+    ...(typeof entry?.plan === 'string' && entry.plan ? { plan: entry.plan } : {}),
     // Regenerating credit bar (synthetic.new: one weekly bar that refills
     // 2% every 202 min, no reset): the feed forwards it as meterInfo on a
     // reactive lane. Its used share (0..1) is what burnMode.floors reads
