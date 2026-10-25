@@ -418,3 +418,85 @@ export function armsForAccount(arms, account) {
     })
     .sort((a, b) => (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
 }
+
+/** Identity-preserving AA aliases, composed rather than mutually exclusive.
+ * Never strip arbitrary/date/generation suffixes in the trusted path. */
+export function taskSlugBases(model) {
+  const canon = canonicalModelName(model);
+  if (!canon) return [];
+  let base = canon.replace(/\./g, '-');
+  // Price/context/contributor decorations may be combined by a served lane.
+  let prior;
+  do {
+    prior = base;
+    base = base.replace(/(?:-free|:free|-1m|-contributor)$/, '');
+  } while (base !== prior);
+  return [...new Set([canon, canon.replace(/\./g, '-'), base])];
+}
+
+export const taskArmId = (model, effort) => `${taskSlugBases(model).at(-1) ?? model}@${effort}`;
+
+/** Discover all exact model-effort observations for served models only.
+ * Existing classic bindings are verified effort evidence; newly discovered
+ * variants require an explicit endpoint effortSupport declaration. A family
+ * ceiling proves rejection above it, never acceptance below it. Unknown and
+ * borrowed observations stay in the report, not normal benchmark admission. */
+export function discoverTaskArms(aaRows, servedModels, { armMap = DEFAULT_ARM_MAP, overrides = {}, effortSupport = {} } = {}) {
+  const counts = new Map();
+  for (const r of aaRows ?? []) if (typeof r?.slug === 'string') counts.set(r.slug, (counts.get(r.slug) ?? 0) + 1);
+  const rows = (aaRows ?? []).filter(r => r?.slug && counts.get(r.slug) === 1);
+  const arms = [], unscored = [];
+  for (const model of new Set([...(servedModels ?? [])].map(canonicalModelName).filter(Boolean))) {
+    const bases = taskSlugBases(model);
+    const family = inferFamily(model);
+    if (NON_CHAT_MODEL_RE.test(model)) { unscored.push({ model, reason: 'non-chat-model', tried: bases }); continue; }
+    if ((family === 'muse' && !/-contributor(?:-free|:free|-1m)*$/.test(model))
+      || (family === 'sol' && !bases.includes('gpt-6-1-sol'))) {
+      unscored.push({ model, reason: 'identity-policy', tried: bases }); continue;
+    }
+    const override = overrides[model] ?? MODEL_AA_OVERRIDES[model];
+    const target = typeof override === 'string' ? override : override?.slug;
+    const identityOf = r => {
+      const exactBase = bases.find(base => base === r.slug);
+      if (exactBase) return { root: exactBase, effort: 'max' };
+      for (const root of bases) {
+        if (!r.slug.startsWith(`${root}-`)) continue;
+        const effort = r.slug.slice(root.length + 1);
+        if (EFFORT_ORDER.includes(effort)) return { root, effort };
+      }
+      return null;
+    };
+    const matched = rows.filter(r => target ? r.slug === target : identityOf(r) != null);
+    if (matched.length === 0) { unscored.push({ model, reason: 'no-aa-match', tried: target ? [target] : bases }); continue; }
+    const byEffort = new Map();
+    for (const r of matched) {
+      const identity = identityOf(r);
+      const effort = target && typeof override === 'object' && override.effort ? override.effort
+        : identity?.effort ?? parseEffortSuffix(r.slug);
+      const root = identity?.root ?? r.slug.replace(/-(minimal|low|medium|high|xhigh|max|ultra)$/, '');
+      const aaEffort = identity?.effort ?? parseEffortSuffix(r.slug);
+      const matchType = bases.includes(root) && effort === aaEffort ? (root === model ? 'exact' : 'verified-alias') : 'borrowed';
+      const knownBinding = armMap.some(b => b.aaSlug === r.slug && b.effort === effort
+        && taskSlugBases(b.model).some(s => bases.includes(s)));
+      const explicit = Object.hasOwn(effortSupport, model) && Array.isArray(effortSupport[model]) && effortSupport[model].includes(effort);
+      const effortVerified = effortAllowed(family, effort) && (knownBinding || explicit);
+      const candidate = { armId: taskArmId(model, effort), model, effort, family, providers: null, dynamic: !knownBinding,
+        aaSlug: r.slug, aaEffort, row: r, matchType, effortVerified,
+        matchReason: effort !== aaEffort ? 'aa-effort-mismatch' : matchType === 'borrowed' ? 'configured-benchmark-borrow' : null,
+        evidenceReason: !effortAllowed(family, effort) ? 'effort-inexpressible' : effortVerified ? null : 'effort-unverified' };
+      // A base and explicit -max row are ambiguous for the same arm. Do not
+      // choose whichever happened to arrive first in the source array.
+      if (byEffort.has(effort)) byEffort.set(effort, null);
+      else byEffort.set(effort, candidate);
+    }
+    for (const [effort, a] of byEffort) {
+      if (a) arms.push(a);
+      else unscored.push({ model, effort, reason: 'effort-ambiguous', tried: matched.map(r => r.slug) });
+    }
+    const expectedEfforts = new Set([...(Object.hasOwn(effortSupport, model) ? effortSupport[model] : []),
+      ...armMap.filter(b => taskSlugBases(b.model).some(base => bases.includes(base))).map(b => b.effort)]);
+    for (const effort of expectedEfforts) if (!byEffort.has(effort)) unscored.push({ model, effort,
+      reason: 'no-aa-effort-match', tried: bases.map(base => effort === 'max' ? base : `${base}-${effort}`) });
+  }
+  return { arms, unscored };
+}

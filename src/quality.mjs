@@ -6,7 +6,11 @@
  * as zero, so new arms with incomplete coverage are not punished for
  * simply being unmeasured.
  *
- * Default weights follow the research design with the SWE-bench proxy
+ * This legacy scorer is retained for off/shadow routing compatibility. Its
+ * Omniscience negation and cross-version fallbacks are NOT the schema used
+ * by the role-aware scorer below.
+ *
+ * Historical weights follow the research design with the SWE-bench proxy
  * folded into terminal-bench and scicode (no curated proxy table is
  * maintained). v0.1.2 adds hle at .10 with the existing weights scaled
  * x0.9 so the sum stays 1: terminalBench .36, scicode .18, tau2 .09,
@@ -40,7 +44,7 @@ export const METRIC_SOURCES = Object.freeze({
   lcr: ['lcr'],
 });
 
-/** Metrics where a higher raw value means worse quality. */
+/** Historical negations, retained only in the legacy scorer. */
 export const NEGATED_METRICS = new Set(['omniscience']);
 
 function metricValue(row, metric) {
@@ -97,5 +101,119 @@ export function computeComposite(arms, weights = DEFAULT_WEIGHTS) {
     }
     if (present <= 0) return { armId: arm.armId, Q: null, coverage: 0 };
     return { armId: arm.armId, Q: num / present, coverage: supportWeight > 0 ? present / supportWeight : 0 };
+  });
+}
+
+// Role ranking is deliberately separate from the legacy composite above:
+// mode=off/shadow must not silently change existing routing distributions.
+// Source/units verified against the public leaderboard and intelligence-
+// benchmarking methodology. Headline Omniscience ranges [-100,100]; its
+// non-hallucination component is a fraction [0,1], NOT a hallucination rate.
+const metric = (source, version, group, { min = 0, max = 1, aggregate = false, category = 'scored' } = {}) =>
+  Object.freeze({ source, direction: 'higher', units: max === 1 ? 'fraction' : 'index', min, max,
+    version, group, aggregate, category });
+const registry = {
+  terminalbenchV40: metric('terminalbenchV40', 'Terminal-Bench 4.0', 'coding'),
+  terminalbenchV21: metric('terminalbenchV21', 'Terminal-Bench 2.1', 'coding-legacy', { category: 'legacy' }),
+  terminalbenchHard: metric('terminalbenchHard', 'Terminal-Bench Hard (legacy)', 'coding-legacy', { category: 'legacy' }),
+  scicode: metric('scicode', 'SciCode (source snapshot harness)', 'coding'),
+  codingIndex: metric('codingIndex', 'legacy API coding index; not Coding Agent Index v2', 'coding', { max: 100, aggregate: true }),
+  intelligenceIndex: metric('intelligenceIndex', 'Intelligence Index (source snapshot version)', 'intelligence', { max: 100, aggregate: true }),
+  hle: metric('hle', 'HLE (source snapshot grader)', 'reasoning'),
+  gpqa: metric('gpqa', 'GPQA Diamond (legacy)', 'reasoning', { category: 'legacy' }),
+  critpt: metric('critpt', 'CritPt (source snapshot)', 'reasoning'),
+  lcr: metric('lcr', 'AA-LCR (source snapshot)', 'long-context'),
+  ifbench: metric('ifbench', 'IFBench (source snapshot)', 'instruction'),
+  gdpvalNormalized: metric('gdpvalNormalized', 'GDPval normalized (source snapshot)', 'agent'),
+  tau2: metric('tau2', 'tau2 (legacy, not Banking)', 'tool-use', { category: 'legacy' }),
+  tauBanking: metric('tauBanking', 'Banking (source snapshot)', 'banking'),
+  apexAgents: metric('apexAgents', 'APEX Agents (source snapshot)', 'agent'),
+  itbenchSre: metric('itbenchSre', 'ITBench SRE (source snapshot)', 'ops'),
+  analystAgent: metric('analystAgent', 'AnalystAgent (source snapshot)', 'agent'),
+  mmmuPro: metric('mmmuPro', 'MMMU Pro (source snapshot)', 'multimodal'),
+  omniscience: metric('omniscience', 'AA-Omniscience headline', 'reliability', { min: -100, max: 100 }),
+  omniscienceAccuracy: metric('omniscienceAccuracy', 'AA-Omniscience accuracy', 'reliability'),
+  omniscienceNonHallucination: metric('omniscienceNonHallucination', 'AA-Omniscience 1 - hallucination rate', 'reliability'),
+};
+// Every numeric observation already ingested has a declared disposition.
+// Aliases below describe the SAME version, not cross-version fallbacks.
+registry.terminalBench40 = { ...registry.terminalbenchV40, source: 'terminalBench40', category: 'diagnostic-only' };
+registry.terminalBench21 = { ...registry.terminalbenchV21, source: 'terminalBench21', category: 'diagnostic-only' };
+for (const source of ['intelligenceIndexCostPerTask', 'price1mInputTokens', 'price1mOutputTokens', 'cacheHitPrice', 'cacheWritePrice']) {
+  registry[source] = { source, direction: 'lower', units: 'USD', min: 0, max: Infinity, version: 'source snapshot', group: 'cost', aggregate: false, category: 'cost-related' };
+}
+registry.contextWindowTokens = { source: 'contextWindowTokens', direction: 'higher', units: 'tokens', min: 1, max: Infinity,
+  version: 'source snapshot', group: 'context', aggregate: false, category: 'feasibility-related' };
+for (const source of ['medianOutputTokensPerSecond', 'outputTokensPerSecondP5', 'outputTokensPerSecondP25',
+  'outputTokensPerSecondP75', 'outputTokensPerSecondP95', 'percentile05OutputTokensPerSecond',
+  'quartile25OutputTokensPerSecond', 'quartile75OutputTokensPerSecond', 'percentile95OutputTokensPerSecond',
+  'percentile05TimeToFirstTokenSeconds', 'quartile25TimeToFirstTokenSeconds', 'quartile75TimeToFirstTokenSeconds',
+  'percentile95TimeToFirstTokenSeconds', 'medianTimeToFirstTokenSeconds', 'medianTimeToFirstAnswerTokenSeconds',
+  'medianEndToEndResponseTimeSeconds', 'medianReasoningTimeSeconds']) {
+  registry[source] = { source, direction: source.includes('OutputTokens') ? 'higher' : 'lower',
+    units: source.includes('OutputTokens') ? 'tokens/second' : 'seconds', min: 0, max: Infinity,
+    version: 'source snapshot', group: 'latency', aggregate: false, category: 'latency-related' };
+}
+export const METRIC_REGISTRY = Object.freeze(Object.fromEntries(Object.entries(registry).map(([k, v]) => [k, Object.freeze(v)])));
+
+export const DEFAULT_ROLE_METRIC_WEIGHTS = Object.freeze({
+  doer: Object.freeze({ terminalbenchV40: .45, scicode: .15, lcr: .15, ifbench: .15, omniscienceNonHallucination: .10 }),
+  reviewer: Object.freeze({ terminalbenchV40: .25, hle: .20, lcr: .20, ifbench: .20, omniscienceNonHallucination: .15 }),
+  thinker: Object.freeze({ hle: .25, gpqa: .15, critpt: .15, gdpvalNormalized: .15, lcr: .15, ifbench: .10, omniscienceNonHallucination: .05 }),
+  other: Object.freeze({ terminalbenchV40: .45, scicode: .15, lcr: .15, ifbench: .15, omniscienceNonHallucination: .10 }),
+});
+
+export function validateMetricWeights(weights) {
+  if (!weights || typeof weights !== 'object' || Array.isArray(weights)) return ['profile must be a metric-weight object'];
+  const errors = [];
+  let total = 0;
+  for (const [key, value] of Object.entries(weights)) {
+    if (!Number.isFinite(value) || value < 0) errors.push(`${key}: weight must be finite and nonnegative`);
+    if (value > 0) {
+      total += value;
+      if (!METRIC_REGISTRY[key] || !['scored', 'legacy'].includes(METRIC_REGISTRY[key].category)) errors.push(`${key}: unsupported quality metric`);
+    }
+  }
+  if (!(total > 0) || !Number.isFinite(total)) errors.push('profile must have a finite positive total weight');
+  const keys = Object.keys(weights).filter(k => weights[k] > 0);
+  // Broad index plus its components double counts evidence. Coding index
+  // schema is legacy/unknown: never claim it is current agentic coding.
+  if (keys.includes('intelligenceIndex') && keys.some(k => !['intelligenceIndex', 'ifbench', 'itbenchSre', 'mmmuPro', 'analystAgent', 'apexAgents', 'codingIndex', 'tau2'].includes(k))) errors.push('intelligenceIndex conflicts with component evidence');
+  if (keys.includes('codingIndex') && keys.some(k => ['terminalbenchV40', 'terminalbenchV21', 'terminalbenchHard', 'scicode'].includes(k))) errors.push('codingIndex conflicts with coding component evidence');
+  if (keys.includes('omniscience') && keys.some(k => ['omniscienceAccuracy', 'omniscienceNonHallucination'].includes(k))) errors.push('omniscience conflicts with its components');
+  return errors;
+}
+
+export function metricObservation(row, key) {
+  const m = METRIC_REGISTRY[key];
+  const raw = m ? row?.[m.source] : null;
+  if (raw == null) return { value: null, reason: 'missing' };
+  if (!Number.isFinite(raw) || raw < m.min || raw > m.max) return { value: null, reason: 'invalid-observation' };
+  return { value: raw, reason: null };
+}
+
+/** Profile coverage is absolute as well as common-support relative. Nulls
+ * never become zeroes. Population may differ from the scored account; the
+ * fleet caller deduplicates model-effort identity before normalization. */
+export function computeRoleComposite(arms, weights, { population = arms } = {}) {
+  const errors = validateMetricWeights(weights);
+  if (errors.length) throw new Error(errors.join('; '));
+  const metrics = Object.keys(weights).filter(k => weights[k] > 0);
+  const stats = new Map(metrics.map(k => [k, meanStd(population.map(a => metricObservation(a.row, k).value).filter(v => v != null))]));
+  const total = metrics.reduce((n, k) => n + weights[k], 0);
+  const support = metrics.reduce((n, k) => n + (stats.get(k) ? weights[k] : 0), 0);
+  return arms.map(arm => {
+    let num = 0, present = 0, observedWeight = 0;
+    const components = Object.fromEntries(metrics.map(key => {
+      const observation = metricObservation(arm.row, key);
+      if (observation.value != null) observedWeight += weights[key];
+      const s = stats.get(key);
+      const z = observation.value == null || !s ? null : s.std > 0 ? (observation.value - s.mean) / s.std : 0;
+      if (z != null) { num += weights[key] * z; present += weights[key]; }
+      return [key, { ...observation, z, weight: weights[key], version: METRIC_REGISTRY[key].version,
+        observedAt: arm.row?.fieldObservedAt?.[key] ?? null, source: arm.row?.fieldSources?.[key] ?? 'aa-snapshot' }];
+    }));
+    return { armId: arm.armId, Q: present > 0 ? num / present : null, coverage: support > 0 ? present / support : 0,
+      absoluteCoverage: observedWeight / total, components };
   });
 }

@@ -39,6 +39,7 @@ import { isReactiveAccount } from './cliproxy.mjs';
 import { hasUsablePlanHeadroom } from './credits.mjs';
 import { isFallbackOnlyView, nativeQualifiedModels } from './cross-account.mjs';
 import { paceGuardPools } from './paceguard.mjs';
+import { compareTaskCosts } from './task-cost.mjs';
 
 /** Normalized burn deficit; 0 when either rate is unknown or required <= 0. */
 export function deficitOf(view) {
@@ -161,7 +162,7 @@ export function orderAccountsForRun(views, opts = {}) {
  * so plugin-routed work leaves quota for the Reviewer. Review runs
  * (forReview true) see the unheld order; absent the option nothing is held.
  */
-export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null, reviewReserve = null, creditPriority = 'fallback' } = {}) {
+export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadbandRel = 0.15, placement = null, pacing = null, reviewReserve = null, creditPriority = 'fallback', taskRanking = null } = {}) {
   const eligible = (views ?? []).filter(v => {
     if (v == null || v.health !== 'healthy') return false;
     if (isReactiveAccount(v)) return true;
@@ -187,7 +188,8 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // burn lanes are never held).
   const pacedVerdicts = verdicts.filter(p => (p.pacedAccountIds?.length ?? 0) > 0);
   const pacedIds = new Set(pacedVerdicts.flatMap(p => p.pacedAccountIds));
-  const routable = unheld.filter(v => !v.held);
+  const taskEnforce = taskRanking?.mode === 'enforce';
+  const routable = unheld.filter(v => !v.held && (!taskEnforce || (v.taskFeasible !== false && v.roleEligible !== false)));
   const qualified = pacedIds.size > 0 ? routable.filter(v => v.burn === true || !pacedIds.has(v.accountId)) : routable;
   // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
   // only models a qualified native also serves sorts after every need band.
@@ -245,6 +247,10 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
       : 0) ||
     (burnRank(b) - burnRank(a)) ||
     bandCmp(a, b) ||
+    // Capability/admission happened before this sort. Surplus quality and
+    // allowance cannot buy a pricier arm in the same operational bucket.
+    (taskEnforce ? Number(b.freeCost === true) - Number(a.freeCost === true) : 0) ||
+    (taskEnforce ? compareTaskCosts(a, b) : 0) ||
     (useQuality ? score.get(b) - score.get(a) : 0) ||
     (shortfall(b) - shortfall(a)) ||
     ((a.laneInFlight ?? 0) - (b.laneInFlight ?? 0)) ||

@@ -168,7 +168,7 @@ const providerOf = (a) => lc(a?.pool ?? a?.provider ?? String(a?.accountId ?? ''
  * Returns { provider, arm, armIndex, accountId, burn, poolPlanAhead,
  *   reason, considered } or { none: true, reason, considered }.
  */
-export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), serves = () => true, inFlightOf = null, reservePct = 0.05 } = {}) {
+export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), serves = () => true, inFlightOf = null, reservePct = 0.05, taskRanking = null, primaryUnavailableReasons = [] } = {}) {
   if (cfg == null || !Array.isArray(cfg.arms) || cfg.arms.length === 0) {
     return { none: true, reason: 'reviewer routing off', considered: 0 };
   }
@@ -189,13 +189,19 @@ export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), ser
   };
   const poolPerHour = (p) => pools.get(p)?.perHour ?? 0;
   const cands = [];
+  const primaryRefusals = [...primaryUnavailableReasons];
+  for (const a of accounts ?? []) if (providerOf(a) === 'meta' && !reviewerServable(a, { reservePct })) {
+    primaryRefusals.push(a.health !== 'healthy' ? `health ${a.health ?? 'unknown'}`
+      : a.action === 'excluded' ? 'excluded by account admission (quota/floor)'
+        : a.guardActive === true ? 'native guard active' : 'insufficient or unknown headroom');
+  }
   let refused = 0;
   for (const a of servable) {
     const p = providerOf(a);
     cfg.arms.forEach((arm, armIndex) => {
       if (arm.provider !== p) return;
       const ok = serves(a, arm);
-      if (ok !== true) { refused += 1; return; }
+      if (ok !== true) { refused += 1; if (p === 'meta') primaryRefusals.push(typeof ok === 'string' ? ok : 'configured primary arm rejected'); return; }
       cands.push({
         a, arm, armIndex, p,
         // The tick saw feed labels/email, including explicit burn exclusions.
@@ -218,6 +224,10 @@ export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), ser
   }
   cands.sort((x, y) =>
     (Number(x.credit) - Number(y.credit))
+    // Configured arms are the approval/risk fence. Benchmark priors never
+    // introduce a reviewer. In new enforce mode only, Meta is the primary
+    // provider AFTER funding/admission, not merely an arm-order tie-break.
+    || (taskRanking?.mode === 'enforce' ? Number(y.p === 'meta') - Number(x.p === 'meta') : 0)
     || (Number(y.burn) - Number(x.burn))
     || (x.ahead - y.ahead)
     || (y.perHour - x.perHour)
@@ -236,6 +246,13 @@ export function selectReviewerRoute({ cfg, accounts, burnTokens = new Set(), ser
     accountId: w.a.accountId,
     burn: w.burn,
     poolPlanAhead: Math.round(w.ahead * 10000) / 10000,
+    ...(taskRanking?.mode === 'enforce' ? {
+      primary: w.p === 'meta',
+      fallbackReason: w.p === 'meta' ? null : `approved Meta primary unavailable: ${cands.some(c => c.p === 'meta')
+        ? 'credit-fallback primary loses to approved plan-funded capacity'
+        : primaryRefusals.length ? [...new Set(primaryRefusals)].join('; ') : 'no Meta account serving a configured primary'}`,
+      evidenceTrust: 'policy-trusted-incumbent',
+    } : {}),
     considered: servable.length,
     reason: `reviewer routing: ${w.arm.model}(${w.arm.effort ?? 'default'}) on ${w.a.accountId} (${why})`,
   };

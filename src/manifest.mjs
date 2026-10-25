@@ -489,6 +489,39 @@ const CONFIG_SCHEMA = {
         lcr: { type: 'number', minimum: 0, default: 0.045 },
       },
     },
+    taskRanking: {
+      type: 'object', additionalProperties: false,
+      description: 'Role-aware AA task-workload cost priors. Shadow by default; cannot enable model resolution. Accepted-task calibration awaits native attributed outcomes.',
+      properties: {
+        mode: { type: 'string', enum: ['off', 'shadow', 'enforce'], default: 'shadow' },
+        profileVersion: { type: 'string', enum: ['aa-role-v1'], default: 'aa-role-v1' },
+        minAbsoluteCoverage: { type: 'number', minimum: .6, maximum: 1, default: .6 },
+        roleMetricWeights: {
+          type: 'object', additionalProperties: false,
+          description: 'Explicit profiles replace defaults for that role. Registered metric keys only; aggregate/component conflicts fail validation.',
+          properties: Object.fromEntries(['doer', 'reviewer', 'thinker', 'other'].map(role => [role, {
+            type: 'object', minProperties: 1, additionalProperties: { type: 'number', minimum: 0 },
+          }])),
+        },
+        effortSupport: {
+          type: 'object',
+          description: 'Verified endpoint effort support by exact emitted ID. Classic bindings retain their verified efforts; a family ceiling alone does not verify newly discovered variants.',
+          additionalProperties: { type: 'array', minItems: 1, uniqueItems: true,
+            items: { type: 'string', enum: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] } },
+        },
+        calibration: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            enabled: { type: 'boolean', enum: [false], default: false },
+            windowDays: { type: 'integer', minimum: 7, default: 7 },
+            minClosedTasks: { type: 'integer', minimum: 30, default: 30 },
+            minAcceptedTasks: { type: 'integer', minimum: 10, default: 10 },
+            priorTasks: { type: 'integer', minimum: 30, default: 30 },
+            maxRelativeCiHalfWidth: { type: 'number', exclusiveMinimum: 0, maximum: .5, default: .5 },
+          },
+        },
+      },
+    },
     eee: {
       type: 'object', additionalProperties: false,
       description: 'EEE benchmark prior (Phase 2): secondary quality signal blended beside AA. Absent/stale artifact keeps AA-only behavior bit-for-bit.',
