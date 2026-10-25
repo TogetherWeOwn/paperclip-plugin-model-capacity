@@ -155,10 +155,22 @@ function drive({ accounts, config = {}, nowMs = NOW }) {
   const key = (k) => JSON.stringify(k);
   let now = nowMs;
   let laneAccounts = accounts;
+  let readPause = null;
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET, ...(config.cliproxy ?? {}) } }) },
-    state: { get: async (k) => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
+    state: {
+      get: async (k) => {
+        if (readPause?.stateKey === k.stateKey) {
+          const pause = readPause;
+          readPause = null;
+          pause.entered.resolve();
+          await pause.released.promise;
+        }
+        return store.get(key(k)) ?? null;
+      },
+      set: async (k, v) => { store.set(key(k), v); },
+    },
     secrets: { resolve: async () => 'lane-key' },
     http: {
       fetch: async () => ({
@@ -189,6 +201,12 @@ function drive({ accounts, config = {}, nowMs = NOW }) {
     setNow: (ms) => { now = ms; },
     setAccounts: (next) => { laneAccounts = next; },
     seed: (stateKey, value) => { store.set(key(stateKey), value); },
+    pauseStateRead: (stateKey) => {
+      const entered = Promise.withResolvers();
+      const released = Promise.withResolvers();
+      readPause = { stateKey, entered, released };
+      return { reached: entered.promise, resume: released.resolve };
+    },
     fire: (e) => handlers.get(e.type)(e),
     api: async (routeKey) => (await plugin.onApiRequest({ companyId: 'acme', routeKey })).body,
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
@@ -374,6 +392,105 @@ test('exhaustion keep rejects a healthy default whose weekly meter is exhausted'
   assert.ok(outs.every(out => out.kind === 'defer'), 'an exhausted default never gets a bounded keep');
   assert.match(outs[10].reason, /claude:a1 excluded from admission/);
   assert.match(outs[10].reason, /default model claude-haiku-5-5 has no safe serving account/);
+});
+
+test('exhaustion keep control: a ready, non-excluded default with a closed breaker can keep', async () => {
+  const d = drive({
+    accounts: [withReadyCredentials(claudeBoundedKeep(), NOW), withReadyCredentials(metaAheadKnown(), NOW)],
+    config: baseConfig({ credentialReadiness: { enforce: true } }),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 10; i++) {
+    assert.equal((await d.hook(`run-keep-control-${i}`)).kind, 'defer', `attempt ${i} defers`);
+  }
+  assert.deepEqual(await d.hook('run-keep-control-11'), { kind: 'keep' });
+});
+
+test('exhaustion keep rejects an excluded default family independently of other hard gates', async () => {
+  const d = drive({
+    accounts: [withReadyCredentials(claudeBoundedKeep(), NOW), withReadyCredentials(metaAheadKnown(), NOW)],
+    config: baseConfig({
+      credentialReadiness: { enforce: true },
+      roles: { minQuality: { doer: null, other: null, thinker: null }, excludeFamilies: { doer: ['haiku'] } },
+    }),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`run-keep-excluded-${i}`);
+    assert.equal(out.kind, 'defer', `excluded default attempt ${i} defers`);
+    if (i >= 11) {
+      assert.match(out.reason, /claude:a1 no eligible arm \(breaker\/readiness\/exclusions\)/);
+      assert.match(out.reason, /default model claude-haiku-5-5 has no safe serving account/);
+    }
+  }
+});
+
+test('exhaustion keep rejects a newly opened breaker before the next live view publishes', async () => {
+  const d = drive({
+    accounts: [withReadyCredentials(claudeBoundedKeep(), NOW), withReadyCredentials(metaAheadKnown(), NOW)],
+    config: baseConfig({ credentialReadiness: { enforce: true }, breakers: { tripCount: 1 } }),
+  });
+  await d.setup();
+  await d.tick();
+  // Record a real bounded keep, then fail that run. The next tick opens its
+  // breaker before publishing a replacement view. A hook during that I/O
+  // gap must recheck the breaker, not trust the old view's admitted arm.
+  for (let i = 1; i <= 10; i++) assert.equal((await d.hook(`run-before-breaker-${i}`)).kind, 'defer');
+  assert.deepEqual(await d.hook('run-before-breaker-11'), { kind: 'keep' });
+  await d.fire({
+    type: 'agent.run.failed', companyId: 'acme', entityId: 'run-before-breaker-11',
+    occurredAt: OBS,
+    payload: { modelDecision: { model: HAIKU }, error: 'auth_unavailable' },
+  });
+  for (let i = 1; i <= 10; i++) assert.equal((await d.hook(`run-keep-breaker-${i}`)).kind, 'defer');
+  const pause = d.pauseStateRead('smoothing-v1');
+  const ticking = d.tick();
+  try {
+    await pause.reached;
+    for (const i of [11, 12]) {
+      const out = await d.hook(`run-keep-breaker-${i}`);
+      assert.equal(out.kind, 'defer', `open-breaker default attempt ${i} defers`);
+      assert.match(out.reason, /claude:a1 no eligible arm \(breaker\/readiness\/exclusions\)/);
+      assert.match(out.reason, /default model claude-haiku-5-5 has no safe serving account/);
+    }
+  } finally {
+    pause.resume();
+    await ticking;
+  }
+  const breakers = (await d.api('capacity')).armBreakers;
+  assert.ok(breakers.some(b => b.accountId === 'claude:a1' && b.armId === HAIKU && b.status === 'open'),
+    'the failed keep really opened the default arm breaker');
+});
+
+test('exhaustion keep rejects expired default credentials while another account remains ready', async () => {
+  const defaultAccount = withReadyCredentials(claudeBoundedKeep(), NOW);
+  for (const row of defaultAccount.credentialAvailability.models) {
+    row.expiresAt = new Date(NOW + 30000).toISOString();
+  }
+  const d = drive({
+    accounts: [defaultAccount, withReadyCredentials(metaAheadKnown(), NOW)],
+    config: baseConfig({ credentialReadiness: { enforce: true } }),
+  });
+  await d.setup();
+  await d.tick();
+  // The view is still fresh, but the default arm's evidence has expired.
+  // Meta stays credential-ready (so the global all-unready fast path cannot
+  // mask the keep gate), yet ahead of plan (so the scan cannot route it).
+  d.setNow(NOW + 31000);
+  d.killIo();
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`run-keep-credentials-${i}`);
+    assert.equal(out.kind, 'defer', `credential-unready default attempt ${i} defers`);
+    if (i >= 11) {
+      assert.match(out.reason, /exhaustion scan:/);
+      assert.match(out.reason, /meta:m1 ahead of plan/);
+      assert.match(out.reason, /default model claude-haiku-5-5 has no safe serving account/);
+    }
+  }
 });
 
 test('exhaustion scan never selects a degraded metered trial account with an exhausted weekly window', async () => {
