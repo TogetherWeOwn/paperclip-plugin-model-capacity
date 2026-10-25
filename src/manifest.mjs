@@ -723,6 +723,29 @@ const CONFIG_SCHEMA = {
         finalAnswerFromAttempt: { type: 'integer', minimum: 1, maximum: 12, default: 11, description: '1-based chain attempt from which the hook answers instead of deferring (12 is the host retry budget).' },
       },
     },
+    freeLanes: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in additive free capacity outside paid C*. Only explicitly listed low-risk issue agents qualify. Provider request rates size slots, not an API request limiter.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        minQuality: { type: 'number', default: 0.4, description: 'Strict fleet-normalized quality floor for free arms. Unknown quality is denied.' },
+        lowRiskAgentIds: { type: 'array', default: [], items: { type: 'string', minLength: 1 } },
+        providers: { type: 'object', default: {}, additionalProperties: {
+          type: 'object', additionalProperties: false, required: ['requestsPerMinute'],
+          properties: {
+            requestsPerMinute: { type: 'number', exclusiveMinimum: 0 },
+            requestsPerMinutePerSlot: { type: 'number', exclusiveMinimum: 0, default: 12 },
+            requestsPerDay: { type: 'integer', minimum: 1 },
+            requestsPerRun: { type: 'number', exclusiveMinimum: 0, description: 'Required with a daily limit. Estimated requests reserved per admission, including failures.' },
+          },
+        } },
+        demotion: { type: 'object', additionalProperties: false, properties: {
+          lastRuns: { type: 'integer', minimum: 1, maximum: 1000, default: 10 },
+          minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
+          windowHours: { type: 'number', exclusiveMinimum: 0, maximum: 24, default: 24 },
+        } },
+      },
+    },
     trials: {
       type: 'object', additionalProperties: false,
       description: 'Trial lanes for model families without fleet success history (roles-gated, adapter-gated, in-flight-capped until measured success graduates them).',

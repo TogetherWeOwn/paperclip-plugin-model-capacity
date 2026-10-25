@@ -138,6 +138,21 @@
   "credentialReadiness": {
     "enforce": false
   },
+  "freeLanes": {
+    "enabled": false,
+    "minQuality": 0.4,
+    "lowRiskAgentIds": [],
+    "providers": {
+      "nvidia-nim": { "requestsPerMinute": 36, "requestsPerMinutePerSlot": 12 },
+      "openrouter": {
+        "requestsPerMinute": 20,
+        "requestsPerMinutePerSlot": 12,
+        "requestsPerDay": 1000,
+        "requestsPerRun": 100
+      }
+    },
+    "demotion": { "lastRuns": 10, "minSuccessRate": 0.8, "windowHours": 24 }
+  },
   "exhaustion": {
     "enabled": false,
     "finalAnswerFromAttempt": 11

@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+### Added
+- Opt-in `freeLanes` routing for dedicated low-risk, first-attempt issue agents. Free-plan providers have shared RPM-sized additive budgets outside paid C*, a separate strict quality floor (default 0.4), optional UTC-day request reservations, and exact-arm outcome demotion (default below 80% of the last 10 measured outcomes). The outcome signal is failed runs/status progress, not adjudicated review acceptance; request budgets are estimates, not an API limiter.
+- Free running counts and cap headroom stay separate from paid allocations. Existing manual exclusions, native pins, reviewer boundaries, credential-readiness mode, context caps, task-evidence trust and breakers retain authority. Synthetic and unmetered Workers AI are excluded; NIM Muse and non-`:free` OpenRouter IDs are denied. No new job, capability, external call, host script or core patch. The default-off path is unchanged.
+
+### Fixed
+- Bound blocking-priority cap smoothing by the paid target before adding free allocations; a held paid cap cannot spend the separate free budget when both opt-ins are enabled.
+- Keep free admissions outside paid per-family trial budgets, before and after each tick. Fail closed before the first free snapshot and when a stale snapshot would keep an unadmitted free default. Preserve free running floors after demotion with weak paid calibration; keep `maxConcurrentRuns` synchronized with additive allocations and prevent queued starts from exceeding the shared process ceiling.
+
+### Blocking-priority allocation
 - Retain the two newest priority snapshots per company, including pending and failed reads, so caps requests for the still-published tick cannot evict the next tick's demand snapshot. Bound retention by tick timestamp rather than request arrival order; deterministic registered-job/API overlap regressions cover active and fallback reads, shared pending requests, eviction and config invalidation.
 - Validate native relation availability before using per-tick demand for the capacity target. Unavailable graphs preserve the legacy target and demand TTL as well as caps; usable graphs share fresh target/caps demand. Pin non-ready priority-root exclusion and equal-size contradictory-edge fallback with integration regressions.
 - Keep active priority counts and metadata on the same fresh per-tick ready snapshot, while unavailable graphs retain ordinary demand refreshes. Reject empty, malformed or contradictory native relation snapshots, and do not amplify priority for idle routed headroom.

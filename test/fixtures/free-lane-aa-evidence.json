@@ -1,0 +1,22 @@
+{
+  "source": "https://artificialanalysis.ai/leaderboards/models",
+  "snapshotAt": "2026-10-25T04:17:28.964Z",
+  "note": "Selected public benchmark fields only. These are not fleet-normalized Q or measured task success rates.",
+  "rows": [
+    {
+      "slug": "step-5",
+      "intelligenceIndex": 43.7343049141614,
+      "terminalbenchV40": 0.333333333333333
+    },
+    {
+      "slug": "gpt-oss-120b",
+      "intelligenceIndex": 11.6028431512592,
+      "terminalbenchV40": 0
+    },
+    {
+      "slug": "llama-4-maverick",
+      "intelligenceIndex": 9.29902687437199,
+      "terminalbenchV40": 0
+    }
+  ]
+}
