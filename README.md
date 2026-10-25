@@ -19,6 +19,83 @@ sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
 
+## Reviewer backlog demand (v0.2.69; opt-in, activation gated)
+
+A slot-metered review gate may enqueue only one review at a time even when many
+CI-green PRs await review. Queued heartbeat runs alone cannot size that reviewer.
+`reviewDemand` adds proven review-eligible **current PR heads** to heartbeat demand:
+
+```json
+{
+  "reviewDemand": {
+    "repositories": ["example/product"],
+    "tokenSecretRef": { "type": "secret_ref", "secretId": "<existing-read-only-token-secret-id>" },
+    "requiredChecks": ["ci-ok", "pr-lint"]
+  }
+}
+```
+
+This optional plugin reader uses a fixed read-only GitHub GraphQL query. The
+native chat review history starts after admission (and its list is limited to
+100 rows); it cannot reveal heads outside the gate. The SDK does not expose
+chat review reads or another plugin's private state. No direct database access,
+core patch, new credential, or host script is used. **Design approval is not
+activation, credential-binding, installation or release approval.** Before
+activation, the authorized custodian must evidence the installed host/SDK build
+and its fixed-target transport (DNS/IP pinning, private-IP refusal, TLS hostname
+verification and no redirect following), plus the existing secret reference's
+version, repository selection, read-only metadata scopes, expiry and revocation
+path. The SDK drops `RequestInit.redirect`; a mocked `manual` flag is not
+transport proof. Incompatible or unverified transport leaves the source disabled.
+Absent configuration or `enabled: false` performs no new source I/O.
+
+Only open, non-draft, mergeable PRs whose configured CI checks all succeeded at
+the current head count. Missing checks, unknown mergeability, mismatched commit
+IDs and truncated check rollups do not count. A same-head Paperclip Review
+success/failure is a verdict, not new demand; a missing, pending, or
+`ACTION_REQUIRED` review is waiting. Required CI names are explicit because
+optional third-party reviews may remain pending; configure the actual CI gate
+names for the selected repositories. This signal changes sizing only, never
+review/merge admission. Different gate-name sets need separate configuration
+in a later extension; do not weaken the list to fit a heterogeneous scope.
+
+The reader caches only aggregate results for five minutes per company/full
+configuration (including secret version), coalesces concurrent reads, rejects
+non-200/followed responses, and caps collection at 25 repositories, 50 pages,
+100 PRs/page and 100 check contexts/head. Owner/repository lengths are bounded
+to 39/100 characters; opaque upstream cursors to 4096. Local configuration events
+invalidate completed and pending cache generations; no subsequent page is issued
+and no pending positive result is published after invalidation. Re-enable starts
+fresh. Secret/page/census logical waits are bounded to 5/10/20 seconds. These
+logical deadlines do not cancel native I/O: an already-issued request may drain
+within the evidenced host transport cap. A failed, partial or rate-limited census
+returns `unavailable` and zero added demand, never stale headroom. If configuration
+changes during caps processing, that response preserves only running floors,
+returns `target: null` and `capsError: "configuration-changed"`, and does not
+mislabel the result as breaker cooling. Unavailable
+results may be cached too; recovery can therefore take up to five minutes. `/caps.reviewDemand` reports health/count/time; review agents report
+`heartbeatQueued` and `reviewEligibleHeads`. The shadow tick includes these heads
+before bounding the fleet target. A shared backlog is split once, weighted by the
+capacity each reviewer can actually use after heartbeat demand and existing
+account/pool/fleet guards; empty admissions and spent pools receive no new shares.
+Equal usable capacity splits evenly, with deterministic remainder assignment.
+
+Reviewer identities come from `reviewReserve.agentIds` (defaulting to
+`roles.keepAgentIds`) and `reviewerRouting.agentIds`, independently of routing.
+Fixed-model reviewers count heads but remain constrained to their serving pool.
+Routed reviewer caps use every account admitted by their configured routing arms,
+not just the adapter default model's pool. Existing arm/readiness/breaker,
+headroom and pace guards remain in force. With blocking priority off, fixed-model
+agents reserve first; reviewers share the remaining account/pool budgets and
+fleet ceiling. When it is on, all new fixed/reviewer/ordinary slots compete by
+resource-feasible weighted quanta as described below. Routing order is unchanged:
+this change does not alter primary/helper preference.
+The admission snapshot expires after two minutes. Newly stamped admissions also
+belong to the producing plugin instance and configuration generation: restart or
+configuration change requires a new tick before those helper grants can resume.
+Exhausted arms preserve only existing running floors. Undo: disable `reviewDemand` to remove the new
+source, or reinstall the prior release to restore the previous cap allocator.
+
 ## Role-aware AA task ranking (unreleased)
 
 `taskRanking.mode` is **`shadow` by default**. It computes a proposed route and
@@ -931,6 +1008,19 @@ agent, with neutral priority when its queue is empty); kept agents reserve no
 idle headroom. When an agent or serving pool
 saturates, its excess share is redistributed among remaining eligible agents,
 including agents in other kept pools, rather than leaving usable slots idle.
+
+When routed reviewer admissions are present, shared account subsets need an
+additional resource constraint. That combined path awards whole slots by the
+highest `((queued + 1) × priorityWeight) / (newSlots + 1)` (D'Hondt), where
+`priorityWeight` includes the fan-out multiplier above, with agent-ID ties, testing the full
+funding plan before each award. Flexible assignments are rematched rather than
+consuming a constrained peer's only account. Fractional accounts can combine
+inside one pool, never across unrelated pools. The ordinary-only path retains
+largest-remainder shares; the combined path is not a claim of exact Hamilton
+rounding. A fixed 8192-step search/flow budget bounds difficult multi-pool cases:
+if reached, only the already-proven feasible prefix is returned and `/caps`
+reports `allocation.resourceStatus: "search-limited"`. Such a response can
+conservatively underfill; it never invents a slot to finish the search.
 
 Active mode fits allocations to **both** the rounded integer fleet target and
 `maxTotal`, rather than the legacy below-target burst to the ceiling. Existing

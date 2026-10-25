@@ -22,6 +22,7 @@
  * (flagged `enforced:true`); the next tick persists the same records.
  */
 
+import { randomUUID } from 'node:crypto';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -108,6 +109,7 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
+import { validateReviewDemand, normalizeReviewDemand, createReviewDemandReader } from './review-demand.mjs';
 import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps, paidTrialLedger } from './free-lanes.mjs';
 
 const NS = 'model-capacity';
@@ -343,6 +345,7 @@ export function validateConfigShape(raw) {
     }
   }
   errors.push(...validateReviewerRouting(raw.reviewerRouting));
+  errors.push(...validateReviewDemand(raw.reviewDemand));
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
       errors.push('armMap entries need aaSlug, model, effort, family, providers');
@@ -638,6 +641,7 @@ export function resolveConfig(raw = {}) {
     reviewerRouting: normalizeReviewerRouting(raw.reviewerRouting, {
       reviewAgentIds: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }).agentIds,
     }),
+    reviewDemand: normalizeReviewDemand(raw.reviewDemand),
     // Burn mode tokens (tolerant read; absent = nothing flagged): reviewer
     // routing prefers accounts flagged here.
     burnModeTokens: [...burnModeTokens(raw.burnMode)],
@@ -1059,6 +1063,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  const readReviewDemand = createReviewDemandReader({ clock });
+  // Persisted admission must not compare equal after a worker restart, even
+  // when its wall clock and first per-company configuration counter match.
+  const reviewAdmissionEpoch = randomUUID();
+  const configGenerations = new Map();
+  const configGenerationOf = companyId => configGenerations.get(companyId) ?? 0;
+  const reviewAgentIdsFor = config => new Set([
+    ...(config?.reviewReserve?.agentIds ?? []), ...(config?.reviewerRouting?.agentIds ?? []),
+  ]);
   // Reconciliation marks (never deletes): every tick, non-terminal ledger
   // records anchored outside the in-flight horizon are flagged `unverified`
   // and excluded from counting. Idempotent, so no once-flag is needed and a
@@ -1341,13 +1354,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const zero = { doer: 0, thinker: 0, other: 0 };
     try {
       const snapshot = config.allocation.blockingPriority ? await blockingSnapshot(companyId, nowMs) : null;
-      // Only a usable graph switches target demand to the tick snapshot. Failed
-      // validation must retain the same ordinary TTL demand as legacy /caps.
-      const counts = snapshot?.priorities != null ? snapshot.counts : await queuedByAgent(companyId, nowMs);
+      // Keep cached priority demand immutable when overlaying review heads.
+      // Invalid graphs retain the ordinary demand memo's TTL semantics.
+      const counts = new Map(snapshot?.priorities != null ? snapshot.counts : await queuedByAgent(companyId, nowMs));
+      const reviewIds = reviewAgentIdsFor(config);
+      let reviewDemand = { eligibleHeads: 0 };
+      if (config.reviewDemand && reviewIds.size > 0 && lastConfig.get(companyId) === config) {
+        const heartbeat = await queuedHeartbeatsByAgent(companyId, nowMs);
+        for (const id of reviewIds) counts.set(id, heartbeat.ok ? (heartbeat.counts.get(id) ?? 0) : 0);
+        // The fleet demand bound must see pre-admission heads too, not only
+        // the later /caps allocator. The reader shares its bounded cache.
+        if (lastConfig.get(companyId) === config) reviewDemand = await readReviewDemand(ctx, companyId, config.reviewDemand);
+        const ids = [...reviewIds].sort();
+        for (const [i, id] of ids.entries()) {
+          const heads = Math.floor(reviewDemand.eligibleHeads / ids.length)
+            + (i < reviewDemand.eligibleHeads % ids.length ? 1 : 0);
+          counts.set(id, (counts.get(id) ?? 0) + heads);
+        }
+      }
       const byRole = { ...zero };
       for (const [agentId, n] of counts) byRole[roleOf(config, agentId)] += n;
       const total = byRole.doer + byRole.thinker + byRole.other;
-      return total > 0 ? { byRole, source: 'issues' } : { byRole: zero, source: 'idle' };
+      return total > 0 ? { byRole, source: reviewDemand.eligibleHeads > 0 ? 'issues+review-heads' : 'issues' }
+        : { byRole: zero, source: 'idle' };
     } catch (error) {
       ctx.logger.error('model-capacity: role demand read failed', { companyId, error: error?.message ?? String(error) });
       return { byRole: zero, source: 'unavailable' };
@@ -2060,6 +2089,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   async function runShadowTick(companyId, job) {
+    const generation = configGenerationOf(companyId);
     const nowMs = clock();
     const raw = await ctx.config.get(companyId);
     const config = resolveConfig(raw);
@@ -2102,6 +2132,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Trial family counters drive which families route as trials; the fresh
     // resolved config feeds the memory-only event-time path (see setup).
     const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
+    if (generation !== configGenerationOf(companyId)) return { status: 'configuration-changed' };
     lastConfig.set(companyId, config);
     // Arm circuit breaker: memory truth loaded once per worker start (like the
     // ledger); every tick reuses it and persists it below. Finished-run
@@ -3285,6 +3316,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     let concurrencyRoleAccess = roleAccess;
     const demand = await roleDemandFor(companyId, config, nowMs);
+    if (generation !== configGenerationOf(companyId)) return { status: 'configuration-changed' };
     // In-flight runs per role join the demand bound (see concurrency.mjs):
     // the queued-issue count cannot see runs on in_review issues, chat or
     // heartbeat runs, and a queued-only bound can otherwise drop the served
@@ -4129,6 +4161,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
     const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
       .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs));
+    // Use the real routing admission, not the configured default model's pool.
+    // An empty list is meaningful: no helper may grant new review slots.
+    const reviewerAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
+      const { admissionOf } = pickReviewerRoute(reviewerLive, companyId, agentId, null, nowMs);
+      return [agentId, (reviewerLive.accounts ?? []).filter(a => config.reviewerRouting.arms.some(arm =>
+        admissionOf.has(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`))).map(a => a.accountId)];
+    }));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
         const access = roleAccess?.[v.accountId];
@@ -4354,10 +4393,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       taskRanking.candidates = taskRanking.candidates.map(({ credentialEvidence, row, ...c }) => c);
       delete taskRanking.accounts;
     }
+    if (generation !== configGenerationOf(companyId)) return { status: 'configuration-changed' };
     const freeCapacity = config.freeLanes.enabled ? freeCapacityReport(liveViews.get(companyId), companyId, nowMs) : null;
     const publishedTarget = freeCapacity?.target > 0
       ? Math.min(config.concurrency.maxTotal, (concurrency.target ?? 0) + freeCapacity.target) : concurrency.target;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
+      reviewAdmissionGeneration: generation,
+      ...(reviewAgentIdsFor(config).size > 0 ? { reviewAdmissionEpoch } : {}),
       atMs: nowMs,
       taskRanking,
       ...(freeCapacity ? { freeLanes: freeCapacity, paidTarget: concurrency.target,
@@ -4417,6 +4459,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       agentRunning,
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
+      reviewerAccountIdsByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -5852,6 +5895,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       configured.add(companyId);
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).
+      configGenerations.set(companyId, configGenerationOf(companyId) + 1);
+      readReviewDemand.invalidate(companyId);
       const nextConfig = resolveConfig(raw);
       blockingPriorityCache.delete(companyId);
       priorityReadyCache.delete(companyId);
@@ -5907,6 +5952,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return { status: 200, body: (await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} } };
       }
       if (input.routeKey === 'caps') {
+        const generation = configGenerationOf(companyId);
+        const resolved = lastConfig.get(companyId);
         const cap = (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? {};
         const atMs = cap.atMs ?? null;
         const calibration = cap.calibration ?? 'weak';
@@ -5944,19 +5991,28 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const blockingPriority = priorityRequested && priorities != null;
         const runningByAgent = cap.agentRunning ?? {};
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
-        // Kept agents and routed review agents (reviewerRouting.agentIds)
-        // draw queued demand from actual queued heartbeat runs, never from
-        // assigned open cards. Every other agent keeps issue demand.
-        const reviewIds = new Set(lastConfig.get(companyId)?.reviewerRouting?.agentIds ?? []);
+        // Review identities do not depend on model routing: fixed-model
+        // reviewers receive the census too, but can use only their own pool.
+        const reviewIds = reviewAgentIdsFor(resolved);
+        const routedReviewIds = new Set(resolved?.reviewerRouting?.agentIds ?? []);
         const heartbeatIds = new Set([...keptIds, ...reviewIds]);
         const heartbeat = await queuedHeartbeatsByAgent(companyId, clock());
-        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
+        const admissionAgeMs = Number.isFinite(atMs) ? clock() - atMs : Infinity;
+        const reviewAdmissionFresh = admissionAgeMs >= 0 && admissionAgeMs <= 120_000
+          && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionGeneration === generation)
+          && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionEpoch === reviewAdmissionEpoch)
+          && generation === configGenerationOf(companyId);
+        const reviewDemandConfig = reviewIds.size > 0 ? resolved?.reviewDemand : null;
+        const reviewDemand = reviewDemandConfig && !reviewAdmissionFresh
+          ? { status: 'unavailable', eligibleHeads: 0, reason: 'review-admission-stale' }
+          : await readReviewDemand(ctx, companyId, reviewDemandConfig);
+        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent), ...reviewIds]);
         if (heartbeat.ok) {
           for (const agentId of heartbeat.counts.keys()) {
             if (heartbeatIds.has(agentId)) agentIds.add(agentId);
           }
         }
-        const capInputs = [...agentIds].map(agentId => ({
+        const baseInputs = [...agentIds].map(agentId => ({
           agentId,
           running: runningByAgent[agentId]?.running ?? 0,
           queued: heartbeatIds.has(agentId)
@@ -5965,24 +6021,51 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           overPace: runningByAgent[agentId]?.overPace === true,
           ...(blockingPriority ? { allocationWeight: priorities.get(agentId)?.weight ?? 1 } : {}),
         }));
-        const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
-          heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
-        ]));
-        // Fixed-model agents consume the same fleet target, but only from the
-        // capacity of their serving pool. Routed demand receives the remainder.
-        const allocated = allocateKeptAndRoutedCaps({
+        const allocationInput = {
           target: paidTarget ?? 0,
+          blockingPriority,
           maxTotal: cap.maxTotal ?? 75,
           demandFactor: cap.demandFactor ?? 1,
-          agents: capInputs,
           keepAgentIds: [...keptIds],
           keptByAgent: cap.keptByAgent ?? {},
           accounts: cap.accounts ?? [],
           perAccount: cap.perAccount ?? [],
           pacePools: cap.paceGuard?.pools ?? [],
           unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
-          blockingPriority,
-        });
+          reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
+            reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
+              ? cap.reviewerAccountIdsByAgent[id] : []])),
+        };
+        // Probe the SAME account/pool/fleet guards without committing slots.
+        // Weight each once-only head share by usable post-heartbeat capacity:
+        // empty admissions and spent pools cannot strand a sibling's backlog.
+        const reviewShares = new Map();
+        if (reviewDemand.eligibleHeads > 0) {
+          const probe = allocateKeptAndRoutedCaps({ ...allocationInput, agents: baseInputs.map(a => ({ ...a,
+            // Priority competition happens AFTER heads join demand. Letting
+            // other queued work spend this feasibility probe can hide heads
+            // before the real weighted split; all running still reserves room.
+            queued: reviewIds.has(a.agentId) ? a.queued + reviewDemand.eligibleHeads : blockingPriority ? 0 : a.queued,
+          })) });
+          const queuedOf = new Map(baseInputs.map(a => [a.agentId, a.queued]));
+          const funded = [...probe.kept, ...probe.routed].filter(a => reviewIds.has(a.agentId))
+            .map(a => ({ id: a.agentId, slots: Math.max(0, a.allocated - a.running - queuedOf.get(a.agentId)) }))
+            .filter(a => a.slots > 0);
+          const slots = funded.reduce((sum, a) => sum + a.slots, 0);
+          const shares = funded.map(a => ({ ...a, exact: reviewDemand.eligibleHeads * a.slots / slots }));
+          for (const a of shares) reviewShares.set(a.id, Math.floor(a.exact));
+          let remainder = reviewDemand.eligibleHeads - [...reviewShares.values()].reduce((sum, n) => sum + n, 0);
+          shares.sort((a, b) => (b.exact % 1) - (a.exact % 1) || a.id.localeCompare(b.id));
+          for (const a of shares) {
+            if (remainder-- <= 0) break;
+            reviewShares.set(a.id, reviewShares.get(a.id) + 1);
+          }
+        }
+        const capInputs = baseInputs.map(a => ({ ...a, queued: a.queued + (reviewShares.get(a.agentId) ?? 0) }));
+        const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
+          heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
+        ]));
+        const allocated = allocateKeptAndRoutedCaps({ ...allocationInput, agents: capInputs });
         const keptCaps = allocated.kept;
         const unheld = allocated.routed;
         // Hysteresis (#3): wants follow the instantaneous queue, so served
@@ -6002,14 +6085,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
               : allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
-          await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+          if (generation === configGenerationOf(companyId)) {
+            await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+          }
         } catch (error) {
           ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
         }
         // Reserved floors run LAST, after the allocator and the hold. Floors
         // suspend during fleet-wide breaker cooling, and a kept-agent floor
         // above its pool ceiling is blocked rather than violating pace.
-        const resolved = lastConfig.get(companyId);
         const reservedFloors = resolved?.caps?.reservedFloors ?? {};
         let floorsSuspended = false;
         let floorSummary = {};
@@ -6047,8 +6131,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         if (cap.freeLanes) {
           const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
-          // This uses paid-only running counts above. Free running never
-          // consumes C*, and additive slots cannot shrink a paid allocation.
+          // Free running and headroom stay outside the paid allocation above.
           const freeEnabled = freeLaneConfigs.get(companyId)?.enabled === true;
           agents = freeLaneCaps(agents, freeRunning, freeEnabled ? cap.freeLanes.target : 0,
             freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], cap.maxTotal ?? 75);
@@ -6056,9 +6139,31 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         for (const agent of agents) {
           agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
           if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
+          if (reviewIds.has(agent.agentId) && reviewDemand.status !== 'disabled') {
+            agent.heartbeatQueued = heartbeat.ok ? (heartbeat.counts.get(agent.agentId) ?? 0) : 0;
+            agent.reviewEligibleHeads = reviewShares.get(agent.agentId) ?? 0;
+            agent.demandSource = `heartbeat-runs+review-heads${reviewDemand.status === 'ok' ? '' : '-unavailable'}`;
+          }
         }
-        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended,
+        // Reader invalidation alone cannot revoke a result already resolved
+        // before hold-state I/O. Fence the entire publication: an old config
+        // may preserve running work, but cannot authorize ANY new slots.
+        if (generation !== configGenerationOf(companyId)) {
+          const paidFloors = baseInputs.map(a => ({ ...a, allocated: a.running, maxConcurrentRuns: a.running }));
+          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
+          const floors = (cap.freeLanes
+            ? freeLaneCaps(paidFloors, freeRunning, 0, [], cap.maxTotal ?? 75) : paidFloors)
+            .filter(a => a.running + a.queued > 0).map(a => ({ ...a,
+              demand: a.running + a.queued, reason: 'configuration-changed', reviewEligibleHeads: 0,
+            }));
+          return { status: 200, body: { atMs, calibration, target: null, agents: floors,
+            capsError: 'configuration-changed',
+            reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
+            reservedFloors: {}, floorsSuspended: false } };
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended,
           ...(priorityRequested ? { allocation: { blockingPriority,
+            ...(allocated.resourceStatus ? { resourceStatus: allocated.resourceStatus } : {}),
             ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
         } };
       }

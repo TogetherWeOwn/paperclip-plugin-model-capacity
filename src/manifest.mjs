@@ -356,9 +356,10 @@
 
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
+import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.68';
+export const PLUGIN_VERSION = '0.2.69';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -638,6 +639,17 @@ const CONFIG_SCHEMA = {
         supplyHoursToReset: { type: 'number', exclusiveMinimum: 0, default: 120, description: 'Hours-to-reset under which unused headroom counts as close to reset.' },
         doerStarvationMarginRuns: { type: 'number', exclusiveMinimum: 0, default: 4, description: 'C*-vs-live-doer gap (runs) that counts as doer starvation.' },
         doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
+      },
+    },
+    reviewDemand: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in pre-admission PR-head census. Requires an explicitly approved read-only GitHub credential reference; absent/disabled performs no new HTTP reads.',
+      anyOf: [{ required: ['enabled'], properties: { enabled: { const: false } } }, { required: ['repositories', 'tokenSecretRef'] }],
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        repositories: { type: 'array', minItems: 1, maxItems: 25, items: { type: 'string', pattern: REVIEW_REPOSITORY_PATTERN.source } },
+        tokenSecretRef: { ...SECRET_REF, description: 'Existing read-only GitHub token, never an App private key. No credential is created or rotated.' },
+        requiredChecks: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string', minLength: 1, maxLength: 200, not: { const: 'Paperclip Review' } }, default: ['ci-ok', 'pr-lint'] },
       },
     },
     reviewerRouting: {
