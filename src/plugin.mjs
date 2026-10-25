@@ -57,7 +57,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
+import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, roleTakesTrial, adapterAllowsTrial, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts, applyBurnFloors } from './burnmode.mjs';
 import {
@@ -136,6 +136,17 @@ const LEGACY_RING_KEY = 'shadow-ring-v1';
 const CLAUDE_CLI_ADAPTERS = new Set(['claude_local', 'claude-code']);
 /** AA context window at or above which a claude run needs the 1M suffix. */
 const ONE_M_CONTEXT_TOKENS = 1000000;
+
+/**
+ * Deferral-exhaustion mirror of the host budget: the host clamps a plugin
+ * defer to [1s, 60s] (retryAfterMs) and allows RUN_MODEL_RESOLVE_MAX_ATTEMPTS
+ * = 12 retries per chain, each retry a NEW runId. The per-runId deferredRuns
+ * marks can therefore never detect the end of the chain; the per-issue+agent
+ * streak below counts it instead. Keep in step with the host constant.
+ */
+export const EXHAUSTION_HOST_ATTEMPTS = 12;
+/** First chain attempt that answers instead of deferring (attempts are 1-based). */
+export const EXHAUSTION_DEFAULT_FINAL_ATTEMPT = 11;
 
 /**
  * Decorated model string for 1M-context claude runs, or null when the
@@ -422,6 +433,22 @@ export function validateConfigShape(raw) {
     }
   }
   if (raw.enforce != null && typeof raw.enforce !== 'boolean') errors.push('enforce must be a boolean');
+  // Deferral-exhaustion (Design B): answering instead of deferring on the last
+  // attempts of the host's bounded retry chain. Off by default.
+  if (raw.exhaustion != null) {
+    const exh = raw.exhaustion;
+    if (typeof exh !== 'object' || Array.isArray(exh)) {
+      errors.push('exhaustion must be an object');
+    } else {
+      if ('enabled' in exh && typeof exh.enabled !== 'boolean') {
+        errors.push('exhaustion.enabled must be a boolean');
+      }
+      if ('finalAnswerFromAttempt' in exh && (!Number.isInteger(exh.finalAnswerFromAttempt)
+        || exh.finalAnswerFromAttempt < 1 || exh.finalAnswerFromAttempt > EXHAUSTION_HOST_ATTEMPTS)) {
+        errors.push(`exhaustion.finalAnswerFromAttempt must be an integer in [1, ${EXHAUSTION_HOST_ATTEMPTS}]`);
+      }
+    }
+  }
   if (raw.credentialReadiness != null) {
     const readiness = raw.credentialReadiness;
     if (typeof readiness !== 'object' || Array.isArray(readiness)) {
@@ -638,6 +665,19 @@ export function resolveConfig(raw = {}) {
       // Empty (default) keeps every provider on the global cap, exactly as
       // before. Malformed entries are dropped, never promoted.
       maxInFlightPerAccountByProvider: normalizeTrialCapByProvider(raw.trials?.maxInFlightPerAccountByProvider),
+    },
+    // Deferral-exhaustion (Design B): on the last attempts of the host's
+    // bounded retry chain (default from attempt 11 of 12), stop deferring
+    // and answer with the cheapest selectable free-overflow arm under the
+    // existing trial caps, else a bounded keep. Disabled by default: absent
+    // reads exactly as before (every terminal still defers).
+    exhaustion: {
+      enabled: raw.exhaustion?.enabled === true,
+      finalAnswerFromAttempt: Number.isInteger(raw.exhaustion?.finalAnswerFromAttempt)
+        && raw.exhaustion.finalAnswerFromAttempt >= 1
+        && raw.exhaustion.finalAnswerFromAttempt <= EXHAUSTION_HOST_ATTEMPTS
+        ? raw.exhaustion.finalAnswerFromAttempt
+        : EXHAUSTION_DEFAULT_FINAL_ATTEMPT,
     },
     // Operator extensions to the AA-slug override table (CLIProxy model
     // id -> AA slug or { slug, effort }); merged over the built-in table.
@@ -862,6 +902,82 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   };
   const clearDeferred = (companyId, runId) => {
     if (runId != null) deferredRuns.get(companyId)?.delete(String(runId));
+  };
+  // Deferral-exhaustion streaks (Design B), per company: key -> { count,
+  // firstAtMs, lastAtMs }. The host retries a deferred run as a NEW runId,
+  // so the per-runId deferredRuns marks reset every retry and can never
+  // detect exhaustion. A streak needs BOTH stable card and agent identifiers;
+  // absent identifiers never share a synthetic fallback key. Memory-only (a
+  // restart starts every streak at zero, i.e. defers first, exactly like today).
+  //
+  // Every non-defer answer, including an exhaustion answer, ends that retry
+  // chain and clears its streak. A later chain for the same card must earn its
+  // own grace period instead of inheriting a terminal count. Streaks expire
+  // after a day and the map is bounded, so a forgotten card cannot grow memory
+  // without bound.
+  const EXHAUSTION_STREAK_TTL_MS = 24 * 3600 * 1000;
+  const EXHAUSTION_STREAK_CAP = 1000;
+  const exhaustionStreaks = new Map();
+  const exhaustionKeyOf = (params) => {
+    const issueId = params?.issueId;
+    const agentId = params?.agentId;
+    if (issueId == null || agentId == null) return null;
+    const issueKey = String(issueId).trim();
+    const agentKey = String(agentId).trim();
+    return issueKey.length > 0 && agentKey.length > 0 ? `${issueKey}|${agentKey}` : null;
+  };
+  const exhaustionStreaksFor = (companyId) => {
+    let m = exhaustionStreaks.get(companyId);
+    if (!m) { m = new Map(); exhaustionStreaks.set(companyId, m); }
+    return m;
+  };
+  const pruneExhaustionStreaks = (m, nowMs) => {
+    for (const [k, s] of m) {
+      if (nowMs - (s?.lastAtMs ?? 0) >= EXHAUSTION_STREAK_TTL_MS) m.delete(k);
+      else break;
+    }
+    while (m.size > EXHAUSTION_STREAK_CAP) {
+      const oldest = m.keys().next();
+      if (oldest.done) break;
+      m.delete(oldest.value);
+    }
+  };
+  const exhaustionStreakCount = (companyId, params, nowMs) => {
+    const key = exhaustionKeyOf(params);
+    if (key == null) return 0;
+    const m = exhaustionStreaks.get(companyId);
+    if (!m) return 0;
+    const s = m.get(key);
+    if (!s || nowMs - (s.lastAtMs ?? 0) >= EXHAUSTION_STREAK_TTL_MS) return 0;
+    return s.count ?? 0;
+  };
+  const bumpExhaustionStreak = (companyId, params, nowMs) => {
+    const key = exhaustionKeyOf(params);
+    if (key == null) return 0;
+    const m = exhaustionStreaksFor(companyId);
+    pruneExhaustionStreaks(m, nowMs);
+    const prev = m.get(key);
+    const next = {
+      count: (prev?.count ?? 0) + 1,
+      firstAtMs: prev?.firstAtMs ?? nowMs,
+      lastAtMs: nowMs,
+    };
+    m.delete(key);
+    m.set(key, next);
+    return next.count;
+  };
+  const clearExhaustionStreak = (companyId, params) => {
+    const key = exhaustionKeyOf(params);
+    if (key != null) exhaustionStreaks.get(companyId)?.delete(key);
+  };
+  /** Resolved exhaustion knob for the hook (memory-only, from onConfigChanged). */
+  const exhaustionFor = (companyId) => lastConfig.get(companyId)?.exhaustion ?? null;
+  const exhaustionEnabledFor = (companyId) => exhaustionFor(companyId)?.enabled === true;
+  const exhaustionFinalAttemptFor = (companyId) => {
+    const n = exhaustionFor(companyId)?.finalAnswerFromAttempt;
+    return Number.isInteger(n) && n >= 1 && n <= EXHAUSTION_HOST_ATTEMPTS
+      ? n
+      : EXHAUSTION_DEFAULT_FINAL_ATTEMPT;
   };
   /**
    * Pooled in-flight for the pace guard: records that are actually
@@ -2191,6 +2307,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         meter: account.meter ?? null,
         quality: account.quality,
         reactive,
+        // Free-overflow marker for the deferral-exhaustion path: a 'free'-plan
+        // account on an operator-listed provider places at zero monetary cost.
+        freeCost: isFreeCostAccount(account, config.placement.freeCostProviders),
         weeklyUsedPct: weeklyUsed,
         fiveHourUsedPct: fiveHourUsed,
         headroomPct,
@@ -3600,6 +3719,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           remainingPct: view?.remainingPct ?? null,
           targetShare: view?.targetShare ?? null,
           reactive: view?.reactive === true,
+          // Free-overflow tier for the deferral-exhaustion path (additive:
+          // nothing else reads it).
+          freeCost: view?.freeCost === true,
           guardActive: view?.guardActive === true,
           health: view?.health ?? 'unknown',
           meter: view?.meter ?? null,
@@ -4405,6 +4527,313 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   /**
+   * Deferral-exhaustion answer (Design B, memory-only). The host gives the
+   * hook RUN_MODEL_RESOLVE_MAX_ATTEMPTS = 12 chained retries (a new runId
+   * every retry) and then freezes the card; the per-runId deferredRuns marks
+   * reset every retry, so they can never see the chain end. When the
+   * per-issue+agent streak reaches the final attempts, this stops deferring
+   * and answers instead:
+   *
+   * 1. Candidate accounts are live accounts with health healthy/degraded, a
+   *    closed-breaker arm surviving the role exclusions, and role access --
+   *    IGNORING the pace-guard pool cap and the 5h headroom reserve (the two
+   *    holds that strand pacing, priced below). The review reserve still
+   *    holds: quota reserved for review runs is never spent here.
+   * 2. Hard caps are never bypassed: the per-account reactive cap
+   *    (liveTrialInflightCapFor), the per-family trial budget
+   *    (effectiveTrialBudget), roleTakesTrial/adapterAllowsTrial, the role
+   *    exclusions, credential readiness, and the arm breaker.
+   * 3. Order is cheapest-first: free-cost providers (nvidia-nim) first, then
+   *    trial-eligible accounts, then the lowest burnPerRunPct/ladder cost.
+   *    Metered pools ahead of plan or exhausted are NEVER selected: an
+   *    ahead lane needs no more runs, whatever the host budget says. (A pool
+   *    held only by the pace-guard in-flight cap is the explicitly priced
+   *    bypass and may be selected.)
+   * 4. No selectable arm falls back to a bounded keep on the agent default
+   *    model -- but ONLY when that model serves from a healthy/degraded
+   *    account, and for non-review runs not from a review-reserve held
+   *    account. An exhausted, held-only, or unmapped default keeps
+   *    deferring: strand the card rather than burn an exhausted pool or
+   *    held quota.
+   *
+   * Returns { answer } (decide or keep, recorded enforced:true / kept with a
+   * 'deferral-exhausted: <prior> -> <arm|kept model>' reason) or
+   * { answer: null, skips } with one per-account skip reason for
+   * diagnosability. Never throws for a malformed view: bad accounts are
+   * skipped, never selected.
+   */
+  async function exhaustionAnswer({ live, params, role, selfId, priorReason, forReview, hookLedger, nowMs }) {
+    const skips = [];
+    const fail = () => ({ answer: null, skips });
+    const companyId = params?.companyId;
+    const roleExcluded = normalizeExcludedFamilies(live?.excludeFamilies?.[role] ?? []);
+    const adapter = params?.adapterType ?? liveAdapterFor(live, params?.agentId) ?? null;
+    const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+    const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
+    const trialRoles = live?.trialRoles ?? DEFAULT_TRIALS.roles;
+    const trialAdapters = live?.trialAdapters ?? {};
+    // The review reserve holds quota FOR review runs: non-review runs never
+    // spend it, even at exhaustion.
+    const heldIds = new Set(
+      (!forReview && live?.reviewReserve?.enabled === true)
+        ? (live.reviewReserve.heldAccountIds ?? [])
+        : [],
+    );
+    const margin = typeof live?.paceGuard?.marginPct === 'number' ? live.paceGuard.marginPct : 0.02;
+    const capBase = new Map((live?.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
+    const acctPending = pendingByAccount(live, companyId, selfId);
+    const budget = effectiveTrialBudget(live, companyId, selfId);
+    const trialOkFor = (arm) => arm?.trial === true
+      && roleTakesTrial(trialRoles, role, arm.family)
+      && adapterAllowsTrial(trialAdapters, adapter, arm.family)
+      && (budget[arm.family] ?? 0) > 0;
+    const armCost = (view, arm) => {
+      const burn = view?.burnPerRunPct?.[arm?.armId];
+      if (typeof burn === 'number' && Number.isFinite(burn)) return burn;
+      const cost = arm?.costEffective ?? arm?.C;
+      if (typeof cost === 'number' && Number.isFinite(cost)) return cost;
+      return Infinity;
+    };
+    const cands = [];
+    for (const view of live?.accounts ?? []) {
+      const accountId = view?.accountId;
+      if (typeof accountId !== 'string' || accountId.length === 0) continue;
+      if (view.health !== 'healthy' && view.health !== 'degraded') {
+        skips.push(`${accountId} health ${view.health ?? 'unknown'}`);
+        continue;
+      }
+      if (view.health === 'healthy' && view.action === 'excluded') {
+        skips.push(`${accountId} ${view.reason ?? 'excluded from admission'}`);
+        continue;
+      }
+      if (heldIds.has(accountId)) {
+        skips.push(`${accountId} review-reserve held`);
+        continue;
+      }
+      // Ahead-of-plan metered pools are never selected at exhaustion: the
+      // pool needs no more runs this window, whatever the host budget says.
+      // Reactive accounts carry no plan position (never ahead); burn-mode
+      // accounts are operator-flagged to spend.
+      const ahead = !view.reactive && view.burn !== true && view.planAhead != null && view.planAhead > margin;
+      if (ahead) {
+        skips.push(`${accountId} ahead of plan ${Math.round(view.planAhead * 1000) / 10}%`);
+        continue;
+      }
+      // Breaker-filtered like the tick loop, so the hook never picks an arm
+      // the tick would skip; then the role exclusions, same as the main loop.
+      const roleRungs = filterRungsByExcludedFamilies(
+        filterBreakerRungs(view.ladderRungs ?? [], bstore, accountId, nowMs, bcfg),
+        roleExcluded,
+      );
+      if (!rungsHaveEligibleArms(roleRungs)) {
+        skips.push(`${accountId} no eligible arm (breaker/readiness/exclusions)`);
+        continue;
+      }
+      if (roleLadderAccess(roleRungs, {
+        role, roleBands: live.roleBands, excludedFamilies: roleExcluded, trialRoles,
+      }).eligible !== true) {
+        skips.push(`${accountId} no arm reachable for role ${role}`);
+        continue;
+      }
+      // Unknown headroom on a metered account is never "plenty of quota"
+      // (CISO unknown-headroom rule); reactive accounts carry no meter.
+      if (!view.reactive && !view.remainingKnown) {
+        skips.push(`${accountId} metered headroom unknown`);
+        continue;
+      }
+      // A spent weekly window cannot serve until reset. Credit-backed lanes
+      // publish `credits` instead and remain eligible under their own guard.
+      // This still matters for degraded accounts, whose recovery eligibility
+      // intentionally bypasses the healthy-only action exclusion above.
+      if (!view.reactive && view.headroomSource === 'weekly') {
+        skips.push(`${accountId} weekly window exhausted`);
+        continue;
+      }
+      // The per-account reactive cap is a hard cap, even at exhaustion.
+      if (view.reactive
+        && (capBase.get(accountId) ?? 0) + (acctPending.get(accountId) ?? 0) >= liveTrialInflightCapFor(live, view)) {
+        skips.push(`${accountId} trial cap ${(capBase.get(accountId) ?? 0) + (acctPending.get(accountId) ?? 0)}/${liveTrialInflightCapFor(live, view)} in flight`);
+        continue;
+      }
+      const arms = roleRungs.flatMap(g => g?.arms ?? []);
+      const free = view.freeCost === true;
+      const trialEligible = arms.some(trialOkFor);
+      let cost = Infinity;
+      for (const arm of arms) cost = Math.min(cost, armCost(view, arm));
+      cands.push({ view, roleRungs, tier: free ? 0 : (trialEligible ? 1 : 2), cost });
+    }
+    cands.sort((a, b) => (a.tier - b.tier) || (a.cost - b.cost)
+      || (a.view.accountId < b.view.accountId ? -1 : a.view.accountId > b.view.accountId ? 1 : 0));
+    for (const { view, roleRungs } of cands) {
+      const d = decide({
+        runId: params.runId,
+        agentId: params.agentId,
+        role,
+        ladderRungs: roleRungs,
+        excludedFamilies: roleExcluded,
+        pointer: view.pointer ?? 0,
+        retryCount: 0,
+        failureClass: 'none',
+        contextTokens: null,
+        // The 5h headroom reserve is ignored at exhaustion (that hold is the
+        // strand); the headroom itself still bounds non-trial arms, and trial
+        // arms bypass it by construction with the family budget bounding them.
+        fiveHourHeadroomPct: view.headroomPct ?? null,
+        burnPerRunPct: view.burnPerRunPct ?? {},
+        reservePct: 0,
+        accountId: view.accountId,
+        roleBands: live.roleBands,
+        contextCaps: live.contextCaps,
+        adapterType: adapter,
+        trialBudget: budget,
+        trialAdapters,
+        trialRoles,
+      });
+      if (d.kind !== 'decide') {
+        skips.push(`${view.accountId} decide skipped (${d.reason})`);
+        continue;
+      }
+      if (!decisionCredentialReady(d, roleRungs, companyId)) {
+        skips.push(`${view.accountId} arm ${d.armId ?? d.model} not credential-ready`);
+        continue;
+      }
+      // Half-open probe claim, exactly like the main loop: only enforced
+      // runs route real traffic, so only they occupy the probe slot.
+      if (d.armId != null && params?.runId != null
+        && breakerState(bstore, d.accountId, d.armId, nowMs, bcfg) === 'half-open'
+        && !startProbe(bstore, d.accountId, d.armId, params.runId, nowMs, bcfg)) {
+        skips.push(`${view.accountId} arm ${d.armId} half-open probe occupied`);
+        continue;
+      }
+      const reason = `deferral-exhausted: ${priorReason} -> ${d.accountId}/${d.armId ?? d.model}`;
+      const emitAdapter = params?.adapterType ?? liveAdapterFor(live, params?.agentId) ?? null;
+      const decorated = decoratedModelFor(d, emitAdapter);
+      clearDeferred(companyId, params.runId);
+      clearExhaustionStreak(companyId, params);
+      recordDecision(hookLedger, {
+        runId: String(params.runId ?? 'unknown'),
+        agentId: String(params.agentId ?? 'unknown'),
+        accountId: d.accountId,
+        armId: d.armId ?? null,
+        effort: d.effort ?? null,
+        enforced: true,
+        wouldModel: decorated ?? `${d.model}(${d.effort ?? 'default'})`,
+        rung: d.rung,
+        trial: d.trial === true,
+        family: inferFamily(canonicalModelName(d.model)),
+        reason,
+      }, nowMs);
+      return {
+        answer: {
+          kind: 'decide',
+          decisionId: d.decisionId,
+          model: decorated ?? d.model,
+          effort: d.effort,
+          env: d.env,
+          source: d.source,
+          reason,
+        },
+      };
+    }
+    // No selectable arm: a bounded keep on the agent default model, but only
+    // when its serving account passes the same hard admission gates as a
+    // candidate. Pace-pool and 5h headroom holds remain the only relaxations.
+    // An exhausted, held-only, excluded, or unmapped default keeps deferring:
+    // strand the card rather than burn an exhausted pool or held quota.
+    const defModel = params?.agentDefaultModel;
+    if (typeof defModel === 'string' && defModel.trim().length > 0) {
+      const canon = String(canonicalModelName(defModel) ?? '').toLowerCase();
+      let serving = null;
+      let heldOnly = false;
+      if (canon) {
+        for (const a of live?.accounts ?? []) {
+          const accountId = a?.accountId;
+          if (typeof accountId !== 'string' || accountId.length === 0) continue;
+          if (a.health !== 'healthy' && a.health !== 'degraded') continue;
+          if (a.health === 'healthy' && a.action === 'excluded') continue;
+          const hasDefault = liveLadderArms(a).some((x) => x != null
+            && String(canonicalModelName(x.model) ?? '').toLowerCase() === canon);
+          if (!hasDefault) continue;
+          // Reserve quota is for review runs: a non-review keep must not
+          // spend a held account, even at exhaustion.
+          if (heldIds.has(accountId)) { heldOnly = true; continue; }
+          const ahead = !a.reactive && a.burn !== true && a.planAhead != null && a.planAhead > margin;
+          if (ahead || (!a.reactive && !a.remainingKnown)
+            || (!a.reactive && a.headroomSource === 'weekly')) continue;
+          if (a.reactive
+            && (capBase.get(accountId) ?? 0) + (acctPending.get(accountId) ?? 0) >= liveTrialInflightCapFor(live, a)) continue;
+          const roleRungs = filterRungsByExcludedFamilies(
+            filterBreakerRungs(a.ladderRungs ?? [], bstore, accountId, nowMs, bcfg),
+            roleExcluded,
+          );
+          if (!rungsHaveEligibleArms(roleRungs)
+            || !roleLadderAccess(roleRungs, {
+              role, roleBands: live.roleBands, excludedFamilies: roleExcluded, trialRoles,
+            }).eligible) continue;
+          const defaultRungs = roleRungs.map(group => ({
+            ...group,
+            arms: (group.arms ?? []).filter(arm => arm != null
+              && String(canonicalModelName(arm.model) ?? '').toLowerCase() === canon),
+          }));
+          if (!rungsHaveEligibleArms(defaultRungs)) continue;
+          const d = decide({
+            runId: params.runId,
+            agentId: params.agentId,
+            role,
+            ladderRungs: defaultRungs,
+            excludedFamilies: roleExcluded,
+            pointer: a.pointer ?? 0,
+            retryCount: 0,
+            failureClass: 'none',
+            contextTokens: null,
+            // A bounded keep intentionally ignores the transient 5h hold;
+            // the account still had to prove known metered headroom above.
+            fiveHourHeadroomPct: null,
+            burnPerRunPct: a.burnPerRunPct ?? {},
+            reservePct: 0,
+            accountId,
+            roleBands: live.roleBands,
+            contextCaps: live.contextCaps,
+            adapterType: adapter,
+            trialBudget: budget,
+            trialAdapters,
+            trialRoles,
+          });
+          if (d.kind !== 'decide' || !decisionCredentialReady(d, defaultRungs, companyId)) continue;
+          if (d.armId != null && params?.runId != null
+            && breakerState(bstore, d.accountId, d.armId, nowMs, bcfg) === 'half-open'
+            && !startProbe(bstore, d.accountId, d.armId, params.runId, nowMs, bcfg)) continue;
+          const arm = defaultRungs.flatMap(group => group.arms ?? [])
+            .find(item => item.armId === d.armId) ?? null;
+          serving = { account: a, arm };
+          break;
+        }
+      }
+      if (serving) {
+        const reason = `deferral-exhausted: ${priorReason} -> kept ${defModel}`;
+        recordDecision(hookLedger, {
+          runId: String(params?.runId ?? 'unknown'),
+          agentId: String(params?.agentId ?? 'unknown'),
+          accountId: serving.account.accountId,
+          armId: serving.arm?.armId ?? null,
+          enforced: false,
+          wouldModel: defModel,
+          family: serving.arm?.family ?? inferFamily(canonicalModelName(defModel)),
+          reason,
+        }, nowMs);
+        clearDeferred(companyId, params?.runId);
+        clearExhaustionStreak(companyId, params);
+        return { answer: keptCapsAnswer(params, live, `deferral-exhausted: ${priorReason}; kept`) ?? { kind: 'keep' } };
+      }
+      if (heldOnly) skips.push(`default model ${defModel} serves only from review-reserve held accounts`);
+      else skips.push(`default model ${defModel} has no safe serving account`);
+    } else {
+      skips.push('no agent default model to keep');
+    }
+    return fail();
+  }
+
+  /**
    * Reviewer routing in the hook (memory-only apart from the ledger join).
    * Returns a decide answer, or null when routing is off for the agent, the
    * snapshot is stale, or no arm qualifies (the caller keeps / routes as
@@ -5023,8 +5452,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     async onResolveRunModel(params) {
       // A run the hook keeps executes on its default model whatever it was
       // told before: it is no longer waiting, so the pace guard counts it.
+      // A routed run proves the lane servable: the exhaustion streak resets.
       const keep = () => {
         clearDeferred(params?.companyId, params?.runId);
+        if (exhaustionEnabledFor(params?.companyId)) clearExhaustionStreak(params.companyId, params);
         return { kind: 'keep' };
       };
       const live = params?.companyId ? liveViews.get(params.companyId) : null;
@@ -5036,7 +5467,43 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // arm (burn mode, then the pool most behind plan); no qualifying arm
       // falls through to keep below. Off (absent config) = unchanged.
       const reviewRoute = await routeReviewerRun(params, live);
-      if (reviewRoute) return reviewRoute;
+      if (reviewRoute) {
+        // A routed review run resets the card's streak; a pace-held reviewer
+        // defer extends it, like every other hook deferral -- and answers
+        // from the final attempt instead of stranding, exactly like the
+        // terminal defers below (same Design B scan, same gates; forReview
+        // reads through so review runs keep spending held quota).
+        if (exhaustionEnabledFor(params?.companyId)) {
+          if (reviewRoute.kind === 'decide') clearExhaustionStreak(params.companyId, params);
+          else if (reviewRoute.kind === 'defer') {
+            const priorCount = exhaustionStreakCount(params.companyId, params, clock());
+            if (priorCount + 1 >= exhaustionFinalAttemptFor(params.companyId)) {
+              const hookLedger = await getOrLoadLedger(params.companyId);
+              const { answer, skips } = await exhaustionAnswer({
+                live,
+                params,
+                role: roleOf({ roles: {
+                  thinkerAgentIds: live.thinkerAgentIds,
+                  doerAgentIds: live.doerAgentIds,
+                } }, params.agentId),
+                selfId: params?.runId != null ? String(params.runId) : null,
+                priorReason: reviewRoute.reason,
+                forReview: liveIsReviewAgent(live, params.agentId),
+                hookLedger,
+                nowMs: clock(),
+              });
+              if (answer) return answer;
+              bumpExhaustionStreak(params.companyId, params, clock());
+              return {
+                ...reviewRoute,
+                reason: `${reviewRoute.reason}; exhaustion scan: ${skips.length > 0 ? skips.join('; ') : 'no candidates'}`,
+              };
+            }
+            bumpExhaustionStreak(params.companyId, params, clock());
+          }
+        }
+        return reviewRoute;
+      }
       // Operator-pinned agents (gating roles) always run their configured model
       // -- with the Sol/Luna context caps when that model needs them.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
@@ -5044,6 +5511,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
         if (capped) {
           clearDeferred(params.companyId, params.runId);
+          if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
           return capped;
         }
         return keep();
@@ -5051,16 +5519,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const credentialEnforced = credentialReadinessEnforced(params.companyId);
       // Every defer below leaves the run waiting, not executing: the pace
       // guard stops counting it as in flight while its mark is fresh (see
-      // the retry-lifespan bound on deferredRuns).
-      const deferred = (out) => {
+      // the retry-lifespan bound on deferredRuns). Terminal capacity defers
+      // extend the card's exhaustion streak; stale credential evidence does
+      // not, because it is not a capacity-retry chain.
+      const deferred = (out, { countTowardExhaustion = true } = {}) => {
         markDeferred(params.companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, out?.retryAfterMs);
+        if (countTowardExhaustion && exhaustionEnabledFor(params.companyId)) {
+          bumpExhaustionStreak(params.companyId, params, clock());
+        }
         return out;
       };
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
         || (credentialEnforced && clock() < live.atMs)) {
-        return credentialEnforced
-          ? deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'))
-          : (keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' });
+        if (credentialEnforced) {
+          return deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'), {
+            countTowardExhaustion: false,
+          });
+        }
+        const staleAns = keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' };
+        // Either answer executes the run, ending the chain: the streak
+        // resets (a plain stale keep is a routed run like any other, not a
+        // deferral, so it must not count toward a future chain's grace).
+        if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
+        return staleAns;
       }
       // Join any ledger load before selection; no await may split admission,
       // the half-open probe claim, and the recorded/emitted decision.
@@ -5153,6 +5634,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             continue;
           }
           clearDeferred(params.companyId, params.runId);
+          if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
           const emitAdapter = params.adapterType ?? liveAdapterFor(live, params.agentId) ?? null;
           const decorated = decoratedModelFor(d, emitAdapter);
           recordDecision(hookLedger, {
@@ -5183,40 +5665,64 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         && !(live.accounts ?? []).some(a => rungsHaveEligibleArms(credentialGroupsFor(a, clock(), true)))) {
         return deferred(credentialDefer(params.companyId));
       }
+      // Terminal defer selection (unchanged strings when exhaustion is off).
       // When the review reserve holds every account that could serve, the
       // wait is for a review slot (or the hold's release near reset): say so
       // and retry on the pace-guard scale -- a 60 s retry would burn the
       // host's 12-attempt budget in ~12 min and abandon the wait long before
       // the hold lifts. A co-holding pace guard is named too, so operators
       // see both holds instead of only the reserve.
+      //
+      // Deferral-exhaustion (Design B): the host retries a deferred run as a
+      // NEW runId up to RUN_MODEL_RESOLVE_MAX_ATTEMPTS = 12 times and then
+      // freezes the card. When the card's streak reaches the final attempts,
+      // answer instead of deferring -- the cheapest selectable free-overflow
+      // arm under the existing trial caps, else a bounded keep -- so the
+      // chain ends in a run, not a freeze. The deferred() wrapper below
+      // extends the streak by one for the defer being returned, so the count
+      // here adds that pending deferral: the final attempt is the first call
+      // that answers. Every answer clears the streak because it ends the
+      // defer chain; a failed scan appends its per-account skip reasons to
+      // the defer reason for diagnosability. Disabled reads bit-for-bit as
+      // before: the same three terminal defers, untouched.
+      let terminal;
       if (order.length === 0 && (reserveHeld?.length ?? 0) > 0) {
         const names = reserveHeld.map(h => h.accountId).join(', ');
         const guard = live.paceGuard ?? {};
         const held = (paced ?? []).map(pacedPoolText);
         const also = held.length > 0 ? `; pace guard also holds ${held.join('; ')}` : '';
-        return deferred({
+        terminal = {
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,
           reason: `review reserve: ${names} held for review runs${also}`,
-        });
-      }
-      // When the pace guard holds a pool, the wait is for one of its runs to
-      // finish (minutes), not for headroom: say so and retry on that scale
-      // so the host does not burn its retry budget. Reaching here means the
-      // loop decided nothing, so any pool left in the order was skipped for
-      // another hold (trial, breaker, readiness); the paced pool is still a
-      // real minutes-scale hold, and it is named first.
-      if (paced.length > 0) {
+        };
+      } else if (paced.length > 0) {
         const guard = live.paceGuard ?? {};
         const held = paced.map(pacedPoolText);
         const also = order.length > 0 ? `; ${new Set(order.map(v => v.accountId)).size} unpaced account(s) also unselectable this call` : '';
-        return deferred({
+        terminal = {
           kind: 'defer',
           retryAfterMs: guard.retryAfterMs ?? 300000,
           reason: `pace guard: ${held.join('; ')}${also}`,
-        });
+        };
+      } else {
+        terminal = { kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' };
       }
-      return deferred({ kind: 'defer', retryAfterMs: 60000, reason: 'no account has headroom right now' });
+      if (exhaustionEnabledFor(params.companyId)) {
+        const priorCount = exhaustionStreakCount(params.companyId, params, clock());
+        if (priorCount + 1 >= exhaustionFinalAttemptFor(params.companyId)) {
+          const { answer, skips } = await exhaustionAnswer({
+            live, params, role, selfId,
+            priorReason: terminal.reason, forReview, hookLedger, nowMs: clock(),
+          });
+          if (answer) return answer;
+          return deferred({
+            ...terminal,
+            reason: `${terminal.reason}; exhaustion scan: ${skips.length > 0 ? skips.join('; ') : 'no candidates'}`,
+          });
+        }
+      }
+      return deferred(terminal);
     },
   };
 }
