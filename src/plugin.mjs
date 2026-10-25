@@ -1331,7 +1331,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   async function roleDemandFor(companyId, config, nowMs) {
     const zero = { doer: 0, thinker: 0, other: 0 };
     try {
-      const counts = await queuedByAgent(companyId, nowMs, config.allocation.blockingPriority ? nowMs : undefined);
+      const snapshot = config.allocation.blockingPriority ? await blockingSnapshot(companyId, nowMs) : null;
+      // Only a usable graph switches target demand to the tick snapshot. Failed
+      // validation must retain the same ordinary TTL demand as legacy /caps.
+      const counts = snapshot?.priorities != null ? snapshot.counts : await queuedByAgent(companyId, nowMs);
       const byRole = { ...zero };
       for (const [agentId, n] of counts) byRole[roleOf(config, agentId)] += n;
       const total = byRole.doer + byRole.thinker + byRole.other;

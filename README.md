@@ -798,8 +798,9 @@ share the ordinary demand cache; three additional status-list reads complete
 the graph once per capacity tick. Active counts and weights share that tick's
 ready-card snapshot; each new tick refreshes it even inside the ordinary demand
 TTL. Concurrent requests share the pending snapshot, and failures are memoized
-until the next tick. An unavailable graph retains ordinary demand refreshes
-and the legacy allocator. No resolver-hook I/O,
+until the next tick. The capacity target uses the same validated snapshot as
+active caps. An unavailable graph retains ordinary demand refreshes for both
+the target and caps, as well as the legacy allocator. No resolver-hook I/O,
 new permission, database access, egress or background job is added.
 
 **Host compatibility gate:** the SDK `Issue` type exposes optional `blockedBy`
