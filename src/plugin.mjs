@@ -904,7 +904,37 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return { pools, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
-  const caches = new Map(); // companyId -> CliproxyCache
+  const caches = new Map(); // companyId -> { identity, cache }
+  const configRevisions = new Map(); // companyId -> { generation, identity, policyIdentity, policyGeneration }
+  // Config contains secret references, never resolved secret values. Canonical
+  // object keys keep equivalent saves from invalidating a healthy view.
+  const configIdentity = value => JSON.stringify(value, (_key, v) =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v);
+  const policyIdentity = ({ enforce, credentialReadiness, ...policy }) => configIdentity(policy);
+  const generationOf = companyId => configRevisions.get(companyId)?.generation ?? 0;
+  const rememberConfig = (companyId, config) => {
+    const identity = configIdentity(config);
+    const previous = configRevisions.get(companyId);
+    if (previous?.identity !== identity) {
+      const policy = policyIdentity(config);
+      configRevisions.set(companyId, {
+        generation: (previous?.generation ?? 0) + 1,
+        identity, policyIdentity: policy,
+        policyGeneration: (previous?.policyGeneration ?? 0) + (previous?.policyIdentity !== policy ? 1 : 0),
+      });
+      const source = caches.get(companyId);
+      if (source && source.identity !== configIdentity(config.cliproxy)) caches.delete(companyId);
+    }
+    return generationOf(companyId);
+  };
+  const liveIsCurrent = (companyId, live) =>
+    live?.policyGeneration === configRevisions.get(companyId)?.policyGeneration;
+  const invalidatedDefer = (params, live) => {
+    const retryAfterMs = 60000;
+    markDeferred(params.companyId, params.runId, clock(), live?.staleHorizonMs ?? 2 * 3600 * 1000, retryAfterMs);
+    return { kind: 'defer', retryAfterMs, reason: 'routing snapshot invalidated by configuration change' };
+  };
   // Live view per company, populated by every tick for the memory-only
   // resolve hook: { atMs, enforce, thinkerAgentIds, doerAgentIds,
   //   excludeFamilies, roleBands, contextCaps,
@@ -938,13 +968,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // mid-tick would re-enable itself when the tick lands.
   const credentialEnforceCompanies = new Set();
 
-  const cacheFor = (companyId, ttlSec) => {
-    let c = caches.get(companyId);
-    if (!c || c.ttlMs !== ttlSec * 1000) {
-      c = new CliproxyCache(ttlSec * 1000);
-      caches.set(companyId, c);
+  const cacheFor = (companyId, config) => {
+    const identity = configIdentity(config.cliproxy);
+    let entry = caches.get(companyId);
+    if (!entry || entry.identity !== identity) {
+      entry = { identity, cache: new CliproxyCache(config.cliproxy.cacheTtlSec * 1000) };
+      caches.set(companyId, entry);
     }
-    return c;
+    return entry;
   };
 
   /**
@@ -953,9 +984,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * Last line of defense: the request re-passes the lane allowlist, so no
    * code path can fetch anywhere else.
    */
-  async function cliproxyLaneGet(companyId, config) {
+  async function cliproxyLaneGet(companyId, config, generation) {
     if (requirePinnedLaneHost) assertLaneHostPinned(config.cliproxy.baseUrl);
     const laneKey = await ctx.secrets.resolve(config.cliproxy.laneKeySecretRef, { companyId, configPath: 'cliproxy.laneKeySecretRef' });
+    if (generationOf(companyId) !== generation) return null;
     const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
     assertLaneRequest({ method: req.method, url: req.url, body: null },
       { baseUrl: config.cliproxy.baseUrl, accountsPath: config.cliproxy.accountsPath });
@@ -965,14 +997,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return res.json();
   }
 
-  async function readAccounts(companyId, config, nowMs) {
-    const cache = cacheFor(companyId, config.cliproxy.cacheTtlSec);
+  async function readAccounts(companyId, config, nowMs, generation) {
+    const entry = cacheFor(companyId, config);
+    const cache = entry.cache;
     const cached = cache.get('accounts', nowMs);
     if (cached) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
       return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null, freeResets: null };
     }
-    const body = await cliproxyLaneGet(companyId, config);
+    const body = await cliproxyLaneGet(companyId, config, generation);
+    // Clearing the cache alone cannot retire an outstanding source read.
+    if (generationOf(companyId) !== generation || caches.get(companyId) !== entry) return null;
     // Validate observation time after the fetch, never against tick start.
     const parsed = parseLaneBody(body, clock());
     if (!parsed) throw new Error('cliproxy-lane-parse-failed');
@@ -1738,8 +1773,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
   async function runShadowTick(companyId, job) {
     const nowMs = clock();
+    let generation = generationOf(companyId);
+    const superseded = () => generationOf(companyId) !== generation;
     const raw = await ctx.config.get(companyId);
+    if (superseded()) return { status: 'superseded' };
     const config = resolveConfig(raw);
+    generation = rememberConfig(companyId, config);
     // In-flight horizon: a run with no terminal event stops counting after
     // max(3 x mean run duration, 2h). The 2h floor keeps the horizon at the
     // ledger's memory even when the duration calibrates short; terminal runIds
@@ -1750,7 +1789,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       3 * (Number.isFinite(meanHours) && meanHours > 0 ? meanHours : 0.186) * 3600 * 1000,
       2 * 3600 * 1000,
     );
-    const rawSnapshot = await readAccounts(companyId, config, nowMs);
+    const rawSnapshot = await readAccounts(companyId, config, nowMs, generation);
+    if (!rawSnapshot || superseded()) return { status: 'superseded' };
     // Burn accounts degraded only by the feed's utilization floor stay
     // allocatable until spent (see burnEligibleAccounts); level floors
     // (burnMode.floors) then take accounts at or below their floor out of
@@ -1779,6 +1819,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Trial family counters drive which families route as trials; the fresh
     // resolved config feeds the memory-only event-time path (see setup).
     const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
+    if (superseded()) return { status: 'superseded' };
     lastConfig.set(companyId, config);
     // Arm circuit breaker: memory truth loaded once per worker start (like the
     // ledger); every tick reuses it and persists it below. Finished-run
@@ -3547,7 +3588,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         liveTrialBudget[fam] = Math.max(0, config.trials.maxInFlightPerFamily - (liveTrialInFlight[fam] ?? 0));
       }
     }
+    if (superseded()) return { status: 'superseded' };
     liveViews.set(companyId, {
+      policyGeneration: configRevisions.get(companyId)?.policyGeneration,
       atMs: nowMs,
       enforce: config.enforce === true,
       credentialReadinessEnforced: config.credentialReadiness.enforce,
@@ -4427,6 +4470,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     const ledger = await getOrLoadLedger(companyId);
     if (!enforceCompanies.has(companyId)) return null;
+    if (!liveIsCurrent(companyId, live)) return invalidatedDefer(params, live);
     const nowMs = clock();
     const selfId = params?.runId != null ? String(params.runId) : null;
     // Reviewer runs obey the pace guard like every other run: lanes the guard
@@ -4496,6 +4540,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const kept = live?.keptByAgent?.[agentId];
     if (!kept || runId == null) return;
     const ledger = await getOrLoadLedger(companyId);
+    if (!liveIsCurrent(companyId, live)) return;
     recordDecision(ledger, {
       runId: String(runId), agentId: String(agentId ?? 'unknown'), accountId: kept.accountId,
       armId: null, enforced: false, wouldModel: kept.model,
@@ -4507,7 +4552,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   async function recordEventTimeShadow(companyId, run) {
     const live = liveViews.get(companyId);
     const config = lastConfig.get(companyId);
-    if (!live || !config) return null;
+    if (!live || !config || !liveIsCurrent(companyId, live)) return null;
     const credentialEnforced = credentialReadinessEnforced(companyId);
     if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
       || (credentialEnforced && clock() < live.atMs)) {
@@ -4529,6 +4574,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     // Await before admission, not between selection and recording.
     const ledger = await getOrLoadLedger(companyId);
+    if (!liveIsCurrent(companyId, live)) return null;
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
     const { order } = withDuplicatePass(duplicates => allocationOrderFromLive(
@@ -4827,10 +4873,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         ctx.logger.error('model-capacity: config rejected', { companyId, errors });
         throw new Error('invalid-config');
       }
+      const config = resolveConfig(raw);
+      rememberConfig(companyId, config);
       configured.add(companyId);
-      // Cache the resolved config immediately so the event-time shadow path
-      // works before the first tick lands (the tick refreshes it every run).
-      lastConfig.set(companyId, resolveConfig(raw));
+      // Enforcement switches retain their established immediate-disable /
+      // next-compatible-tick-enable semantics, independent of policy identity.
+      lastConfig.set(companyId, config);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
       if (raw?.credentialReadiness?.enforce === true) credentialEnforceCompanies.add(companyId);
@@ -5032,15 +5080,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return keep();
       }
+      // Keep the old view for its safety guards, but never route from retired
+      // policy/source data. Deleting it would make missing-view fail open.
+      if (!liveIsCurrent(params.companyId, live)) return invalidatedDefer(params, live);
       // Reviewer routing: listed review agents route to the best configured
       // arm (burn mode, then the pool most behind plan); no qualifying arm
       // falls through to keep below. Off (absent config) = unchanged.
       const reviewRoute = await routeReviewerRun(params, live);
       if (reviewRoute) return reviewRoute;
+      if (!enforceCompanies.has(params.companyId)) return keep();
+      if (!liveIsCurrent(params.companyId, live)) return invalidatedDefer(params, live);
       // Operator-pinned agents (gating roles) always run their configured model
       // -- with the Sol/Luna context caps when that model needs them.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
+        if (!enforceCompanies.has(params.companyId)) return keep();
+        if (!liveIsCurrent(params.companyId, live)) return invalidatedDefer(params, live);
         const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
         if (capped) {
           clearDeferred(params.companyId, params.runId);
@@ -5068,6 +5123,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Config changes can land while the ledger load yields, even when the
       // tick cannot refresh the live view. Enforce off is an immediate kill switch.
       if (!enforceCompanies.has(params.companyId)) return keep();
+      if (!liveIsCurrent(params.companyId, live)) return invalidatedDefer(params, live);
       const role = roleOf({ roles: {
         thinkerAgentIds: live.thinkerAgentIds,
         doerAgentIds: live.doerAgentIds,
