@@ -136,6 +136,7 @@ test('onHealth degrades when the build did not pin a lane host', async () => {
 // only in the package-build overlay of the pin file, never here.
 const PUBLIC_HOSTS = new Set([
   'artificialanalysis.ai',
+  'api.github.com', // fixed read-only reviewer-demand census, not a lane host
   'cliproxy', // docker service name used as a negative-test input
   'z.ai', // model provider named in an error-path fixture, not a lane host
   'codex-reset.com', // public Codex free-reset timeline feeding burnHorizon history, not a lane host
@@ -246,6 +247,14 @@ test('host collectors catch bare and port forms and ignore code chains', () => {
   assert.deepEqual(collectBareHosts('managed ' + 'Z' + '.ai capacity remains'), ['z.ai']);
   assert.ok(isAllowlistedHost('z.ai'));
   assert.ok(!isAllowlistedHost('metrics' + corpNet));
+});
+
+test('the public census hostname exception is exact and does not alter the lane allowlist', () => {
+  assert.ok(isAllowlistedHost('api.github.com'));
+  for (const other of ['prefix.' + 'api.github.com', 'api.github.com' + '.evil' + '.net', 'uploads.' + 'github' + '.com']) {
+    assert.equal(isAllowlistedHost(other), false);
+  }
+  assert.ok(!LANE_BASE_URL_ALLOWLIST.includes('https://api.github.com'));
 });
 
 test('example config validates against any pin: it does not set baseUrl', () => {
