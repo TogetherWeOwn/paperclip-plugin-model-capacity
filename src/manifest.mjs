@@ -682,6 +682,15 @@ const CONFIG_SCHEMA = {
         meanRunDurationHours: { type: 'number', exclusiveMinimum: 0, default: 0.186 },
       },
     },
+    allocation: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        blockingPriority: {
+          type: 'boolean', default: false,
+          description: 'Weight scarce new slots by unsatisfied demand, transitive open-card fan-out (capped at 100) and highest ready-card priority. Requires native relation arrays in issues.read payloads; missing fields or failed reads retain the legacy allocation. Active mode bounds new slots by target and ceiling, including smoothing and reserved floors.',
+        },
+      },
+    },
     contextCaps: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -724,6 +733,29 @@ const CONFIG_SCHEMA = {
       properties: {
         enabled: { type: 'boolean', default: false },
         finalAnswerFromAttempt: { type: 'integer', minimum: 1, maximum: 12, default: 11, description: '1-based chain attempt from which the hook answers instead of deferring (12 is the host retry budget).' },
+      },
+    },
+    freeLanes: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in additive free capacity outside paid C*. Only explicitly listed low-risk issue agents qualify. Provider request rates size slots, not an API request limiter.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        minQuality: { type: 'number', default: 0.4, description: 'Strict fleet-normalized quality floor for free arms. Unknown quality is denied.' },
+        lowRiskAgentIds: { type: 'array', default: [], items: { type: 'string', minLength: 1 } },
+        providers: { type: 'object', default: {}, additionalProperties: {
+          type: 'object', additionalProperties: false, required: ['requestsPerMinute'],
+          properties: {
+            requestsPerMinute: { type: 'number', exclusiveMinimum: 0 },
+            requestsPerMinutePerSlot: { type: 'number', exclusiveMinimum: 0, default: 12 },
+            requestsPerDay: { type: 'integer', minimum: 1 },
+            requestsPerRun: { type: 'number', exclusiveMinimum: 0, description: 'Required with a daily limit. Estimated requests reserved per admission, including failures.' },
+          },
+        } },
+        demotion: { type: 'object', additionalProperties: false, properties: {
+          lastRuns: { type: 'integer', minimum: 1, maximum: 1000, default: 10 },
+          minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
+          windowHours: { type: 'number', exclusiveMinimum: 0, maximum: 24, default: 24 },
+        } },
       },
     },
     trials: {
