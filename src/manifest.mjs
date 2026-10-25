@@ -670,6 +670,15 @@ const CONFIG_SCHEMA = {
         meanRunDurationHours: { type: 'number', exclusiveMinimum: 0, default: 0.186 },
       },
     },
+    allocation: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        blockingPriority: {
+          type: 'boolean', default: false,
+          description: 'Weight scarce new slots by unsatisfied demand, transitive open-card fan-out (capped at 100) and highest ready-card priority. Requires native relation arrays in issues.read payloads; missing fields or failed reads retain the legacy allocation. Active mode bounds new slots by target and ceiling, including smoothing and reserved floors.',
+        },
+      },
+    },
     contextCaps: {
       type: 'object', additionalProperties: false,
       properties: {

@@ -304,7 +304,7 @@ export function distributeWeightedCaps(target, demands, maxTotal = 75) {
  * floor-running | capped-ceiling. maxConcurrentRuns mirrors allocated for
  * the existing /caps consumer.
  */
-export function allocateDemandCaps(target, agents, maxTotal = 75) {
+export function allocateDemandCaps(target, agents, maxTotal = 75, { blockingPriority = false } = {}) {
   const list = (agents ?? [])
     .filter(a => a && typeof a.agentId === 'string' && a.agentId.length > 0)
     .map(a => ({
@@ -312,6 +312,8 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
       running: Math.max(0, Math.floor(a.running ?? 0)),
       queued: Math.max(0, Math.floor(a.queued ?? 0)),
       overPace: a.overPace === true,
+      ...(blockingPriority ? { allocationWeight: Number.isFinite(a.allocationWeight) && a.allocationWeight > 0
+        ? Math.min(404, a.allocationWeight) : 1 } : {}),
     }))
     .filter(a => a.running + a.queued > 0)
     .sort((x, y) => ((y.running + y.queued) - (x.running + x.queued)) || (x.agentId < y.agentId ? -1 : 1));
@@ -345,12 +347,21 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
     // its running+1 headroom claim): weighting by full demand would let
     // already-held running outshout real queue, starving the agents that
     // actually wait while over-feeding agents past their own want.
-    const needWeights = out.map(e => e.queued + 1);
+    const needWeights = out.map(e => (e.queued + 1) * (blockingPriority ? e.allocationWeight : 1));
     const needTotal = needWeights.reduce((s, w) => s + w, 0);
     const extras = needTotal > 0 ? largestRemainder(R, needWeights) : out.map(() => 0);
     out.forEach((e, i) => applyCeiling(e, e.running + extras[i], 'proportional'));
   };
-  if (T <= 0) {
+  if (blockingPriority) {
+    // Unlike the legacy below-target burst, opt-in allocations fit the actual
+    // target as well as the ceiling. Only existing running may exceed either.
+    const wants = out.map(e => Math.max(e.demand, e.running + 1));
+    if (wants.reduce((sum, want) => sum + want, 0) <= Math.min(T, ceiling)) {
+      out.forEach((e, i) => applyCeiling(e, wants[i], e.queued > 0 ? 'full-demand' : 'headroom'));
+    } else {
+      shedProportionally(T);
+    }
+  } else if (T <= 0) {
     // Explicit shed: hold running, start nothing.
     for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
   } else if (totalRunning < T) {
@@ -380,6 +391,7 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
 export function allocateKeptAndRoutedCaps({
   target, maxTotal = 75, demandFactor = 1, agents = [], keepAgentIds = [],
   keptByAgent = {}, accounts = [], perAccount = [], pacePools = [], unavailableAccountIds = [],
+  blockingPriority = false,
 } = {}) {
   const keptIds = new Set(keepAgentIds);
   const unavailableAccounts = new Set(unavailableAccountIds);
@@ -438,7 +450,16 @@ export function allocateKeptAndRoutedCaps({
 
   const totalTarget = target == null ? maxTotal : target;
   const totalCeiling = Math.max(1, Math.min(Math.floor(maxTotal), Math.round(totalTarget)));
-  const groupCaps = allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
+  // In priority mode all agents compete for the same new slots BEFORE kept
+  // pools reserve shares. Otherwise a low-priority kept queue can take the
+  // first slot, or reserve capacity needed by an already-running routed run.
+  const priorityShares = blockingPriority ? new Map(allocateDemandCaps(totalTarget, agents, maxTotal,
+    { blockingPriority }).map(entry => [entry.agentId, entry.allocated])) : null;
+  const groupCaps = blockingPriority ? groupInputs.map(group => ({
+    agentId: group.agentId,
+    allocated: groupById.get(group.agentId).members.reduce((sum, member) =>
+      sum + (priorityShares.get(member.agentId) ?? 0), 0),
+  })) : allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
   for (const groupCap of groupCaps) {
     const group = groupById.get(groupCap.agentId);
     // The member ceiling is the group's fleet share, never the full pool
@@ -450,7 +471,7 @@ export function allocateKeptAndRoutedCaps({
     // Do not reserve idle headroom beyond a kept member's declared demand.
     // The ordinary allocator may split spare slots past a member's want;
     // leave those slots available to routed work instead.
-    const entries = allocateDemandCaps(groupCap.allocated, group.members, share).map(entry => {
+    const entries = allocateDemandCaps(groupCap.allocated, group.members, share, { blockingPriority }).map(entry => {
       if (entry.allocated <= entry.demand) return entry;
       return { ...entry, allocated: entry.demand, maxConcurrentRuns: entry.demand, reason: 'full-demand' };
     });
@@ -485,6 +506,7 @@ export function allocateKeptAndRoutedCaps({
     routedTarget,
     agents.filter(agent => !keptIds.has(agent.agentId)),
     routedCeiling,
+    { blockingPriority },
   );
   return { kept, keptCeilings, routed, routedTarget, routedCeiling };
 }

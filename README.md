@@ -761,6 +761,60 @@ report `floor` (and `floorBlocked: true` while suspended); the body carries
 `reservedFloors` (per-agent floor, applied, blocked) and `floorsSuspended`
 for audit. Weak calibration (no target) returns `agents: []`.
 
+### Blocking-priority allocation (unreleased, default OFF)
+
+Enable through the plugin's company configuration, not a host scheduler:
+
+```json
+{ "allocation": { "blockingPriority": true } }
+```
+
+With complete native issue-relation data, **new** slots use largest-remainder
+weights `(queued + 1) × (1 + min(100, blockingFanOut)) × priorityWeight`.
+`blockingFanOut` is the union of readable, open cards transitively blocked by
+an agent's assigned `todo`/`in_progress` cards. Duplicate paths, cycles and
+the agent's seed cards do not increase it. Open statuses are `backlog`,
+`todo`, `in_progress`, `in_review` and `blocked`; terminal cards do not count.
+The highest priority among the ready cards supplies `priorityWeight`:
+critical 4, high 3, medium 2, low 1 (unknown priority uses medium).
+Agents without ready-card metadata use multiplier 1.
+
+Active mode fits allocations to **both** the rounded integer fleet target and
+`maxTotal`, rather than the legacy below-target burst to the ceiling. Existing
+running counts always survive; if they already exceed a bound, no new slots
+are granted. Kept/pinned agents compete with routed agents before reserving
+pool-constrained shares. Smoothing cannot retain slots beyond the remaining
+target, and a reserved floor that would raise the selected allocation is
+reported blocked instead of overriding the priority decision. The flag does
+not reorder an agent's own queue or preempt running work.
+
+Only the already-declared `issues.read` capability is used. Ready-card reads
+share the ordinary demand cache; three additional status-list reads complete
+the graph once per capacity tick. Concurrent requests share the pending
+snapshot, and failures are memoized until the next tick. No resolver-hook I/O,
+new permission, database access, egress or background job is added.
+
+**Host compatibility gate:** the SDK `Issue` type exposes optional `blockedBy`
+and `blocks` arrays, but that does not guarantee they are returned. In the
+host source inspected for this change, `issues.list` omits relations by
+default and `issues.get` enriches labels/watchdogs only. The SDK list input
+also does not expose/forward the server's `includeBlockedBy` option. This host
+therefore **cannot activate** the weighting using `issues.read` alone. The
+plugin requires a complete `blockedBy` direction (or a complete `blocks`
+direction) on all readable open rows; it never treats an absent field as an
+empty relation set. Do not enable expecting an operational improvement until
+a native SDK/host contract supplies those fields. No core patch or undeclared
+RPC parameter is used to bypass this gate.
+
+When requested, `/caps` reports `allocation.blockingPriority: true` only when
+the snapshot is usable, with per-agent `allocationPriority` containing
+`blockingFanOut`, `cardPriority` and `weight`. Failed reads or unavailable
+relation arrays report `allocation: { blockingPriority: false,
+error: "priority-unavailable" }` and retain the **exact legacy allocation**.
+The existing demand-read failure still returns `capsError: issues-unavailable`
+and no recommendation. Setting the flag to false (or omitting it) makes no
+additional reads and preserves the existing response shape and allocation.
+
 ### Reserved per-agent floors
 
 `caps.reservedFloors` maps an agent id to `{ base, perQueued, max }`, empty

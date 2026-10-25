@@ -73,6 +73,7 @@ import {
   recordAccountBalanceExhaustion, isBalanceExhaustion,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
+import { buildBlockingPriorities } from './blocking-priority.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
@@ -182,6 +183,18 @@ export function validateConfigShape(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
   errors.push(...validateTaskRanking(raw.taskRanking));
+  if (raw.allocation != null) {
+    const allocation = raw.allocation;
+    if (typeof allocation !== 'object' || Array.isArray(allocation)) errors.push('allocation must be an object');
+    else {
+      if ('blockingPriority' in allocation && typeof allocation.blockingPriority !== 'boolean') {
+        errors.push('allocation.blockingPriority must be a boolean');
+      }
+      for (const key of Object.keys(allocation)) {
+        if (key !== 'blockingPriority') errors.push(`allocation.${key} is not a known key`);
+      }
+    }
+  }
   // The lane key is sent as X-Api-Key to baseUrl: only the hard-coded
   // allowlist may name it, or config could redirect the key to any host.
   if (cliproxy?.baseUrl != null && !LANE_BASE_URL_ALLOWLIST.includes(cliproxy.baseUrl)) {
@@ -643,6 +656,7 @@ export function resolveConfig(raw = {}) {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
+    allocation: { blockingPriority: raw.allocation?.blockingPriority === true },
     // Sol window / Luna cliff caps over the defaults (legacy solLuna* keys
     // set Luna only); tierAffectsQuota false restores base-cost burn.
     contextCaps: normalizeContextCaps(raw.contextCaps),
@@ -1213,8 +1227,34 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
       }
     }
-    queuedCache.set(companyId, { atMs: nowMs, counts });
+    queuedCache.set(companyId, { atMs: nowMs, counts,
+      ...(lastConfig.get(companyId)?.allocation?.blockingPriority === true ? { issues: lists.flat() } : {}),
+    });
     return counts;
+  }
+
+  // One priority snapshot per capacity tick, including a failed attempt. Share
+  // pending reads across concurrent /caps requests. No new reads when disabled.
+  // The SDK's optional relation fields must actually be present; the current
+  // upstream host can omit them from issues.read, in which case we fall back.
+  const blockingPriorityCache = new Map();
+  async function blockingPriorities(companyId, tickAtMs) {
+    const hit = blockingPriorityCache.get(companyId);
+    if (hit?.tickAtMs === tickAtMs) return hit.pending;
+    const ready = queuedCache.get(companyId)?.issues;
+    const pending = (async () => {
+      try {
+        if (!Array.isArray(ready)) throw new Error('priority-snapshot-unavailable');
+        const other = await Promise.all(['backlog', 'in_review', 'blocked'].map(status =>
+          ctx.issues.list({ companyId, status })));
+        return buildBlockingPriorities([...ready, ...other.flat()]);
+      } catch (error) {
+        ctx.logger.error('model-capacity: blocking priority unavailable', { companyId, code: 'priority-unavailable' });
+        return null;
+      }
+    })();
+    blockingPriorityCache.set(companyId, { tickAtMs, pending });
+    return pending;
   }
 
   // Runnable queued demand for kept/review agents: ACTUAL queued heartbeat
@@ -5630,6 +5670,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).
       const nextConfig = resolveConfig(raw);
+      blockingPriorityCache.delete(companyId);
+      if (nextConfig.allocation.blockingPriority !== lastConfig.get(companyId)?.allocation?.blockingPriority) {
+        queuedCache.delete(companyId);
+      }
       taskRankingModes.set(companyId, nextConfig.taskRanking.mode);
       lastConfig.set(companyId, nextConfig);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
@@ -5706,6 +5750,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // running-first (at/above target the fleet starts nothing new). No
         // cap lands below an agent's running count -- throttling existing
         // runs while the fleet idles is the failure this replaces.
+        const priorityRequested = lastConfig.get(companyId)?.allocation?.blockingPriority === true;
+        const priorities = priorityRequested ? await blockingPriorities(companyId, atMs) : null;
+        const blockingPriority = priorityRequested && priorities != null;
         const runningByAgent = cap.agentRunning ?? {};
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
         // Kept agents and routed review agents (reviewerRouting.agentIds)
@@ -5727,6 +5774,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
             : (counts.get(agentId) ?? 0),
           overPace: runningByAgent[agentId]?.overPace === true,
+          ...(blockingPriority ? { allocationWeight: priorities.get(agentId)?.weight ?? 1 } : {}),
         }));
         const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
           heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
@@ -5744,6 +5792,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           perAccount: cap.perAccount ?? [],
           pacePools: cap.paceGuard?.pools ?? [],
           unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+          blockingPriority,
         });
         const keptCaps = allocated.kept;
         const unheld = allocated.routed;
@@ -5759,7 +5808,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const held = holdCaps(unheld, prevHold, nowMs, {
             halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
             staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
-            ceiling: allocated.routedCeiling,
+            ceiling: blockingPriority ? Math.min(allocated.routedCeiling,
+              Math.max(0, Math.round(target) - keptCaps.reduce((sum, entry) => sum + entry.allocated, 0)))
+              : allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
           await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
@@ -5781,6 +5832,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
           }
           const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
+          // A configured floor cannot invent new slots or override the winner
+          // of a scarce priority split. Report the conflict, never hide it.
+          if (blockingPriority) {
+            for (const agent of agents) {
+              const floor = computeReservedFloor(agent.running, agent.queued, reservedFloors[agent.agentId]);
+              if (floor != null && floor > agent.allocated) blockedAgentIds.add(agent.agentId);
+            }
+          }
           const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
           for (const agent of keptCaps) {
             const spec = reservedFloors[agent.agentId];
@@ -5797,8 +5856,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = floored.entries;
           floorSummary = floored.floors;
         }
-        for (const agent of agents) agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
-        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
+        for (const agent of agents) {
+          agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
+          if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended,
+          ...(priorityRequested ? { allocation: { blockingPriority,
+            ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
+        } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },
