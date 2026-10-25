@@ -364,3 +364,80 @@ test('the existing maxConcurrentRuns cap field includes free allocations', async
   assert.ok(triage.freeAllocated > 0);
   assert.equal(triage.maxConcurrentRuns, triage.allocated);
 });
+
+for (const model of [MODEL, 'step-5-preview-nim']) {
+  test(`a fresh kept managed-free default defers without reservations or a kept ledger entry: ${model}`, async () => {
+    const free = { ...freeConfig, providers: { 'nvidia-nim': { requestsPerMinute: 36,
+      requestsPerMinutePerSlot: 12, requestsPerDay: 150, requestsPerRun: 50 } } };
+    const d = await drive({ free, config: { roles: { keepAgentIds: ['triage'] } } });
+    const { io: hookIo } = d;
+    const savedIo = { ...hookIo };
+    d.killIo();
+    const answer = await d.hook({ runId: 'kept-free', agentDefaultModel: model });
+    assert.equal(answer.kind, 'defer', 'kept defaults must not bypass managed-free admission on a fresh tick');
+    Object.assign(hookIo, savedIo);
+    await d.tick();
+    assert.equal(d.store.get(skey('ledger-v1')).some(r => r.runId === 'kept-free'), false,
+      'a deferred kept default must not enter the ledger');
+    assert.equal(d.store.get(skey('free-lanes-v1')).requests?.['nvidia-nim'] ?? 0, 0,
+      'a deferred kept default must not spend the daily free budget');
+
+    await d.configure({ roles: { keepAgentIds: [] } });
+    await d.tick();
+    const admitted = await Promise.all(Array.from({ length: 3 }, (_, i) => d.hook({ runId: `admitted-${i}` })));
+    assert.equal(admitted.filter(a => a.model === MODEL).length, 3,
+      'the deferred kept default must leave all three free slots available');
+    await d.tick();
+    assert.equal(d.store.get(skey('free-lanes-v1')).requests['nvidia-nim'], 150);
+  });
+}
+
+for (const { name, free, extra } of [
+  { name: 'paid kept defaults', free: freeConfig, extra: { agentDefaultModel: 'claude-haiku-5-5' } },
+  { name: 'explicit free pins', free: freeConfig, extra: { agentDefaultModel: MODEL, issueOverrideModel: MODEL } },
+  { name: 'explicit paid pins over free defaults', free: freeConfig,
+    extra: { agentDefaultModel: MODEL, issueOverrideModel: 'claude-haiku-5-5' } },
+  { name: 'feature-off kept free defaults', free: { ...freeConfig, enabled: false }, extra: { agentDefaultModel: MODEL } },
+]) {
+  test(`the fresh kept-default guard preserves ${name} without hook IO`, async () => {
+    const d = await drive({ free, config: { roles: { keepAgentIds: ['triage'] } } });
+    d.killIo();
+    assert.equal((await d.hook(extra)).kind, 'keep');
+  });
+}
+
+test('restart caps grant no new free slots from a persisted three-slot target before a live tick', async () => {
+  const d = await drive();
+  assert.equal((await d.api('capacity')).freeLanes.target, 3);
+  assert.equal((await d.api('caps')).agents.find(a => a.agentId === 'triage').freeAllocated, 3);
+  const restarted = await drive({ state: d.store, initialTick: false });
+  assert.equal((await restarted.api('capacity')).freeLanes.target, 3,
+    'restart must actually load the persisted positive target');
+  const triage = (await restarted.api('caps')).agents.find(a => a.agentId === 'triage');
+  assert.equal(triage.freeAllocated, 0, 'a persisted target without live eligibility must not grant new free slots');
+  assert.equal((await restarted.hook({ agentDefaultModel: MODEL })).kind, 'defer');
+
+  await restarted.tick();
+  assert.equal((await restarted.api('caps')).agents.find(a => a.agentId === 'triage').freeAllocated, 3);
+  const admitted = await Promise.all(Array.from({ length: 4 }, (_, i) => restarted.hook({ runId: `fresh-${i}` })));
+  assert.equal(admitted.filter(a => a.model === MODEL).length, 3,
+    'a fresh live tick must restore ordinary three-slot free admission');
+  assert.notEqual(admitted[3].model, MODEL);
+});
+
+test('restart caps retain exactly one persisted running-free floor, not the three-slot target', async () => {
+  const d = await drive();
+  assert.equal((await d.hook({ runId: 'running-free' })).model, MODEL);
+  await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'running-free', occurredAt: new Date(NOW).toISOString(),
+    payload: { run: { agentId: 'triage', issueId: 'i', model: MODEL, modelSource: 'run-decision' } } });
+  await d.tick();
+  const capacity = await d.api('capacity');
+  assert.equal(capacity.freeLanes.target, 3);
+  assert.equal(capacity.agentRunning.triage.freeRunning, 1);
+  const restarted = await drive({ state: d.store, initialTick: false });
+  assert.equal((await restarted.api('capacity')).freeLanes.target, 3);
+  const triage = (await restarted.api('caps')).agents.find(a => a.agentId === 'triage');
+  assert.equal(triage.freeAllocated, 1, 'without live eligibility, only the existing running-free slot may survive');
+  assert.equal(triage.allocated, 1);
+  assert.equal(triage.maxConcurrentRuns, 1, 'the host cap must preserve the running floor without admitting more work');
+});
