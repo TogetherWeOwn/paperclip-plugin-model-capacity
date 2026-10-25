@@ -236,9 +236,11 @@ test('/capacity publishes the read-only model inventory', async () => {
   assert.equal(inv.configuredModels.coverage, 'incomplete');
   const haiku = inv.models.find(m => m.canonical === 'claude-haiku-5-5');
   assert.deepEqual(haiku.rawIds, ['claude-haiku-5-5']);
+  assert.deepEqual(haiku.rawIdsByAccount, { 'claude:lane-1': ['claude-haiku-5-5'] });
   assert.equal(haiku.emittedByAccount['claude:lane-1'], 'claude-haiku-5-5');
   assert.equal(haiku.servedIdStatusByAccount['claude:lane-1'], 'present');
   const gpt = inv.models.find(m => m.canonical === 'gpt-5-5');
+  assert.deepEqual(gpt.rawIdsByAccount, { 'devin:lane-2': ['devin/gpt-5-5'] });
   assert.equal(gpt.emittedByAccount['devin:lane-2'], 'devin/gpt-5-5');
   assert.equal(gpt.servedIdStatusByAccount['devin:lane-2'], 'present');
   assert.deepEqual(haiku.arms, [{ aaSlug: 'claude-haiku-5-5', effort: 'max' }]);
@@ -249,11 +251,13 @@ test('/capacity publishes the read-only model inventory', async () => {
   assert.deepEqual(gpt.readiness, [{ accountId: 'devin:lane-2', eligible: true, reason: 'ready' }]);
   assert.deepEqual(gpt.unservable, []);
   const sonnet = inv.models.find(m => m.canonical === 'claude-sonnet-5-5');
+  assert.deepEqual(sonnet.rawIdsByAccount, { 'claude:lane-1': ['claude-sonnet-5-5'] });
   assert.deepEqual(sonnet.arms, [{ aaSlug: 'claude-sonnet-5-5', effort: 'max' }]);
   assert.deepEqual(sonnet.unservable, [{ accountId: 'claude:lane-1', emitted: 'claude-sonnet-5-5' }]);
   assert.deepEqual(sonnet.readiness, []);
   assert.equal(sonnet.unscored, null);
   const unknown = inv.models.find(m => m.canonical === 'new-model-1');
+  assert.deepEqual(unknown.rawIdsByAccount, { 'claude:lane-1': ['new-model-1'] });
   assert.deepEqual(unknown.arms, []);
   assert.deepEqual(unknown.unscored, { reason: 'no-aa-match', tried: ['new-model-1'] });
   assert.deepEqual(unknown.unservable, []);
