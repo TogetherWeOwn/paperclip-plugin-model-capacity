@@ -162,6 +162,147 @@ live enforcement or establishes an optimal model for every individual task.
 Methodology: [AA intelligence benchmarking](https://artificialanalysis.ai/methodology/intelligence-benchmarking),
 [AA coding-agent benchmarking](https://artificialanalysis.ai/methodology/coding-agents-benchmarking).
 
+## Additive always-on free lanes (unreleased, default off)
+
+`freeLanes.enabled=false` is the default. It adds no jobs, traffic or routing
+changes. The existing enforce-capable manifest and `enforce=true` are still
+required to select a model. This policy runs inside `run.model.resolve`; it
+never edits an agent or changes credentials. There is no host pacer or core
+patch.
+
+When enabled, a configured **free-plan** account on a provider in
+`placement.freeCostProviders` has a separate provider-wide slot budget. It
+never enters paid C*, and its running count does not consume paid demand/caps.
+`/capacity.paidTarget` remains paid C*. `/capacity.freeLanes.target` is the
+additive budget. Existing consumers see their sum in `/capacity.target`
+(also `totalTarget`), bounded by the hard `concurrency.maxTotal` process
+ceiling. Free-only capacity reports `partial` calibration with the original
+paid confidence in `paidCalibration`; unknown paid capacity is not invented.
+`/caps` allocates from paid C* first, then adds free headroom
+only to eligible agents. It holds all existing free running counts even when
+free capacity is demoted or the feature is disabled. A paid pace hold does not
+hold a free provider. If free selection fails, ordinary paid routing continues.
+Managed free accounts cannot bypass these checks via the ordinary or
+exhaustion path. Other providers and paid trial caps are unchanged.
+
+### Exact low-risk signals
+
+The native hook does **not** carry task text, labels, difficulty, context size,
+retry count or review adjudication. Do not infer them from a wake reason.
+An operator must list **dedicated low-risk agents** in `lowRiskAgentIds` (for
+example, agents whose only assignment is triage or read-only summaries).
+Membership is a policy assertion about that agent's entire workload, not a
+classifier for arbitrary builder work. Do not list general-purpose builders.
+The hook additionally requires all of these existing signals:
+
+- Nonempty `runId` and `issueId`: issue-backed work only.
+- Agent role `doer` or `other`, from the existing thinker/doer ID lists.
+- No `previous` decision for this company/agent/issue. The host has no failure
+  class, so any previous attempt conservatively disqualifies free routing.
+- No explicit issue model pin; no `roles.keepAgentIds` entry; no configured
+  reviewer identity from reviewer routing or review reserve.
+- `adapterType` must allow the family under `trials.adapters`, even after
+  graduation. Unknown/unlisted adapters receive no free arm.
+
+`invocationSource` and `wakeReason` are not sufficient evidence of low risk.
+A monitor or comment wake can still perform high-impact work. Native human
+assignment, explicit connection bindings/router pools and issue pins keep
+precedence in Paperclip before this hook is called.
+
+### Rate sizing, daily budget and limits
+
+Slots are `floor(requestsPerMinute / requestsPerMinutePerSlot)`, shared across
+**all accounts/keys on that provider**, never multiplied by account count.
+The default intensity estimate is 12 requests/minute per running slot. Thus
+36 RPM yields 3 slots and 20 RPM yields 1. Configure actual account-wide
+provider limits and a conservative measured intensity; these are not provider
+lookup tables. A rate below one slot yields zero slots, not a forced minimum.
+
+With `requestsPerDay`, `requestsPerRun` is required. Each admission reserves
+that many estimated requests until the UTC day ends, including failed or
+cancelled runs. A duplicate hook call for the same admitted run does not
+reserve again. The existing native tick persists reservations in company
+plugin state (`free-lanes-v1`) along with the run ledger. Like pending routing
+decisions, reservations after the last successful tick can be lost in a
+worker crash. They are not a billing-grade counter.
+
+**This hook admits runs, not individual provider requests.** The RPM intensity
+and per-run reservations are estimates, not proof of compliance with actual
+provider RPM/day usage. The proxy/provider's own request limiter remains
+necessary. No new proxy limiter or provider integration ships here.
+OpenRouter arms must emit an exact `:free` ID; a free-plan account alone cannot
+make a paid ID free. Missing AA/served-ID bindings still deny routing (use
+existing `modelAaOverrides` only for verified identities). Synthetic, including
+its infinite lane, is paid and excluded. Workers AI is excluded because this
+feed has no authoritative remaining-free-neurons signal; enabling a provider
+name cannot grant permission for paid neurons. NIM `meta/muse-*` is excluded.
+
+### Quality and automatic demotion
+
+`freeLanes.minQuality` is independent of `roles.minQuality`. The default is
+**0.4 fleet-normalized Q**, not AA Intelligence Index 40 or a success rate. It
+keeps the existing capable-arm bar instead of lowering it just because a
+model is free. The cached AA snapshot in
+[`test/fixtures/free-lane-aa-evidence.json`](test/fixtures/free-lane-aa-evidence.json)
+(2026-10-25) records Step 5 Intelligence Index 43.73 and Terminal-Bench 4.0
+0.333, versus GPT-OSS 120B 11.60/0 and Llama 4 Maverick 9.30/0. That evidence
+supports a capability floor rather than indiscriminate free routing; it does
+not establish an optimal cut point or a task success guarantee. Q depends on
+the served population and weights: inspect the current `/capacity` scores
+before enabling. This separate floor is **never suspended** for a tiny/empty
+population; a missing score is denied. In task-ranking enforce mode, exact
+benchmark/effort trust, primary evidence and operational feasibility still
+apply. Free policy replaces only the paid quality minimum, not these checks.
+Manual exclusions, context caps, credential-readiness mode and arm breakers
+remain authoritative.
+
+Default demotion: fewer than 80% successful **measured outcomes among the last
+10** for an exact `(free provider, arm)` in 24 hours removes that arm. A failed
+run counts as failure. A finished run with a trusted issue baseline counts as
+success on `progressed` and failure on `noChange`, using the existing native
+status-progress collector. Cancelled/unknown outcomes are excluded, not
+successes. All ten failures demote too; there is no best-arm exemption or
+empty-role suspension. Evidence expires after the configured window, allowing
+a bounded re-trial. Ledger retention can shorten available evidence.
+
+This is an **operational progress proxy, not adjudicated review success**.
+The SDK does not expose accepted-artifact/review outcomes. A successful process
+exit alone is not evidence of a correct artifact. The feature does not claim
+to detect failed reviews that native lifecycle/status signals do not expose.
+
+### Enabling example (merge into existing configuration)
+
+```json
+{
+  "enforce": true,
+  "placement": { "freeCostProviders": ["nvidia-nim", "openrouter"] },
+  "freeLanes": {
+    "enabled": true,
+    "minQuality": 0.4,
+    "lowRiskAgentIds": ["dedicated-triage-agent"],
+    "providers": {
+      "nvidia-nim": { "requestsPerMinute": 36, "requestsPerMinutePerSlot": 12 },
+      "openrouter": {
+        "requestsPerMinute": 20,
+        "requestsPerMinutePerSlot": 12,
+        "requestsPerDay": 1000,
+        "requestsPerRun": 100
+      }
+    },
+    "demotion": { "lastRuns": 10, "minSuccessRate": 0.8, "windowHours": 24 }
+  }
+}
+```
+
+Replace the agent ID and validate rate/intensity assumptions for your account.
+The OpenRouter daily example permits at most ten **new admissions** per UTC
+day, not 1,000 agent runs. Only already served, benchmark-qualified,
+adapter-compatible arms qualify. No API key, account, free model or live
+configuration is created by this example. Enabling/editing waits for a matching
+native tick; disabling stops new free decisions immediately. Roll back with
+`freeLanes.enabled=false`. The flag-off regression also compares decisions,
+capacity, caps, shadow and persisted state against the absent-feature path.
+
 ## Automatic account plan sizing
 
 No provider/plan-size table is needed. The accounts feed can include credential-attributed

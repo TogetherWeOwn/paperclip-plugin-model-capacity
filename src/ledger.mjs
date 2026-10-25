@@ -109,6 +109,10 @@ export function recordDecision(ledger, decision, atMs) {
   r.decidedAccount = decision?.accountId ?? null;
   r.decidedAt = atMs;
   r.enforced = enforced;
+  if (decision?.freeProvider != null) {
+    r.freeProvider = decision.freeProvider;
+    r.freeAnswer = decision.freeAnswer;
+  }
   if (decision?.armId != null) r.armId = String(decision.armId);
   // Effort rides the record so burn calibration keys runs by model+effort.
   if (decision?.effort != null) r.effort = String(decision.effort);

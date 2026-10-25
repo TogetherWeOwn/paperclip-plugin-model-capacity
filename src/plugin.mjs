@@ -107,6 +107,7 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
+import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps } from './free-lanes.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -181,7 +182,7 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
-  errors.push(...validateTaskRanking(raw.taskRanking));
+  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes));
   // The lane key is sent as X-Api-Key to baseUrl: only the hard-coded
   // allowlist may name it, or config could redirect the key to any host.
   if (cliproxy?.baseUrl != null && !LANE_BASE_URL_ALLOWLIST.includes(cliproxy.baseUrl)) {
@@ -710,6 +711,7 @@ export function resolveConfig(raw = {}) {
       // (default) prices every account from AA, exactly as before.
       freeCostProviders: normalizeFreeCostProviders(raw.placement?.freeCostProviders),
     },
+    freeLanes: normalizeFreeLanes(raw.freeLanes),
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
     // Anchor for per-run burn when CLIProxy deltas are not yet calibrated
     // for an account (research example value; flagged calibration: weak).
@@ -1034,6 +1036,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Config lifecycle owns this fence; a stale tick cannot re-enable a mode
   // after an operator changed it while the tick was awaiting telemetry.
   const taskRankingModes = new Map();
+  const freeLaneConfigs = new Map(); // lifecycle fence; a stale tick cannot re-enable free routing
+  const freeLaneUsage = new Map(); // company -> UTC-day request reservations, tick-persisted
   const taskModeCompatible = (live, companyId) => !taskRankingModes.has(companyId)
     || live?.taskRanking?.mode === taskRankingModes.get(companyId);
   // Hook and event-time decisions write straight into the memory ledger
@@ -2497,6 +2501,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // failed post-restart read can never wipe the saved ledger. The next
     // tick retries the load (rejected loads are not cached).
     const ledger = await loadLedger(companyId);
+    if (config.freeLanes.enabled && !freeLaneUsage.has(companyId)) {
+      const saved = await ctx.state.get(scopeKey(companyId, 'free-lanes-v1'));
+      if (!freeLaneUsage.has(companyId)) freeLaneUsage.set(companyId, saved ?? {});
+    }
     // Allocation targets and provider pools. CLIProxy round-robins lanes
     // of the same provider onto shared credentials, so lane-level in-flight
     // spreading is theater: pressure is real only at the provider bucket.
@@ -3218,9 +3226,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const agentId = r?.agentId;
       if (typeof agentId !== 'string' || agentId.length === 0 || agentId === 'unknown') continue;
       const role = roleOf(config, agentId);
-      if (Object.hasOwn(roleRunning, role)) roleRunning[role] += 1;
+      if (freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) == null
+        && Object.hasOwn(roleRunning, role)) roleRunning[role] += 1;
     }
-    const concurrencyAccounts = ordered.map(a => {
+    // Free providers never enter paid C*, including calibration/fallback sums.
+    const concurrencyAccounts = ordered.filter(a => freeProvider(a, config.freeLanes) == null).map(a => {
       const gid = calibGroupOf.get(a.accountId) ?? a.accountId;
       return {
         accountId: a.accountId,
@@ -3546,8 +3556,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
       return orderAccountsWithPacing(
-        accountViews.filter(v => routesRun(v, true)
-          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0)).map(v => ({
+        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
+          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -3821,6 +3831,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Same '__proto__' discipline as agentRunning below: agentIds key this
     // map, so accumulate in a Map and snapshot with fromEntries (own data
     // properties; a direct assignment would hit the prototype setter).
+    if (config.freeLanes.enabled) {
+      await Promise.all(config.freeLanes.lowRiskAgentIds.map(id => agentAdapterType(companyId, id)));
+    }
     const adapterByAgentEntries = new Map();
     for (const [k, v] of agentAdapterCache) {
       const sep = k.indexOf(':');
@@ -3850,6 +3863,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     liveViews.set(companyId, {
       atMs: nowMs,
       enforce: config.enforce === true,
+      ...(config.freeLanes.enabled ? { freeLanes: config.freeLanes,
+        freeLanesMaxTotal: config.concurrency.maxTotal,
+        freeManualExclusions: config.taskRanking.mode === 'enforce' ? taskManual : config.roles.excludeFamilies } : {}),
       credentialReadinessEnforced: config.credentialReadiness.enforce,
       // RunIds whose decisions the frozen counts above already reflect.
       // Hook/event-time pressure is the ledger decisions NOT in this set --
@@ -4003,6 +4019,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       throw new Error('model-capacity: refusing ledger persist without a successful load');
     }
     await ctx.state.set(scopeKey(companyId, LEDGER_KEY), ledgerToJSON(ledger));
+    if (config.freeLanes.enabled) {
+      await ctx.state.set(scopeKey(companyId, 'free-lanes-v1'), freeLaneUsage.get(companyId) ?? {});
+    }
     // Gated on a successful load (see above): persisting without one would
     // wipe saved open/half-open breakers with an empty store.
     if (breakerReady.has(companyId)) {
@@ -4027,7 +4046,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
       let entry = agentRunningById.get(r.agentId);
       if (!entry) { entry = { running: 0, overPace: false }; agentRunningById.set(r.agentId, entry); }
-      entry.running += 1;
+      const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
+      if (free) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
+      else entry.running += 1;
       const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
@@ -4263,10 +4284,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       taskRanking.candidates = taskRanking.candidates.map(({ credentialEvidence, row, ...c }) => c);
       delete taskRanking.accounts;
     }
+    const freeCapacity = config.freeLanes.enabled ? freeCapacityReport(liveViews.get(companyId), companyId, nowMs) : null;
+    const publishedTarget = freeCapacity?.target > 0
+      ? Math.min(config.concurrency.maxTotal, (concurrency.target ?? 0) + freeCapacity.target) : concurrency.target;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       atMs: nowMs,
       taskRanking,
-      target: concurrency.target,
+      ...(freeCapacity ? { freeLanes: freeCapacity, paidTarget: concurrency.target,
+        paidCalibration: concurrency.calibration, totalTarget: publishedTarget } : {}),
+      // Existing fleet-target consumers see additive throughput. The paid
+      // allocator below still uses paidTarget, never this combined budget.
+      target: publishedTarget,
       demandFactor: concurrency.demandFactor ?? 1,
       // Unsmoothed usable target, and the quota-only sum with no role
       // filtering (what the target used to read), so the gap stays visible.
@@ -4275,7 +4303,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       demandBound: concurrency.demandBound ?? null,
       targetUnweighted: concurrency.slotsTotal ?? null,
       maxTotal: config.concurrency.maxTotal,
-      calibration: concurrency.calibration,
+      calibration: freeCapacity?.target > 0 && concurrency.calibration === 'weak' ? 'partial' : concurrency.calibration,
       // Did finished runs do their job (issue moved to a disposition), per
       // resolved model family, last 24h.
       familyOutcomes: familyOutcomes(terminalRecords(ledger), {
@@ -4392,6 +4420,125 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       calibration: concurrency.calibration, observed, runs: ledger.size, runsSource: 'events',
     });
     return { status: 'shadow', observed };
+  }
+
+  function managedFreeAccount(live, companyId, account) {
+    // Keep the old managed accounts out of ordinary routing until a disabling
+    // tick lands too; otherwise turning off would open a bypass immediately.
+    return freeProvider(account, freeLaneConfigs.get(companyId)) != null
+      || freeProvider(account, live?.freeLanes) != null;
+  }
+
+  function safeFreeAgentIds(live, companyId) {
+    const cfg = freeLaneConfigs.get(companyId);
+    return (cfg?.lowRiskAgentIds ?? []).filter(agentId => lowRiskRun({
+      agentId, runId: 'eligibility', issueId: 'eligibility', previous: null,
+    }, cfg, { role: roleOf({ roles: live ?? {} }, agentId),
+      kept: live?.keepAgentIds?.includes(agentId) === true,
+      reviewer: liveIsReviewAgent(live, agentId) || live?.reviewerRouting?.agentIds?.includes(agentId) === true }));
+  }
+
+  function freeRunGroups(live, companyId, account, role, nowMs, report = null) {
+    const cfg = live.freeLanes;
+    const provider = freeProvider(account, cfg);
+    const ledger = ledgers.get(companyId) ?? new Map();
+    const candidates = live.taskRanking?.mode === 'enforce'
+      ? account.taskRoles?.[role]?.candidates ?? [] : account.credentialRanking?.candidates ?? [];
+    const manual = live.freeManualExclusions?.[role] ?? [];
+    const arms = candidates.filter(arm => {
+      const verdict = freeArmVerdict(arm, provider, ledger.values(), cfg, nowMs);
+      if (report) report.push({ accountId: account.accountId, provider, armId: arm.armId, model: arm.model, ...verdict });
+      if (!verdict.eligible) return false;
+      // Replace only the paid quality floor. Task trust, exact effort support,
+      // operational identity and a usable resource estimate stay mandatory.
+      if (arm.taskRanking && (!arm.benchmarkTrusted || !arm.effortVerified
+        || (arm.operationalReasons?.length ?? 0) > 0 || !Number.isFinite(arm.taskCostProxy)
+        || !['eligible', 'pareto-dominated', 'min-quality'].includes(arm.selectionReason))) return false;
+      return true;
+    }).map(arm => ({ ...arm, eligible: true }));
+    const groups = filterRungsByExcludedFamilies([{ rung: 0, arms }], manual);
+    const ready = credentialReadinessEnforced(companyId) ? filterCredentialRungs(groups, nowMs) : groups;
+    return filterBreakerRungs(ready, breakerStores.get(companyId) ?? createBreakerStore(), account.accountId,
+      nowMs, lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS);
+  }
+
+  function freeDecisionFor(params, live, role, account, nowMs, available) {
+    if (!account.reactive && !account.remainingKnown) return { decision: { kind: 'defer' }, groups: [] };
+    const adapter = params.adapterType ?? liveAdapterFor(live, params.agentId);
+    const groups = freeRunGroups(live, params.companyId, account, role, nowMs).map(g => ({ ...g,
+      arms: g.arms.filter(a => adapterAllowsTrial(live.trialAdapters, adapter, a.family)) }));
+    const trialBudget = Object.fromEntries(groups.flatMap(g => g.arms.map(a => [a.family, available])));
+    const decision = decide({ runId: params.runId, agentId: params.agentId, role,
+      ladderRungs: groups, accountId: account.accountId, pointer: 0,
+      roleBands: { [role]: { floorRung: 0, ceilingRung: 0 } }, contextCaps: live.contextCaps,
+      adapterType: adapter, trialBudget, trialAdapters: live.trialAdapters, trialRoles: live.trialRoles,
+      fiveHourHeadroomPct: account.headroomPct, burnPerRunPct: account.burnPerRunPct,
+      reservePct: 0.05, taskRanking: live.taskRanking });
+    return { decision, groups };
+  }
+
+  function freeCapacityReport(live, companyId, nowMs) {
+    const cfg = live.freeLanes;
+    const ledger = ledgers.get(companyId) ?? new Map();
+    const usage = freeLaneUsage.get(companyId) ?? {};
+    const providers = {}, arms = [];
+    const allowed = safeFreeAgentIds(live, companyId);
+    for (const provider of Object.keys(cfg.providers)) {
+      const accounts = live.accounts.filter(a => freeProvider(a, cfg) === provider);
+      const budget = freeLaneBudget(provider, live.accounts, ledger, usage, cfg, nowMs, null, live.staleHorizonMs);
+      const usable = accounts.some(a => a.health === 'healthy' && a.action !== 'excluded'
+        && allowed.some(agentId => freeDecisionFor({ runId: 'free-capacity-preview', companyId, agentId },
+          live, roleOf({ roles: live }, agentId), a, nowMs, budget.slots).decision.kind === 'decide'));
+      for (const a of accounts) freeRunGroups(live, companyId, a, 'doer', nowMs, arms);
+      Object.defineProperty(providers, provider, { enumerable: true, value: { ...budget,
+        target: usable && (budget.dailyRemaining == null || budget.dailyRemaining >= cfg.providers[provider].requestsPerRun)
+          ? budget.slots : 0 } });
+    }
+    return { enabled: true, minQuality: cfg.minQuality, providers, arms,
+      target: Object.values(providers).reduce((sum, p) => sum + p.target, 0),
+      outcomeSignal: 'failed-run-or-status-progress; not adjudicated review acceptance' };
+  }
+
+  function routeFreeRun(params, live, role, ledger) {
+    const cfg = freeLaneConfigs.get(params.companyId);
+    if (!lowRiskRun(params, cfg, { role,
+      kept: live.keepAgentIds?.includes(params.agentId),
+      reviewer: liveIsReviewAgent(live, params.agentId) || live.reviewerRouting?.agentIds?.includes(params.agentId) })) return null;
+    if (JSON.stringify(cfg) !== JSON.stringify(live.freeLanes)) return null;
+    const previous = ledger.get(params.runId);
+    if (previous?.freeAnswer && previous.enforced && !isTerminalStatus(previous.status)) return previous.freeAnswer;
+    if (previous?.enforced || isTerminalStatus(previous?.status)) return null;
+    const nowMs = clock();
+    if (nowMs < live.atMs) return null;
+    const executing = [...ledger.values()].filter(r => r.runId !== params.runId
+      && !deferredRuns.get(params.companyId)?.has(r.runId)
+      && isInflight(r, nowMs, live.staleHorizonMs)).length;
+    if (executing >= live.freeLanesMaxTotal) return null;
+    const usage = freeLaneUsage.get(params.companyId);
+    if (!usage) return null; // no native tick/usage load yet
+    for (const account of live.accounts) {
+      const provider = freeProvider(account, cfg);
+      if (!provider || account.health !== 'healthy' || account.action === 'excluded') continue;
+      const budget = freeLaneBudget(provider, live.accounts, ledger, usage, cfg, nowMs, params.runId, live.staleHorizonMs);
+      if (budget.available < 1) continue;
+      const { decision: d, groups } = freeDecisionFor(params, live, role, account, nowMs, budget.available);
+      if (d.kind !== 'decide' || !decisionCredentialReady(d, groups, params.companyId)) continue;
+      const bstore = breakerStores.get(params.companyId) ?? createBreakerStore();
+      const bcfg = lastConfig.get(params.companyId)?.breakers ?? DEFAULT_BREAKERS;
+      if (breakerState(bstore, account.accountId, d.armId, nowMs, bcfg) === 'half-open'
+        && !startProbe(bstore, account.accountId, d.armId, params.runId, nowMs, bcfg)) continue;
+      const answer = { kind: 'decide', decisionId: d.decisionId, model: d.model, effort: d.effort,
+        env: d.env, source: d.source, reason: `additive free lane ${provider}: ${d.reason}` };
+      // Synchronous admission + reservation + record, with no await between
+      // them: concurrent hook RPCs cannot spend the same provider slot twice.
+      reserveFreeRun(usage, provider, cfg, nowMs);
+      recordDecision(ledger, { runId: params.runId, agentId: params.agentId, accountId: d.accountId,
+        armId: d.armId, effort: d.effort, enforced: true, wouldModel: d.model, rung: d.rung,
+        trial: d.trial, family: inferFamily(canonicalModelName(d.model)), reason: answer.reason,
+        freeProvider: provider, freeAnswer: answer }, nowMs);
+      return answer;
+    }
+    return null;
   }
 
   function credentialReadinessEnforced(companyId) {
@@ -4604,8 +4751,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg)),
     bstore, a.accountId, nowMs, bcfg);
     return orderAccountsWithPacing(
-      (live.accounts ?? []).filter(a => rungsHaveEligibleArms(routesRun(a, true))
-        || (forReview && live.taskRanking?.mode === 'enforce' && (a.policyReviewerArms?.length ?? 0) > 0)).map(a => {
+      (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (rungsHaveEligibleArms(routesRun(a, true))
+        || (forReview && live.taskRanking?.mode === 'enforce' && (a.policyReviewerArms?.length ?? 0) > 0))).map(a => {
         const p = poolOf(a.accountId);
         const ladderRungs = routesRun(a, duplicates);
         const preview = live.taskRanking?.mode === 'enforce' ? decide({ ...inputsFor(a), ladderRungs }) : null;
@@ -4772,7 +4919,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const admissionOf = new Map();
     const pick = selectReviewerRoute({
       cfg,
-      accounts: (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId)),
+      accounts: (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId) && !managedFreeAccount(live, companyId, a)),
       burnTokens: new Set(live.burnModeTokens ?? []),
       taskRanking: live.taskRanking,
       primaryUnavailableReasons: (live.accounts ?? []).filter(a => excludeIds?.has(a.accountId)
@@ -4954,6 +5101,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const cands = [];
     for (const view of live?.accounts ?? []) {
       const accountId = view?.accountId;
+      // Managed free lanes have one admission path. Exhaustion cannot bypass
+      // low-risk eligibility, provider slots, daily reservations or demotion.
+      if (managedFreeAccount(live, companyId, view)) continue;
       if (typeof accountId !== 'string' || accountId.length === 0) continue;
       if (view.health !== 'healthy' && view.health !== 'degraded') {
         skips.push(`${accountId} health ${view.health ?? 'unknown'}`);
@@ -5097,6 +5247,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         for (const a of live?.accounts ?? []) {
           const accountId = a?.accountId;
           if (typeof accountId !== 'string' || accountId.length === 0) continue;
+          if (managedFreeAccount(live, companyId, a)) continue;
           if (a.health !== 'healthy' && a.health !== 'degraded') continue;
           if (a.health === 'healthy' && a.action === 'excluded') continue;
           const hasDefault = liveLadderArms(a).some((x) => x != null
@@ -5631,6 +5782,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // works before the first tick lands (the tick refreshes it every run).
       const nextConfig = resolveConfig(raw);
       taskRankingModes.set(companyId, nextConfig.taskRanking.mode);
+      freeLaneConfigs.set(companyId, nextConfig.freeLanes);
       lastConfig.set(companyId, nextConfig);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
@@ -5682,9 +5834,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const atMs = cap.atMs ?? null;
         const calibration = cap.calibration ?? 'weak';
         const target = cap.target ?? null;
+        const paidTarget = cap.freeLanes ? cap.paidTarget : target;
         // Weak calibration means no target at all: no caps, never zeros
         // masquerading as a recommendation.
-        if (target == null || calibration === 'weak') {
+        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0)) {
           return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
         }
         // Agents with queued/ready work: assigned non-terminal issues
@@ -5734,7 +5887,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Fixed-model agents consume the same fleet target, but only from the
         // capacity of their serving pool. Routed demand receives the remainder.
         const allocated = allocateKeptAndRoutedCaps({
-          target,
+          target: paidTarget ?? 0,
           maxTotal: cap.maxTotal ?? 75,
           demandFactor: cap.demandFactor ?? 1,
           agents: capInputs,
@@ -5797,6 +5950,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = floored.entries;
           floorSummary = floored.floors;
         }
+        if (cap.freeLanes) {
+          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
+          // This uses paid-only running counts above. Free running never
+          // consumes C*, and additive slots cannot shrink a paid allocation.
+          const freeEnabled = freeLaneConfigs.get(companyId)?.enabled === true;
+          agents = freeLaneCaps(agents, freeRunning, freeEnabled ? cap.freeLanes.target : 0,
+            freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], cap.maxTotal ?? 75);
+        }
         for (const agent of agents) agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
         return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
       }
@@ -5844,6 +6005,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (live.taskRanking?.mode === 'enforce' && (!Number.isFinite(live.atMs)
         || clock() - live.atMs > 120000 || clock() < live.atMs)) {
         return { kind: 'defer', retryAfterMs: 20000, reason: 'task-ranking evidence snapshot stale or invalid' };
+      }
+      if (freeLaneConfigs.get(params.companyId)?.enabled === true
+        && JSON.stringify(live.freeLanes) !== JSON.stringify(freeLaneConfigs.get(params.companyId))) {
+        return { kind: 'defer', retryAfterMs: 20000, reason: 'free-lane configuration changed; awaiting the next native tick' };
       }
       // Reviewer routing: listed review agents route to the best configured
       // arm (burn mode, then the pool most behind plan); no qualifying arm
@@ -5938,6 +6103,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         doerAgentIds: live.doerAgentIds,
       } }, params.agentId);
       const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
+      if (freeLaneConfigs.get(params.companyId)?.enabled === true
+        && JSON.stringify(live.freeLanes) !== JSON.stringify(freeLaneConfigs.get(params.companyId))) {
+        return { kind: 'defer', retryAfterMs: 20000, reason: 'free-lane configuration changed; awaiting the next native tick' };
+      }
+      const freeAnswer = routeFreeRun(params, live, role, hookLedger);
+      if (freeAnswer) {
+        clearDeferred(params.companyId, params.runId);
+        if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
+        return freeAnswer;
+      }
       // Same water-filling order as the shadow tick: need band first, then
       // largest (targetShare - pooled in-flight). Metered accounts without
       // headroom never qualify; healthy reactive accounts qualify without
