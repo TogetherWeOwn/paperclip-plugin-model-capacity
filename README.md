@@ -777,7 +777,11 @@ the agent's seed cards do not increase it. Open statuses are `backlog`,
 `todo`, `in_progress`, `in_review` and `blocked`; terminal cards do not count.
 The highest priority among the ready cards supplies `priorityWeight`:
 critical 4, high 3, medium 2, low 1 (unknown priority uses medium).
-Agents without ready-card metadata use multiplier 1.
+Agents without ready-card metadata use multiplier 1. Each agent's new share
+stops at its queued demand (or one idle headroom slot for a running routed
+agent); kept agents reserve no idle headroom. When an agent or serving pool
+saturates, its excess share is redistributed among remaining eligible agents,
+including agents in other kept pools, rather than leaving usable slots idle.
 
 Active mode fits allocations to **both** the rounded integer fleet target and
 `maxTotal`, rather than the legacy below-target burst to the ceiling. Existing

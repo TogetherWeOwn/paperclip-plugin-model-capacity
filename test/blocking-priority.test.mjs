@@ -205,6 +205,35 @@ test('priority mode preserves running and never grants beyond target or ceiling'
   }
 });
 
+test('priority shares stop at useful demand and redistribute to waiting agents', () => {
+  const rows = allocateDemandCaps(10, [
+    { agentId: 'blocker', running: 0, queued: 1, allocationWeight: 404 },
+    { agentId: 'worker', running: 0, queued: 100, allocationWeight: 1 },
+  ], 75, { blockingPriority: true });
+  assert.equal(asMap(rows).get('blocker').allocated, 1);
+  assert.equal(asMap(rows).get('worker').allocated, 9);
+  assert.equal(total(rows), 10);
+});
+
+test('saturated kept pools release slots to other kept pools before leaving capacity idle', () => {
+  for (const smallSlots of [0, 1]) {
+    const result = allocateKeptAndRoutedCaps({
+      target: 2, maxTotal: 75, blockingPriority: true,
+      agents: [
+        { agentId: 'blocker', running: 0, queued: 10, allocationWeight: 404 },
+        { agentId: 'worker', running: 0, queued: 10, allocationWeight: 1 },
+      ],
+      keepAgentIds: ['blocker', 'worker'],
+      keptByAgent: { blocker: { accountId: 'small' }, worker: { accountId: 'large' } },
+      accounts: [{ accountId: 'small', pool: 'small' }, { accountId: 'large', pool: 'large' }],
+      perAccount: [{ accountId: 'small', slots: smallSlots }, { accountId: 'large', slots: 10 }],
+    });
+    assert.equal(asMap(result.kept).get('blocker').allocated, smallSlots);
+    assert.equal(asMap(result.kept).get('worker').allocated, 2 - smallSlots);
+    assert.equal(total([...result.kept, ...result.routed]), 2);
+  }
+});
+
 test('running counts above the target are preserved with no new slots', async () => {
   const d = await drive({ config: enabled, running: { operator: 3, worker: 9 }, target: 0.9 });
   const body = await d.caps();
@@ -279,6 +308,42 @@ test('unknown priorities are medium and prototype-looking ids remain plain keys'
   const row = asMap((await d.caps()).agents).get('__proto__');
   assert.deepEqual(row.allocationPriority, { blockingFanOut: 1, cardPriority: 'medium', weight: 4 });
   assert.equal(Object.prototype.blockingFanOut, undefined);
+});
+
+test('priority fills every feasible slot across multiple shared, saturated and unavailable pools', () => {
+  let seed = 0x51a7c0de;
+  const random = n => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
+  for (let i = 0; i < 2000; i++) {
+    const pools = Array.from({ length: 3 }, (_, j) => ({ accountId: `p${j}`, pool: `p${j}`, slots: random(12) }));
+    const agents = Array.from({ length: 3 + random(10) }, (_, j) => ({
+      agentId: `a${j}`, running: random(4), queued: random(20), allocationWeight: 1 + random(404),
+    }));
+    const kept = agents.filter((_, j) => j % 4 !== 3);
+    const keptByAgent = Object.fromEntries(kept.map((agent, j) => [agent.agentId, { accountId: pools[j % 3].accountId }]));
+    const unavailableAccountIds = random(2) ? ['p0'] : [];
+    const target = random(80) / 2, maxTotal = 1 + random(40);
+    const result = allocateKeptAndRoutedCaps({ target, maxTotal, agents, blockingPriority: true,
+      keepAgentIds: kept.map(agent => agent.agentId), keptByAgent, accounts: pools, perAccount: pools,
+      unavailableAccountIds,
+    });
+    const rows = [...result.kept, ...result.routed];
+    const running = agents.reduce((sum, agent) => sum + agent.running, 0);
+    let feasibleExtras = agents.filter(agent => !keptByAgent[agent.agentId])
+      .reduce((sum, agent) => sum + (agent.running + agent.queued > 0 ? Math.max(agent.queued, 1) : 0), 0);
+    for (const pool of pools) {
+      const members = kept.filter(agent => keptByAgent[agent.agentId].accountId === pool.accountId);
+      const poolRunning = members.reduce((sum, agent) => sum + agent.running, 0);
+      const poolQueued = members.reduce((sum, agent) => sum + agent.queued, 0);
+      const ceiling = unavailableAccountIds.includes(pool.accountId) ? 0 : pool.slots;
+      feasibleExtras += Math.min(poolQueued, Math.max(0, ceiling - poolRunning));
+      assert.ok(total(rows.filter(row => members.some(agent => agent.agentId === row.agentId))) <= Math.max(poolRunning, ceiling));
+    }
+    const budget = Math.max(0, Math.min(Math.round(target), maxTotal) - running);
+    assert.equal(total(rows), running + Math.min(budget, feasibleExtras), `case ${i}`);
+    assert.ok(rows.every(row => row.allocated >= row.running));
+    assert.ok(result.kept.every(row => row.allocated <= row.demand));
+    assert.ok(result.routed.every(row => row.allocated <= Math.max(row.demand, row.running + 1)));
+  }
 });
 
 test('seeded kept/routed allocation sweep respects running and pool ceilings', () => {
