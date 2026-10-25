@@ -607,6 +607,17 @@ const CONFIG_SCHEMA = {
         doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
       },
     },
+    reviewDemand: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in pre-admission PR-head census. Requires an explicitly approved read-only GitHub credential reference; absent/disabled performs no new HTTP reads.',
+      anyOf: [{ required: ['enabled'], properties: { enabled: { const: false } } }, { required: ['repositories', 'tokenSecretRef'] }],
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        repositories: { type: 'array', minItems: 1, maxItems: 25, items: { type: 'string', pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' } },
+        tokenSecretRef: { ...SECRET_REF, description: 'Existing read-only GitHub token, never an App private key. No credential is created or rotated.' },
+        requiredChecks: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string', minLength: 1, maxLength: 200, not: { const: 'Paperclip Review' } }, default: ['ci-ok', 'pr-lint'] },
+      },
+    },
     reviewerRouting: {
       type: 'object', additionalProperties: false,
       anyOf: [

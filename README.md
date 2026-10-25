@@ -19,6 +19,57 @@ sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
 
+## Reviewer backlog demand (opt-in; activation requires security sign-off)
+
+A slot-metered review gate may enqueue only one review at a time even when many
+CI-green PRs await review. Queued heartbeat runs alone cannot size that reviewer.
+`reviewDemand` adds proven review-eligible **current PR heads** to heartbeat demand:
+
+```json
+{
+  "reviewDemand": {
+    "repositories": ["example/product"],
+    "tokenSecretRef": { "type": "secret_ref", "secretId": "<existing-read-only-token-secret-id>" },
+    "requiredChecks": ["ci-ok", "pr-lint"]
+  }
+}
+```
+
+This optional plugin reader uses a fixed read-only GitHub GraphQL query. The
+native chat review history starts after admission (and its list is limited to
+100 rows); it cannot reveal heads outside the gate. The SDK does not expose
+chat review reads or another plugin's private state. No direct database access,
+core patch, new credential, or host script is used. **Do not activate until the
+new outbound origin and the existing credential binding have security approval.**
+Absent configuration or `enabled: false` performs no new source I/O.
+
+Only open, non-draft, mergeable PRs whose configured CI checks all succeeded at
+the current head count. Missing checks, unknown mergeability, mismatched commit
+IDs and truncated check rollups do not count. A same-head Paperclip Review
+success/failure is a verdict, not new demand; a missing, pending, or
+`ACTION_REQUIRED` review is waiting. Required CI names are explicit because
+optional third-party reviews may remain pending; configure the actual CI gate
+names for the selected repositories. This signal changes sizing only, never
+review/merge admission. Different gate-name sets need separate configuration
+in a later extension; do not weaken the list to fit a heterogeneous scope.
+
+The reader caches counts only for five minutes per company/config, coalesces
+concurrent reads, refuses redirects, and caps collection at 25 repositories,
+50 pages, 100 PRs/page and 100 check contexts/head. A failed, partial or
+rate-limited census replaces positive demand with `unavailable`, never stale
+headroom. `/caps.reviewDemand` reports health/count/time; review agents report
+`heartbeatQueued` and `reviewEligibleHeads`. A shared backlog is split once
+across configured reviewer identities rather than duplicated per reviewer.
+
+Reviewer caps use every account admitted by their configured routing arms,
+not just the adapter default model's pool. Existing arm/readiness/breaker,
+headroom and pace guards remain in force. Fixed-model agents reserve first;
+reviewers share the remaining account/pool budgets and fleet ceiling. Routing
+order is unchanged: this change does not alter primary/helper preference.
+The admission snapshot expires after two minutes, and exhausted arms preserve
+only existing running floors. Undo: disable `reviewDemand` to remove the new
+source, or reinstall the prior release to restore the previous cap allocator.
+
 ## Automatic account plan sizing
 
 No provider/plan-size table is needed. The accounts feed can include credential-attributed

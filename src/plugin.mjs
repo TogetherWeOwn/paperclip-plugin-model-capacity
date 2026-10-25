@@ -106,6 +106,7 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
+import { validateReviewDemand, normalizeReviewDemand, createReviewDemandReader } from './review-demand.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -315,6 +316,7 @@ export function validateConfigShape(raw) {
     }
   }
   errors.push(...validateReviewerRouting(raw.reviewerRouting));
+  errors.push(...validateReviewDemand(raw.reviewDemand));
   for (const b of armMap ?? []) {
     if (!b?.aaSlug || !b?.model || !b?.effort || !b?.family || !Array.isArray(b?.providers)) {
       errors.push('armMap entries need aaSlug, model, effort, family, providers');
@@ -593,6 +595,7 @@ export function resolveConfig(raw = {}) {
     reviewerRouting: normalizeReviewerRouting(raw.reviewerRouting, {
       reviewAgentIds: normalizeReviewReserve(raw.reviewReserve, { keepAgentIds }).agentIds,
     }),
+    reviewDemand: normalizeReviewDemand(raw.reviewDemand),
     // Burn mode tokens (tolerant read; absent = nothing flagged): reviewer
     // routing prefers accounts flagged here.
     burnModeTokens: [...burnModeTokens(raw.burnMode)],
@@ -916,6 +919,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  const readReviewDemand = createReviewDemandReader({ clock });
   // Reconciliation marks (never deletes): every tick, non-terminal ledger
   // records anchored outside the in-flight horizon are flagged `unverified`
   // and excluded from counting. Idempotent, so no once-flag is needed and a
@@ -3728,6 +3732,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
     const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
       .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs));
+    // Use the real routing admission, not the configured default model's pool.
+    // An empty list is meaningful: no helper may grant new review slots.
+    const reviewerAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
+      const { admissionOf } = pickReviewerRoute(reviewerLive, companyId, agentId, null, nowMs);
+      return [agentId, (reviewerLive.accounts ?? []).filter(a => config.reviewerRouting.arms.some(arm =>
+        admissionOf.has(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`))).map(a => a.accountId)];
+    }));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
         const access = roleAccess?.[v.accountId];
@@ -3930,6 +3941,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       agentRunning,
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
+      reviewerAccountIdsByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -4913,7 +4925,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const reviewIds = new Set(lastConfig.get(companyId)?.reviewerRouting?.agentIds ?? []);
         const heartbeatIds = new Set([...keptIds, ...reviewIds]);
         const heartbeat = await queuedHeartbeatsByAgent(companyId, clock());
-        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent)]);
+        const admissionAgeMs = Number.isFinite(atMs) ? clock() - atMs : Infinity;
+        const reviewAdmissionFresh = admissionAgeMs >= 0 && admissionAgeMs <= 120_000;
+        const reviewDemandConfig = reviewIds.size > 0 ? lastConfig.get(companyId)?.reviewDemand : null;
+        const reviewDemand = reviewDemandConfig && !reviewAdmissionFresh
+          ? { status: 'unavailable', eligibleHeads: 0, reason: 'review-admission-stale' }
+          : await readReviewDemand(ctx, companyId, reviewDemandConfig);
+        // A shared PR head is demand once, not once per helper/reviewer identity.
+        const reviewShares = new Map([...reviewIds].sort().map((id, i, ids) => [id,
+          Math.floor(reviewDemand.eligibleHeads / ids.length) + (i < reviewDemand.eligibleHeads % ids.length ? 1 : 0)]));
+        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent),
+          ...[...reviewShares].filter(([, n]) => n > 0).map(([id]) => id)]);
         if (heartbeat.ok) {
           for (const agentId of heartbeat.counts.keys()) {
             if (heartbeatIds.has(agentId)) agentIds.add(agentId);
@@ -4923,7 +4945,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agentId,
           running: runningByAgent[agentId]?.running ?? 0,
           queued: heartbeatIds.has(agentId)
-            ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
+            ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0) + (reviewShares.get(agentId) ?? 0)
             : (counts.get(agentId) ?? 0),
           overPace: runningByAgent[agentId]?.overPace === true,
         }));
@@ -4943,6 +4965,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           perAccount: cap.perAccount ?? [],
           pacePools: cap.paceGuard?.pools ?? [],
           unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+          reviewerAccountIdsByAgent: Object.fromEntries([...reviewIds].map(id => [id,
+            reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
+              ? cap.reviewerAccountIdsByAgent[id] : []])),
         });
         const keptCaps = allocated.kept;
         const unheld = allocated.routed;
@@ -4996,8 +5021,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = floored.entries;
           floorSummary = floored.floors;
         }
-        for (const agent of agents) agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
-        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
+        for (const agent of agents) {
+          agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
+          if (reviewIds.has(agent.agentId) && reviewDemand.status !== 'disabled') {
+            agent.heartbeatQueued = heartbeat.ok ? (heartbeat.counts.get(agent.agentId) ?? 0) : 0;
+            agent.reviewEligibleHeads = reviewShares.get(agent.agentId) ?? 0;
+            agent.demandSource = `heartbeat-runs+review-heads${reviewDemand.status === 'ok' ? '' : '-unavailable'}`;
+          }
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },
