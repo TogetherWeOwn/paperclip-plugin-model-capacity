@@ -4500,6 +4500,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   function safeFreeAgentIds(live, companyId) {
+    if (live == null) return [];
     const cfg = freeLaneConfigs.get(companyId);
     return (cfg?.lowRiskAgentIds ?? []).filter(agentId => lowRiskRun({
       agentId, runId: 'eligibility', issueId: 'eligibility', previous: null,
@@ -6155,19 +6156,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         return reviewRoute;
       }
-      // Operator-pinned agents (gating roles) always run their configured model
-      // -- with the Sol/Luna context caps when that model needs them.
-      if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
-        await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
-        const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
-        if (capped) {
-          clearDeferred(params.companyId, params.runId);
-          if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
-          return capped;
-        }
-        return keep();
-      }
-      const credentialEnforced = credentialReadinessEnforced(params.companyId);
       // Every defer below leaves the run waiting, not executing: the pace
       // guard stops counting it as in flight while its mark is fresh (see
       // the retry-lifespan bound on deferredRuns). Terminal capacity defers
@@ -6180,6 +6168,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         return out;
       };
+      // Operator-pinned agents retain their configured model and context caps,
+      // but keep must not bypass managed free-provider admission.
+      if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
+        const defaultKey = canonicalKey(params.agentDefaultModel);
+        if (defaultKey && (live.accounts ?? []).some(a => managedFreeAccount(live, params.companyId, a)
+          && (a.models ?? []).some(m => canonicalKey(m) === defaultKey))) {
+          return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'kept agent default requires managed free-lane admission' }, {
+            countTowardExhaustion: false,
+          });
+        }
+        await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
+        const capped = keptCapsAnswer(params, live, 'kept: agent pinned to its configured model (roles.keepAgentIds)');
+        if (capped) {
+          clearDeferred(params.companyId, params.runId);
+          if (exhaustionEnabledFor(params.companyId)) clearExhaustionStreak(params.companyId, params);
+          return capped;
+        }
+        return keep();
+      }
+      const credentialEnforced = credentialReadinessEnforced(params.companyId);
       if (!Number.isFinite(live.atMs) || clock() - live.atMs > 120000
         || (credentialEnforced && clock() < live.atMs)) {
         if (credentialEnforced) {
