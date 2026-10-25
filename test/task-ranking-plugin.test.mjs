@@ -187,10 +187,78 @@ test('a configured reviewer with no approved feasible arm defers instead of taki
   assert.equal((await d.shadow()).entries.some(r => r.runId === 'review-observation'), false);
 });
 
-test('existing per-arm manual exclusions retain their meaning after canonical effort identity changes', async () => {
-  const d = await drive({ config: { roles: { excludeFamilies: { doer: ['arm:gpt-6-1-sol-high'] },
-    thinkerFloorRung: 0, minQuality: { doer: null, thinker: null, other: null } } } });
-  assert.equal((await d.hook()).model, 'gpt-5.6-terra');
+for (const token of ['arm:gpt-6-1-sol-high', 'arm:GPT-6-1-Sol-High', 'ARM:GPT-6-1-Sol-High', 'arm:GPT-6.1-Sol']) {
+  test(`existing per-arm manual exclusion ${token} retains its meaning after canonical effort identity changes`, async () => {
+    const d = await drive({ config: { roles: { excludeFamilies: { doer: [token] },
+      thinkerFloorRung: 0, minQuality: { doer: null, thinker: null, other: null } } } });
+    assert.equal((await d.hook()).model, 'gpt-5.6-terra');
+  });
+}
+
+for (const token of ['arm:gpt-6-1-sol-high', 'ARM:GPT-6-1-Sol-High']) {
+  test(`missing-AA reviewer respects legacy exclusion ${token} in enforce mode`, async () => {
+    const d = await drive({ aaRows: rows.filter(r => r.slug !== 'gpt-6-1-sol-high'),
+      config: { roles: { excludeFamilies: { doer: [token] },
+        minQuality: { doer: null, thinker: null, other: null } },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [
+        { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
+        { provider: 'codex', model: 'gpt-5.6-terra', effort: 'max' },
+      ] } } });
+    const pick = await d.hook({ agentId: 'reviewer' });
+    assert.equal(pick.kind, 'decide');
+    assert.equal(pick.model, 'gpt-5.6-terra');
+    await d.fire('excluded-review', 'reviewer');
+    await d.tick();
+    const observation = (await d.shadow()).entries.find(r => r.runId === 'excluded-review');
+    assert.equal(observation.wouldModel, 'gpt-5.6-terra(max)');
+  });
+}
+
+for (const mode of ['off', 'shadow', 'enforce']) {
+  test(`legacy reviewer AA alias remains excluded without exact task evidence in ${mode} mode`, async () => {
+    // Legacy bindings may borrow a configured AA alias. Exact task discovery
+    // intentionally cannot treat that old alias as evidence for this model.
+    const alias = 'legacy-sol-high';
+    const d = await drive({ mode, aaRows: [{ ...rows[0], slug: alias }, rows[1]],
+      config: { armMap: [{ ...armMap[0], aaSlug: alias }, armMap[1]],
+        roles: { excludeFamilies: { doer: ['ARM:Legacy-Sol-High'] },
+          minQuality: { doer: null, thinker: null, other: null } },
+        reviewerRouting: { agentIds: ['reviewer'], arms: [
+          { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
+          { provider: 'codex', model: 'gpt-5.6-terra', effort: 'max' },
+        ] } } });
+    const pick = await d.hook({ agentId: 'reviewer' });
+    assert.equal(pick.kind, 'decide');
+    assert.equal(pick.model, 'gpt-5.6-terra');
+  });
+}
+
+test('missing-AA reviewer legacy aliases do not exclude sibling efforts or invent benchmark trust', async () => {
+  const d = await drive({ aaRows: rows.filter(r => r.slug !== 'gpt-6-1-sol-high'),
+    config: { armMap: [...armMap, { ...armMap[0], aaSlug: 'gpt-6-1-sol', effort: 'max' }],
+      roles: { excludeFamilies: { doer: ['arm:gpt-6-1-sol-high'] },
+        minQuality: { doer: null, thinker: null, other: null } },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [
+        { provider: 'codex', model: 'gpt-6.1-sol', effort: 'max' },
+      ] } } });
+  const pick = await d.hook({ agentId: 'reviewer' });
+  assert.equal(pick.kind, 'decide');
+  assert.equal(pick.model, 'gpt-6.1-sol');
+  assert.equal(pick.effort, 'max');
+  const incumbent = (await d.capacity()).taskRanking.candidates.find(c => c.role === 'reviewer' && c.model === 'gpt-6.1-sol');
+  assert.equal(incumbent.aaSlug, null);
+  assert.equal(incumbent.benchmarkTrusted, false);
+  assert.equal(incumbent.qFleet, null);
+});
+
+test('excluding the sole missing-AA reviewer incumbent defers rather than bypassing its legacy token', async () => {
+  const d = await drive({ aaRows: rows.filter(r => r.slug !== 'gpt-6-1-sol-high'),
+    config: { roles: { excludeFamilies: { doer: ['arm:gpt-6-1-sol-high'] },
+      minQuality: { doer: null, thinker: null, other: null } },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [
+        { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
+      ] } } });
+  assert.equal((await d.hook({ agentId: 'reviewer' })).kind, 'defer');
 });
 
 test('unsupported positive legacy weights and nonfinite values are rejected instead of silently ignored', () => {

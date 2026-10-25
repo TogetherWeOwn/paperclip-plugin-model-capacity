@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { computeRoleComposite, METRIC_REGISTRY } from '../src/quality.mjs';
 import { discoverTaskArms } from '../src/arms.mjs';
-import { normalizeTaskRanking, validateTaskRanking, buildTaskRanking } from '../src/task-ranking.mjs';
+import { normalizeTaskRanking, validateTaskRanking, buildTaskRanking, translateTaskExclusions } from '../src/task-ranking.mjs';
 import { orderAccountsForRun } from '../src/select.mjs';
 import { decide } from '../src/decide.mjs';
 import { carryForwardCosts } from '../src/aa.mjs';
@@ -12,6 +12,20 @@ const row = (slug, v, cost = 1) => ({ slug, terminalbenchV40: v, scicode: v, lcr
   ifbench: v, omniscienceNonHallucination: v, hle: 1 - v, gpqa: 1 - v,
   critpt: 1 - v, gdpvalNormalized: 1 - v, intelligenceIndexCostPerTask: cost });
 const arms = [row('a', .8), row('b', .2)].map(r => ({ armId: r.slug, row: r }));
+
+test('task exclusions match every identity case-insensitively and preserve unmatched tokens', () => {
+  const candidate = { armId: 'gpt-6-1-sol@high', aaSlug: 'gpt-6-1-sol-high',
+    canonicalModel: 'GPT-6.1-Sol', model: 'Codex/GPT-6.1-Sol' };
+  for (const token of ['arm:GPT-6-1-Sol@High', 'arm:GPT-6-1-Sol-High', 'ARM:GPT-6-1-Sol-High',
+    'arm:gpt-6.1-sol', 'arm:codex/gpt-6.1-sol']) {
+    const translated = translateTaskExclusions({ doer: [token], thinker: [token], other: [token] }, [candidate]);
+    for (const role of ['doer', 'thinker', 'other']) {
+      assert.deepEqual(translated[role], ['arm:gpt-6-1-sol@high'], `${role}: ${token}`);
+    }
+  }
+  const untouched = ['ARM:Unknown-Model', 'SoL', null];
+  assert.deepEqual(translateTaskExclusions({ doer: untouched }, [candidate]).doer, untouched);
+});
 
 test('role profiles are distinct, reliability is higher-is-better, missing metrics are not zero', () => {
   const doer = computeRoleComposite(arms, { terminalbenchV40: 1 });

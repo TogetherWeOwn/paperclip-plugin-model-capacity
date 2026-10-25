@@ -1690,7 +1690,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const model = servedIdForArm(account.models, canon, account.provider, servedIds);
           if (servedIds && !servedIds.has(model)) return [];
           const measured = taskRanking.accounts[key]?.roles.reviewer.candidates.find(c => c.model === model && c.effort === approved.effort);
-          return [{ armId: taskArmId(canon, approved.effort ?? 'default'), model, effort: approved.effort,
+          // Keep configured legacy exclusion identities even when the exact
+          // AA observation is absent. These aliases confer no benchmark trust
+          // and must not exclude a sibling effort of the approved model.
+          const legacyArmIds = config.armMap.filter(b => canonicalModelName(b.model) === canon
+            && b.effort === approved.effort).map(b => b.aaSlug);
+          return [{ armId: taskArmId(canon, approved.effort ?? 'default'), model, effort: approved.effort, legacyArmIds,
             family: inferFamily(canon), aaSlug: measured?.aaSlug ?? null, credentialEvidence: credentialEvidenceFor(account, canon),
             contextWindow: measured?.contextWindow ?? null, cap: measured?.cap ?? tierCaps[tierModelKey(canon)] ?? null,
             evidenceTrust: 'policy-trusted-incumbent', benchmarkTrusted: measured?.benchmarkTrusted === true,
@@ -4711,7 +4716,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const fam = inferFamily(canon);
     if (fam && excluded.has(fam)) return { ok: `family ${fam} excluded for the role` };
     if (excluded.has(armToken(canon)) || (match && (excluded.has(String(match.family ?? '').toLowerCase())
-      || excluded.has(armToken(match.armId)) || (match.aaSlug && excluded.has(armToken(match.aaSlug)))))) {
+      || excluded.has(armToken(match.armId)) || (match.aaSlug && excluded.has(armToken(match.aaSlug)))
+      || (match.legacyArmIds ?? []).some(id => excluded.has(armToken(id)))))) {
       return { ok: 'arm excluded for the role' };
     }
     if (bstore && bcfg?.enabled !== false && match?.armId != null
