@@ -815,7 +815,10 @@ export function buildManifest({ modelResolve = false } = {}) {
     'secrets.read-ref',
     'events.subscribe',
     'agents.read',
-    'agents.queued_counts.read',
+    // 'agents.queued_counts.read' is declared only once upstream Paperclip ships
+    // agents.getQueuedRunCounts: the host validates capabilities against its
+    // PLUGIN_CAPABILITIES enum, so an unknown one rejects the whole manifest.
+    // The queued-run read below stays optional and degrades to running-only.
     'issues.read',
     'api.routes.register',
     // No database capabilities: run facts come from SDK surfaces only
