@@ -2,6 +2,7 @@
 
 ## Unreleased
 ### Added
+- Read-only `modelInventory` on `/capacity`: raw, canonical and emitted spellings of every reported model id side by side, per-account served present/absent/unknown (an absent served list reads unknown, fail-open as routing does), linked unscored/unservable/readiness evidence, and explicit unknown markers for protocol/tool/reasoning compatibility and configured-model coverage (other-agent adapter configuration is restricted). Pure reporting; routing reads nothing from it. No new capability, egress, secret or env key.
 - Opt-in `freeLanes` routing for dedicated low-risk, first-attempt issue agents. Free-plan providers have shared RPM-sized additive budgets outside paid C*, a separate strict quality floor (default 0.4), optional UTC-day request reservations, and exact-arm outcome demotion (default below 80% of the last 10 measured outcomes). The outcome signal is failed runs/status progress, not adjudicated review acceptance; request budgets are estimates, not an API limiter.
 - Free running counts and cap headroom stay separate from paid allocations. Existing manual exclusions, native pins, reviewer boundaries, credential-readiness mode, context caps, task-evidence trust and breakers retain authority. Synthetic and unmetered Workers AI are excluded; NIM Muse and non-`:free` OpenRouter IDs are denied. No new job, capability, external call, host script or core patch. The default-off path is unchanged.
 

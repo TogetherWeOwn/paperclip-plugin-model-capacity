@@ -98,6 +98,14 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.70 = READ-ONLY MODEL INVENTORY ON /capacity: `modelInventory` keeps
+ *   the raw, canonical and emitted spelling of every reported model id side
+ *   by side with per-account served present/absent/unknown (absent list reads
+ *   unknown, fail-open as routing does), the linked unscored/unservable/
+ *   readiness evidence, and explicit unknown markers for protocol/tool/
+ *   reasoning compatibility and configured-model coverage (other-agent
+ *   adapter configuration is restricted). Pure reporting; routing reads
+ *   nothing from it. No capability, egress, secret or env-key change.
  * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
  *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
  *   never the bare id CLIProxy 400s or routes to another provider);
@@ -358,7 +366,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.68';
+export const PLUGIN_VERSION = '0.2.70';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
