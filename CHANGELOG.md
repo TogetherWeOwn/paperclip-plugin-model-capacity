@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Keep active priority counts and metadata on the same fresh per-tick ready snapshot, while unavailable graphs retain ordinary demand refreshes. Reject empty, malformed or contradictory native relation snapshots, and do not amplify priority for idle routed headroom.
 - Bound priority shares by useful per-agent demand and serving-pool headroom before assigning new slots. Redistribute saturated shares across eligible routed and kept agents so a tiny high-priority queue or exhausted kept pool cannot strand usable fleet capacity.
 - Optional `allocation.blockingPriority` (default false) weights new-run demand by capped transitive open-card fan-out and highest ready-card priority. Active mode preserves running workloads and fits new allocations within the rounded fleet target, fleet ceiling and kept-agent serving pools; smoothing and reserved floors cannot override the split.
 - Priority issue snapshots and read failures are memoized per capacity tick using only `issues.read`. Failed reads or missing native relation fields retain the legacy allocation and report `priority-unavailable`. The inspected host omits relation arrays from these SDK reads, so the feature remains inactive there until native payload support exists; no capability, core patch or host automation is added.

@@ -408,7 +408,7 @@ function boundedPriorityShares(entries, available, pools) {
   while (available > 0) {
     const weights = entries.map((entry, i) => extras[i] < limits[i]
       && (groupByIndex.get(i)?.remaining ?? Infinity) > 0
-      ? (entry.queued + 1) * entry.allocationWeight : 0);
+      ? (entry.queued + 1) * (entry.queued > 0 ? entry.allocationWeight : 1) : 0);
     if (!weights.some(weight => weight > 0)) break;
     const grants = largestRemainder(available, weights).map((share, i) => Math.min(share, limits[i] - extras[i]));
     for (const group of groups) {

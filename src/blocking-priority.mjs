@@ -15,18 +15,34 @@ export function buildBlockingPriorities(issues) {
     if (issue && OPEN.has(issue.status) && typeof issue.id === 'string') rows.set(issue.id, issue);
   }
   const open = [...rows.values()];
-  const direction = open.every(issue => Array.isArray(issue.blockedBy)) ? 'blockedBy'
-    : open.every(issue => Array.isArray(issue.blocks)) ? 'blocks' : null;
-  if (!direction) throw new Error('issue-relations-unavailable');
-  const edges = new Map(open.map(issue => [issue.id, new Set()]));
+  const directions = ['blockedBy', 'blocks'].filter(direction => open.every(issue =>
+    Array.isArray(issue[direction]) && issue[direction].every(relation =>
+      relation != null && typeof relation.id === 'string' && relation.id.length > 0)));
+  if (open.length === 0 || directions.length === 0) throw new Error('issue-relations-unavailable');
+  const graphFor = direction => {
+    const graph = new Map(open.map(issue => [issue.id, new Set()]));
+    for (const issue of open) {
+      for (const relation of issue[direction]) {
+        if (!rows.has(relation.id)) continue; // Only readable, open cards count.
+        const from = direction === 'blockedBy' ? relation.id : issue.id;
+        const to = direction === 'blockedBy' ? issue.id : relation.id;
+        graph.get(from).add(to);
+      }
+    }
+    return graph;
+  };
+  const edges = graphFor(directions[0]);
+  if (directions.length === 2) {
+    const reverse = graphFor(directions[1]);
+    for (const [id, children] of edges) {
+      const other = reverse.get(id);
+      if (children.size !== other.size || [...children].some(child => !other.has(child))) {
+        throw new Error('issue-relations-inconsistent');
+      }
+    }
+  }
   const roots = new Map();
   for (const issue of open) {
-    for (const relation of issue[direction]) {
-      if (!rows.has(relation?.id)) continue; // Only readable, open cards count.
-      const from = direction === 'blockedBy' ? relation.id : issue.id;
-      const to = direction === 'blockedBy' ? issue.id : relation.id;
-      edges.get(from).add(to);
-    }
     if (!READY.has(issue.status) || typeof issue.assigneeAgentId !== 'string') continue;
     if (!roots.has(issue.assigneeAgentId)) roots.set(issue.assigneeAgentId, []);
     roots.get(issue.assigneeAgentId).push(issue);

@@ -779,7 +779,8 @@ The highest priority among the ready cards supplies `priorityWeight`:
 critical 4, high 3, medium 2, low 1 (unknown priority uses medium).
 Agents without ready-card metadata use multiplier 1. Each agent's new share
 stops at its queued demand (or one idle headroom slot for a running routed
-agent); kept agents reserve no idle headroom. When an agent or serving pool
+agent, with neutral priority when its queue is empty); kept agents reserve no
+idle headroom. When an agent or serving pool
 saturates, its excess share is redistributed among remaining eligible agents,
 including agents in other kept pools, rather than leaving usable slots idle.
 
@@ -794,8 +795,11 @@ not reorder an agent's own queue or preempt running work.
 
 Only the already-declared `issues.read` capability is used. Ready-card reads
 share the ordinary demand cache; three additional status-list reads complete
-the graph once per capacity tick. Concurrent requests share the pending
-snapshot, and failures are memoized until the next tick. No resolver-hook I/O,
+the graph once per capacity tick. Active counts and weights share that tick's
+ready-card snapshot; each new tick refreshes it even inside the ordinary demand
+TTL. Concurrent requests share the pending snapshot, and failures are memoized
+until the next tick. An unavailable graph retains ordinary demand refreshes
+and the legacy allocator. No resolver-hook I/O,
 new permission, database access, egress or background job is added.
 
 **Host compatibility gate:** the SDK `Issue` type exposes optional `blockedBy`
@@ -804,9 +808,11 @@ host source inspected for this change, `issues.list` omits relations by
 default and `issues.get` enriches labels/watchdogs only. The SDK list input
 also does not expose/forward the server's `includeBlockedBy` option. This host
 therefore **cannot activate** the weighting using `issues.read` alone. The
-plugin requires a complete `blockedBy` direction (or a complete `blocks`
-direction) on all readable open rows; it never treats an absent field as an
-empty relation set. Do not enable expecting an operational improvement until
+plugin requires a nonempty open-card snapshot with a complete `blockedBy`
+direction (or a complete `blocks` direction) whose entries have nonempty string
+IDs. If both directions are complete, their readable open edges must agree.
+It never treats absent or malformed fields, contradictory directions, or an
+empty snapshot as proof of native relation support. Do not enable expecting an operational improvement until
 a native SDK/host contract supplies those fields. No core patch or undeclared
 RPC parameter is used to bypass this gate.
 

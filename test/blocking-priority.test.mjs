@@ -164,6 +164,32 @@ test('priority reads, including failures, are memoized for one capacity tick', a
   }
 });
 
+test('same-tick demand and weights share one ready-card snapshot beyond the ordinary TTL', async () => {
+  const issues = chain();
+  const d = await drive({ issues, config: enabled });
+  const first = await d.caps();
+  issues[0] = { ...issues[0], assigneeAgentId: 'replacement' };
+  d.advance(30000);
+  const second = await d.caps();
+  assert.deepEqual(second.agents, first.agents);
+  for (const status of ['todo', 'in_progress', 'backlog', 'in_review', 'blocked']) {
+    assert.equal(d.reads.filter(read => read === status).length, 1);
+  }
+});
+
+test('a new tick refreshes ready cards even inside the ordinary demand TTL', async () => {
+  const issues = chain();
+  const d = await drive({ issues, config: enabled });
+  await d.caps();
+  issues[0] = { ...issues[0], assigneeAgentId: 'replacement' };
+  d.advance(5000);
+  d.cap.atMs += 5000;
+  const rows = asMap((await d.caps()).agents);
+  assert.equal(rows.has('operator'), false);
+  assert.equal(rows.get('replacement').allocated, 1);
+  assert.equal(rows.get('replacement').allocationPriority.blockingFanOut, 2);
+});
+
 test('priority read failure falls back to exact legacy allocations without leaking errors', async () => {
   const legacy = await drive();
   const d = await drive({ config: enabled, failStatus: 'blocked' });
@@ -174,6 +200,35 @@ test('priority read failure falls back to exact legacy allocations without leaki
   assert.ok(!JSON.stringify(body).includes('private upstream error'));
 });
 
+test('unavailable priority metadata retains ordinary demand refreshes within the tick', async () => {
+  const issues = chain();
+  const legacy = await drive({ issues });
+  const d = await drive({ issues, config: enabled, failStatus: 'blocked' });
+  await legacy.caps();
+  await d.caps();
+  issues[0] = { ...issues[0], assigneeAgentId: 'replacement' };
+  legacy.advance(30000);
+  d.advance(30000);
+  assert.deepEqual((await d.caps()).agents, (await legacy.caps()).agents);
+  assert.equal(d.reads.filter(status => status === 'blocked').length, 1);
+});
+
+test('unavailable metadata also preserves the legacy TTL across a new capacity tick', async () => {
+  const issues = chain();
+  const legacy = await drive({ issues });
+  const d = await drive({ issues, config: enabled, failStatus: 'blocked' });
+  await legacy.caps();
+  await d.caps();
+  issues[0] = { ...issues[0], assigneeAgentId: 'replacement' };
+  legacy.advance(5000);
+  d.advance(5000);
+  legacy.cap.atMs += 5000;
+  d.cap.atMs += 5000;
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual((await d.caps()).agents, (await legacy.caps()).agents);
+  }
+});
+
 test('SDK payloads without relation arrays degrade instead of pretending there are no blockers', async () => {
   const issues = chain().map(({ blockedBy, ...row }) => row);
   const legacy = await drive({ issues });
@@ -182,6 +237,40 @@ test('SDK payloads without relation arrays degrade instead of pretending there a
   assert.deepEqual(body.agents, (await legacy.caps()).agents);
   assert.equal(body.allocation.blockingPriority, false);
   assert.equal(body.allocation.error, 'priority-unavailable');
+});
+
+test('empty issue snapshots cannot establish native relation support', async () => {
+  const options = { issues: [], queuedCounts: [{ agentId: 'worker', queued: 4 }] };
+  const config = { reviewerRouting: { agentIds: ['worker'], arms: [{ provider: 'paid', model: 'test-model' }] } };
+  const legacy = await drive({ ...options, config });
+  const d = await drive({ ...options, config: { ...config, ...enabled } });
+  const body = await d.caps();
+  assert.deepEqual(body.agents, (await legacy.caps()).agents);
+  assert.deepEqual(body.allocation, { blockingPriority: false, error: 'priority-unavailable' });
+});
+
+test('malformed native relation entries fall back rather than silently losing edges', async () => {
+  for (const relation of ['root', null, {}, { id: 42 }, { id: '' }]) {
+    const issues = [issue('root', 'operator'), issue('child', null, { status: 'blocked', blockedBy: [relation] })];
+    const legacy = await drive({ issues });
+    const d = await drive({ issues, config: enabled });
+    const body = await d.caps();
+    assert.deepEqual(body.agents, (await legacy.caps()).agents);
+    assert.deepEqual(body.allocation, { blockingPriority: false, error: 'priority-unavailable' });
+  }
+});
+
+test('contradictory complete relation directions fall back; consistent directions remain usable', async () => {
+  for (const consistent of [false, true]) {
+    const d = await drive({ config: enabled, issues: [
+      issue('root', 'operator', { blocks: [{ id: 'child' }] }),
+      issue('child', null, { status: 'blocked', blockedBy: consistent ? [{ id: 'root' }] : [], blocks: [] }),
+    ] });
+    const body = await d.caps();
+    assert.equal(body.allocation.blockingPriority, consistent);
+    if (consistent) assert.equal(asMap(body.agents).get('operator').allocationPriority.blockingFanOut, 1);
+    else assert.equal(body.allocation.error, 'priority-unavailable');
+  }
 });
 
 test('failure of the existing demand read preserves the existing safe error response', async () => {
@@ -203,6 +292,15 @@ test('priority mode preserves running and never grants beyond target or ceiling'
       for (const row of rows) assert.ok(row.allocated >= row.running);
     }
   }
+});
+
+test('idle routed headroom does not amplify stale ready-card priority over real queued work', () => {
+  const rows = allocateDemandCaps(2, [
+    { agentId: 'idle-reviewer', running: 1, queued: 0, allocationWeight: 404 },
+    { agentId: 'worker', running: 0, queued: 5, allocationWeight: 1 },
+  ], 75, { blockingPriority: true });
+  assert.equal(asMap(rows).get('idle-reviewer').allocated, 1);
+  assert.equal(asMap(rows).get('worker').allocated, 1);
 });
 
 test('priority shares stop at useful demand and redistribute to waiting agents', () => {
