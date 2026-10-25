@@ -148,7 +148,7 @@ const baseConfig = (extra = {}) => ({
   ...extra,
 });
 
-function drive({ accounts, config = {}, nowMs = NOW }) {
+function drive({ accounts, config = {}, nowMs = NOW, rows = aaRows() }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -193,7 +193,7 @@ function drive({ accounts, config = {}, nowMs = NOW }) {
       await plugin.setup(io);
       store.set(
         key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
-        { fetchedAt: new Date(NOW).toISOString(), rows: aaRows(), duplicateSlugs: [] },
+        { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] },
       );
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
@@ -769,4 +769,84 @@ test('stale credential evidence does not consume the capacity-retry grace period
   const answer = await d.hook('run-capacity-after-stale-11');
   assert.equal(answer.kind, 'decide', 'only the eleventh capacity defer triggers recovery');
   assert.match(answer.reason, /^deferral-exhausted: no account has headroom right now -> /);
+});
+
+// The fallback scan must use the same context safety as ordinary admission.
+// A degraded overflow lane is deliberately only eligible during recovery.
+const resumeWindowRows = () => aaRows().map(row => ({
+  ...row, contextWindowTokens: row.slug === 'step-5' ? 200000 : 1000000,
+}));
+const previousWideRun = { runId: 'prior-wide-run', model: HAIKU, decisionId: 'prior-wide-decision' };
+
+test('exhaustion recovery cannot shrink a resumed 1M session onto 200k free overflow', async () => {
+  const d = drive({
+    accounts: [claudeAheadKnown(), nimTrial({ health: 'degraded' })],
+    config: baseConfig(), rows: resumeWindowRows(),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`resume-context-recovery-${i}`, {
+      previous: previousWideRun, agentDefaultModel: 'unmapped-default',
+    });
+    assert.equal(out.kind, 'defer', `attempt ${i} must not trade context safety for liveness: ${JSON.stringify(out)}`);
+  }
+});
+
+test('fresh exhaustion recovery still uses the 200k free-overflow arm on attempt 11', async () => {
+  const d = drive({
+    accounts: [claudeAheadKnown(), nimTrial({ health: 'degraded' })],
+    config: baseConfig(), rows: resumeWindowRows(),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 10; i++) assert.equal((await d.hook(`fresh-context-recovery-${i}`)).kind, 'defer');
+  const out = await d.hook('fresh-context-recovery-11');
+  assert.equal(out.kind, 'decide');
+  assert.equal(out.model, NIM_ALIAS);
+  assert.match(out.reason, /^deferral-exhausted: /);
+});
+
+test('reviewer exhaustion recovery also rejects smaller-window overflow on a resumed session', async () => {
+  const d = drive({
+    accounts: [claudeReviewerPaced(), nimTrial({ health: 'degraded' })],
+    config: baseConfig({ reviewerRouting: {
+      agentIds: ['agent-R'], arms: [{ provider: 'claude', model: HAIKU }],
+    } }),
+    rows: resumeWindowRows(),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  const hook = i => d.hook(`review-context-recovery-${i}`, {
+    agentId: 'agent-R', issueId: 'review-context', previous: previousWideRun,
+    agentDefaultModel: 'unmapped-default',
+  });
+  const first = await hook(1);
+  assert.equal(first.kind, 'decide');
+  assert.equal(first.model, `${HAIKU}(default)[1m]`);
+  for (let i = 2; i <= 12; i++) {
+    const out = await hook(i);
+    assert.equal(out.kind, 'defer', `review attempt ${i} must not shrink the session: ${JSON.stringify(out)}`);
+  }
+});
+
+test('exhaustion bounded keep cannot fall back to a smaller configured default model', async () => {
+  const d = drive({
+    accounts: [claudeBoundedKeep()], config: baseConfig(),
+    rows: aaRows().map(row => ({
+      ...row, contextWindowTokens: row.slug === HAIKU ? 200000 : 1000000,
+    })),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`context-bounded-keep-${i}`, {
+      previous: { runId: 'prior-muse', model: MUSE, decisionId: 'prior-muse-decision' },
+    });
+    assert.equal(out.kind, 'defer', `attempt ${i} must not keep the smaller default: ${JSON.stringify(out)}`);
+  }
 });
