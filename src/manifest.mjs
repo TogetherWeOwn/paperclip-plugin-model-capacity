@@ -358,7 +358,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.67';
+export const PLUGIN_VERSION = '0.2.68';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -671,6 +671,14 @@ const CONFIG_SCHEMA = {
       description: 'Credential-readiness admission is opt-in until every lane account publishes a valid envelope. Check /capacity counts before enabling.',
       properties: {
         enforce: { type: 'boolean', default: false },
+      },
+    },
+    exhaustion: {
+      type: 'object', additionalProperties: false,
+      description: 'Deferral-exhaustion (Design B): the host retries a deferred run as a new runId up to 12 times and then freezes the card. When enabled, the hook stops deferring on the last attempts of the chain (default from attempt 11) and answers with the cheapest selectable free-overflow arm under the existing trial caps, else a bounded keep; metered pools ahead of plan are never selected. Disabled (default): every terminal still defers, exactly as before.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        finalAnswerFromAttempt: { type: 'integer', minimum: 1, maximum: 12, default: 11, description: '1-based chain attempt from which the hook answers instead of deferring (12 is the host retry budget).' },
       },
     },
     trials: {

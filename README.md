@@ -724,6 +724,31 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   deferral budget; `/capacity` shows `inFlight` against `cap` so it is
   visible. The guard errs towards spending less, never more.
 
+### Deferral-exhaustion
+
+The host clamps a plugin defer to [1s, 60s] and retries a deferred run as a
+new run under a new id up to 12 times (`RUN_MODEL_RESOLVE_MAX_ATTEMPTS`),
+then freezes the card. The per-runId deferred marks above therefore reset
+every retry and can never see the chain end. `exhaustion.enabled`
+(default `false`) counts consecutive hook deferrals per issue+agent instead:
+from `exhaustion.finalAnswerFromAttempt` (default 11, 1-based) the hook
+stops deferring and answers with the cheapest selectable free-overflow arm
+(free-cost providers first, then trial arms, then the lowest burn) under
+the existing per-account reactive cap and per-family trial budget, else a
+bounded keep on the agent default model. Ignored at exhaustion: the
+pace-guard pool cap and the 5h headroom reserve. Never bypassed: trial
+role/adapter/family gates, credential readiness, the arm breaker, role
+exclusions, the review reserve. Metered pools ahead of plan are never
+selected, and the keep is allowed only when the default model serves from
+a healthy/degraded account -- and, for non-review runs, not from a
+review-reserve held account -- otherwise the hook keeps deferring (strand
+rather than burn an exhausted pool or held quota). The reviewer pace-hold
+defer answers the same way from the final attempt. Decisions record
+`deferral-exhausted: <prior reason> -> <arm|kept model>`; a failed scan
+appends per-account skip reasons to the defer reason. With `enabled:
+false` every terminal defers byte-for-byte as before. Memory-only, no new
+capability, egress, secret or env key.
+
 ### Review reserve
 
 The pace guard keeps the fleet on plan, but reviews starve anyway: review
