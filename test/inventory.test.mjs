@@ -33,6 +33,8 @@ test('inventory retains raw, canonical and emitted ids per account', () => {
   assert.deepEqual(sonnet.rawIds, ['claude-sonnet-5-5', 'claude/claude-sonnet-5-5']);
   assert.deepEqual(sonnet.emittedByAccount, { 'claude:lane-1': 'claude-sonnet-5-5' });
   assert.deepEqual(sonnet.servedIdStatusByAccount, { 'claude:lane-1': 'present' });
+  assert.deepEqual(sonnet.arms, [{ aaSlug: 'claude-sonnet-5-5', effort: 'max' }]);
+  assert.equal(sonnet.unscored, null);
 
   const gpt = inv.models.find(m => m.canonical === 'gpt-5-5');
   assert.deepEqual(gpt.rawIds, ['devin/gpt-5-5']);
@@ -43,6 +45,56 @@ test('inventory retains raw, canonical and emitted ids per account', () => {
   assert.deepEqual(muse.rawIds, ['muse-spark-1.3-contributor']);
   assert.equal(muse.emittedByAccount['meta:lane-1'], 'muse-spark-1.3-contributor');
   assert.deepEqual(muse.servedIdStatusByAccount, { 'meta:lane-1': 'present' });
+});
+
+// Native alias-only accounts depend on the global served list, not just the
+// discovery spelling. An empty authoritative catalog is not an unknown one.
+test('inventory uses the served catalog to choose native alias-only emissions', () => {
+  for (const [servedModels, emitted, status] of [
+    [['claude/claude-haiku-5-5'], 'claude/claude-haiku-5-5', 'present'],
+    [['claude/claude-haiku-5-5', 'claude-haiku-5-5'], 'claude-haiku-5-5', 'present'],
+    [[], 'claude/claude-haiku-5-5', 'absent'],
+    [null, 'claude-haiku-5-5', 'unknown'],
+  ]) {
+    const inv = buildModelInventory({
+      nowMs: NOW,
+      accounts: [{ accountId: 'claude:lane-1', provider: 'claude', models: ['claude/claude-haiku-5-5'] }],
+      servedModels,
+    });
+    const haiku = inv.models.find(m => m.canonical === 'claude-haiku-5-5');
+    assert.deepEqual(haiku.emittedByAccount, { 'claude:lane-1': emitted });
+    assert.deepEqual(haiku.servedIdStatusByAccount, { 'claude:lane-1': status });
+    assert.deepEqual(inv.servedList, {
+      status: servedModels === null ? 'unknown' : 'present',
+      count: servedModels === null ? null : servedModels.length,
+    });
+  }
+});
+
+test('inventory keeps each account\'s raw spellings alongside their union', () => {
+  const inv = buildModelInventory({
+    accounts: [
+      { accountId: 'claude:lane-1', provider: 'claude', models: ['claude-haiku-5-5', 'claude-haiku-5-5'] },
+      { accountId: 'claude:lane-2', provider: 'claude', models: ['claude/claude-haiku-5-5'] },
+    ],
+  });
+  const haiku = inv.models.find(m => m.canonical === 'claude-haiku-5-5');
+  assert.deepEqual(haiku.rawIds, ['claude-haiku-5-5', 'claude/claude-haiku-5-5']);
+  assert.deepEqual(haiku.rawIdsByAccount, {
+    'claude:lane-1': ['claude-haiku-5-5'],
+    'claude:lane-2': ['claude/claude-haiku-5-5'],
+  });
+});
+
+test('inventory counts refusal evidence separately from absent unscored ids', () => {
+  const inv = buildModelInventory({
+    accounts: [{ accountId: 'acme:lane-1', provider: 'acme', models: ['new-model-1'] }],
+    servedModels: [],
+    unscored: [{ model: 'new-model-1', reason: 'no-aa-match', tried: ['new-model-1'] }],
+  });
+  assert.equal(inv.counts.servedAbsent, 1);
+  assert.equal(inv.counts.unservable, 0);
+  assert.deepEqual(inv.models[0].unservable, []);
 });
 
 // An emitted id the served list does not contain reads absent and links the
@@ -122,35 +174,12 @@ test('inventory covers provider-bound arms on feeds without model lists', () => 
   assert.deepEqual(inv.feedModelsAbsentAccounts, ['claude:lane-1']);
   const haiku = inv.models.find(m => m.canonical === 'claude-haiku-5-5');
   assert.deepEqual(haiku.rawIds, []);
+  assert.deepEqual(haiku.rawIdsByAccount, { 'claude:lane-1': [] });
   assert.deepEqual(haiku.servedBy, ['claude:lane-1']);
   assert.deepEqual(haiku.servedIdStatusByAccount, { 'claude:lane-1': 'unknown' });
 });
 
-// End to end: the shadow tick publishes the inventory on /capacity next to
-// the existing unscored/unservable fields, from synthetic fixtures only.
-test('/capacity publishes the read-only model inventory', async () => {
-  const lane = {
-    observedAt: new Date(NOW).toISOString(),
-    servedModels: ['claude-haiku-5-5', 'devin/gpt-5-5'],
-    accounts: [
-      {
-        lane: 'lane-1', provider: 'claude', accountKey: 'lane-1',
-        health: 'healthy', meter: 'reactive', models: ['claude-haiku-5-5'],
-        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
-        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
-      },
-      {
-        lane: 'lane-2', provider: 'devin', accountKey: 'lane-2',
-        health: 'healthy', meter: 'reactive', models: ['devin/gpt-5-5'],
-        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
-        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
-      },
-    ],
-  };
-  const rows = [
-    { slug: 'claude-haiku-5-5', intelligenceIndex: 60, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
-    { slug: 'gpt-5-5', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
-  ];
+async function capacityFor(lane, rows) {
   const config = { enforce: false, cliproxy: { laneKeySecretRef: SECRET } };
   const store = new Map();
   const jobs = new Map();
@@ -171,8 +200,37 @@ test('/capacity publishes the read-only model inventory', async () => {
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
   await jobs.get('shadow-tick')({});
-  const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
-  const inv = capacity.body.modelInventory;
+  return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
+}
+
+// End to end: the shadow tick publishes the inventory on /capacity next to
+// the existing unscored/unservable fields, from synthetic fixtures only.
+test('/capacity publishes the read-only model inventory', async () => {
+  const lane = {
+    observedAt: new Date(NOW).toISOString(),
+    servedModels: ['claude-haiku-5-5', 'devin/gpt-5-5'],
+    accounts: [
+      {
+        lane: 'lane-1', provider: 'claude', accountKey: 'lane-1',
+        health: 'healthy', meter: 'reactive', models: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'new-model-1'],
+        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
+        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+      },
+      {
+        lane: 'lane-2', provider: 'devin', accountKey: 'lane-2',
+        health: 'healthy', meter: 'reactive', models: ['devin/gpt-5-5'],
+        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
+        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+      },
+    ],
+  };
+  const rows = [
+    { slug: 'claude-haiku-5-5', intelligenceIndex: 60, intelligenceIndexCostPerTask: 7, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'claude-sonnet-5-5', intelligenceIndex: 75, intelligenceIndexCostPerTask: 8, price1mInputTokens: 1, price1mOutputTokens: 4 },
+    { slug: 'gpt-5-5', intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 },
+  ];
+  const capacity = await capacityFor(lane, rows);
+  const inv = capacity.modelInventory;
   assert.equal(inv.version, INVENTORY_VERSION);
   assert.deepEqual(inv.servedList, { status: 'present', count: 2 });
   assert.equal(inv.configuredModels.coverage, 'incomplete');
@@ -183,5 +241,73 @@ test('/capacity publishes the read-only model inventory', async () => {
   const gpt = inv.models.find(m => m.canonical === 'gpt-5-5');
   assert.equal(gpt.emittedByAccount['devin:lane-2'], 'devin/gpt-5-5');
   assert.equal(gpt.servedIdStatusByAccount['devin:lane-2'], 'present');
-  assert.ok(inv.counts.canonicalModels >= 2);
+  assert.deepEqual(haiku.arms, [{ aaSlug: 'claude-haiku-5-5', effort: 'max' }]);
+  assert.deepEqual(haiku.readiness, [{ accountId: 'claude:lane-1', eligible: true, reason: 'ready' }]);
+  assert.deepEqual(haiku.unservable, []);
+  assert.equal(haiku.unscored, null);
+  assert.deepEqual(gpt.arms, [{ aaSlug: 'gpt-5-5', effort: 'max' }]);
+  assert.deepEqual(gpt.readiness, [{ accountId: 'devin:lane-2', eligible: true, reason: 'ready' }]);
+  assert.deepEqual(gpt.unservable, []);
+  const sonnet = inv.models.find(m => m.canonical === 'claude-sonnet-5-5');
+  assert.deepEqual(sonnet.arms, [{ aaSlug: 'claude-sonnet-5-5', effort: 'max' }]);
+  assert.deepEqual(sonnet.unservable, [{ accountId: 'claude:lane-1', emitted: 'claude-sonnet-5-5' }]);
+  assert.deepEqual(sonnet.readiness, []);
+  assert.equal(sonnet.unscored, null);
+  const unknown = inv.models.find(m => m.canonical === 'new-model-1');
+  assert.deepEqual(unknown.arms, []);
+  assert.deepEqual(unknown.unscored, { reason: 'no-aa-match', tried: ['new-model-1'] });
+  assert.deepEqual(unknown.unservable, []);
+  assert.deepEqual(unknown.readiness, []);
+  assert.deepEqual(inv.counts, {
+    canonicalModels: 4, rawIds: 4, servedPresent: 2, servedAbsent: 2,
+    servedUnknown: 0, unscored: 1, unservable: 1,
+  });
+});
+
+// Both entries have the same normalized accountId. The tick's unique keys
+// must survive projection even though their canonical model is identical.
+test('/capacity preserves duplicate account identities and differing served statuses', async () => {
+  const capacity = await capacityFor({
+    observedAt: new Date(NOW).toISOString(),
+    servedModels: ['claude/claude-haiku-5-5'],
+    accounts: [
+      {
+        lane: 'lane-1', provider: 'claude', accountKey: 'shared',
+        health: 'healthy', meter: 'reactive', models: ['claude/claude-haiku-5-5'],
+        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
+        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+      },
+      {
+        lane: 'lane-2', provider: 'claude', accountKey: 'shared',
+        health: 'healthy', meter: 'reactive', models: ['claude-haiku-5-5'],
+        weekly: { used: null, resetsAt: null }, fiveHour: { used: null, resetsAt: null },
+        observedAt: new Date(NOW).toISOString(), quality: 'reactive',
+      },
+    ],
+  }, [{ slug: 'claude-haiku-5-5', intelligenceIndex: 60, intelligenceIndexCostPerTask: 7,
+    price1mInputTokens: 1, price1mOutputTokens: 4 }]);
+  const inv = capacity.modelInventory;
+  assert.equal(inv.models.length, 1);
+  const haiku = inv.models[0];
+  assert.deepEqual(haiku.servedBy, ['claude:shared', 'claude:shared#lane-2']);
+  assert.deepEqual(haiku.emittedByAccount, {
+    'claude:shared': 'claude/claude-haiku-5-5',
+    'claude:shared#lane-2': 'claude-haiku-5-5',
+  });
+  assert.deepEqual(haiku.servedIdStatusByAccount, {
+    'claude:shared': 'present', 'claude:shared#lane-2': 'absent',
+  });
+  assert.deepEqual(haiku.rawIdsByAccount, {
+    'claude:shared': ['claude/claude-haiku-5-5'],
+    'claude:shared#lane-2': ['claude-haiku-5-5'],
+  });
+  assert.deepEqual(haiku.arms, [{ aaSlug: 'claude-haiku-5-5', effort: 'max' }]);
+  // Duplicate credential identities stay fail-closed even while the report
+  // disambiguates each lane's discovery and servability evidence.
+  assert.deepEqual(haiku.readiness, [{ accountId: 'claude:shared', eligible: false, reason: 'ambiguous-account' }]);
+  assert.deepEqual(haiku.unservable, [{ accountId: 'claude:shared#lane-2', emitted: 'claude-haiku-5-5' }]);
+  assert.deepEqual(inv.counts, {
+    canonicalModels: 1, rawIds: 2, servedPresent: 1, servedAbsent: 1,
+    servedUnknown: 0, unscored: 0, unservable: 1,
+  });
 });

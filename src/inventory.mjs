@@ -161,6 +161,7 @@ export function buildModelInventory({
   const models = [...canonicals].sort().map(canonical => {
     const providers = new Set();
     const servedBy = [];
+    const rawIdsByAccount = {};
     const emittedByAccount = {};
     const servedIdStatusByAccount = {};
     for (let i = 0; i < list.length; i += 1) {
@@ -168,6 +169,7 @@ export function buildModelInventory({
       if (!serves(account, canonical)) continue;
       const accountId = ids[i];
       servedBy.push(accountId);
+      rawIdsByAccount[accountId] = sorted((account?.models ?? []).filter(raw => canonicalModelName(raw) === canonical));
       if (typeof account?.provider === 'string') providers.add(account.provider);
       const emitted = servedIdForArm(account?.models, canonical, account?.provider, servedIds);
       emittedByAccount[accountId] = emitted;
@@ -182,11 +184,12 @@ export function buildModelInventory({
     const unscoredEntry = armEntries.length === 0 ? (unscoredByModel.get(canonical) ?? null) : null;
     if (unscoredEntry) unscoredCount += 1;
     const refusedEntries = refusedByModel.get(canonical) ?? [];
-    if (Object.values(servedIdStatusByAccount).includes('absent')) unservableCount += 1;
+    if (refusedEntries.length > 0) unservableCount += 1;
     return {
       canonical,
       family: inferFamily(canonical),
       rawIds: sorted(rawByCanonical.get(canonical) ?? []),
+      rawIdsByAccount,
       providers: [...providers].sort(),
       servedBy,
       emittedByAccount,

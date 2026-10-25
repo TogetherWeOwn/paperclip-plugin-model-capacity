@@ -541,9 +541,12 @@ provider is prefixed-only `devin`/`opencode-go`).
 reports refused `{ model, accountId, emitted }` entries; an absent or invalid
 list leaves old routing unchanged and logs one warning. An empty valid list
 refuses all arms. `/capacity.modelInventory` keeps the raw, canonical and
-emitted spelling of every reported id side by side with per-account served
-present/absent/unknown, the linked unscored/unservable/readiness evidence,
-and explicit unknown markers for protocol/tool/reasoning compatibility and
+emitted spelling of every reported id side by side. `rawIdsByAccount` retains
+which account reported each spelling alongside the combined `rawIds` list.
+It reports per-account served present/absent/unknown and linked
+unscored/unservable/readiness evidence; `counts.unservable` counts models
+with refusal evidence, separately from absent-ID account/model pairs.
+It includes explicit unknown markers for protocol/tool/reasoning compatibility and
 configured-model coverage (other-agent adapter configuration is restricted).
 Reporting only; routing reads nothing from it. Families without fleet success history route as capped trials (doer and other roles by default;
 thinkers never; adapter-gated) until measured success graduates them; reactive accounts (vendor publishes no
