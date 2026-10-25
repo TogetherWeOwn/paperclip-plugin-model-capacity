@@ -95,7 +95,15 @@ model or risk tier. In new enforce mode an approved feasible Meta primary wins
 after funding/admission; fallback reasons name quota/headroom, credential,
 servability or pace constraints. No approved feasible arm means defer, not
 ordinary builder overflow—even on deferral exhaustion. Tick/event observation,
-review preview and enforcement share this boundary.
+review preview and enforcement share this boundary. Policy incumbency does not
+bypass the contributor-only Muse, Sol identity or emitted-servability fences;
+reviewer readiness and breaker checks use the policy's exact arm identity.
+
+In task enforce mode, exhaustion may choose another explicitly admitted
+model-effort, but cannot issue the legacy bounded default `keep` (including a
+caps-only `decide`). The native request does not carry the default effort, so
+an admitted sibling effort cannot prove the configured default safe. If no
+explicit feasible decision exists, the resolver continues to defer.
 
 ### Cost units and calibration boundary
 

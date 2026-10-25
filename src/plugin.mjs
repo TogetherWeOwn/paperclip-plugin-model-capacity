@@ -4742,13 +4742,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const bstore = breakerStores.get(companyId) ?? createBreakerStore();
     const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
     const readiness = credentialReadinessEnforced(companyId);
-    return (a, arm) => reviewerArmCheck(a, arm, {
-      ladderArms: liveLadderArms(a),
-      readyArms: readiness ? (live.taskRanking?.mode === 'enforce'
-        ? (a.policyReviewerArms ?? []).filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
-        : credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? [])) : null,
-      roleExcluded, bstore, bcfg, nowMs,
-    });
+    const taskEnforce = live.taskRanking?.mode === 'enforce';
+    return (a, arm) => {
+      // Use the policy identity, not a legacy sibling of the same model.
+      // Even with readiness off, require the policy record: its construction
+      // enforces the model identity and emitted-servability fences.
+      const policy = a.policyReviewerArms ?? [];
+      return reviewerArmCheck(a, arm, {
+        ladderArms: taskEnforce ? policy : liveLadderArms(a),
+        readyArms: taskEnforce
+          ? policy.filter(c => !readiness || credentialReadiness(c.credentialEvidence, nowMs).eligible)
+          : readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
+        roleExcluded, bstore, bcfg, nowMs,
+      });
+    };
   }
 
   /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
@@ -5062,6 +5069,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           reason,
         },
       };
+    }
+    if (live.taskRanking?.mode === 'enforce') {
+      // The hook does not receive the configured default effort. Proving a
+      // sibling effort cannot authorize keep (or caps-only decide) on that
+      // unknown binding after every explicit feasible decision was refused.
+      skips.push('bounded default keep unavailable: task ranking requires an explicit admitted model-effort decision');
+      return fail();
     }
     // No selectable arm: a bounded keep on the agent default model, but only
     // when its serving account passes the same hard admission gates as a

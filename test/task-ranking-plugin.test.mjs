@@ -278,3 +278,36 @@ test('task-enforced resolution remains memory-only after the native tick', async
   }
   assert.equal((await hook()).model, 'gpt-6.1-sol');
 });
+
+test('policy-trusted reviewers with sparse legacy AA evidence use their policy identity for readiness', async () => {
+  const d = await drive({ aaRows: rows.map(({ terminalbenchV40, scicode, lcr, ifbench, omniscienceNonHallucination, ...r }) => r),
+    config: { credentialReadiness: { enforce: true }, reviewerRouting: { agentIds: ['reviewer'], arms: [
+      { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
+    ] } } });
+  const out = await d.hook({ agentId: 'reviewer' });
+  assert.equal(out.kind, 'decide');
+  assert.equal(out.model, 'gpt-6.1-sol');
+  assert.equal(out.effort, 'high');
+});
+
+test('task exhaustion never keeps an unverified default effort using a different admitted effort', async () => {
+  const d = await drive({ fiveHourUsed: .99999, served: ['gpt-6.1-sol'],
+    config: { exhaustion: { enabled: true, finalAnswerFromAttempt: 1 } } });
+  for (const account of d.lane.accounts) account.weekly.used = 0;
+  d.setNow(NOW + 61000); d.lane.observedAt = new Date(NOW + 61000).toISOString();
+  await d.tick();
+  const out = await d.hook({ agentDefaultModel: 'gpt-6.1-sol(max)' });
+  assert.equal(out.kind, 'defer', 'the only Sol evidence is high, not the configured max default');
+});
+
+test('approved reviewer config cannot bypass contributor-only Muse or Sol identity fences', async () => {
+  for (const model of ['muse-spark-1.3', 'gpt-6-sol']) {
+    const d = await drive({ served: [model], aaRows: [], config: { reviewerRouting: {
+      agentIds: ['reviewer'], arms: [{ provider: 'codex', model, effort: 'max' }],
+    } } });
+    d.lane.accounts = [{ ...d.lane.accounts[0], models: [model] }];
+    d.setNow(NOW + 61000); d.lane.observedAt = new Date(NOW + 61000).toISOString();
+    await d.tick();
+    assert.equal((await d.hook({ agentId: 'reviewer' })).kind, 'defer', model);
+  }
+});
