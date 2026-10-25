@@ -107,7 +107,7 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
-import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps } from './free-lanes.mjs';
+import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps, paidTrialLedger } from './free-lanes.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -3603,7 +3603,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Fresh trial budgets per candidate: decisions write through to the
     // ledger, so re-reading bounds single-tick trial bursts structurally.
     const freshTrialBudget = () => {
-      const inFlight = trialInflight(ledger, { nowMs });
+      const inFlight = trialInflight(paidTrialLedger(ledger, config.freeLanes), { nowMs });
       const out = {};
       const fams = new Set(Object.keys(inFlight));
       for (const ladder of Object.values(ladders ?? {})) {
@@ -3848,7 +3848,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const p = poolOfKey(id);
       livePools[p] = (livePools[p] ?? 0) + n;
     }
-    const liveTrialInFlight = trialInflight(ledger, { nowMs });
+    const liveTrialInFlight = trialInflight(paidTrialLedger(ledger, config.freeLanes), { nowMs });
     const liveTrialBudget = {};
     {
       const fams = new Set(Object.keys(liveTrialInFlight));
@@ -4817,7 +4817,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   function effectiveTrialBudget(live, companyId, excludeRunId = null) {
     const use = new Map();
     for (const q of decisionsSinceTick(live, companyId, excludeRunId)) {
-      if (q?.trial !== true || !q?.family) continue;
+      if (q?.trial !== true || !q?.family
+        || (live.freeLanes?.enabled === true && q.enforced === true && q.freeProvider != null)) continue;
       use.set(q.family, (use.get(q.family) ?? 0) + 1);
     }
     const out = {};
@@ -5837,7 +5838,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const paidTarget = cap.freeLanes ? cap.paidTarget : target;
         // Weak calibration means no target at all: no caps, never zeros
         // masquerading as a recommendation.
-        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0)) {
+        const freeRunningFloor = cap.freeLanes && Object.values(cap.agentRunning ?? {}).some(r => r.freeRunning > 0);
+        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !freeRunningFloor) {
           return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
         }
         // Agents with queued/ready work: assigned non-terminal issues
@@ -5996,6 +5998,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)) {
         return { kind: 'defer', retryAfterMs: 20000, reason: 'awaiting native task-ranking evidence snapshot' };
       }
+      if (!live && enforceCompanies.has(params?.companyId) && freeLaneConfigs.get(params.companyId)?.enabled === true
+        && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)) {
+        return { kind: 'defer', retryAfterMs: 20000, reason: 'awaiting native free-lane evidence snapshot' };
+      }
       if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return keep();
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return keep();
@@ -6080,6 +6086,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         || (credentialEnforced && clock() < live.atMs)) {
         if (credentialEnforced) {
           return deferred(credentialDefer(params.companyId, 'routing snapshot stale or invalid'), {
+            countTowardExhaustion: false,
+          });
+        }
+        // Keep executes the configured model; it must not reopen a managed
+        // free provider without low-risk, rate and demotion admission. Model
+        // aliases can be ambiguous across accounts, so fail closed on a match.
+        const defaultKey = canonicalKey(params.agentDefaultModel);
+        if (defaultKey && (live.accounts ?? []).some(a => managedFreeAccount(live, params.companyId, a)
+          && (a.models ?? []).some(m => canonicalKey(m) === defaultKey))) {
+          return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'free-lane evidence snapshot stale or invalid' }, {
             countTowardExhaustion: false,
           });
         }

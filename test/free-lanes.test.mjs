@@ -140,3 +140,34 @@ test('caps retain free-only running agents even when no queue or paid allocation
   assert.equal(out.find(a => a.agentId === 'triage')?.allocated, 3);
   assert.equal(out.find(a => a.agentId === 'triage')?.running, 3);
 });
+
+test('additive caps cannot grant paid starts above the hard ceiling already occupied by free runs', () => {
+  const out = freeLaneCaps([{ agentId: 'builder', running: 0, queued: 10, allocated: 2 }], { triage: 1 }, 1, [], 2);
+  assert.equal(out.reduce((sum, a) => sum + a.allocated, 0), 2);
+  assert.equal(out.find(a => a.agentId === 'triage')?.allocated, 1);
+});
+
+test('all cap consumers see free headroom and free-only running floors', () => {
+  const out = freeLaneCaps([{ agentId: 'triage', running: 0, queued: 5, allocated: 0, maxConcurrentRuns: 0 }], {}, 3, ['triage'], 75);
+  assert.equal(out[0].maxConcurrentRuns, 3);
+  const runningOnly = freeLaneCaps([], { triage: 2 }, 0, [], 75);
+  assert.equal(runningOnly[0].maxConcurrentRuns, 2);
+});
+
+
+test('running-first free caps honor the process ceiling across mixed running and queued demand', () => {
+  for (let paidRunning = 0; paidRunning <= 3; paidRunning++) {
+    for (let paidQueued = 0; paidQueued <= 3; paidQueued++) {
+      for (let freeRunning = 0; freeRunning <= 3; freeRunning++) {
+        for (let ceiling = 1; ceiling <= 5; ceiling++) {
+          const input = [{ agentId: 'triage', running: paidRunning, queued: 8, allocated: paidRunning + paidQueued }];
+          const out = freeLaneCaps(input, { triage: freeRunning }, 3, ['triage'], ceiling);
+          assert.ok(out[0].allocated >= paidRunning + freeRunning);
+          assert.ok(out[0].allocated <= Math.max(ceiling, paidRunning + freeRunning));
+          assert.equal(out[0].maxConcurrentRuns, out[0].allocated);
+          assert.equal(input[0].allocated, paidRunning + paidQueued, 'input remains unchanged');
+        }
+      }
+    }
+  }
+});

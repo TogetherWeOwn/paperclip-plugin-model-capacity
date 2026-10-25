@@ -15,7 +15,7 @@ const params = extra => ({ runId: 'r', companyId: 'acme', agentId: 'triage', iss
   adapterType: 'claude-code', invocationSource: 'assignment', wakeReason: 'issue_assigned',
   previous: null, issueOverrideModel: null, ...extra });
 
-async function drive({ free = freeConfig, config: extra = {}, records = [], usage = null, accounts: customAccounts = null, state = null } = {}) {
+async function drive({ free = freeConfig, config: extra = {}, records = [], usage = null, accounts: customAccounts = null, state = null, initialTick = true } = {}) {
   let config = { enforce: true, cliproxy: { laneKeySecretRef: SECRET },
     roles: { minQuality: { doer: 0.4, other: 0.4, thinker: 0.4 }, thinkerAgentIds: ['thinker'] },
     modelAaOverrides: { 'step-5-preview-nim': { slug: 'step-5', effort: 'max' } },
@@ -54,7 +54,7 @@ async function drive({ free = freeConfig, config: extra = {}, records = [], usag
   if (!state) store.set(skey('ledger-v1'), records);
   if (usage) store.set(skey('free-lanes-v1'), usage);
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  if (initialTick) await jobs.get('shadow-tick')({});
   return {
     store, io, lane, plugin, hook: extra => plugin.onResolveRunModel(params(extra)),
     api: async routeKey => (await plugin.onApiRequest({ companyId: 'acme', routeKey })).body,
@@ -294,4 +294,73 @@ test('measured positive paid C* and paid agent caps are preserved when free capa
     const match = ac.agents.find(a => a.agentId === agent.agentId);
     assert.equal(match.allocated - match.freeAllocated, agent.allocated - agent.freeAllocated);
   }
+});
+
+test('free trials cannot consume paid same-family trial budgets before or after a tick', async () => {
+  const base = await drive();
+  const accounts = [base.lane.accounts[0], { ...base.lane.accounts[0], lane: 'paid-step', accountKey: 'paid-step', plan: 'paid' }];
+  const config = { roles: { minQuality: { doer: 0, other: 0, thinker: 0 } } };
+  const paidOnly = await drive({ accounts: [accounts[1]], config });
+  assert.equal((await paidOnly.hook({ agentId: 'builder', runId: 'paid-control' })).kind, 'decide');
+  for (const tick of [false, true]) {
+    const d = await drive({ accounts, config, free: { ...freeConfig, minQuality: 0 } });
+    const free = await d.hook({ runId: 'free-trial' });
+    assert.equal(free.model, MODEL);
+    assert.match(free.reason, /additive free lane/);
+    if (tick) {
+      await d.tick();
+      assert.equal((await d.api('capacity')).trialFamilies.step.budget, 1);
+    }
+    const pick = await d.hook({ agentId: 'builder', runId: 'paid-trial' });
+    assert.equal(pick.kind, 'decide', `tick=${tick}: ${JSON.stringify(pick)}`);
+    assert.match(pick.reason, /nvidia-nim:paid-step/);
+  }
+});
+
+test('a stale snapshot cannot keep an unadmitted managed free default', async () => {
+  const d = await drive();
+  d.setNow(NOW + 120001);
+  for (const extra of [{ agentId: 'builder' }, { previous: { runId: 'old', model: MODEL } }]) {
+    const answer = await d.hook({ ...extra, agentDefaultModel: MODEL });
+    assert.equal(answer.kind, 'defer', JSON.stringify(answer));
+  }
+  const off = await drive({ free: null });
+  off.setNow(NOW + 120001);
+  assert.equal((await off.hook({ agentDefaultModel: MODEL })).kind, 'keep');
+});
+
+test('free-only running floors survive a demoted target and weak paid calibration', async () => {
+  const base = await drive();
+  const d = await drive({ free: { ...freeConfig, minQuality: 0 }, accounts: [base.lane.accounts[0]],
+    config: { breakers: { enabled: false } } });
+  assert.equal((await d.hook({ runId: 'still-running' })).model, MODEL);
+  await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'still-running', occurredAt: new Date(NOW).toISOString(),
+    payload: { run: { agentId: 'triage', issueId: 'i', model: MODEL, modelSource: 'run-decision' } } });
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await d.hook({ runId: `bad-floor-${i}` })).model, MODEL);
+    await d.fire({ type: 'agent.run.failed', companyId: 'acme', entityId: `bad-floor-${i}`, occurredAt: new Date(NOW).toISOString(),
+      payload: { run: { agentId: 'triage', issueId: 'i', model: MODEL, modelSource: 'run-decision', error: 'test assertion failed' } } });
+  }
+  await d.tick();
+  assert.equal((await d.api('capacity')).freeLanes.target, 0);
+  const caps = await d.api('caps');
+  assert.equal(caps.agents.find(a => a.agentId === 'triage')?.allocated, 1, JSON.stringify(caps));
+  await d.configure({ freeLanes: { ...freeConfig, enabled: false } });
+  assert.equal((await d.api('caps')).agents.find(a => a.agentId === 'triage')?.maxConcurrentRuns, 1);
+});
+
+test('free enforcement waits for its first native snapshot, without overriding explicit pins', async () => {
+  const d = await drive({ initialTick: false });
+  assert.equal((await d.hook({ agentDefaultModel: MODEL })).kind, 'defer');
+  assert.equal((await d.hook({ issueOverrideModel: MODEL })).kind, 'keep');
+  const off = await drive({ free: null, initialTick: false });
+  assert.equal((await off.hook()).kind, 'keep', 'flag off keeps legacy startup behavior');
+});
+
+test('the existing maxConcurrentRuns cap field includes free allocations', async () => {
+  const d = await drive();
+  const caps = await d.api('caps');
+  const triage = caps.agents.find(a => a.agentId === 'triage');
+  assert.ok(triage.freeAllocated > 0);
+  assert.equal(triage.maxConcurrentRuns, triage.allocated);
 });

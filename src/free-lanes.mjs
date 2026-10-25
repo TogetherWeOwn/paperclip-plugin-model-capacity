@@ -1,5 +1,6 @@
 /** Additive free capacity. Pure policy; the existing tick owns persistence. */
 import { isInflight } from './ledger.mjs';
+import { applyReservedFloors } from './concurrency.mjs';
 
 const object = v => v != null && typeof v === 'object' && !Array.isArray(v);
 const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
@@ -123,29 +124,40 @@ export function reserveFreeRun(usage, provider, config, nowMs) {
   set(usage.requests, provider, (own(usage.requests, provider) ?? 0) + requests);
 }
 
-/** Add ONLY free headroom to low-risk agents. Paid allocations are never reduced. */
+/** Free admissions have their own budget, never the paid family's trial cap. */
+export function paidTrialLedger(ledger, config) {
+  return config?.enabled === true
+    ? new Map([...ledger].filter(([, r]) => !(r?.enforced === true && r?.freeProvider != null)))
+    : ledger;
+}
+
+/** Add free headroom after paid caps, preserving all running and the process ceiling. */
 export function freeLaneCaps(paid, runningByAgent, slots, allowedIds, maxTotal) {
   const allowed = new Set(allowedIds);
-  const rows = paid.map(a => ({ ...a, freeAllocated: own(runningByAgent, a.agentId) ?? 0 }));
-  const included = new Set(rows.map(a => a.agentId));
+  const combined = paid.map(a => {
+    const freeRunning = own(runningByAgent, a.agentId) ?? 0;
+    return { ...a, running: a.running + freeRunning, allocated: a.allocated + freeRunning, freeAllocated: freeRunning };
+  });
+  const included = new Set(combined.map(a => a.agentId));
   for (const [agentId, running] of Object.entries(runningByAgent)) {
-    if (running > 0 && !included.has(agentId)) rows.push({ agentId, running: 0, queued: 0,
-      allocated: 0, freeAllocated: running, reason: 'floor-running' });
+    if (running > 0 && !included.has(agentId)) combined.push({ agentId, running, queued: 0,
+      allocated: running, freeAllocated: running, reason: 'floor-running' });
   }
+  // A rising paid target can meet free runs admitted under an earlier tick.
+  // Reuse the running-first ceiling policy: trim only not-yet-running starts,
+  // never live work. Below the physical ceiling paid caps remain unchanged.
+  const rows = applyReservedFloors(combined, { ceiling: maxTotal }).entries;
   const freeRunning = Object.values(runningByAgent).reduce((sum, n) => sum + n, 0);
-  const paidSlots = rows.reduce((sum, r) => sum + r.allocated, 0);
-  let extra = Math.max(0, Math.min(slots - freeRunning, maxTotal - paidSlots - freeRunning));
+  const allocated = rows.reduce((sum, r) => sum + r.allocated, 0);
+  let extra = Math.max(0, Math.min(slots - freeRunning, maxTotal - allocated));
   const candidates = rows.filter(a => allowed.has(a.agentId)).sort((a, b) => a.agentId.localeCompare(b.agentId));
   while (extra > 0) {
     let placed = false;
     for (const a of candidates) {
-      const paidQueued = Math.max(0, a.allocated - a.running);
-      const freeQueued = a.freeAllocated - (own(runningByAgent, a.agentId) ?? 0);
-      if (a.queued <= paidQueued + freeQueued || extra <= 0) continue;
-      a.freeAllocated += 1; extra -= 1; placed = true;
+      if (a.queued <= Math.max(0, a.allocated - a.running) || extra <= 0) continue;
+      a.freeAllocated += 1; a.allocated += 1; extra -= 1; placed = true;
     }
     if (!placed) break;
   }
-  return rows.map(a => ({ ...a, running: a.running + (own(runningByAgent, a.agentId) ?? 0),
-    allocated: a.allocated + a.freeAllocated }));
+  return rows.map(a => ({ ...a, maxConcurrentRuns: a.allocated }));
 }

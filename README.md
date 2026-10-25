@@ -179,8 +179,13 @@ additive budget. Existing consumers see their sum in `/capacity.target`
 ceiling. Free-only capacity reports `partial` calibration with the original
 paid confidence in `paidCalibration`; unknown paid capacity is not invented.
 `/caps` allocates from paid C* first, then adds free headroom
-only to eligible agents. It holds all existing free running counts even when
-free capacity is demoted or the feature is disabled. A paid pace hold does not
+only to eligible agents, with `allocated` and the existing `maxConcurrentRuns`
+field kept in sync. Free admissions never consume paid per-family trial caps.
+It holds all existing free running counts even when free capacity is demoted,
+paid calibration is weak, or the feature is disabled. If an increased paid
+allocation meets existing free runs at the physical process ceiling, only
+not-yet-running starts are trimmed; paid C* itself is unchanged. Existing
+running work is never cancelled, even if it already exceeds that ceiling. A paid pace hold does not
 hold a free provider. If free selection fails, ordinary paid routing continues.
 Managed free accounts cannot bypass these checks via the ordinary or
 exhaustion path. Other providers and paid trial caps are unchanged.
@@ -299,7 +304,9 @@ The OpenRouter daily example permits at most ten **new admissions** per UTC
 day, not 1,000 agent runs. Only already served, benchmark-qualified,
 adapter-compatible arms qualify. No API key, account, free model or live
 configuration is created by this example. Enabling/editing waits for a matching
-native tick; disabling stops new free decisions immediately. Roll back with
+native tick, including the first tick after startup. A stale snapshot cannot
+fall back to `keep` on a managed free default and bypass admission; it defers
+until the native tick refreshes. Disabling stops new free decisions immediately. Roll back with
 `freeLanes.enabled=false`. The flag-off regression also compares decisions,
 capacity, caps, shadow and persisted state against the absent-feature path.
 
