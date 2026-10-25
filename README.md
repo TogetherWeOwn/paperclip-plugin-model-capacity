@@ -797,11 +797,13 @@ Only the already-declared `issues.read` capability is used. Ready-card reads
 share the ordinary demand cache; three additional status-list reads complete
 the graph once per capacity tick. Active counts and weights share that tick's
 ready-card snapshot; each new tick refreshes it even inside the ordinary demand
-TTL. Concurrent requests share the pending snapshot, and failures are memoized
-until the next tick. The capacity target uses the same validated snapshot as
-active caps. An unavailable graph retains ordinary demand refreshes for both
-the target and caps, as well as the legacy allocator. No resolver-hook I/O,
-new permission, database access, egress or background job is added.
+TTL. Concurrent requests share the pending snapshot, including failed attempts.
+The two newest tick snapshots are retained per company so an API request for the
+still-published tick cannot evict the next tick's in-progress snapshot; older
+requests cannot displace those newer entries. The capacity target uses the same
+validated snapshot as active caps. An unavailable graph retains ordinary demand
+refreshes for both the target and caps, as well as the legacy allocator. No
+resolver-hook I/O, new permission, database access, egress or background job is added.
 
 **Host compatibility gate:** the SDK `Issue` type exposes optional `blockedBy`
 and `blocks` arrays, but that does not guarantee they are returned. In the

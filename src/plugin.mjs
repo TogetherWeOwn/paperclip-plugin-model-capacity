@@ -1253,14 +1253,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return (await queuedSnapshot(companyId, nowMs, tickAtMs)).counts;
   }
 
-  // One priority snapshot per capacity tick, including a failed attempt. Share
-  // pending reads across concurrent /caps requests. No new reads when disabled.
-  // The SDK's optional relation fields must actually be present; the current
-  // upstream host can omit them from issues.read, in which case we fall back.
+  // Retain the two newest ticks per company, including pending/failed reads:
+  // /caps can still serve the published tick while the next tick awaits state
+  // writes. Older API requests must not evict either newer snapshot. No new
+  // reads when disabled. Missing optional SDK relation fields still fall back.
   const blockingPriorityCache = new Map();
   async function blockingSnapshot(companyId, tickAtMs) {
-    const hit = blockingPriorityCache.get(companyId);
-    if (hit?.tickAtMs === tickAtMs) return hit.pending;
+    let ticks = blockingPriorityCache.get(companyId);
+    if (!ticks) {
+      ticks = new Map();
+      blockingPriorityCache.set(companyId, ticks);
+    }
+    if (ticks.has(tickAtMs)) return ticks.get(tickAtMs);
     const pending = (async () => {
       // Demand and metadata must use the SAME ready-card snapshot. A new tick
       // refreshes it even inside the legacy TTL; same-tick calls retain both.
@@ -1275,7 +1279,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return { counts: ready.counts, priorities: null };
       }
     })();
-    blockingPriorityCache.set(companyId, { tickAtMs, pending });
+    ticks.set(tickAtMs, pending);
+    if (ticks.size > 2) ticks.delete([...ticks.keys()].sort((a, b) => a - b)[0]);
     return pending;
   }
 
