@@ -9,6 +9,7 @@ import {
 } from '../src/plugin.mjs';
 import { MODEL_ROUTING_ENV_KEYS } from '../src/manifest.mjs';
 import { REVIEW_RESERVE_STATE_KEY } from '../src/reviewreserve.mjs';
+import { syntheticAvailability } from './synthetic-readiness.mjs';
 
 // Deferral-exhaustion (Design B): the host clamps a plugin defer to 60s and
 // allows RUN_MODEL_RESOLVE_MAX_ATTEMPTS=12 retries per chain (each retry is a
@@ -81,6 +82,37 @@ const metaAheadKnown = () => ({
   quality: 'live', models: [MUSE],
   weekly: { used: 0.99, resetsAt: RESET_WEEK },
   fiveHour: { used: 0.99, resetsAt: RESET_5H },
+});
+// A known-metered default with no 5h headroom: normal selection defers, while
+// the exhaustion keep can intentionally bypass that transient hold.
+const claudeBoundedKeep = () => ({
+  observedAt: OBS,
+  lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
+  quality: 'live', models: [HAIKU],
+  weekly: { used: 0, resetsAt: RESET_WEEK },
+  fiveHour: { used: 1, resetsAt: RESET_5H },
+});
+// A known-metered default whose weekly window is empty. It remains health
+// healthy so the exhaustion path must honor the normal `action: excluded`
+// admission state instead of using its bounded-keep relaxation.
+const claudeWeeklyExhausted = () => ({
+  observedAt: OBS,
+  lane: 'claude-1', provider: 'claude', accountKey: 'a1', health: 'healthy',
+  quality: 'live', models: [HAIKU],
+  weekly: { used: 1, resetsAt: RESET_WEEK },
+  fiveHour: { used: 0, resetsAt: RESET_5H },
+});
+// A degraded trial-family lane with a real (but exhausted) vendor meter.
+// Trial arms bypass 5h burn checks, so the weekly meter must stop it before
+// decide() even though the healthy-only action exclusion does not apply.
+const meteredTrialWeeklyExhausted = () => agTrial({
+  health: 'degraded', meter: 'metered', quality: 'live',
+  weekly: { used: 1, resetsAt: RESET_WEEK },
+  fiveHour: { used: 0, resetsAt: RESET_5H },
+});
+const withReadyCredentials = (account, nowMs) => ({
+  ...account,
+  credentialAvailability: syntheticAvailability(account, nowMs, { models: [NIM_BARE] }),
 });
 const metaAhead = () => acct({
   lane: 'meta-1', provider: 'meta', accountKey: 'm1', health: 'healthy',
@@ -230,7 +262,7 @@ test('flag off reproduces today byte-for-byte across the whole chain', async () 
   assert.deepEqual(explicit, implicit);
 });
 
-test('streak survives new runIds: attempts 1-10 defer, 11-12 decide NIM', async () => {
+test('streak survives new runIds: attempts 1-10 defer, 11 decides, then a new chain starts fresh', async () => {
   const d = drive({ accounts: [claudeAhead(), metaAhead(), nimTrial({ health: 'degraded' }), agTrial({ health: 'degraded' })], config: baseConfig() });
   await d.setup();
   await d.tick();
@@ -241,17 +273,16 @@ test('streak survives new runIds: attempts 1-10 defer, 11-12 decide NIM', async 
     assert.equal(outs[i].kind, 'defer', `attempt ${i + 1} defers`);
     assert.equal(outs[i].reason, 'no account has headroom right now');
   }
-  for (const i of [10, 11]) {
-    const out = outs[i];
-    assert.equal(out.kind, 'decide', `attempt ${i + 1} answers`);
-    assert.match(out.decisionId, /^mc-run-x-(11|12)-nvidia-nim-n1-/);
-    assert.ok(String(out.model).startsWith(NIM_ALIAS), `NIM alias, got ${out.model}`);
-    assert.match(out.reason, /^deferral-exhausted: no account has headroom right now -> /);
-    assert.equal(out.source, 'model-capacity');
-    for (const k of Object.keys(out.env ?? {})) {
-      assert.ok(MODEL_ROUTING_ENV_KEYS.includes(k), `undeclared env key ${k}`);
-    }
+  const answer = outs[10];
+  assert.equal(answer.kind, 'decide', 'attempt 11 answers');
+  assert.match(answer.decisionId, /^mc-run-x-11-nvidia-nim-n1-/);
+  assert.ok(String(answer.model).startsWith(NIM_ALIAS), `NIM alias, got ${answer.model}`);
+  assert.match(answer.reason, /^deferral-exhausted: no account has headroom right now -> /);
+  assert.equal(answer.source, 'model-capacity');
+  for (const k of Object.keys(answer.env ?? {})) {
+    assert.ok(MODEL_ROUTING_ENV_KEYS.includes(k), `undeclared env key ${k}`);
   }
+  assert.equal(outs[11].kind, 'defer', 'an answer clears the streak before a later chain');
   // No decision in the whole chain ever names a metered-ahead pool.
   for (const out of outs) {
     if (out.kind !== 'decide') continue;
@@ -276,17 +307,18 @@ test('NIM at cap falls through to the next selectable free/trial arm', async () 
   const outs = [];
   for (let i = 1; i <= 12; i++) outs.push(await d.hook(`run-y-${i}`));
   for (let i = 0; i < 10; i++) assert.equal(outs[i].kind, 'defer', `attempt ${i + 1} defers`);
-  for (const i of [10, 11]) {
+  for (const i of [10]) {
     const out = outs[i];
     assert.equal(out.kind, 'decide', `attempt ${i + 1} answers`);
     assert.match(out.decisionId, /-antigravity-g1-/, `falls through to antigravity, got ${out.decisionId}`);
     assert.match(out.reason, /^deferral-exhausted: no account has headroom right now -> /);
   }
+  assert.equal(outs[11].kind, 'defer', 'the exhaustion answer clears the streak');
 });
 
 test('thinker without a trial role cannot take trial arms: bounded keep with a ledger entry', async () => {
   const d = drive({
-    accounts: [claudeAhead(), nimTrial(), agTrial({ health: 'degraded' })],
+    accounts: [claudeBoundedKeep(), nimTrial(), agTrial({ health: 'degraded' })],
     config: baseConfig({ roles: { thinkerAgentIds: ['agent-9'], minQuality: { doer: null, other: null, thinker: null } } }),
   });
   await d.setup();
@@ -297,9 +329,8 @@ test('thinker without a trial role cannot take trial arms: bounded keep with a l
   const outs = [];
   for (let i = 1; i <= 12; i++) outs.push(await d.hook(`run-t-${i}`));
   for (let i = 0; i < 10; i++) assert.equal(outs[i].kind, 'defer', `attempt ${i + 1} defers`);
-  for (const i of [10, 11]) {
-    assert.deepEqual(outs[i], { kind: 'keep' }, `attempt ${i + 1} keeps (bounded, default pool not exhausted)`);
-  }
+  assert.deepEqual(outs[10], { kind: 'keep' }, 'attempt 11 keeps on the bounded default pool');
+  assert.equal(outs[11].kind, 'defer', 'the keep clears the streak before a later chain');
   await d.tick();
   const entries = await d.shadow();
   const kept = entries.find(e => e.runId === 'run-t-11');
@@ -327,6 +358,58 @@ test('keep denied when the default pool is exhausted: keep deferring with skip r
     assert.equal(out.kind, 'defer', `attempt ${i + 1} still defers (strand rather than burn an exhausted pool)`);
     assert.ok(out.reason.startsWith('no account has headroom right now; exhaustion scan: '), `skip reasons appended, got ${out.reason}`);
     assert.match(out.reason, /exhausted/);
+  }
+});
+
+test('exhaustion keep rejects a healthy default whose weekly meter is exhausted', async () => {
+  const d = drive({ accounts: [claudeWeeklyExhausted()], config: baseConfig() });
+  await d.setup();
+  await d.tick();
+  const view = (await d.api('capacity')).accounts.find(account => account.accountId === 'claude:a1');
+  assert.equal(view.health, 'healthy');
+  assert.equal(view.action, 'excluded');
+  d.killIo();
+  const outs = [];
+  for (let i = 1; i <= 11; i++) outs.push(await d.hook(`run-weekly-default-${i}`));
+  assert.ok(outs.every(out => out.kind === 'defer'), 'an exhausted default never gets a bounded keep');
+  assert.match(outs[10].reason, /claude:a1 excluded from admission/);
+  assert.match(outs[10].reason, /default model claude-haiku-5-5 has no safe serving account/);
+});
+
+test('exhaustion scan never selects a degraded metered trial account with an exhausted weekly window', async () => {
+  const d = drive({
+    accounts: [meteredTrialWeeklyExhausted()],
+    config: baseConfig({ burnMode: { accounts: ['antigravity:g1'] } }),
+  });
+  await d.setup();
+  await d.tick();
+  const cap = await d.api('capacity');
+  const view = cap.accounts.find(account => account.accountId === 'antigravity:g1');
+  assert.equal(view.health, 'degraded');
+  assert.equal(view.headroomSource, 'weekly');
+  assert.equal(cap.trialFamilies.oss.proven, false, 'the exhausted account serves a trial family');
+  d.killIo();
+  const outs = [];
+  for (let i = 1; i <= 11; i++) outs.push(await d.hook(`run-weekly-trial-${i}`, { agentDefaultModel: 'unmapped-model-9' }));
+  assert.ok(outs.every(out => out.kind === 'defer'), 'a weekly-exhausted trial account is never selected');
+  assert.match(outs[10].reason, /antigravity:g1 weekly window exhausted/);
+});
+
+test('missing issue or agent identity never accrues a shared exhaustion streak', async () => {
+  const d = drive({
+    accounts: [claudeAhead(), nimTrial({ health: 'degraded' }), agTrial({ health: 'degraded' })],
+    config: baseConfig(),
+  });
+  await d.setup();
+  await d.tick();
+  d.killIo();
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`run-no-issue-${i}`, { issueId: undefined });
+    assert.equal(out.kind, 'defer', `missing issue attempt ${i} defers`);
+  }
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`run-no-agent-${i}`, { agentId: undefined });
+    assert.equal(out.kind, 'defer', `missing agent attempt ${i} defers`);
   }
 });
 
@@ -493,14 +576,13 @@ test('metered-ahead pools with known headroom are never selected (ahead path)', 
   const outs = [];
   for (let i = 1; i <= 12; i++) outs.push(await picked.hook(`run-k-${i}`));
   for (let i = 0; i < 10; i++) assert.equal(outs[i].kind, 'defer', `attempt ${i + 1} defers`);
-  for (const i of [10, 11]) {
-    const out = outs[i];
-    assert.equal(out.kind, 'decide', `attempt ${i + 1} answers`);
-    assert.match(out.decisionId, /-nvidia-nim-n1-/, 'ahead pools skipped, NIM free-overflow arm selected');
-    assert.match(out.reason, /^deferral-exhausted: /);
-    assert.ok(!String(out.decisionId).includes('claude-a1'), `claude selected: ${out.decisionId}`);
-    assert.ok(!String(out.decisionId).includes('meta-m1'), `meta selected: ${out.decisionId}`);
-  }
+  const answer = outs[10];
+  assert.equal(answer.kind, 'decide', 'attempt 11 answers');
+  assert.match(answer.decisionId, /-nvidia-nim-n1-/, 'ahead pools skipped, NIM free-overflow arm selected');
+  assert.match(answer.reason, /^deferral-exhausted: /);
+  assert.ok(!String(answer.decisionId).includes('claude-a1'), `claude selected: ${answer.decisionId}`);
+  assert.ok(!String(answer.decisionId).includes('meta-m1'), `meta selected: ${answer.decisionId}`);
+  assert.equal(outs[11].kind, 'defer', 'the exhaustion answer clears the streak');
   // No selectable arm and an unmapped default: the scan fails and the per
   // account skip reasons must name the ahead exclusion (not unknown
   // headroom, not a breaker).
@@ -537,4 +619,37 @@ test('a stale-snapshot keep resets the streak: post-recovery defers count from o
   for (let i = 1; i <= 6; i++) {
     assert.equal((await d.hook(`run-s-${i + 5}`)).kind, 'defer', `post-recovery deferral ${i} of 6 defers`);
   }
+});
+
+test('stale credential evidence does not consume the capacity-retry grace period', async () => {
+  const staleAt = NOW + 120001;
+  const freshAccounts = (at) => [
+    withReadyCredentials(claudeAheadKnown(), at),
+    withReadyCredentials(nimTrial({ health: 'degraded' }), at),
+    withReadyCredentials(agTrial({ health: 'degraded' }), at),
+  ];
+  const d = drive({
+    accounts: freshAccounts(NOW),
+    config: baseConfig({ credentialReadiness: { enforce: true } }),
+    nowMs: NOW,
+  });
+  await d.setup();
+  await d.tick(NOW);
+  d.setNow(staleAt);
+  for (let i = 1; i <= 12; i++) {
+    const out = await d.hook(`run-stale-credentials-${i}`);
+    assert.equal(out.kind, 'defer', `stale credential defer ${i}`);
+    assert.equal(out.reason, 'routing snapshot stale or invalid');
+  }
+  d.setAccounts(freshAccounts(staleAt));
+  await d.tick(staleAt);
+  d.killIo();
+  for (let i = 1; i <= 10; i++) {
+    const out = await d.hook(`run-capacity-after-stale-${i}`);
+    assert.equal(out.kind, 'defer', `capacity defer ${i} retains the full grace period`);
+    assert.equal(out.reason, 'no account has headroom right now');
+  }
+  const answer = await d.hook('run-capacity-after-stale-11');
+  assert.equal(answer.kind, 'decide', 'only the eleventh capacity defer triggers recovery');
+  assert.match(answer.reason, /^deferral-exhausted: no account has headroom right now -> /);
 });
