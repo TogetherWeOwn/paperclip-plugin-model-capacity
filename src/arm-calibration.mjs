@@ -39,6 +39,9 @@ const MODEL_BY_ARM_ID = new Map(
 /** Model id behind a routed arm id (classic table, else dynamic identity). */
 function modelFromArmId(armId, { servedId = null } = {}) {
   if (typeof armId !== 'string' || armId.length === 0) return null;
+  // Task-ranking identity is benchmark-normalized; the emitted served ID
+  // remains authoritative for quota attribution (dots, prefixes, aliases).
+  if (/@(?:minimal|low|medium|high|xhigh|max|ultra)$/.test(armId)) return servedId;
   const mapped = MODEL_BY_ARM_ID.get(armId);
   if (mapped) return mapped;
   // Dynamic arms carry the model id as the arm id; operator armIds may carry

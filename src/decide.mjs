@@ -11,6 +11,7 @@
  */
 
 import { canonicalModelName } from './arms.mjs';
+import { compareTaskCosts } from './task-cost.mjs';
 
 export const MAX_CONTEXT_ENV_KEY = 'CLAUDE_CODE_MAX_CONTEXT_TOKENS';
 export const AUTO_COMPACT_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
@@ -474,6 +475,7 @@ export function decide({
   trialAdapters = null,
   trialRoles = DEFAULT_TRIALS.roles,
   excludedFamilies = [],
+  taskRanking = null,
 } = {}) {
   if (failureClass === 'rate-limit') {
     return { kind: 'defer', retryAfterMs: 20000, reason: 'previous run rate-limited: reroute to next account' };
@@ -507,25 +509,41 @@ export function decide({
   const order = [];
   for (let rung = target; rung >= floor; rung--) order.push(rung);
   for (let rung = target + 1; rung <= ceiling; rung++) order.push(rung);
-  for (const rung of order) {
-    const entry = ladderRungs.find(r => r.rung === rung);
-    const arms = (entry?.arms ?? []).filter(a => (a.contextWindow ?? Number.MAX_SAFE_INTEGER) >= requiredWindow);
-    const fitting = arms.filter(a => {
-      if (armExcluded(a, excludedFamilySet)) return false;
-      if (!trialOk(a)) return false;
-      // Trial picks bypass the burn check: unmeasured by definition.
-      if (a.trial) return true;
-      const burn = burnPerRunPct[a.armId];
-      if (fiveHourHeadroomPct == null) return true;
-      if (burn == null) return false;
-      return burn <= fiveHourHeadroomPct - reservePct;
+  const taskEnforce = taskRanking?.mode === 'enforce';
+  const feasible = arm => {
+    let window = arm.contextWindow ?? Number.MAX_SAFE_INTEGER;
+    if (taskEnforce && requiredWindow > 0) {
+      const cap = positiveInt(Number(contextCapsEnv(arm, contextCaps)[MAX_CONTEXT_ENV_KEY]));
+      window = Math.min(window, cap ?? Number.MAX_SAFE_INTEGER);
+    }
+    if (window < requiredWindow) return false;
+    if (taskEnforce && arm.eligible === false) return false;
+    if (armExcluded(arm, excludedFamilySet) || !trialOk(arm)) return false;
+    if (arm.trial || fiveHourHeadroomPct == null) return true;
+    const burn = burnPerRunPct[arm.armId];
+    return burn != null && burn <= fiveHourHeadroomPct - reservePct;
+  };
+  const fittingByRung = new Map(order.map(rung => [rung,
+    (ladderRungs.find(r => r.rung === rung)?.arms ?? []).filter(feasible)]));
+  // With no retry escalation the pointer is a pacing preference, not a
+  // reason to purchase surplus quality. Capability and role window already
+  // constrain these arms. Explicit retries retain their existing rung walk.
+  if (taskEnforce && escalation === 0) {
+    const cheapest = new Map([...fittingByRung].map(([rung, arms]) => [rung, [...arms].sort(compareTaskCosts)[0]]));
+    order.sort((a, b) => {
+      const x = cheapest.get(a), y = cheapest.get(b);
+      return Number(!x) - Number(!y) || (x && y ? compareTaskCosts(x, y) : 0) || a - b;
     });
+  }
+  for (const rung of order) {
+    const fitting = fittingByRung.get(rung);
     if (fitting.length === 0) continue;
     // Thinkers rank on their own EEE blend (qThinker, alpha 0.10); every
     // other role ranks on the ladder Q (doer blend). Arms without a thinker
     // blend (AA-only, or ladders built before it existed) fall back to Q.
     const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
-    fitting.sort((a, b) => (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
+    fitting.sort((a, b) => (taskEnforce ? compareTaskCosts(a, b) : 0)
+      || (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     // Sol window (a tier cap may only lower it), else the tier cap, else the
     // Luna caps for sol/luna, plus the haiku output cap: the shared builder
@@ -545,7 +563,8 @@ export function decide({
       env,
       source: 'model-capacity',
       calibration: weak ? 'weak' : 'ok',
-      reason: `rung ${rung} on ${accountId} (${role}${escalation ? `, +${escalation} retry escalation` : ''})`,
+      reason: `rung ${rung} on ${accountId} (${role}${escalation ? `, +${escalation} retry escalation` : ''})`
+        + (taskEnforce ? `; AA workload proxy ${arm.taskCostProxy ?? 'unknown'} USD (not calibrated accepted-task cost)` : ''),
       rung,
       accountId,
       agentId,

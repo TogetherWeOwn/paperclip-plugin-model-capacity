@@ -44,6 +44,20 @@
     "omniscience": 0.045,
     "lcr": 0.045
   },
+  "taskRanking": {
+    "mode": "shadow",
+    "profileVersion": "aa-role-v1",
+    "minAbsoluteCoverage": 0.6,
+    "effortSupport": {},
+    "calibration": {
+      "enabled": false,
+      "windowDays": 7,
+      "minClosedTasks": 30,
+      "minAcceptedTasks": 10,
+      "priorTasks": 30,
+      "maxRelativeCiHalfWidth": 0.5
+    }
+  },
   "pacing": {
     "deadband": 0.02,
     "rungCooldownMs": 600000,

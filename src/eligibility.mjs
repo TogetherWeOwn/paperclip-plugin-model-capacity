@@ -119,7 +119,8 @@ export function normalizeOutcomeGate(raw) {
 
 /** The quality an arm is judged on for a role; null when it has no score. */
 export function armQuality(arm, role) {
-  const q = role === 'thinker' ? (arm?.qFleetThinker ?? arm?.qFleet) : arm?.qFleet;
+  const q = arm?.qFleetByRole != null ? arm.qFleetByRole[role]
+    : role === 'thinker' ? (arm?.qFleetThinker ?? arm?.qFleet) : arm?.qFleet;
   return isFiniteNumber(q) ? q : null;
 }
 
@@ -140,7 +141,8 @@ export function qualityVerdicts(arms, minQuality, { minFleetArms = MIN_FLEET_ARM
     for (const arm of arms ?? []) {
       const q = armQuality(arm, role);
       let verdict;
-      if (!applies) verdict = { ok: true, q, min: isFiniteNumber(min) ? min : null, reason: null };
+      if (arm?.roleTrusted?.[role] === false) verdict = { ok: false, q, min: isFiniteNumber(min) ? min : null, reason: 'task-evidence-admission' };
+      else if (!applies) verdict = { ok: true, q, min: isFiniteNumber(min) ? min : null, reason: null };
       else if (q == null) verdict = { ok: false, q, min, reason: 'unscored' };
       else if (q < min) verdict = { ok: false, q, min, reason: `min-quality: ${q.toFixed(2)} < ${min}` };
       else verdict = { ok: true, q, min, reason: null };
@@ -232,7 +234,7 @@ function usableFamiliesForRole(arms, quality, manualArmSet, role, ignoreQuality)
   const usable = new Set();
   for (const a of arms ?? []) {
     const fam = String(a?.family ?? '').toLowerCase();
-    if (!fam) continue;
+    if (!fam || a?.roleTrusted?.[role] === false) continue;
     if (manualArmSet.has(armToken(a?.armId))) continue;
     if (!ignoreQuality && quality?.[role]?.[a?.armId]?.ok === false) continue;
     usable.add(fam);
@@ -373,14 +375,15 @@ export function buildEligibility({
   const suspendedByRole = {};
   const manualSuspendedByRole = {};
   const finalOutcomes = {};
-  const accessible = (role, tokens) => (accountGroups ?? []).some(groups => roleLadderAccess(groups, {
+  const groupsForRole = (groups, role) => Array.isArray(groups) ? groups : groups?.[role] ?? [];
+  const accessible = (role, tokens) => groupsForRole(accountGroups, role).some(groups => roleLadderAccess(groups, {
     role, roleBands, excludedFamilies: tokens, trialRoles,
   }).eligible);
   // Structural view: every lane, whether healthy or not, breaker-filtered
   // or not. A non-banned arm fitting the role window and trial rules
   // anywhere in the fleet means the role is only transiently empty.
   const structural = structuralGroups ?? accountGroups;
-  const structurallyAccessible = (role, tokens) => (structural ?? []).some(groups => roleLadderAccess(groups, {
+  const structurallyAccessible = (role, tokens) => groupsForRole(structural, role).some(groups => roleLadderAccess(groups, {
     role, roleBands, excludedFamilies: tokens, trialRoles,
   }).eligible);
 
