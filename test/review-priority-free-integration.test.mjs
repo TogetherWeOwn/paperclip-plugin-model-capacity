@@ -299,9 +299,16 @@ for (const barrierAt of ['census', 'hold']) {
 for (const stale of [false, true]) {
   test(`caps integration: pre-request admission generation ${stale ? 'mismatch keeps only running' : 'match admits queued work'}`, async () => {
     const raw = { ...config(), reviewDemand: { enabled: false } };
-    const d = await drive({ raw, cap: capacity({ reviewAdmissionGeneration: 1, agentRunning: { review: { running: 2 } } }),
-      heartbeats: [{ agentId: 'review', queued: 7 }],
-    });
+    const d = await drive({ raw, heartbeats: [{ agentId: 'review', queued: 7 }] });
+    await d.tick();
+    const produced = d.store.get('capacity-v1');
+    assert.equal(typeof produced.reviewAdmissionEpoch, 'string', 'tick must publish its current instance epoch');
+    assert.ok(produced.reviewAdmissionEpoch.length > 0);
+    d.store.set('capacity-v1', capacity({
+      reviewAdmissionGeneration: produced.reviewAdmissionGeneration,
+      reviewAdmissionEpoch: produced.reviewAdmissionEpoch,
+      agentRunning: { review: { running: 2 } },
+    }));
     if (stale) await d.configure(raw);
     const body = await d.caps();
     const row = rowOf(body.agents, 'review');

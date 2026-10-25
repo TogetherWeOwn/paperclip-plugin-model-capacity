@@ -22,6 +22,7 @@
  * (flagged `enforced:true`); the next tick persists the same records.
  */
 
+import { randomUUID } from 'node:crypto';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -1063,6 +1064,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
   const readReviewDemand = createReviewDemandReader({ clock });
+  // Persisted admission must not compare equal after a worker restart, even
+  // when its wall clock and first per-company configuration counter match.
+  const reviewAdmissionEpoch = randomUUID();
   const configGenerations = new Map();
   const configGenerationOf = companyId => configGenerations.get(companyId) ?? 0;
   const reviewAgentIdsFor = config => new Set([
@@ -4395,6 +4399,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ? Math.min(config.concurrency.maxTotal, (concurrency.target ?? 0) + freeCapacity.target) : concurrency.target;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       reviewAdmissionGeneration: generation,
+      ...(reviewAgentIdsFor(config).size > 0 ? { reviewAdmissionEpoch } : {}),
       atMs: nowMs,
       taskRanking,
       ...(freeCapacity ? { freeLanes: freeCapacity, paidTarget: concurrency.target,
@@ -5995,6 +6000,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const admissionAgeMs = Number.isFinite(atMs) ? clock() - atMs : Infinity;
         const reviewAdmissionFresh = admissionAgeMs >= 0 && admissionAgeMs <= 120_000
           && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionGeneration === generation)
+          && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionEpoch === reviewAdmissionEpoch)
           && generation === configGenerationOf(companyId);
         const reviewDemandConfig = reviewIds.size > 0 ? resolved?.reviewDemand : null;
         const reviewDemand = reviewDemandConfig && !reviewAdmissionFresh
@@ -6157,6 +6163,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         }
         return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended,
           ...(priorityRequested ? { allocation: { blockingPriority,
+            ...(allocated.resourceStatus ? { resourceStatus: allocated.resourceStatus } : {}),
             ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
         } };
       }

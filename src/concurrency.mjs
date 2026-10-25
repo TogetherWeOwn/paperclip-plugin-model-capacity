@@ -16,6 +16,8 @@
  * target null -- no caps are recommended until E is observed.
  */
 
+import { allocatePriorityResourceSlots } from './priority-resources.mjs';
+
 export const DEFAULT_CONCURRENCY = Object.freeze({
   maxTotal: 75,
   meanRunDurationHours: 0.186,
@@ -390,9 +392,9 @@ export function allocateDemandCaps(target, agents, maxTotal = 75, { blockingPrio
  * Each clipped round exhausts an agent/pool or spends all remaining slots, so
  * work scales with candidates, not with the configured numeric fleet ceiling.
  */
-function boundedPriorityShares(entries, available, pools, { spend, noHeadroomIds = new Set() } = {}) {
+function boundedPriorityShares(entries, available, pools) {
   const extras = entries.map(() => 0);
-  const limits = entries.map(entry => noHeadroomIds.has(entry.agentId) ? entry.queued : Math.max(entry.queued, 1));
+  const limits = entries.map(entry => Math.max(entry.queued, 1));
   const indexById = new Map(entries.map((entry, i) => [entry.agentId, i]));
   const groupByIndex = new Map();
   const groups = pools.map(pool => {
@@ -418,17 +420,8 @@ function boundedPriorityShares(entries, available, pools, { spend, noHeadroomIds
         const bounded = largestRemainder(remaining, members.map(i => grants[i]));
         members.forEach((i, j) => { grants[i] = bounded[j]; });
       }
+      group.remaining -= members.reduce((sum, i) => sum + grants[i], 0);
     }
-    if (spend) {
-      for (let i = 0; i < grants.length; i++) {
-        let granted = 0;
-        while (granted < grants[i] && spend(entries[i])) granted++;
-        // Budgets only shrink: an unfunded row cannot win another round.
-        if (granted < grants[i]) limits[i] = extras[i] + granted;
-        grants[i] = granted;
-      }
-    }
-    for (const group of groups) group.remaining -= group.members.reduce((sum, i) => sum + grants[i], 0);
     grants.forEach((grant, i) => { extras[i] += grant; });
     available -= grants.reduce((sum, grant) => sum + grant, 0);
   }
@@ -622,9 +615,7 @@ function allocateMultiPoolReviewers(input) {
     .sort((a, b) => reviewerAccountIdsByAgent[a.agentId].length - reviewerAccountIdsByAgent[b.agentId].length
       || a.agentId.localeCompare(b.agentId));
   const spend = row => {
-    const servingPool = accountPool.get(keptByAgent[row.agentId]?.accountId);
-    const ids = [...new Set(reviewIds.has(row.agentId) ? reviewerAccountIdsByAgent[row.agentId]
-      : [...accountLeft.keys()].filter(id => accountPool.get(id) === servingPool))];
+    const ids = [...new Set(reviewerAccountIdsByAgent[row.agentId])];
     for (const pool of new Set(ids.map(id => accountPool.get(id)))) {
       if ((poolLeft.get(pool) ?? 0) < 1) continue;
       // Sustainable slots are fractional. Combine admitted fractions inside
@@ -653,15 +644,20 @@ function allocateMultiPoolReviewers(input) {
   let left = Math.max(0, totalCeiling - fixed.kept.reduce((s, a) => s + a.allocated, 0)
     - reviews.reduce((s, a) => s + a.running, 0) - ordinary.reduce((s, a) => s + (a.running ?? 0), 0));
   if (blockingPriority) {
-    // Compete globally BEFORE fixed/helper reservations, using the same bounded
-    // priority splitter as ordinary caps and the same account/pool spend oracle.
+    // Compete on actual feasible resources before committing ANY new slot.
+    // Funding is rematched, not consumed by demand/id-ordered tentative grants.
     const noHeadroomIds = new Set([...fixedIds, ...reviewIds]);
     const weights = new Map(agents.map(a => [a.agentId,
       Number.isFinite(a.allocationWeight) && a.allocationWeight > 0 ? Math.min(404, a.allocationWeight) : 1]));
     const rows = allocateDemandCaps(0, agents, maxTotal).map(a => ({ ...a, allocationWeight: weights.get(a.agentId) }));
-    const extras = boundedPriorityShares(rows, left, [], {
-      noHeadroomIds, spend: row => !noHeadroomIds.has(row.agentId) || spend(row),
-    });
+    const admissions = new Map(rows.filter(row => noHeadroomIds.has(row.agentId)).map(row => {
+      const servingId = keptByAgent[row.agentId]?.accountId;
+      return [row.agentId, [...new Set(reviewIds.has(row.agentId) ? reviewerAccountIdsByAgent[row.agentId]
+        : [...accountLeft.keys()].filter(id => accountPool.get(id) === accountPool.get(servingId))
+          .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b)))]];
+    }));
+    const { extras, resourceStatus } = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds,
+      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn });
     const entries = rows.map(({ allocationWeight, ...row }, i) => ({ ...row,
       allocated: row.running + extras[i], maxConcurrentRuns: row.running + extras[i],
       reason: extras[i] > 0 ? 'proportional' : 'floor-running',
@@ -669,7 +665,8 @@ function allocateMultiPoolReviewers(input) {
     const kept = entries.filter(row => noHeadroomIds.has(row.agentId));
     const routedTarget = Math.max(0, totalCeiling - kept.reduce((sum, row) => sum + row.allocated, 0));
     return { kept, keptCeilings: new Map(kept.map(row => [row.agentId, row.allocated])),
-      routed: entries.filter(row => !noHeadroomIds.has(row.agentId)), routedTarget, routedCeiling: Math.max(1, routedTarget) };
+      routed: entries.filter(row => !noHeadroomIds.has(row.agentId)), routedTarget, routedCeiling: Math.max(1, routedTarget),
+      ...(resourceStatus ? { resourceStatus } : {}) };
   }
   while (left > 0) {
     let changed = false;

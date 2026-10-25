@@ -85,11 +85,15 @@ Reviewer identities come from `reviewReserve.agentIds` (defaulting to
 Fixed-model reviewers count heads but remain constrained to their serving pool.
 Routed reviewer caps use every account admitted by their configured routing arms,
 not just the adapter default model's pool. Existing arm/readiness/breaker,
-headroom and pace guards remain in force. Fixed-model agents reserve first;
-reviewers share the remaining account/pool budgets and fleet ceiling. Routing
-order is unchanged: this change does not alter primary/helper preference.
-The admission snapshot expires after two minutes, and exhausted arms preserve
-only existing running floors. Undo: disable `reviewDemand` to remove the new
+headroom and pace guards remain in force. With blocking priority off, fixed-model
+agents reserve first; reviewers share the remaining account/pool budgets and
+fleet ceiling. When it is on, all new fixed/reviewer/ordinary slots compete by
+resource-feasible weighted quanta as described below. Routing order is unchanged:
+this change does not alter primary/helper preference.
+The admission snapshot expires after two minutes. Newly stamped admissions also
+belong to the producing plugin instance and configuration generation: restart or
+configuration change requires a new tick before those helper grants can resume.
+Exhausted arms preserve only existing running floors. Undo: disable `reviewDemand` to remove the new
 source, or reinstall the prior release to restore the previous cap allocator.
 
 ## Role-aware AA task ranking (unreleased)
@@ -1004,6 +1008,19 @@ agent, with neutral priority when its queue is empty); kept agents reserve no
 idle headroom. When an agent or serving pool
 saturates, its excess share is redistributed among remaining eligible agents,
 including agents in other kept pools, rather than leaving usable slots idle.
+
+When routed reviewer admissions are present, shared account subsets need an
+additional resource constraint. That combined path awards whole slots by the
+highest `((queued + 1) × priorityWeight) / (newSlots + 1)` (D'Hondt), where
+`priorityWeight` includes the fan-out multiplier above, with agent-ID ties, testing the full
+funding plan before each award. Flexible assignments are rematched rather than
+consuming a constrained peer's only account. Fractional accounts can combine
+inside one pool, never across unrelated pools. The ordinary-only path retains
+largest-remainder shares; the combined path is not a claim of exact Hamilton
+rounding. A fixed 8192-step search/flow budget bounds difficult multi-pool cases:
+if reached, only the already-proven feasible prefix is returned and `/caps`
+reports `allocation.resourceStatus: "search-limited"`. Such a response can
+conservatively underfill; it never invents a slot to finish the search.
 
 Active mode fits allocations to **both** the rounded integer fleet target and
 `maxTotal`, rather than the legacy below-target burst to the ceiling. Existing
