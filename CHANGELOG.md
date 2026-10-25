@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.69
+- Optional reviewer-backlog demand: a fixed read-only GitHub current-head census adds CI-green PR heads awaiting a verdict to queued reviewer heartbeats, split once across reviewer identities. Disabled configuration performs no source I/O; errors and incomplete reads add zero census demand. Cache generations are company/config/secret-version scoped; local config changes invalidate pending results and prevent later pages. Activation requires independent installed-transport and repository-limited read-only credential evidence.
+- Reviewer caps now use every admitted routing account across helper providers, sharing existing account, pace-pool and fleet budgets with fixed agents and running floors. Routing preference and review/merge admission are unchanged.
+
 ## 0.2.67
 - NVIDIA NIM lane support, three small generic config-driven changes (all default-off, so unconfigured behavior is bit-identical to 0.2.66).
 - Prefixed-only emission: `nvidia-nim` joins `PREFIXED_ONLY_PROVIDERS` (`devin`, `opencode-go`, `synthetic`, `synthetic-infinite`). A lane listing only `nvidia-nim/<id>` aliases now emits the exact `nvidia-nim/<id>` id even when the global served catalog is absent (fail-open old feeds); the bare id is unknown to CLIProxy or names another provider's model. A prefixed-only account that also lists the bare id emits its own `provider/<id>` alias; other providers' emission is untouched.

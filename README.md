@@ -19,7 +19,7 @@ sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
 
-## Reviewer backlog demand (opt-in; activation requires security sign-off)
+## Reviewer backlog demand (v0.2.69; opt-in, activation gated)
 
 A slot-metered review gate may enqueue only one review at a time even when many
 CI-green PRs await review. Queued heartbeat runs alone cannot size that reviewer.
@@ -39,8 +39,14 @@ This optional plugin reader uses a fixed read-only GitHub GraphQL query. The
 native chat review history starts after admission (and its list is limited to
 100 rows); it cannot reveal heads outside the gate. The SDK does not expose
 chat review reads or another plugin's private state. No direct database access,
-core patch, new credential, or host script is used. **Do not activate until the
-new outbound origin and the existing credential binding have security approval.**
+core patch, new credential, or host script is used. **Design approval is not
+activation, credential-binding, installation or release approval.** Before
+activation, the authorized custodian must evidence the installed host/SDK build
+and its fixed-target transport (DNS/IP pinning, private-IP refusal, TLS hostname
+verification and no redirect following), plus the existing secret reference's
+version, repository selection, read-only metadata scopes, expiry and revocation
+path. The SDK drops `RequestInit.redirect`; a mocked `manual` flag is not
+transport proof. Incompatible or unverified transport leaves the source disabled.
 Absent configuration or `enabled: false` performs no new source I/O.
 
 Only open, non-draft, mergeable PRs whose configured CI checks all succeeded at
@@ -53,11 +59,18 @@ names for the selected repositories. This signal changes sizing only, never
 review/merge admission. Different gate-name sets need separate configuration
 in a later extension; do not weaken the list to fit a heterogeneous scope.
 
-The reader caches counts only for five minutes per company/config, coalesces
-concurrent reads, refuses redirects, and caps collection at 25 repositories,
-50 pages, 100 PRs/page and 100 check contexts/head. A failed, partial or
-rate-limited census replaces positive demand with `unavailable`, never stale
-headroom. `/caps.reviewDemand` reports health/count/time; review agents report
+The reader caches only aggregate results for five minutes per company/full
+configuration (including secret version), coalesces concurrent reads, rejects
+non-200/followed responses, and caps collection at 25 repositories, 50 pages,
+100 PRs/page and 100 check contexts/head. Owner/repository lengths are bounded
+to 39/100 characters; opaque upstream cursors to 4096. Local configuration events
+invalidate completed and pending cache generations; no subsequent page is issued
+and no pending positive result is published after invalidation. Re-enable starts
+fresh. Secret/page/census logical waits are bounded to 5/10/20 seconds. These
+logical deadlines do not cancel native I/O: an already-issued request may drain
+within the evidenced host transport cap. A failed, partial or rate-limited census
+returns `unavailable` and zero added demand, never stale headroom. Unavailable
+results may be cached too; recovery can therefore take up to five minutes. `/caps.reviewDemand` reports health/count/time; review agents report
 `heartbeatQueued` and `reviewEligibleHeads`. A shared backlog is split once
 across configured reviewer identities rather than duplicated per reviewer.
 

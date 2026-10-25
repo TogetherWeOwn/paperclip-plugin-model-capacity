@@ -358,7 +358,7 @@ import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST }
 import { LANE_BASE_URLS } from './lane-host.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.67';
+export const PLUGIN_VERSION = '0.2.69';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

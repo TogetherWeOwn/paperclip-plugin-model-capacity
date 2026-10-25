@@ -4842,6 +4842,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       configured.add(companyId);
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).
+      readReviewDemand.invalidate(companyId);
       lastConfig.set(companyId, resolveConfig(raw));
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);

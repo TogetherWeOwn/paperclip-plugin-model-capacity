@@ -34,7 +34,8 @@ export function validateReviewDemand(raw) {
   if (raw == null || raw.enabled === false) return [];
   const errors = [];
   if (!Array.isArray(raw.repositories) || raw.repositories.length < 1 || raw.repositories.length > 25
-    || raw.repositories.some(r => typeof r !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r))) {
+    || raw.repositories.some(r => typeof r !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(r)
+      || ['.', '..'].includes(r.split('/')[1]))) {
     errors.push('reviewDemand.repositories must contain 1-25 owner/repository names');
   }
   if (raw.tokenSecretRef?.type !== 'secret_ref' || typeof raw.tokenSecretRef.secretId !== 'string') {
@@ -56,9 +57,11 @@ export function normalizeReviewDemand(raw) {
 export function eligibleReviewHead(pull, requiredChecks) {
   if (!Number.isSafeInteger(pull?.number) || pull.number < 1 || pull.isDraft !== false || pull.mergeable !== 'MERGEABLE'
     || !/^[a-f0-9]{40}$/i.test(pull.headRefOid ?? '')) return false;
-  const commit = pull.commits?.nodes?.[0]?.commit;
+  if (!Array.isArray(pull.commits?.nodes) || pull.commits.nodes.length !== 1) return false;
+  const commit = pull.commits.nodes[0]?.commit;
   const contexts = commit?.statusCheckRollup?.contexts;
-  if (commit?.oid !== pull.headRefOid || contexts?.pageInfo?.hasNextPage !== false || !Array.isArray(contexts.nodes)) return false;
+  if (commit?.oid !== pull.headRefOid || contexts?.pageInfo?.hasNextPage !== false
+    || !Array.isArray(contexts.nodes) || contexts.nodes.length > 100) return false;
   const named = new Map();
   for (const c of contexts.nodes) {
     const name = c?.__typename === 'CheckRun' ? c.name : c?.__typename === 'StatusContext' ? c.context : null;
@@ -76,17 +79,26 @@ export function eligibleReviewHead(pull, requiredChecks) {
 /** Per-company/config single-flight cache; only counts, never credentials or PR data. */
 export function createReviewDemandReader({ clock = Date.now } = {}) {
   const cache = new Map();
-  return async (ctx, companyId, config) => {
-    if (!config) return { status: 'disabled', eligibleHeads: 0 };
+  const read = async (ctx, companyId, config) => {
+    if (!config) {
+      cache.delete(companyId);
+      return { status: 'disabled', eligibleHeads: 0 };
+    }
     const key = JSON.stringify([companyId, config]);
     const prev = cache.get(companyId);
     if (prev?.key === key && clock() >= prev.atMs && clock() - prev.atMs < TTL_MS) return prev.result;
     const atMs = clock();
+    const entry = { key, atMs, result: null };
+    cache.set(companyId, entry);
+    const assertCurrent = () => {
+      if (cache.get(companyId) !== entry) throw new Error('configuration-changed');
+    };
     const result = (async () => {
       try {
         const deadline = Date.now() + 20_000;
         const token = await bounded(() => ctx.secrets.resolve(config.tokenSecretRef,
           { companyId, configPath: 'reviewDemand.tokenSecretRef' }), 5_000);
+        assertCurrent();
         if (typeof token !== 'string' || !token) throw new Error('unavailable');
         const heads = new Set();
         let pages = 0;
@@ -95,6 +107,7 @@ export function createReviewDemandReader({ clock = Date.now } = {}) {
           let cursor = null;
           const cursors = new Set();
           do {
+            assertCurrent();
             if (++pages > MAX_PAGES) throw new Error('page-limit');
             const body = await bounded(async () => {
               const res = await ctx.http.fetch(URL, { method: 'POST', redirect: 'manual',
@@ -103,6 +116,7 @@ export function createReviewDemandReader({ clock = Date.now } = {}) {
               if (res.status !== 200 || res.redirected === true) throw new Error('unavailable');
               return res.json();
             }, Math.min(10_000, deadline - Date.now()));
+            assertCurrent();
             const prs = body?.data?.repository?.pullRequests;
             if (body?.errors?.length || !Array.isArray(prs?.nodes) || prs.nodes.length > 100
               || typeof prs.pageInfo?.hasNextPage !== 'boolean') throw new Error('incomplete');
@@ -111,7 +125,7 @@ export function createReviewDemandReader({ clock = Date.now } = {}) {
             }
             if (!prs.pageInfo.hasNextPage) break;
             cursor = prs.pageInfo.endCursor;
-            if (typeof cursor !== 'string' || !cursor || cursors.has(cursor)) throw new Error('incomplete');
+            if (typeof cursor !== 'string' || !cursor || cursor.length > 4096 || cursors.has(cursor)) throw new Error('incomplete');
             cursors.add(cursor);
           } while (true);
         }
@@ -121,7 +135,10 @@ export function createReviewDemandReader({ clock = Date.now } = {}) {
         return { status: 'unavailable', eligibleHeads: 0, atMs, source: 'github-current-head-checks' };
       }
     })();
-    cache.set(companyId, { key, atMs, result });
+    entry.result = result;
     return result;
   };
+  // Configuration events revoke a generation even when no /caps read follows.
+  read.invalidate = companyId => cache.delete(companyId);
+  return read;
 }
