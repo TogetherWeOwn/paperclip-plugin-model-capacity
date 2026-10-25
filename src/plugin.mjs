@@ -107,6 +107,7 @@ import {
 import { manifest, LANE_BASE_URL_ALLOWLIST } from './manifest.mjs';
 import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } from './availability.mjs';
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
+import { buildModelInventory } from './inventory.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
 import { validateReviewDemand, normalizeReviewDemand, createReviewDemandReader } from './review-demand.mjs';
@@ -1843,7 +1844,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       armId: a.armId, family: a.family, model: a.model, effort: a.effort,
       qFleet: fleetQ(a.armId, fleetAlphaDoer), qFleetThinker: fleetQ(a.armId, fleetAlphaThinker),
     }));
-    return { ladders, fleet, taskFleet, taskRanking, skipped, arms: arms.map(a => a.armId), unscored, unservable, credentialAdmission, tierCaps, tierBaseline, withinNoise: blocked };
+    // Read-only inventory projection for /capacity: raw/canonical/emitted ids
+    // plus served present/absent/unknown. Pure reporting; routing reads
+    // nothing from it.
+    const modelInventory = buildModelInventory({
+      accounts, servedModels, arms, unscored, unservable, credentialAdmission,
+      accountKeys: (accounts ?? []).map((account, i) => keyOf(account, i)),
+      nowMs: tickNow,
+    });
+    return { ladders, fleet, taskFleet, taskRanking, skipped, arms: arms.map(a => a.armId), unscored, unservable, credentialAdmission, modelInventory, tierCaps, tierBaseline, withinNoise: blocked };
   }
 
   function accountKey(account) {
@@ -2161,7 +2170,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
-    const { ladders, fleet: fleetArmScores, taskFleet, taskRanking, skipped, unscored, unservable, credentialAdmission, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
+    const { ladders, fleet: fleetArmScores, taskFleet, taskRanking, skipped, unscored, unservable, credentialAdmission, modelInventory, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
       accounts: snapshot.accounts, servedModels: snapshot.servedModels, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
       tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
     });
@@ -4435,6 +4444,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       skippedArms: skipped,
       unscored,
       unservable,
+      // Read-only model inventory: raw/canonical/emitted ids per account with
+      // served present/absent/unknown. Reporting only; routing ignores it.
+      modelInventory,
       credentialAvailability: credentialAvailabilityReport,
       contextTiers: { baselineMultiplier: tierBaseline, caps: tierCaps },
       trialFamilies,
