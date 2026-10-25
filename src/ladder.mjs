@@ -63,7 +63,7 @@ export function paretoFilter(entries, opts = {}) {
   }
   const noisyBlocks = [];
   const dominatesForDrop = (o, m) => {
-    if (!strictlyDominates(o, m) && !sameFamilyNewerDominates(o, m)) return false;
+    if (!ladderDominates(o, m)) return false;
     const newcomer = incumbents && !incumbents.has(o.armId);
     const heldAgainst = incumbents && held.has(heldPairKey(o.armId, m.armId));
     if (incumbents && gateByArm && incumbents.has(m.armId) && (newcomer || heldAgainst)) {
@@ -183,4 +183,11 @@ export function buildLadder(entries, previousRungs = [], gateByArm = null, heldP
   const { rungs, dominated, dropped, withinNoise } = paretoFilter(entries, { incumbents, gateByArm, heldPairs });
   const pinned = pinRungs(rungs, previousRungs);
   return { rungs: pinned, dominated, dropped, withinNoise };
+}
+
+/** The same dominance relation for frontier pruning and backup admission.
+ * Includes equal-score/cost newer-version replacement; do not approximate
+ * it with strict numeric dominance when mapping a revived backup's rung. */
+export function ladderDominates(a, b) {
+  return strictlyDominates(a, b) || sameFamilyNewerDominates(a, b);
 }

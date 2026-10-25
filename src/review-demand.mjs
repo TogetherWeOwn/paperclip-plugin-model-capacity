@@ -30,12 +30,13 @@ const QUERY = `query ReviewDemand($owner:String!,$name:String!,$cursor:String) {
   }
 }`;
 
+export const REVIEW_REPOSITORY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/(?!\.{1,2}$)[A-Za-z0-9_.-]{1,100}$/;
+
 export function validateReviewDemand(raw) {
   if (raw == null || raw.enabled === false) return [];
   const errors = [];
   if (!Array.isArray(raw.repositories) || raw.repositories.length < 1 || raw.repositories.length > 25
-    || raw.repositories.some(r => typeof r !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]{1,100}$/.test(r)
-      || ['.', '..'].includes(r.split('/')[1]))) {
+    || raw.repositories.some(r => typeof r !== 'string' || !REVIEW_REPOSITORY_PATTERN.test(r))) {
     errors.push('reviewDemand.repositories must contain 1-25 owner/repository names');
   }
   if (raw.tokenSecretRef?.type !== 'secret_ref' || typeof raw.tokenSecretRef.secretId !== 'string') {

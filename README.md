@@ -69,12 +69,21 @@ and no pending positive result is published after invalidation. Re-enable starts
 fresh. Secret/page/census logical waits are bounded to 5/10/20 seconds. These
 logical deadlines do not cancel native I/O: an already-issued request may drain
 within the evidenced host transport cap. A failed, partial or rate-limited census
-returns `unavailable` and zero added demand, never stale headroom. Unavailable
+returns `unavailable` and zero added demand, never stale headroom. If configuration
+changes during caps processing, that response preserves only running floors,
+returns `target: null` and `capsError: "configuration-changed"`, and does not
+mislabel the result as breaker cooling. Unavailable
 results may be cached too; recovery can therefore take up to five minutes. `/caps.reviewDemand` reports health/count/time; review agents report
-`heartbeatQueued` and `reviewEligibleHeads`. A shared backlog is split once
-across configured reviewer identities rather than duplicated per reviewer.
+`heartbeatQueued` and `reviewEligibleHeads`. The shadow tick includes these heads
+before bounding the fleet target. A shared backlog is split once, weighted by the
+capacity each reviewer can actually use after heartbeat demand and existing
+account/pool/fleet guards; empty admissions and spent pools receive no new shares.
+Equal usable capacity splits evenly, with deterministic remainder assignment.
 
-Reviewer caps use every account admitted by their configured routing arms,
+Reviewer identities come from `reviewReserve.agentIds` (defaulting to
+`roles.keepAgentIds`) and `reviewerRouting.agentIds`, independently of routing.
+Fixed-model reviewers count heads but remain constrained to their serving pool.
+Routed reviewer caps use every account admitted by their configured routing arms,
 not just the adapter default model's pool. Existing arm/readiness/breaker,
 headroom and pace guards remain in force. Fixed-model agents reserve first;
 reviewers share the remaining account/pool budgets and fleet ceiling. Routing
@@ -82,6 +91,149 @@ order is unchanged: this change does not alter primary/helper preference.
 The admission snapshot expires after two minutes, and exhausted arms preserve
 only existing running floors. Undo: disable `reviewDemand` to remove the new
 source, or reinstall the prior release to restore the previous cap allocator.
+
+## Role-aware AA task ranking (unreleased)
+
+`taskRanking.mode` is **`shadow` by default**. It computes a proposed route and
+adds evidence to `/capacity`; it does not change existing routes, concurrency,
+pacing targets, reserves, credit permissions or rate limits. `off` keeps the
+legacy scorer/selector. `enforce` opts into role-specific frontiers and
+cost-first placement **within existing policy buckets**. The separate plugin
+`enforce` flag and opt-in `run.model.resolve` manifest remain authoritative.
+This feature cannot enable resolution by itself.
+
+### Quality and identity
+
+AA observations attach to the exact model **and effort**, not a model family.
+Discovery enumerates AA effort rows only for served models, deduplicates
+classic/dynamic bindings and preserves the exact emitted endpoint ID. Existing
+classic bindings verify their already-supported efforts. Other variants remain
+`effort-unverified` unless `taskRanking.effortSupport` explicitly lists their
+verified efforts by **exact emitted ID**. A family ceiling is not evidence of
+endpoint support. Provider/price/contributor aliases can compose, but generation
+suffixes are never stripped. Configured benchmark borrowing is labelled
+`borrowed`, not measured evidence. A max-row override cannot manufacture a
+high-effort measurement. Contributor-only Muse and the GPT-6.1 Sol identity
+fences apply in the new path.
+
+Initial profile weights are configurable **priors**, not learned optimal weights:
+
+| Metric | Doer / Other | Reviewer (advisory) | Thinker |
+| --- | ---: | ---: | ---: |
+| Terminal-Bench 4.0 | .45 | .25 | 0 |
+| SciCode | .15 | 0 | 0 |
+| HLE | 0 | .20 | .25 |
+| GPQA | 0 | 0 | .15 |
+| CritPt | 0 | 0 | .15 |
+| GDPval normalized | 0 | 0 | .15 |
+| LCR | .15 | .20 | .15 |
+| IFBench | .15 | .20 | .10 |
+| Omniscience non-hallucination | .10 | .15 | .05 |
+
+An explicit `roleMetricWeights[role]` replaces that profile; it does not partially
+merge defaults. Finite nonnegative weights, supported metric names, nonempty
+profiles and known aggregate/component conflicts are validated. The registry
+also classifies cost, feasibility, latency, legacy and diagnostic observations;
+using all available evidence does **not** mean double-counting every column.
+Hard / 2.1 / 4.0 Terminal-Bench and tau2 / Banking never cross-fill. The legacy
+API `codingIndex` is not renamed to Coding Agent Index v2. Headline Omniscience
+is higher-is-better on [-100,100]; non-hallucination is higher-is-better on [0,1].
+Invalid observations are excluded individually, never zero-filled. Legacy
+scoring (including its historical Omniscience inversion) stays isolated for
+`off`/`shadow` routing compatibility.
+
+Each role has account-local scores for its frontier and unique-model-effort
+fleet scores for capability comparisons. Borrowed/unverified observations and
+account copies cannot skew normalization. Common-support and absolute profile
+coverage are reported separately. Benchmark trust needs at least .60 absolute
+coverage and task-aligned primary evidence (current coding evidence for coding
+roles, reasoning evidence for thinkers). Existing EEE freshness/blend settings
+and numeric `roles.minQuality` values remain unchanged. Small-population and
+known-data empty-role suspensions are explicit; they never grant missing or
+borrowed AA evidence normal benchmark trust. `other` initially inherits doer;
+an operator can explicitly choose an ops profile using ITBench SRE/tool-use
+metrics without introducing another scheduling role or classifier.
+
+Per-run adapter, trial, context, credential, breaker, exclusion and headroom
+feasibility is checked before task-frontier pruning, using the same pure
+`decide` path as enforcement. An ineligible cheap dominator cannot hide a
+feasible backup. Surplus quality/allowance is a tie-breaker, not a reason to buy
+a more expensive capable arm. Funding/credit fallback, burn/floor, need bands,
+native/aggregator fallback, role rung windows and explicit retry policy still
+have authority; this is **not unconditional global cost minimization**.
+
+Configured reviewers remain policy-trusted incumbents, including missing-AA
+reviewers. Reviewer metrics are advisory, not permission to substitute a cheaper
+model or risk tier. In new enforce mode an approved feasible Meta primary wins
+after funding/admission; fallback reasons name quota/headroom, credential,
+servability or pace constraints. No approved feasible arm means defer, not
+ordinary builder overflow—even on deferral exhaustion. Tick/event observation,
+review preview and enforcement share this boundary. Policy incumbency does not
+bypass the contributor-only Muse, Sol identity or emitted-servability fences;
+reviewer readiness and breaker checks use the policy's exact arm identity.
+
+In task enforce mode, exhaustion may choose another explicitly admitted
+model-effort, but cannot issue the legacy bounded default `keep` (including a
+caps-only `decide`). The native request does not carry the default effort, so
+an admitted sibling effort cannot prove the configured default safe. If no
+explicit feasible decision exists, the resolver continues to defer.
+
+### Cost units and calibration boundary
+
+`aaCostPerTask` is AA's **Intelligence Index benchmark workload** cost, not our
+cost per merged issue or valid review. `taskCostProxy` applies the existing
+context-tier multiplier once. Cost carry retains original per-field ages;
+price-profile, family-median and fleet-median fallback sources are explicit.
+For example, AA observations of $0.31914442375664703 and $1.3987235612691513
+establish a benchmark-workload cost difference, not a fleet productivity ratio.
+Token-price blends are not substituted for measured AA workload cost.
+
+`estimatedApiEquivalentPerAcceptedTask` stays null and calibration reports
+`awaiting-native-attributed-outcomes`. Lifecycle/issue summaries do not supply
+verified actual effort/endpoint pricing, complete failed-attempt usage or
+accepted-artifact adjudication. There is **no collector, core-table access,
+new model-evaluation traffic, paid subscription or additional egress** here.
+`calibration.enabled=true` is rejected until a supported native attributed
+outcome surface exists.
+
+The pure calibration helper/tests implement `P/A = (P/N) * (N/A)` over closed
+role-task episodes, including failed/rework attempts once, episode-level ratio
+uncertainty, sample gates and shrinkage toward the AA proxy. Qualification
+requires at least 30 closed tasks, 10 verified accepted outcomes, complete
+attribution/usage/pricing, a seven-day window and a 95% relative confidence
+half-width <= .5. Pending work is censored; zero acceptance is unusable, never
+zero cost. Acceptance must certify a merged/test-passing artifact plus its
+observation window, or a valid review with adjudicated finding/escape evidence;
+process success, issue status and a reviewer's own score do not establish it.
+Learned task cost is never fed back into quota burn. Reconciled cash is separate
+and otherwise null; verified-free cash can be zero while resource cost and
+quota consumption remain positive.
+
+### Audit and rollout
+
+`/capacity.taskRanking` includes all discovered/unmatched/dominated candidates,
+exact effort/slug/match type, metric observations and provenance, AA/EEE
+contributions, coverage, trust/minimum verdicts, cost/fallback/tier evidence,
+calibration readiness, policy buckets and concrete cheaper-alternative refusal
+reasons. Static benchmark dominance is not a hard per-run exclusion. Route
+comparisons are **explicit deterministic preview scenarios** (role, configured
+adapter type or unknown, null context, no retries), not live task outcomes or
+performance measurements. Reviewer routing reports primary/fallback and policy
+trust separately.
+
+Before enabling enforcement, inspect these score distributions, coverage,
+gate suspensions and each scenario difference against actual lane capabilities;
+never lower thresholds just to admit models. Calibration can remain disabled
+independently. Roll back with `taskRanking.mode=off`; the next existing native
+tick publishes the retained legacy view. During a mode transition, startup without a view, or stale task evidence, the
+resolver defers rather than keeping an unvetted default; explicit issue pins
+retain authority. No core deployment, database migration,
+new job, timer, host script or core patch is required; normal plugin packaging
+and installation remain a separate step. Nothing in this PR enables
+live enforcement or establishes an optimal model for every individual task.
+
+Methodology: [AA intelligence benchmarking](https://artificialanalysis.ai/methodology/intelligence-benchmarking),
+[AA coding-agent benchmarking](https://artificialanalysis.ai/methodology/coding-agents-benchmarking).
 
 ## Automatic account plan sizing
 

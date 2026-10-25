@@ -74,6 +74,8 @@ test('carryForwardCosts restores dropped cost fields and marks the row', () => {
     slug: 'muse-spark-1-3', intelligenceIndex: 55.2,
     intelligenceIndexCostPerTask: 1.6, price1mInputTokens: 1.25, price1mOutputTokens: 4.25,
     costCarriedFrom: '2026-10-21T04:17:00.000Z',
+    costFieldObservedAt: { intelligenceIndexCostPerTask: '2026-10-21T04:17:00.000Z',
+      price1mInputTokens: '2026-10-21T04:17:00.000Z', price1mOutputTokens: '2026-10-21T04:17:00.000Z' },
   }]);
   assert.equal(prev[0].costCarriedFrom, undefined, 'previous rows are never marked');
 });
