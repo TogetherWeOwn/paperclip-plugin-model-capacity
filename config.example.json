@@ -113,6 +113,9 @@
     "maxTotal": 75,
     "meanRunDurationHours": 0.186
   },
+  "allocation": {
+    "blockingPriority": false
+  },
   "caps": {
     "reservedFloors": {
       "agent-a": { "base": 4, "perQueued": 20, "max": 8 }

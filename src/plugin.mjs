@@ -73,6 +73,7 @@ import {
   recordAccountBalanceExhaustion, isBalanceExhaustion,
 } from './breakers.mjs';
 import { computeConcurrencyTarget, distributeCaps, distributeWeightedCaps, allocateKeptAndRoutedCaps, computeReservedFloor, applyReservedFloors, DEFAULT_CONCURRENCY, ROLES, medianPositive, fleetStallAlarms } from './concurrency.mjs';
+import { buildBlockingPriorities } from './blocking-priority.mjs';
 import { buildCalibrationGroups, pooledBurnPerRun } from './pools.mjs';
 import { SMOOTHING_DEFAULTS, normalizeSmoothing, smoothValue, smoothTarget, holdCaps } from './smoothing.mjs';
 import { appendAccountUsage, calibrateAccounts } from './calibration.mjs';
@@ -182,6 +183,18 @@ export function validateConfigShape(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
   errors.push(...validateTaskRanking(raw.taskRanking));
+  if (raw.allocation != null) {
+    const allocation = raw.allocation;
+    if (typeof allocation !== 'object' || Array.isArray(allocation)) errors.push('allocation must be an object');
+    else {
+      if ('blockingPriority' in allocation && typeof allocation.blockingPriority !== 'boolean') {
+        errors.push('allocation.blockingPriority must be a boolean');
+      }
+      for (const key of Object.keys(allocation)) {
+        if (key !== 'blockingPriority') errors.push(`allocation.${key} is not a known key`);
+      }
+    }
+  }
   // The lane key is sent as X-Api-Key to baseUrl: only the hard-coded
   // allowlist may name it, or config could redirect the key to any host.
   if (cliproxy?.baseUrl != null && !LANE_BASE_URL_ALLOWLIST.includes(cliproxy.baseUrl)) {
@@ -643,6 +656,7 @@ export function resolveConfig(raw = {}) {
       maxTotal: raw.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal,
       meanRunDurationHours: raw.concurrency?.meanRunDurationHours ?? DEFAULT_CONCURRENCY.meanRunDurationHours,
     },
+    allocation: { blockingPriority: raw.allocation?.blockingPriority === true },
     // Sol window / Luna cliff caps over the defaults (legacy solLuna* keys
     // set Luna only); tierAffectsQuota false restores base-cost burn.
     contextCaps: normalizeContextCaps(raw.contextCaps),
@@ -1187,12 +1201,24 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Queued work per agent: assigned open issues (todo + in_progress, grouped
   // by assignee). Shared by the tick (role-weighted target) and GET /caps,
   // behind a short memo so the two read one snapshot instead of doubling
-  // issue reads. Throws when issues.read is unavailable; callers degrade.
-  const queuedCache = new Map(); // companyId -> { atMs, counts: Map(agentId -> n) }
+  // issue reads. Priority mode instead keys that snapshot to the capacity tick.
+  // Throws when issues.read is unavailable; callers degrade.
+  const queuedCache = new Map(); // companyId -> ordinary TTL snapshot
+  const priorityReadyCache = new Map(); // companyId -> { tickAtMs, atMs, counts, issues }
   const QUEUED_TTL_MS = 20000;
-  async function queuedByAgent(companyId, nowMs) {
+  async function queuedSnapshot(companyId, nowMs, tickAtMs) {
     const hit = queuedCache.get(companyId);
-    if (hit && nowMs - hit.atMs >= 0 && nowMs - hit.atMs < QUEUED_TTL_MS) return hit.counts;
+    const fresh = hit && nowMs - hit.atMs >= 0 && nowMs - hit.atMs < QUEUED_TTL_MS;
+    if (tickAtMs === undefined && fresh) return hit;
+    if (tickAtMs !== undefined) {
+      const priorityHit = priorityReadyCache.get(companyId);
+      if (priorityHit?.tickAtMs === tickAtMs) return priorityHit;
+      if (fresh && hit.atMs >= tickAtMs && Array.isArray(hit.issues)) {
+        const snapshot = { ...hit, tickAtMs };
+        priorityReadyCache.set(companyId, snapshot);
+        return snapshot;
+      }
+    }
     const lists = await Promise.all([
       ctx.issues.list({ companyId, status: 'todo' }),
       ctx.issues.list({ companyId, status: 'in_progress' }),
@@ -1213,8 +1239,49 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
       }
     }
-    queuedCache.set(companyId, { atMs: nowMs, counts });
-    return counts;
+    const snapshot = { atMs: nowMs, counts,
+      ...(tickAtMs !== undefined ? { tickAtMs, issues: lists.flat() } : {}),
+    };
+    if (tickAtMs !== undefined) priorityReadyCache.set(companyId, snapshot);
+    // A forced priority refresh must not replace a still-fresh legacy memo:
+    // unavailable relation data must retain that memo's exact TTL semantics.
+    if (tickAtMs === undefined || !fresh) queuedCache.set(companyId, snapshot);
+    return snapshot;
+  }
+
+  async function queuedByAgent(companyId, nowMs, tickAtMs) {
+    return (await queuedSnapshot(companyId, nowMs, tickAtMs)).counts;
+  }
+
+  // Retain the two newest ticks per company, including pending/failed reads:
+  // /caps can still serve the published tick while the next tick awaits state
+  // writes. Older API requests must not evict either newer snapshot. No new
+  // reads when disabled. Missing optional SDK relation fields still fall back.
+  const blockingPriorityCache = new Map();
+  async function blockingSnapshot(companyId, tickAtMs) {
+    let ticks = blockingPriorityCache.get(companyId);
+    if (!ticks) {
+      ticks = new Map();
+      blockingPriorityCache.set(companyId, ticks);
+    }
+    if (ticks.has(tickAtMs)) return ticks.get(tickAtMs);
+    const pending = (async () => {
+      // Demand and metadata must use the SAME ready-card snapshot. A new tick
+      // refreshes it even inside the legacy TTL; same-tick calls retain both.
+      // A failed ready read still rejects to the existing capsError path.
+      const ready = await queuedSnapshot(companyId, clock(), tickAtMs);
+      try {
+        const other = await Promise.all(['backlog', 'in_review', 'blocked'].map(status =>
+          ctx.issues.list({ companyId, status })));
+        return { counts: ready.counts, priorities: buildBlockingPriorities([...ready.issues, ...other.flat()]) };
+      } catch (error) {
+        ctx.logger.error('model-capacity: blocking priority unavailable', { companyId, code: 'priority-unavailable' });
+        return { counts: ready.counts, priorities: null };
+      }
+    })();
+    ticks.set(tickAtMs, pending);
+    if (ticks.size > 2) ticks.delete([...ticks.keys()].sort((a, b) => a - b)[0]);
+    return pending;
   }
 
   // Runnable queued demand for kept/review agents: ACTUAL queued heartbeat
@@ -1269,7 +1336,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   async function roleDemandFor(companyId, config, nowMs) {
     const zero = { doer: 0, thinker: 0, other: 0 };
     try {
-      const counts = await queuedByAgent(companyId, nowMs);
+      const snapshot = config.allocation.blockingPriority ? await blockingSnapshot(companyId, nowMs) : null;
+      // Only a usable graph switches target demand to the tick snapshot. Failed
+      // validation must retain the same ordinary TTL demand as legacy /caps.
+      const counts = snapshot?.priorities != null ? snapshot.counts : await queuedByAgent(companyId, nowMs);
       const byRole = { ...zero };
       for (const [agentId, n] of counts) byRole[roleOf(config, agentId)] += n;
       const total = byRole.doer + byRole.thinker + byRole.other;
@@ -5630,6 +5700,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Cache the resolved config immediately so the event-time shadow path
       // works before the first tick lands (the tick refreshes it every run).
       const nextConfig = resolveConfig(raw);
+      blockingPriorityCache.delete(companyId);
+      priorityReadyCache.delete(companyId);
+      if (nextConfig.allocation.blockingPriority !== lastConfig.get(companyId)?.allocation?.blockingPriority) {
+        queuedCache.delete(companyId);
+      }
       taskRankingModes.set(companyId, nextConfig.taskRanking.mode);
       lastConfig.set(companyId, nextConfig);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
@@ -5691,9 +5766,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // (todo + in_progress), grouped by assignee and weighted by count.
         // issues.read is already declared; any denial degrades to no
         // recommendation instead of failing the request.
-        let counts;
+        const priorityRequested = lastConfig.get(companyId)?.allocation?.blockingPriority === true;
+        let counts, priorities = null;
         try {
-          counts = await queuedByAgent(companyId, clock());
+          if (priorityRequested) ({ counts, priorities } = await blockingSnapshot(companyId, atMs));
+          // An unavailable graph keeps the ordinary demand TTL as well as the
+          // legacy allocator. Only usable metadata pins counts to the tick.
+          if (!priorityRequested || priorities == null) counts = await queuedByAgent(companyId, clock());
         } catch (error) {
           // Sanitized: callers get a stable code, never upstream text.
           // Details go server-side only.
@@ -5706,6 +5785,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // running-first (at/above target the fleet starts nothing new). No
         // cap lands below an agent's running count -- throttling existing
         // runs while the fleet idles is the failure this replaces.
+        const blockingPriority = priorityRequested && priorities != null;
         const runningByAgent = cap.agentRunning ?? {};
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
         // Kept agents and routed review agents (reviewerRouting.agentIds)
@@ -5727,6 +5807,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
             : (counts.get(agentId) ?? 0),
           overPace: runningByAgent[agentId]?.overPace === true,
+          ...(blockingPriority ? { allocationWeight: priorities.get(agentId)?.weight ?? 1 } : {}),
         }));
         const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
           heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
@@ -5744,6 +5825,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           perAccount: cap.perAccount ?? [],
           pacePools: cap.paceGuard?.pools ?? [],
           unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+          blockingPriority,
         });
         const keptCaps = allocated.kept;
         const unheld = allocated.routed;
@@ -5759,7 +5841,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const held = holdCaps(unheld, prevHold, nowMs, {
             halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
             staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
-            ceiling: allocated.routedCeiling,
+            ceiling: blockingPriority ? Math.min(allocated.routedCeiling,
+              Math.max(0, Math.round(target) - keptCaps.reduce((sum, entry) => sum + entry.allocated, 0)))
+              : allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
           await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
@@ -5781,6 +5865,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
           }
           const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
+          // A configured floor cannot invent new slots or override the winner
+          // of a scarce priority split. Report the conflict, never hide it.
+          if (blockingPriority) {
+            for (const agent of agents) {
+              const floor = computeReservedFloor(agent.running, agent.queued, reservedFloors[agent.agentId]);
+              if (floor != null && floor > agent.allocated) blockedAgentIds.add(agent.agentId);
+            }
+          }
           const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
           for (const agent of keptCaps) {
             const spec = reservedFloors[agent.agentId];
@@ -5797,8 +5889,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = floored.entries;
           floorSummary = floored.floors;
         }
-        for (const agent of agents) agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
-        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended } };
+        for (const agent of agents) {
+          agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
+          if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
+        }
+        return { status: 200, body: { atMs, calibration, target, agents, reservedFloors: floorSummary, floorsSuspended,
+          ...(priorityRequested ? { allocation: { blockingPriority,
+            ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
+        } };
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },
