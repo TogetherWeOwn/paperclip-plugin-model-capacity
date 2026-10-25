@@ -684,6 +684,14 @@ const CONFIG_SCHEMA = {
         enforce: { type: 'boolean', default: false },
       },
     },
+    exhaustion: {
+      type: 'object', additionalProperties: false,
+      description: 'Deferral-exhaustion (Design B): the host retries a deferred run as a new runId up to 12 times and then freezes the card. When enabled, the hook stops deferring on the last attempts of the chain (default from attempt 11) and answers with the cheapest selectable free-overflow arm under the existing trial caps, else a bounded keep; metered pools ahead of plan are never selected. Disabled (default): every terminal still defers, exactly as before.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        finalAnswerFromAttempt: { type: 'integer', minimum: 1, maximum: 12, default: 11, description: '1-based chain attempt from which the hook answers instead of deferring (12 is the host retry budget).' },
+      },
+    },
     trials: {
       type: 'object', additionalProperties: false,
       description: 'Trial lanes for model families without fleet success history (roles-gated, adapter-gated, in-flight-capped until measured success graduates them).',
@@ -818,7 +826,10 @@ export function buildManifest({ modelResolve = false } = {}) {
     'secrets.read-ref',
     'events.subscribe',
     'agents.read',
-    'agents.queued_counts.read',
+    // 'agents.queued_counts.read' is declared only once upstream Paperclip ships
+    // agents.getQueuedRunCounts: the host validates capabilities against its
+    // PLUGIN_CAPABILITIES enum, so an unknown one rejects the whole manifest.
+    // The queued-run read below stays optional and degrades to running-only.
     'issues.read',
     'api.routes.register',
     // No database capabilities: run facts come from SDK surfaces only

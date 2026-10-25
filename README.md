@@ -788,6 +788,39 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   deferral budget; `/capacity` shows `inFlight` against `cap` so it is
   visible. The guard errs towards spending less, never more.
 
+### Deferral-exhaustion
+
+The host clamps a plugin defer to [1s, 60s] and retries a deferred run as a
+new run under a new id up to 12 times (`RUN_MODEL_RESOLVE_MAX_ATTEMPTS`),
+then freezes the card. The per-runId deferred marks above therefore reset
+every retry and can never see the chain end. `exhaustion.enabled`
+(default `false`) counts consecutive **capacity** deferrals per issue+agent
+instead, but only when both stable identifiers are present; calls without
+one never share a synthetic streak. Stale credential-snapshot deferrals are
+an evidence wait rather than capacity pressure and do not consume this
+budget. From `exhaustion.finalAnswerFromAttempt` (default 11, 1-based) the
+hook stops deferring and answers with the cheapest selectable free-overflow
+arm (free-cost providers first, then trial arms, then the lowest burn), else
+a bounded keep on the agent default model. Every non-defer answer, including
+an exhaustion recovery, clears the streak so a later retry chain earns a new
+grace period.
+
+Only the pace-guard pool cap and the transient 5h reserve are relaxed at
+exhaustion. Never bypassed -- for either a selected arm or bounded keep --
+are trial role/adapter/family gates, credential readiness, the arm breaker,
+role exclusions, the review reserve, known metered-headroom evidence,
+reactive in-flight caps, and metered plan position. A healthy
+admission-excluded account is never selected; a spent weekly meter and a
+metered pool ahead of plan are never selected. The keep is allowed only when
+the default model's serving account passes those hard gates; for
+non-review runs it also cannot use a review-reserve-held account. Otherwise
+the hook keeps deferring (strand rather than burn excluded, exhausted, or
+held quota). The reviewer pace-hold defer answers the same way from the
+final attempt. Decisions record `deferral-exhausted: <prior reason> ->
+<arm|kept model>`; a failed scan appends per-account skip reasons to the
+defer reason. With `enabled: false`, terminal defers retain their existing
+behavior. Memory-only, no new capability, egress, secret or env key.
+
 ### Review reserve
 
 The pace guard keeps the fleet on plan, but reviews starve anyway: review

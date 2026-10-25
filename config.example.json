@@ -121,6 +121,10 @@
   "credentialReadiness": {
     "enforce": false
   },
+  "exhaustion": {
+    "enabled": false,
+    "finalAnswerFromAttempt": 11
+  },
   "trials": {
     "maxInFlightPerAccount": 2,
     "maxInFlightPerFamily": 2,

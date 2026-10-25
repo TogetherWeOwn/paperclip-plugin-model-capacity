@@ -254,7 +254,9 @@ test('the public census hostname exception is exact and does not alter the lane 
   for (const other of ['prefix.' + 'api.github.com', 'api.github.com' + '.evil' + '.net', 'uploads.' + 'github' + '.com']) {
     assert.equal(isAllowlistedHost(other), false);
   }
-  assert.ok(!LANE_BASE_URL_ALLOWLIST.includes('https://api.github.com'));
+  for (const baseUrl of LANE_BASE_URL_ALLOWLIST) {
+    assert.notEqual(new URL(baseUrl).hostname, 'api.github.com');
+  }
 });
 
 test('example config validates against any pin: it does not set baseUrl', () => {
