@@ -259,7 +259,24 @@ test('count bands escalate coarsely, not per run', () => {
   state.accounts[ACCT].events.push({ runId: 'r5', atMs: T0 + 200, errorCode: 'adapter_failed' });
   const escalated = evaluateClusters(state, T0 + 200);
   assert.deepEqual(escalated.escalated, [ACCT]);
+  assert.deepEqual(escalated.deescalated, []);
   assert.equal(escalated.writeDue, true);
+});
+
+test('band decay records deescalate (not escalate) and still writes', () => {
+  const state = emptyClusterState();
+  state.accounts[ACCT] = { events: [1, 2, 3, 4].map(n => ({ runId: `r${n}`, atMs: T0 + n, errorCode: 'adapter_failed' })) };
+  state.prevActive = [ACCT];
+  state.prevBands = { [ACCT]: '5-9' };
+  const decayed = evaluateClusters(state, T0 + 100);
+  assert.deepEqual(decayed.escalated, []);
+  assert.deepEqual(decayed.deescalated, [ACCT]);
+  assert.equal(decayed.writeDue, true);
+  // Unknown previous band fails toward escalate (the conservative label).
+  const unknown = evaluateClusters(
+    { ...emptyClusterState(), accounts: state.accounts, prevActive: [ACCT], prevBands: {} }, T0 + 100);
+  assert.deepEqual(unknown.escalated, [ACCT]);
+  assert.deepEqual(unknown.deescalated, []);
 });
 
 test('transition signatures are deterministic over set + bands', () => {
@@ -451,6 +468,26 @@ test('crash between write and state-save converges without a duplicate write', a
   assert.deepEqual(issues.calls.update, []);
   const converged = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
   assert.deepEqual(converged.prevActive, [ACCT]);
+});
+
+test('enter, escalate, deescalate sequence records each direction', async () => {
+  const store = fakeStore();
+  const issues = fakeIssues();
+  const { run } = driveCtx({ store, issues });
+  await run(failedEvent({ runId: 'r1', at: T0 }));
+  await run(failedEvent({ runId: 'r2', at: T0 + 1000 }));
+  await run(failedEvent({ runId: 'r3', at: T0 + 2000 }));
+  // Growth lands past the 60s write backoff so the escalation writes.
+  await run(failedEvent({ runId: 'r4', at: T0 + 61000 }));
+  await run(failedEvent({ runId: 'r5', at: T0 + 62000 }));
+  assert.equal(issues.calls.create.length, 1);
+  assert.equal(issues.calls.update.length, 1);
+  // Two oldest events age out: 5-9 falls back to 3-4, still active.
+  const decayed = await run(null, T0 + 901500);
+  assert.equal(decayed.action, 'updated');
+  assert.equal(issues.calls.update.length, 2);
+  const state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
+  assert.deepEqual(state.transitions.map(t => t.type), ['enter', 'escalate', 'deescalate']);
 });
 
 test('exit transition updates the singleton to cleared', async () => {
@@ -647,7 +684,9 @@ function pluginHarness({ config = {}, now = T0, issuesClient = null } = {}) {
   return {
     plugin,
     handlers,
+    jobs,
     setNow: (ms) => { currentNow = ms; },
+    breakConfig: () => { fake.config.get = async () => { throw new Error('config-unavailable'); }; },
     boot: async () => {
       await plugin.setup(fake);
       await plugin.onConfigChanged(config, { companyId: 'acme' });
@@ -704,6 +743,27 @@ test('plugin wiring: disabled config ingests nothing and writes nothing', async 
   assert.deepEqual(issues.calls.get, []);
   const clusterKeys = [...store.keys()].filter(k => k.includes('failure-cluster'));
   assert.equal(clusterKeys.length, clusterReadsBefore);
+});
+
+test('tick maintenance runs even when the shadow tick itself fails', async () => {
+  const issues = fakeIssues();
+  const harness = pluginHarness({
+    config: { failureClusterAlert: { enabled: true, assigneeAgentId: 'agent-devops' } },
+    issuesClient: issues.client,
+  });
+  await harness.boot();
+  const onFailed = harness.handlers.get('agent.run.failed');
+  await onFailed(failedEvent({ runId: 'r1', at: T0 - 2000 }));
+  await onFailed(failedEvent({ runId: 'r2', at: T0 - 1000 }));
+  await onFailed(failedEvent({ runId: 'r3', at: T0 }));
+  assert.equal(issues.calls.create.length, 1);
+  // The window expires, then the tick feed breaks: the job must still fail
+  // loudly while maintenance lands the exit write.
+  harness.setNow(T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
+  harness.breakConfig();
+  await assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  assert.equal(issues.calls.update.length, 1);
+  assert.equal(issues.calls.update[0].patch.status, 'done');
 });
 
 test('health reports error while a cluster is active, base status once clear', async () => {

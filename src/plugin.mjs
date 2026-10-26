@@ -1089,6 +1089,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     clusterChains.set(companyId, next.catch(() => {}));
     return next;
   };
+  // Per-minute cluster maintenance (exits, write retries). Fully contained:
+  // it never throws, and the job callback runs it even when the shadow tick
+  // itself fails, so a troubled feed cannot stall alert exits.
+  const runClusterMaintenance = async (companyId) => {
+    const alert = lastConfig.get(companyId)?.failureClusterAlert;
+    if (!alert || alert.enabled !== true) return;
+    try {
+      await chainCluster(companyId, () => updateFailureClusters({
+        ctx,
+        companyId,
+        alert,
+        nowMs: clock(),
+        event: null,
+        stateKey: scopeKey,
+      }));
+    } catch (error) {
+      ctx.logger.error('model-capacity: failure-cluster maintenance failed', { companyId, error: error?.message ?? String(error) });
+    }
+  };
   // Aggregate cluster status for health: per enabled company, the active
   // accounts with counts plus any unresolved alert-write error. Counts and
   // account keys only; never run payloads or secrets.
@@ -4615,22 +4634,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       companyId, accounts: accountViews.length, target: concurrency.target,
       calibration: concurrency.calibration, observed, runs: ledger.size, runsSource: 'events',
     });
-    // Failure-cluster maintenance (exits, write retries): same per-company
-    // chain as event ingest, contained so it can never fail the tick.
-    if (config.failureClusterAlert?.enabled === true) {
-      try {
-        await chainCluster(companyId, () => updateFailureClusters({
-          ctx,
-          companyId,
-          alert: config.failureClusterAlert,
-          nowMs,
-          event: null,
-          stateKey: scopeKey,
-        }));
-      } catch (error) {
-        ctx.logger.error('model-capacity: failure-cluster maintenance failed', { companyId, error: error?.message ?? String(error) });
-      }
-    }
     return { status: 'shadow', observed };
   }
 
@@ -5907,11 +5910,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (results.some(r => r.status === 'rejected')) throw new Error('aa-refresh-failed');
       });
       ctx.jobs.register('shadow-tick', async job => {
-        const results = await Promise.allSettled([...configured].sort().map(companyId =>
-          runShadowTick(companyId, job).catch(error => {
+        const results = await Promise.allSettled([...configured].sort().map(async companyId => {
+          try {
+            await runShadowTick(companyId, job);
+          } catch (error) {
             ctx.logger.error('model-capacity: shadow tick failed', { companyId, error: error?.message ?? String(error) });
             throw error;
-          })));
+          } finally {
+            await runClusterMaintenance(companyId);
+          }
+        }));
         if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
       });
       // Run facts come from agent.run.* events only (started, finished,

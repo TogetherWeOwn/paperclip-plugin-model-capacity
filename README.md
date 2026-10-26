@@ -1520,7 +1520,7 @@ through plugin health until the cluster clears:
 ```
 
 Disabled (default) or unassigned means zero issue writes. Alert-only:
-transition writes (cluster enter/exit/count-band escalation) on one
+transition writes (cluster enter/exit/count-band escalation or de-escalation) on one
 singleton issue, never per-run writes, never disables anything, never
 touches routing or the `enforce` flag. The predicate counts only
 `status: failed` (`timed_out` excluded) with the account extracted from

@@ -11,7 +11,8 @@
  * Alert-only: this module never disables accounts, never changes routing,
  * never touches the `enforce` flag, and never duplicates the host's native
  * per-run / budget / agent-error attention. Writes happen only on material
- * cluster transitions (enter, exit, count-band escalation), never per run.
+ * cluster transitions (enter, exit, count-band escalation/de-escalation),
+ * never per run.
  *
  * Predicate fidelity notes (documented differences from a created_at poll):
  * - Only `status === 'failed'` qualifies. The host emits `agent.run.failed`
@@ -66,6 +67,12 @@ export function countBand(count) {
   if (count < 25) return '10-24';
   return '25+';
 }
+
+// Band rank orders crossings by direction: a rise records `escalate`, a fall
+// records `deescalate`. Both are threshold crossings and both rewrite the
+// singleton, so a decaying storm stays fresh until its exit write.
+const BAND_RANK = { '3-4': 0, '5-9': 1, '10-24': 2, '25+': 3 };
+const bandRank = band => BAND_RANK[band] ?? -1;
 
 const ACCOUNT_PATTERN = / on ([\w.-]+:[\w.-]+)/;
 
@@ -195,8 +202,9 @@ export function transitionSig(activeSorted, bands) {
 
 /**
  * Prune to the window and compute the cluster transition. Pure: reads
- * `state`, returns `{ accounts, active, entered, exited, escalated, sig,
- * writeDue }` where `accounts` holds per-account window summaries.
+ * `state`, returns `{ accounts, active, entered, exited, escalated,
+ * deescalated, sig, writeDue }` where `accounts` holds per-account window
+ * summaries.
  */
 export function evaluateClusters(state, nowMs) {
   const floorMs = nowMs - FAILURE_CLUSTER_WINDOW_MS;
@@ -225,16 +233,19 @@ export function evaluateClusters(state, nowMs) {
   const activeSet = new Set(active);
   const entered = active.filter(account => !prevSet.has(account));
   const exited = (state.prevActive ?? []).filter(account => !activeSet.has(account));
-  const escalated = active.filter(account => prevSet.has(account) && (state.prevBands ?? {})[account] !== bands[account]);
+  const bandChanged = active.filter(account => prevSet.has(account) && (state.prevBands ?? {})[account] !== bands[account]);
+  const escalated = bandChanged.filter(account => bandRank(bands[account]) > bandRank((state.prevBands ?? {})[account]));
+  const deescalated = bandChanged.filter(account => bandRank(bands[account]) < bandRank((state.prevBands ?? {})[account]));
   return {
     accounts,
     active,
     entered,
     exited,
     escalated,
+    deescalated,
     sig: transitionSig(active, bands),
     bands,
-    writeDue: entered.length > 0 || exited.length > 0 || escalated.length > 0,
+    writeDue: entered.length > 0 || exited.length > 0 || escalated.length > 0 || deescalated.length > 0,
   };
 }
 
@@ -480,6 +491,7 @@ export async function updateFailureClusters({ ctx, companyId, alert, nowMs, even
     if (evalResult.entered.length > 0) state.transitions.push(historyEntry('enter', evalResult.entered));
     if (evalResult.exited.length > 0) state.transitions.push(historyEntry('exit', evalResult.exited));
     if (evalResult.escalated.length > 0) state.transitions.push(historyEntry('escalate', evalResult.escalated));
+    if (evalResult.deescalated.length > 0) state.transitions.push(historyEntry('deescalate', evalResult.deescalated));
     if (state.transitions.length > FAILURE_CLUSTER_MAX_TRANSITIONS) {
       state.transitions = state.transitions.slice(state.transitions.length - FAILURE_CLUSTER_MAX_TRANSITIONS);
     }
