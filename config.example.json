@@ -138,6 +138,10 @@
   "credentialReadiness": {
     "enforce": false
   },
+  "failureClusterAlert": {
+    "enabled": false,
+    "assigneeAgentId": ""
+  },
   "freeLanes": {
     "enabled": false,
     "minQuality": 0.4,
