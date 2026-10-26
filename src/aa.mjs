@@ -377,6 +377,9 @@ function buildLeaderboardRow(rec) {
   for (const key of LEADERBOARD_STRING_FIELDS) row[key] = typeof rec[key] === 'string' ? rec[key] : null;
   for (const key of LEADERBOARD_BOOLEAN_FIELDS) row[key] = typeof rec[key] === 'boolean' ? rec[key] : null;
   for (const key of LEADERBOARD_NUMERIC_FIELDS) row[key] = num(rec[key]);
+  const known = new Set(LEADERBOARD_NUMERIC_FIELDS);
+  const unexpected = Object.keys(rec).filter(k => typeof rec[k] === 'number' && !known.has(k) && k !== 'id');
+  if (unexpected.length > 0) row.schemaWarnings = unexpected.map(k => `unregistered-source-field:${k}`);
   // 2026-10-17 renames: backfill the canonical names the quality composite
   // reads so a page carrying only the new spelling still scores.
   if (row.terminalbenchV21 == null) row.terminalbenchV21 = num(rec.terminalBench21);
@@ -451,8 +454,12 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
       continue;
     }
     for (const [k, v] of Object.entries(row)) {
-      if (k === 'slug') continue;
-      if (v != null) base[k] = v;
+      if (['slug', 'fieldObservedAt', 'fieldSources'].includes(k)) continue;
+      if (v != null) {
+        base[k] = v;
+        if (row.fieldObservedAt?.[k] != null) base.fieldObservedAt = { ...base.fieldObservedAt, [k]: row.fieldObservedAt[k] };
+        if (row.fieldSources?.[k] != null) base.fieldSources = { ...base.fieldSources, [k]: row.fieldSources[k] };
+      }
     }
   }
   const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([s]) => s);
@@ -487,8 +494,12 @@ export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
       continue;
     }
     for (const [k, v] of Object.entries(row)) {
-      if (k === 'slug') continue;
-      if (v != null && base[k] == null) base[k] = v;
+      if (['slug', 'fieldObservedAt', 'fieldSources'].includes(k)) continue;
+      if (v != null && base[k] == null) {
+        base[k] = v;
+        if (row.fieldObservedAt?.[k] != null) base.fieldObservedAt = { ...base.fieldObservedAt, [k]: row.fieldObservedAt[k] };
+        if (row.fieldSources?.[k] != null) base.fieldSources = { ...base.fieldSources, [k]: row.fieldSources[k] };
+      }
     }
   }
   const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([s]) => s);
@@ -522,18 +533,24 @@ export function carryForwardCosts(mergedRows = [], prevRows = [], carriedFrom = 
   }
   return (mergedRows ?? []).map(row => {
     if (!row || typeof row.slug !== 'string') return row;
-    const { costCarriedFrom: _stale, ...fresh } = row;
+    const { costCarriedFrom: _stale, costFieldObservedAt: _staleFields, ...fresh } = row;
     const prev = prevBySlug.get(row.slug);
     if (!prev) return fresh;
-    let carried = false;
+    const observed = {};
     const next = { ...fresh };
     for (const field of COST_CARRY_FIELDS) {
       if (next[field] == null && prev[field] != null) {
         next[field] = prev[field];
-        carried = true;
+        observed[field] = prev.costFieldObservedAt?.[field]
+          ?? prev.fieldObservedAt?.[field] ?? prev.costCarriedFrom ?? carriedFrom;
       }
     }
-    if (carried) next.costCarriedFrom = carriedFrom;
+    if (Object.keys(observed).length > 0) {
+      next.costFieldObservedAt = observed;
+      // Keep the legacy summary, but never rejuvenate a repeatedly carried
+      // observation to the latest snapshot time. Per-field stamps are exact.
+      next.costCarriedFrom = Object.values(observed).filter(v => v != null).sort()[0] ?? carriedFrom;
+    }
     return next;
   });
 }
@@ -561,4 +578,16 @@ export function parseAaFreeList(text) {
     }
   }
   return rows.length > 0 ? { rows, duplicateSlugs: [...duplicates] } : null;
+}
+
+/** Stamp numeric fields at source observation time, before merging sources.
+ * Existing stamps win for a kept layer. Does not mutate input fixtures/state. */
+export function stampAaObservations(rows, observedAt, source) {
+  return (rows ?? []).map(row => {
+    const fields = Object.keys(row).filter(k => typeof row[k] === 'number');
+    return { ...row,
+      fieldObservedAt: { ...Object.fromEntries(fields.map(k => [k, observedAt])), ...row.fieldObservedAt },
+      fieldSources: { ...Object.fromEntries(fields.map(k => [k, source])), ...row.fieldSources },
+    };
+  });
 }

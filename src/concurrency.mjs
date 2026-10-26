@@ -16,6 +16,8 @@
  * target null -- no caps are recommended until E is observed.
  */
 
+import { allocatePriorityResourceSlots } from './priority-resources.mjs';
+
 export const DEFAULT_CONCURRENCY = Object.freeze({
   maxTotal: 75,
   meanRunDurationHours: 0.186,
@@ -304,7 +306,7 @@ export function distributeWeightedCaps(target, demands, maxTotal = 75) {
  * floor-running | capped-ceiling. maxConcurrentRuns mirrors allocated for
  * the existing /caps consumer.
  */
-export function allocateDemandCaps(target, agents, maxTotal = 75) {
+export function allocateDemandCaps(target, agents, maxTotal = 75, { blockingPriority = false, priorityPools = [] } = {}) {
   const list = (agents ?? [])
     .filter(a => a && typeof a.agentId === 'string' && a.agentId.length > 0)
     .map(a => ({
@@ -312,6 +314,8 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
       running: Math.max(0, Math.floor(a.running ?? 0)),
       queued: Math.max(0, Math.floor(a.queued ?? 0)),
       overPace: a.overPace === true,
+      ...(blockingPriority ? { allocationWeight: Number.isFinite(a.allocationWeight) && a.allocationWeight > 0
+        ? Math.min(404, a.allocationWeight) : 1 } : {}),
     }))
     .filter(a => a.running + a.queued > 0)
     .sort((x, y) => ((y.running + y.queued) - (x.running + x.queued)) || (x.agentId < y.agentId ? -1 : 1));
@@ -350,7 +354,14 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
     const extras = needTotal > 0 ? largestRemainder(R, needWeights) : out.map(() => 0);
     out.forEach((e, i) => applyCeiling(e, e.running + extras[i], 'proportional'));
   };
-  if (T <= 0) {
+  if (blockingPriority) {
+    // Bound useful new slots before weighting: tiny high-priority queues and
+    // exhausted kept pools must not strand slots that other agents can use.
+    const extras = boundedPriorityShares(out, Math.max(0, Math.min(T, ceiling) - totalRunning), priorityPools);
+    const scarce = out.some((e, i) => extras[i] < Math.max(e.queued, 1));
+    out.forEach((e, i) => applyCeiling(e, e.running + extras[i], scarce ? 'proportional'
+      : e.queued > 0 ? 'full-demand' : 'headroom'));
+  } else if (T <= 0) {
     // Explicit shed: hold running, start nothing.
     for (const e of out) { e.allocated = e.running; e.reason = 'floor-running'; }
   } else if (totalRunning < T) {
@@ -376,11 +387,57 @@ export function allocateDemandCaps(target, agents, maxTotal = 75) {
   }));
 }
 
+/**
+ * Largest-remainder new-slot shares with useful-demand and serving-pool bounds.
+ * Each clipped round exhausts an agent/pool or spends all remaining slots, so
+ * work scales with candidates, not with the configured numeric fleet ceiling.
+ */
+function boundedPriorityShares(entries, available, pools) {
+  const extras = entries.map(() => 0);
+  const limits = entries.map(entry => Math.max(entry.queued, 1));
+  const indexById = new Map(entries.map((entry, i) => [entry.agentId, i]));
+  const groupByIndex = new Map();
+  const groups = pools.map(pool => {
+    const members = pool.agentIds.map(id => indexById.get(id)).filter(i => i != null);
+    const group = { members, remaining: Math.max(0,
+      pool.ceiling - members.reduce((sum, i) => sum + entries[i].running, 0)) };
+    for (const i of members) {
+      groupByIndex.set(i, group);
+      limits[i] = entries[i].queued; // Kept agents never reserve idle headroom.
+    }
+    return group;
+  });
+  while (available > 0) {
+    const weights = entries.map((entry, i) => extras[i] < limits[i]
+      && (groupByIndex.get(i)?.remaining ?? Infinity) > 0
+      ? (entry.queued + 1) * (entry.queued > 0 ? entry.allocationWeight : 1) : 0);
+    if (!weights.some(weight => weight > 0)) break;
+    const grants = largestRemainder(available, weights).map((share, i) => Math.min(share, limits[i] - extras[i]));
+    for (const group of groups) {
+      const { members, remaining } = group;
+      if (members.reduce((sum, i) => sum + grants[i], 0) > remaining) {
+        // Scaling integer grants down cannot exceed an individual grant.
+        const bounded = largestRemainder(remaining, members.map(i => grants[i]));
+        members.forEach((i, j) => { grants[i] = bounded[j]; });
+      }
+      group.remaining -= members.reduce((sum, i) => sum + grants[i], 0);
+    }
+    grants.forEach((grant, i) => { extras[i] += grant; });
+    available -= grants.reduce((sum, grant) => sum + grant, 0);
+  }
+  return extras;
+}
+
 /** Allocate kept agents against their serving pools before routing the remainder. */
 export function allocateKeptAndRoutedCaps({
   target, maxTotal = 75, demandFactor = 1, agents = [], keepAgentIds = [],
   keptByAgent = {}, accounts = [], perAccount = [], pacePools = [], unavailableAccountIds = [],
+  reviewerAccountIdsByAgent = {}, blockingPriority = false,
 } = {}) {
+  if (Object.keys(reviewerAccountIdsByAgent).length > 0) {
+    return allocateMultiPoolReviewers({ target, maxTotal, demandFactor, agents, keepAgentIds,
+      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, blockingPriority });
+  }
   const keptIds = new Set(keepAgentIds);
   const unavailableAccounts = new Set(unavailableAccountIds);
   const accountPool = new Map(accounts.map(account => [account.accountId, account.pool]));
@@ -412,6 +469,7 @@ export function allocateKeptAndRoutedCaps({
   const keptCeilings = new Map();
   const groupInputs = [];
   const groupById = new Map();
+  const priorityPools = [];
   for (const [pool, members] of groups) {
     const paced = pacedPools.get(pool);
     const slots = pool === '' ? { paced: 0, burn: 0 } : (poolSlots.get(pool) ?? { paced: 0, burn: 0 });
@@ -422,6 +480,7 @@ export function allocateKeptAndRoutedCaps({
     const running = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.running ?? 0)), 0);
     const queued = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.queued ?? 0)), 0);
     const groupId = `pool:${JSON.stringify(pool)}`;
+    priorityPools.push({ agentIds: members.map(member => member.agentId), ceiling: boundedCapacity });
     if (boundedCapacity === 0) {
       const entries = allocateDemandCaps(0, members, 1);
       kept.push(...entries);
@@ -438,7 +497,17 @@ export function allocateKeptAndRoutedCaps({
 
   const totalTarget = target == null ? maxTotal : target;
   const totalCeiling = Math.max(1, Math.min(Math.floor(maxTotal), Math.round(totalTarget)));
-  const groupCaps = allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
+  // In priority mode all agents compete for the same new slots BEFORE kept
+  // pools reserve shares. Otherwise a low-priority kept queue can take the
+  // first slot, or reserve capacity needed by an already-running routed run.
+  const priorityEntries = blockingPriority ? allocateDemandCaps(totalTarget, agents, maxTotal,
+    { blockingPriority, priorityPools }) : null;
+  const priorityShares = new Map(priorityEntries?.map(entry => [entry.agentId, entry]) ?? []);
+  const groupCaps = blockingPriority ? groupInputs.map(group => ({
+    agentId: group.agentId,
+    allocated: groupById.get(group.agentId).members.reduce((sum, member) =>
+      sum + (priorityShares.get(member.agentId)?.allocated ?? 0), 0),
+  })) : allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
   for (const groupCap of groupCaps) {
     const group = groupById.get(groupCap.agentId);
     // The member ceiling is the group's fleet share, never the full pool
@@ -450,7 +519,9 @@ export function allocateKeptAndRoutedCaps({
     // Do not reserve idle headroom beyond a kept member's declared demand.
     // The ordinary allocator may split spare slots past a member's want;
     // leave those slots available to routed work instead.
-    const entries = allocateDemandCaps(groupCap.allocated, group.members, share).map(entry => {
+    const shares = blockingPriority ? group.members.map(member => priorityShares.get(member.agentId)).filter(Boolean)
+      : allocateDemandCaps(groupCap.allocated, group.members, share);
+    const entries = shares.map(entry => {
       if (entry.allocated <= entry.demand) return entry;
       return { ...entry, allocated: entry.demand, maxConcurrentRuns: entry.demand, reason: 'full-demand' };
     });
@@ -481,12 +552,138 @@ export function allocateKeptAndRoutedCaps({
   const routedCeiling = Math.max(1, Math.floor(keptTotal === 0
     ? maxTotal
     : Math.min(maxTotal - keptTotal, totalCeiling - keptTotal)));
-  const routed = allocateDemandCaps(
+  const routed = blockingPriority ? priorityEntries.filter(entry => !keptIds.has(entry.agentId)) : allocateDemandCaps(
     routedTarget,
     agents.filter(agent => !keptIds.has(agent.agentId)),
     routedCeiling,
   );
   return { kept, keptCeilings, routed, routedTarget, routedCeiling };
+}
+
+// Fixed-model agents reserve their own pools first. Reviewers may then use
+// ANY admitted arm, but every account and pace pool is spent only once. The
+// small integer round-robin is bounded by maxTotal, not by PR backlog size.
+function allocateMultiPoolReviewers(input) {
+  const { target, maxTotal, demandFactor, agents, keepAgentIds, keptByAgent,
+    accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, blockingPriority } = input;
+  const reviewIds = new Set(Object.keys(reviewerAccountIdsByAgent));
+  const fixedIds = keepAgentIds.filter(id => !reviewIds.has(id));
+  const otherRunning = agents.filter(a => !fixedIds.includes(a.agentId)).reduce((s, a) => s + (a.running ?? 0), 0);
+  const fixed = allocateKeptAndRoutedCaps({ ...input, reviewerAccountIdsByAgent: {},
+    target: blockingPriority ? 0 : Math.max(0, (target ?? maxTotal) - otherRunning), maxTotal: Math.max(1, maxTotal - otherRunning),
+    keepAgentIds: fixedIds, agents: agents.filter(a => fixedIds.includes(a.agentId)) });
+  const accountPool = new Map(accounts.map(a => [a.accountId, a.pool]));
+  const unavailable = new Set(unavailableAccountIds);
+  const burn = new Set(pacePools.flatMap(p => p.burnAccountIds ?? []));
+  const paced = new Map(pacePools.map(p => [p.pool, p]));
+  const accountLeft = new Map();
+  const poolLeft = new Map();
+  const pacedLeft = new Map();
+  for (const a of perAccount) {
+    const pool = accountPool.get(a.accountId);
+    if (unavailable.has(a.accountId) || typeof pool !== 'string' || !Number.isFinite(a.slots)) continue;
+    const n = Math.max(0, a.slots * demandFactor);
+    accountLeft.set(a.accountId, n);
+    poolLeft.set(pool, (poolLeft.get(pool) ?? 0) + n);
+    if (!burn.has(a.accountId)) pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
+  }
+  for (const [pool, n] of pacedLeft) {
+    const cap = paced.get(pool)?.cap;
+    const bounded = Number.isFinite(cap) ? Math.max(0, Math.min(n, cap)) : n;
+    poolLeft.set(pool, Math.max(0, Math.floor((poolLeft.get(pool) ?? 0) - n + bounded)));
+    pacedLeft.set(pool, bounded);
+  }
+  // Conservatively charge fixed reservations to the shared pool before helpers.
+  for (const row of fixed.kept) {
+    const servingId = keptByAgent[row.agentId]?.accountId;
+    const pool = accountPool.get(servingId);
+    poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - row.allocated));
+    let charge = row.allocated;
+    const ids = [...accountLeft.keys()].filter(id => accountPool.get(id) === pool)
+      .sort((a, b) => Number(b === servingId) - Number(a === servingId));
+    for (const id of ids) {
+      const used = Math.min(charge, accountLeft.get(id));
+      accountLeft.set(id, accountLeft.get(id) - used);
+      if (!burn.has(id)) pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
+      charge -= used;
+      if (charge <= 0) break;
+    }
+  }
+  const reviews = agents.filter(a => reviewIds.has(a.agentId) && a.running + a.queued > 0)
+    .map(a => ({ agentId: a.agentId, running: Math.max(0, Math.floor(a.running ?? 0)),
+      queued: Math.max(0, Math.floor(a.queued ?? 0)), allocated: Math.max(0, Math.floor(a.running ?? 0)) }))
+    .sort((a, b) => reviewerAccountIdsByAgent[a.agentId].length - reviewerAccountIdsByAgent[b.agentId].length
+      || a.agentId.localeCompare(b.agentId));
+  const spend = row => {
+    const ids = [...new Set(reviewerAccountIdsByAgent[row.agentId])];
+    for (const pool of new Set(ids.map(id => accountPool.get(id)))) {
+      if ((poolLeft.get(pool) ?? 0) < 1) continue;
+      // Sustainable slots are fractional. Combine admitted fractions inside
+      // one pool without rounding every account up or discarding its share.
+      let need = 1;
+      let pacedBudget = pacedLeft.get(pool) ?? 0;
+      const charges = [];
+      for (const id of ids.filter(id => accountPool.get(id) === pool)) {
+        const n = Math.min(need, accountLeft.get(id) ?? 0, burn.has(id) ? Infinity : pacedBudget);
+        if (n <= 0) continue;
+        charges.push([id, n]); need -= n;
+        if (!burn.has(id)) pacedBudget -= n;
+        if (need <= 0) break;
+      }
+      if (need > 0) continue;
+      for (const [id, n] of charges) accountLeft.set(id, accountLeft.get(id) - n);
+      poolLeft.set(pool, poolLeft.get(pool) - 1);
+      pacedLeft.set(pool, pacedBudget);
+      return true;
+    }
+    return false;
+  };
+  for (const row of reviews) for (let i = 0; i < row.running; i++) if (!spend(row)) break;
+  const ordinary = agents.filter(a => !reviewIds.has(a.agentId) && !fixedIds.includes(a.agentId));
+  const totalCeiling = Math.max(0, Math.min(maxTotal, Math.round(target ?? maxTotal)));
+  let left = Math.max(0, totalCeiling - fixed.kept.reduce((s, a) => s + a.allocated, 0)
+    - reviews.reduce((s, a) => s + a.running, 0) - ordinary.reduce((s, a) => s + (a.running ?? 0), 0));
+  if (blockingPriority) {
+    // Compete on actual feasible resources before committing ANY new slot.
+    // Funding is rematched, not consumed by demand/id-ordered tentative grants.
+    const noHeadroomIds = new Set([...fixedIds, ...reviewIds]);
+    const weights = new Map(agents.map(a => [a.agentId,
+      Number.isFinite(a.allocationWeight) && a.allocationWeight > 0 ? Math.min(404, a.allocationWeight) : 1]));
+    const rows = allocateDemandCaps(0, agents, maxTotal).map(a => ({ ...a, allocationWeight: weights.get(a.agentId) }));
+    const admissions = new Map(rows.filter(row => noHeadroomIds.has(row.agentId)).map(row => {
+      const servingId = keptByAgent[row.agentId]?.accountId;
+      return [row.agentId, [...new Set(reviewIds.has(row.agentId) ? reviewerAccountIdsByAgent[row.agentId]
+        : [...accountLeft.keys()].filter(id => accountPool.get(id) === accountPool.get(servingId))
+          .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b)))]];
+    }));
+    const { extras, resourceStatus } = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds,
+      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn });
+    const entries = rows.map(({ allocationWeight, ...row }, i) => ({ ...row,
+      allocated: row.running + extras[i], maxConcurrentRuns: row.running + extras[i],
+      reason: extras[i] > 0 ? 'proportional' : 'floor-running',
+    }));
+    const kept = entries.filter(row => noHeadroomIds.has(row.agentId));
+    const routedTarget = Math.max(0, totalCeiling - kept.reduce((sum, row) => sum + row.allocated, 0));
+    return { kept, keptCeilings: new Map(kept.map(row => [row.agentId, row.allocated])),
+      routed: entries.filter(row => !noHeadroomIds.has(row.agentId)), routedTarget, routedCeiling: Math.max(1, routedTarget),
+      ...(resourceStatus ? { resourceStatus } : {}) };
+  }
+  while (left > 0) {
+    let changed = false;
+    for (const row of reviews) {
+      if (left <= 0) break;
+      if (row.allocated >= row.running + row.queued || !spend(row)) continue;
+      row.allocated++; left--; changed = true;
+    }
+    if (!changed) break;
+  }
+  const kept = [...fixed.kept, ...reviews.map(a => ({ ...a, demand: a.running + a.queued,
+    maxConcurrentRuns: a.allocated, reason: a.allocated === a.running ? 'floor-running' : 'reviewer-headroom' }))];
+  const keptCeilings = new Map([...fixed.keptCeilings, ...reviews.map(a => [a.agentId, a.allocated])]);
+  const used = kept.reduce((s, a) => s + a.allocated, 0);
+  const routedTarget = Math.max(0, totalCeiling - used);
+  const routedCeiling = Math.max(1, routedTarget);
+  return { kept, keptCeilings, routed: allocateDemandCaps(routedTarget, ordinary, routedCeiling), routedTarget, routedCeiling };
 }
 
 /**

@@ -44,6 +44,20 @@
     "omniscience": 0.045,
     "lcr": 0.045
   },
+  "taskRanking": {
+    "mode": "shadow",
+    "profileVersion": "aa-role-v1",
+    "minAbsoluteCoverage": 0.6,
+    "effortSupport": {},
+    "calibration": {
+      "enabled": false,
+      "windowDays": 7,
+      "minClosedTasks": 30,
+      "minAcceptedTasks": 10,
+      "priorTasks": 30,
+      "maxRelativeCiHalfWidth": 0.5
+    }
+  },
   "pacing": {
     "deadband": 0.02,
     "rungCooldownMs": 600000,
@@ -99,6 +113,9 @@
     "maxTotal": 75,
     "meanRunDurationHours": 0.186
   },
+  "allocation": {
+    "blockingPriority": false
+  },
   "caps": {
     "reservedFloors": {
       "agent-a": { "base": 4, "perQueued": 20, "max": 8 }
@@ -120,6 +137,25 @@
   "enforce": false,
   "credentialReadiness": {
     "enforce": false
+  },
+  "freeLanes": {
+    "enabled": false,
+    "minQuality": 0.4,
+    "lowRiskAgentIds": [],
+    "providers": {
+      "nvidia-nim": { "requestsPerMinute": 36, "requestsPerMinutePerSlot": 12 },
+      "openrouter": {
+        "requestsPerMinute": 20,
+        "requestsPerMinutePerSlot": 12,
+        "requestsPerDay": 1000,
+        "requestsPerRun": 100
+      }
+    },
+    "demotion": { "lastRuns": 10, "minSuccessRate": 0.8, "windowHours": 24 }
+  },
+  "exhaustion": {
+    "enabled": false,
+    "finalAnswerFromAttempt": 11
   },
   "trials": {
     "maxInFlightPerAccount": 2,

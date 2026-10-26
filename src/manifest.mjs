@@ -98,6 +98,14 @@
  *   spent sibling); a flat whole-percent meter extends its rate window to
  *   the last tick (6h) and never reads 0 with runs in flight. No capability,
  *   egress, secret or env-key change.
+ * v0.2.70 = READ-ONLY MODEL INVENTORY ON /capacity: `modelInventory` keeps
+ *   the raw, canonical and emitted spelling of every reported model id side
+ *   by side with per-account served present/absent/unknown (absent list reads
+ *   unknown, fail-open as routing does), the linked unscored/unservable/
+ *   readiness evidence, and explicit unknown markers for protocol/tool/
+ *   reasoning compatibility and configured-model coverage (other-agent
+ *   adapter configuration is restricted). Pure reporting; routing reads
+ *   nothing from it. No capability, egress, secret or env-key change.
  * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
  *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
  *   never the bare id CLIProxy 400s or routes to another provider);
@@ -356,9 +364,10 @@
 
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
+import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.67';
+export const PLUGIN_VERSION = '0.2.70';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -489,6 +498,39 @@ const CONFIG_SCHEMA = {
         lcr: { type: 'number', minimum: 0, default: 0.045 },
       },
     },
+    taskRanking: {
+      type: 'object', additionalProperties: false,
+      description: 'Role-aware AA task-workload cost priors. Shadow by default; cannot enable model resolution. Accepted-task calibration awaits native attributed outcomes.',
+      properties: {
+        mode: { type: 'string', enum: ['off', 'shadow', 'enforce'], default: 'shadow' },
+        profileVersion: { type: 'string', enum: ['aa-role-v1'], default: 'aa-role-v1' },
+        minAbsoluteCoverage: { type: 'number', minimum: .6, maximum: 1, default: .6 },
+        roleMetricWeights: {
+          type: 'object', additionalProperties: false,
+          description: 'Explicit profiles replace defaults for that role. Registered metric keys only; aggregate/component conflicts fail validation.',
+          properties: Object.fromEntries(['doer', 'reviewer', 'thinker', 'other'].map(role => [role, {
+            type: 'object', minProperties: 1, additionalProperties: { type: 'number', minimum: 0 },
+          }])),
+        },
+        effortSupport: {
+          type: 'object',
+          description: 'Verified endpoint effort support by exact emitted ID. Classic bindings retain their verified efforts; a family ceiling alone does not verify newly discovered variants.',
+          additionalProperties: { type: 'array', minItems: 1, uniqueItems: true,
+            items: { type: 'string', enum: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] } },
+        },
+        calibration: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            enabled: { type: 'boolean', enum: [false], default: false },
+            windowDays: { type: 'integer', minimum: 7, default: 7 },
+            minClosedTasks: { type: 'integer', minimum: 30, default: 30 },
+            minAcceptedTasks: { type: 'integer', minimum: 10, default: 10 },
+            priorTasks: { type: 'integer', minimum: 30, default: 30 },
+            maxRelativeCiHalfWidth: { type: 'number', exclusiveMinimum: 0, maximum: .5, default: .5 },
+          },
+        },
+      },
+    },
     eee: {
       type: 'object', additionalProperties: false,
       description: 'EEE benchmark prior (Phase 2): secondary quality signal blended beside AA. Absent/stale artifact keeps AA-only behavior bit-for-bit.',
@@ -607,6 +649,17 @@ const CONFIG_SCHEMA = {
         doerStarvationSustainMs: { type: 'number', exclusiveMinimum: 0, default: 600000, description: 'How long the gap must persist before the starvation wake fires.' },
       },
     },
+    reviewDemand: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in pre-admission PR-head census. Requires an explicitly approved read-only GitHub credential reference; absent/disabled performs no new HTTP reads.',
+      anyOf: [{ required: ['enabled'], properties: { enabled: { const: false } } }, { required: ['repositories', 'tokenSecretRef'] }],
+      properties: {
+        enabled: { type: 'boolean', default: true },
+        repositories: { type: 'array', minItems: 1, maxItems: 25, items: { type: 'string', pattern: REVIEW_REPOSITORY_PATTERN.source } },
+        tokenSecretRef: { ...SECRET_REF, description: 'Existing read-only GitHub token, never an App private key. No credential is created or rotated.' },
+        requiredChecks: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string', minLength: 1, maxLength: 200, not: { const: 'Paperclip Review' } }, default: ['ci-ok', 'pr-lint'] },
+      },
+    },
     reviewerRouting: {
       type: 'object', additionalProperties: false,
       anyOf: [
@@ -635,6 +688,15 @@ const CONFIG_SCHEMA = {
       properties: {
         maxTotal: { type: 'integer', minimum: 1, default: 75 },
         meanRunDurationHours: { type: 'number', exclusiveMinimum: 0, default: 0.186 },
+      },
+    },
+    allocation: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        blockingPriority: {
+          type: 'boolean', default: false,
+          description: 'Weight scarce new slots by unsatisfied demand, transitive open-card fan-out (capped at 100) and highest ready-card priority. Requires native relation arrays in issues.read payloads; missing fields or failed reads retain the legacy allocation. Active mode bounds new slots by target and ceiling, including smoothing and reserved floors.',
+        },
       },
     },
     contextCaps: {
@@ -671,6 +733,37 @@ const CONFIG_SCHEMA = {
       description: 'Credential-readiness admission is opt-in until every lane account publishes a valid envelope. Check /capacity counts before enabling.',
       properties: {
         enforce: { type: 'boolean', default: false },
+      },
+    },
+    exhaustion: {
+      type: 'object', additionalProperties: false,
+      description: 'Deferral-exhaustion (Design B): the host retries a deferred run as a new runId up to 12 times and then freezes the card. When enabled, the hook stops deferring on the last attempts of the chain (default from attempt 11) and answers with the cheapest selectable free-overflow arm under the existing trial caps, else a bounded keep; metered pools ahead of plan are never selected. Disabled (default): every terminal still defers, exactly as before.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        finalAnswerFromAttempt: { type: 'integer', minimum: 1, maximum: 12, default: 11, description: '1-based chain attempt from which the hook answers instead of deferring (12 is the host retry budget).' },
+      },
+    },
+    freeLanes: {
+      type: 'object', additionalProperties: false,
+      description: 'Opt-in additive free capacity outside paid C*. Only explicitly listed low-risk issue agents qualify. Provider request rates size slots, not an API request limiter.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        minQuality: { type: 'number', default: 0.4, description: 'Strict fleet-normalized quality floor for free arms. Unknown quality is denied.' },
+        lowRiskAgentIds: { type: 'array', default: [], items: { type: 'string', minLength: 1 } },
+        providers: { type: 'object', default: {}, additionalProperties: {
+          type: 'object', additionalProperties: false, required: ['requestsPerMinute'],
+          properties: {
+            requestsPerMinute: { type: 'number', exclusiveMinimum: 0 },
+            requestsPerMinutePerSlot: { type: 'number', exclusiveMinimum: 0, default: 12 },
+            requestsPerDay: { type: 'integer', minimum: 1 },
+            requestsPerRun: { type: 'number', exclusiveMinimum: 0, description: 'Required with a daily limit. Estimated requests reserved per admission, including failures.' },
+          },
+        } },
+        demotion: { type: 'object', additionalProperties: false, properties: {
+          lastRuns: { type: 'integer', minimum: 1, maximum: 1000, default: 10 },
+          minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
+          windowHours: { type: 'number', exclusiveMinimum: 0, maximum: 24, default: 24 },
+        } },
       },
     },
     trials: {
@@ -807,7 +900,10 @@ export function buildManifest({ modelResolve = false } = {}) {
     'secrets.read-ref',
     'events.subscribe',
     'agents.read',
-    'agents.queued_counts.read',
+    // 'agents.queued_counts.read' is declared only once upstream Paperclip ships
+    // agents.getQueuedRunCounts: the host validates capabilities against its
+    // PLUGIN_CAPABILITIES enum, so an unknown one rejects the whole manifest.
+    // The queued-run read below stays optional and degrades to running-only.
     'issues.read',
     'api.routes.register',
     // No database capabilities: run facts come from SDK surfaces only

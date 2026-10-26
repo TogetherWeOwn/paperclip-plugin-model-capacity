@@ -19,6 +19,374 @@ sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
 
+## Reviewer backlog demand (v0.2.69; opt-in, activation gated)
+
+A slot-metered review gate may enqueue only one review at a time even when many
+CI-green PRs await review. Queued heartbeat runs alone cannot size that reviewer.
+`reviewDemand` adds proven review-eligible **current PR heads** to heartbeat demand:
+
+```json
+{
+  "reviewDemand": {
+    "repositories": ["example/product"],
+    "tokenSecretRef": { "type": "secret_ref", "secretId": "<existing-read-only-token-secret-id>" },
+    "requiredChecks": ["ci-ok", "pr-lint"]
+  }
+}
+```
+
+This optional plugin reader uses a fixed read-only GitHub GraphQL query. The
+native chat review history starts after admission (and its list is limited to
+100 rows); it cannot reveal heads outside the gate. The SDK does not expose
+chat review reads or another plugin's private state. No direct database access,
+core patch, new credential, or host script is used. **Design approval is not
+activation, credential-binding, installation or release approval.** Before
+activation, the authorized custodian must evidence the installed host/SDK build
+and its fixed-target transport (DNS/IP pinning, private-IP refusal, TLS hostname
+verification and no redirect following), plus the existing secret reference's
+version, repository selection, read-only metadata scopes, expiry and revocation
+path. The SDK drops `RequestInit.redirect`; a mocked `manual` flag is not
+transport proof. Incompatible or unverified transport leaves the source disabled.
+Absent configuration or `enabled: false` performs no new source I/O.
+
+Only open, non-draft, mergeable PRs whose configured CI checks all succeeded at
+the current head count. Missing checks, unknown mergeability, mismatched commit
+IDs and truncated check rollups do not count. A same-head Paperclip Review
+success/failure is a verdict, not new demand; a missing, pending, or
+`ACTION_REQUIRED` review is waiting. Required CI names are explicit because
+optional third-party reviews may remain pending; configure the actual CI gate
+names for the selected repositories. This signal changes sizing only, never
+review/merge admission. Different gate-name sets need separate configuration
+in a later extension; do not weaken the list to fit a heterogeneous scope.
+
+The reader caches only aggregate results for five minutes per company/full
+configuration (including secret version), coalesces concurrent reads, rejects
+non-200/followed responses, and caps collection at 25 repositories, 50 pages,
+100 PRs/page and 100 check contexts/head. Owner/repository lengths are bounded
+to 39/100 characters; opaque upstream cursors to 4096. Local configuration events
+invalidate completed and pending cache generations; no subsequent page is issued
+and no pending positive result is published after invalidation. Re-enable starts
+fresh. Secret/page/census logical waits are bounded to 5/10/20 seconds. These
+logical deadlines do not cancel native I/O: an already-issued request may drain
+within the evidenced host transport cap. A failed, partial or rate-limited census
+returns `unavailable` and zero added demand, never stale headroom. If configuration
+changes during caps processing, that response preserves only running floors,
+returns `target: null` and `capsError: "configuration-changed"`, and does not
+mislabel the result as breaker cooling. Unavailable
+results may be cached too; recovery can therefore take up to five minutes. `/caps.reviewDemand` reports health/count/time; review agents report
+`heartbeatQueued` and `reviewEligibleHeads`. The shadow tick includes these heads
+before bounding the fleet target. A shared backlog is split once, weighted by the
+capacity each reviewer can actually use after heartbeat demand and existing
+account/pool/fleet guards; empty admissions and spent pools receive no new shares.
+Equal usable capacity splits evenly, with deterministic remainder assignment.
+
+Reviewer identities come from `reviewReserve.agentIds` (defaulting to
+`roles.keepAgentIds`) and `reviewerRouting.agentIds`, independently of routing.
+Fixed-model reviewers count heads but remain constrained to their serving pool.
+Routed reviewer caps use every account admitted by their configured routing arms,
+not just the adapter default model's pool. Existing arm/readiness/breaker,
+headroom and pace guards remain in force. With blocking priority off, fixed-model
+agents reserve first; reviewers share the remaining account/pool budgets and
+fleet ceiling. When it is on, all new fixed/reviewer/ordinary slots compete by
+resource-feasible weighted quanta as described below. Routing order is unchanged:
+this change does not alter primary/helper preference.
+The admission snapshot expires after two minutes. Newly stamped admissions also
+belong to the producing plugin instance and configuration generation: restart or
+configuration change requires a new tick before those helper grants can resume.
+Exhausted arms preserve only existing running floors. Undo: disable `reviewDemand` to remove the new
+source, or reinstall the prior release to restore the previous cap allocator.
+
+## Role-aware AA task ranking (unreleased)
+
+`taskRanking.mode` is **`shadow` by default**. It computes a proposed route and
+adds evidence to `/capacity`; it does not change existing routes, concurrency,
+pacing targets, reserves, credit permissions or rate limits. `off` keeps the
+legacy scorer/selector. `enforce` opts into role-specific frontiers and
+cost-first placement **within existing policy buckets**. The separate plugin
+`enforce` flag and opt-in `run.model.resolve` manifest remain authoritative.
+This feature cannot enable resolution by itself.
+
+### Quality and identity
+
+AA observations attach to the exact model **and effort**, not a model family.
+Discovery enumerates AA effort rows only for served models, deduplicates
+classic/dynamic bindings and preserves the exact emitted endpoint ID. Existing
+classic bindings verify their already-supported efforts. Other variants remain
+`effort-unverified` unless `taskRanking.effortSupport` explicitly lists their
+verified efforts by **exact emitted ID**. A family ceiling is not evidence of
+endpoint support. Provider/price/contributor aliases can compose, but generation
+suffixes are never stripped. Configured benchmark borrowing is labelled
+`borrowed`, not measured evidence. A max-row override cannot manufacture a
+high-effort measurement. Contributor-only Muse and the GPT-6.1 Sol identity
+fences apply in the new path.
+
+Initial profile weights are configurable **priors**, not learned optimal weights:
+
+| Metric | Doer / Other | Reviewer (advisory) | Thinker |
+| --- | ---: | ---: | ---: |
+| Terminal-Bench 4.0 | .45 | .25 | 0 |
+| SciCode | .15 | 0 | 0 |
+| HLE | 0 | .20 | .25 |
+| GPQA | 0 | 0 | .15 |
+| CritPt | 0 | 0 | .15 |
+| GDPval normalized | 0 | 0 | .15 |
+| LCR | .15 | .20 | .15 |
+| IFBench | .15 | .20 | .10 |
+| Omniscience non-hallucination | .10 | .15 | .05 |
+
+An explicit `roleMetricWeights[role]` replaces that profile; it does not partially
+merge defaults. Finite nonnegative weights, supported metric names, nonempty
+profiles and known aggregate/component conflicts are validated. The registry
+also classifies cost, feasibility, latency, legacy and diagnostic observations;
+using all available evidence does **not** mean double-counting every column.
+Hard / 2.1 / 4.0 Terminal-Bench and tau2 / Banking never cross-fill. The legacy
+API `codingIndex` is not renamed to Coding Agent Index v2. Headline Omniscience
+is higher-is-better on [-100,100]; non-hallucination is higher-is-better on [0,1].
+Invalid observations are excluded individually, never zero-filled. Legacy
+scoring (including its historical Omniscience inversion) stays isolated for
+`off`/`shadow` routing compatibility.
+
+Each role has account-local scores for its frontier and unique-model-effort
+fleet scores for capability comparisons. Borrowed/unverified observations and
+account copies cannot skew normalization. Common-support and absolute profile
+coverage are reported separately. Benchmark trust needs at least .60 absolute
+coverage and task-aligned primary evidence (current coding evidence for coding
+roles, reasoning evidence for thinkers). Existing EEE freshness/blend settings
+and numeric `roles.minQuality` values remain unchanged. Small-population and
+known-data empty-role suspensions are explicit; they never grant missing or
+borrowed AA evidence normal benchmark trust. `other` initially inherits doer;
+an operator can explicitly choose an ops profile using ITBench SRE/tool-use
+metrics without introducing another scheduling role or classifier.
+
+Per-run adapter, trial, context, credential, breaker, exclusion and headroom
+feasibility is checked before task-frontier pruning, using the same pure
+`decide` path as enforcement. An ineligible cheap dominator cannot hide a
+feasible backup. Surplus quality/allowance is a tie-breaker, not a reason to buy
+a more expensive capable arm. Funding/credit fallback, burn/floor, need bands,
+native/aggregator fallback, role rung windows and explicit retry policy still
+have authority; this is **not unconditional global cost minimization**.
+
+Configured reviewers remain policy-trusted incumbents, including missing-AA
+reviewers. Reviewer metrics are advisory, not permission to substitute a cheaper
+model or risk tier. In new enforce mode an approved feasible Meta primary wins
+after funding/admission; fallback reasons name quota/headroom, credential,
+servability or pace constraints. No approved feasible arm means defer, not
+ordinary builder overflow—even on deferral exhaustion. Tick/event observation,
+review preview and enforcement share this boundary. Policy incumbency does not
+bypass the contributor-only Muse, Sol identity or emitted-servability fences;
+reviewer readiness and breaker checks use the policy's exact arm identity.
+
+In task enforce mode, exhaustion may choose another explicitly admitted
+model-effort, but cannot issue the legacy bounded default `keep` (including a
+caps-only `decide`). The native request does not carry the default effort, so
+an admitted sibling effort cannot prove the configured default safe. If no
+explicit feasible decision exists, the resolver continues to defer.
+
+### Cost units and calibration boundary
+
+`aaCostPerTask` is AA's **Intelligence Index benchmark workload** cost, not our
+cost per merged issue or valid review. `taskCostProxy` applies the existing
+context-tier multiplier once. Cost carry retains original per-field ages;
+price-profile, family-median and fleet-median fallback sources are explicit.
+For example, AA observations of $0.31914442375664703 and $1.3987235612691513
+establish a benchmark-workload cost difference, not a fleet productivity ratio.
+Token-price blends are not substituted for measured AA workload cost.
+
+`estimatedApiEquivalentPerAcceptedTask` stays null and calibration reports
+`awaiting-native-attributed-outcomes`. Lifecycle/issue summaries do not supply
+verified actual effort/endpoint pricing, complete failed-attempt usage or
+accepted-artifact adjudication. There is **no collector, core-table access,
+new model-evaluation traffic, paid subscription or additional egress** here.
+`calibration.enabled=true` is rejected until a supported native attributed
+outcome surface exists.
+
+The pure calibration helper/tests implement `P/A = (P/N) * (N/A)` over closed
+role-task episodes, including failed/rework attempts once, episode-level ratio
+uncertainty, sample gates and shrinkage toward the AA proxy. Qualification
+requires at least 30 closed tasks, 10 verified accepted outcomes, complete
+attribution/usage/pricing, a seven-day window and a 95% relative confidence
+half-width <= .5. Pending work is censored; zero acceptance is unusable, never
+zero cost. Acceptance must certify a merged/test-passing artifact plus its
+observation window, or a valid review with adjudicated finding/escape evidence;
+process success, issue status and a reviewer's own score do not establish it.
+Learned task cost is never fed back into quota burn. Reconciled cash is separate
+and otherwise null; verified-free cash can be zero while resource cost and
+quota consumption remain positive.
+
+### Audit and rollout
+
+`/capacity.taskRanking` includes all discovered/unmatched/dominated candidates,
+exact effort/slug/match type, metric observations and provenance, AA/EEE
+contributions, coverage, trust/minimum verdicts, cost/fallback/tier evidence,
+calibration readiness, policy buckets and concrete cheaper-alternative refusal
+reasons. Static benchmark dominance is not a hard per-run exclusion. Route
+comparisons are **explicit deterministic preview scenarios** (role, configured
+adapter type or unknown, null context, no retries), not live task outcomes or
+performance measurements. Reviewer routing reports primary/fallback and policy
+trust separately.
+
+Before enabling enforcement, inspect these score distributions, coverage,
+gate suspensions and each scenario difference against actual lane capabilities;
+never lower thresholds just to admit models. Calibration can remain disabled
+independently. Roll back with `taskRanking.mode=off`; the next existing native
+tick publishes the retained legacy view. During a mode transition, startup without a view, or stale task evidence, the
+resolver defers rather than keeping an unvetted default; explicit issue pins
+retain authority. No core deployment, database migration,
+new job, timer, host script or core patch is required; normal plugin packaging
+and installation remain a separate step. Nothing in this PR enables
+live enforcement or establishes an optimal model for every individual task.
+
+Methodology: [AA intelligence benchmarking](https://artificialanalysis.ai/methodology/intelligence-benchmarking),
+[AA coding-agent benchmarking](https://artificialanalysis.ai/methodology/coding-agents-benchmarking).
+
+## Additive always-on free lanes (unreleased, default off)
+
+`freeLanes.enabled=false` is the default. It adds no jobs, traffic or routing
+changes. The existing enforce-capable manifest and `enforce=true` are still
+required to select a model. This policy runs inside `run.model.resolve`; it
+never edits an agent or changes credentials. There is no host pacer or core
+patch.
+
+When enabled, a configured **free-plan** account on a provider in
+`placement.freeCostProviders` has a separate provider-wide slot budget. It
+never enters paid C*, and its running count does not consume paid demand/caps.
+`/capacity.paidTarget` remains paid C*. `/capacity.freeLanes.target` is the
+additive budget. Existing consumers see their sum in `/capacity.target`
+(also `totalTarget`), bounded by the hard `concurrency.maxTotal` process
+ceiling. Free-only capacity reports `partial` calibration with the original
+paid confidence in `paidCalibration`; unknown paid capacity is not invented.
+`/caps` allocates from paid C* first, then adds free headroom
+only to eligible agents, with `allocated` and the existing `maxConcurrentRuns`
+field kept in sync. Free admissions never consume paid per-family trial caps.
+It holds all existing free running counts even when free capacity is demoted,
+paid calibration is weak, or the feature is disabled. If an increased paid
+allocation meets existing free runs at the physical process ceiling, only
+not-yet-running starts are trimmed; paid C* itself is unchanged. Existing
+running work is never cancelled, even if it already exceeds that ceiling. A paid pace hold does not
+hold a free provider. If free selection fails, ordinary paid routing continues.
+Managed free accounts cannot bypass these checks via the ordinary or
+exhaustion path. Other providers and paid trial caps are unchanged.
+
+### Exact low-risk signals
+
+The native hook does **not** carry task text, labels, difficulty, context size,
+retry count or review adjudication. Do not infer them from a wake reason.
+An operator must list **dedicated low-risk agents** in `lowRiskAgentIds` (for
+example, agents whose only assignment is triage or read-only summaries).
+Membership is a policy assertion about that agent's entire workload, not a
+classifier for arbitrary builder work. Do not list general-purpose builders.
+The hook additionally requires all of these existing signals:
+
+- Nonempty `runId` and `issueId`: issue-backed work only.
+- Agent role `doer` or `other`, from the existing thinker/doer ID lists.
+- No `previous` decision for this company/agent/issue. The host has no failure
+  class, so any previous attempt conservatively disqualifies free routing.
+- No explicit issue model pin; no `roles.keepAgentIds` entry; no configured
+  reviewer identity from reviewer routing or review reserve.
+- `adapterType` must allow the family under `trials.adapters`, even after
+  graduation. Unknown/unlisted adapters receive no free arm.
+
+`invocationSource` and `wakeReason` are not sufficient evidence of low risk.
+A monitor or comment wake can still perform high-impact work. Native human
+assignment, explicit connection bindings/router pools and issue pins keep
+precedence in Paperclip before this hook is called.
+
+### Rate sizing, daily budget and limits
+
+Slots are `floor(requestsPerMinute / requestsPerMinutePerSlot)`, shared across
+**all accounts/keys on that provider**, never multiplied by account count.
+The default intensity estimate is 12 requests/minute per running slot. Thus
+36 RPM yields 3 slots and 20 RPM yields 1. Configure actual account-wide
+provider limits and a conservative measured intensity; these are not provider
+lookup tables. A rate below one slot yields zero slots, not a forced minimum.
+
+With `requestsPerDay`, `requestsPerRun` is required. Each admission reserves
+that many estimated requests until the UTC day ends, including failed or
+cancelled runs. A duplicate hook call for the same admitted run does not
+reserve again. The existing native tick persists reservations in company
+plugin state (`free-lanes-v1`) along with the run ledger. Like pending routing
+decisions, reservations after the last successful tick can be lost in a
+worker crash. They are not a billing-grade counter.
+
+**This hook admits runs, not individual provider requests.** The RPM intensity
+and per-run reservations are estimates, not proof of compliance with actual
+provider RPM/day usage. The proxy/provider's own request limiter remains
+necessary. No new proxy limiter or provider integration ships here.
+OpenRouter arms must emit an exact `:free` ID; a free-plan account alone cannot
+make a paid ID free. Missing AA/served-ID bindings still deny routing (use
+existing `modelAaOverrides` only for verified identities). Synthetic, including
+its infinite lane, is paid and excluded. Workers AI is excluded because this
+feed has no authoritative remaining-free-neurons signal; enabling a provider
+name cannot grant permission for paid neurons. NIM `meta/muse-*` is excluded.
+
+### Quality and automatic demotion
+
+`freeLanes.minQuality` is independent of `roles.minQuality`. The default is
+**0.4 fleet-normalized Q**, not AA Intelligence Index 40 or a success rate. It
+keeps the existing capable-arm bar instead of lowering it just because a
+model is free. The cached AA snapshot in
+[`test/fixtures/free-lane-aa-evidence.json`](test/fixtures/free-lane-aa-evidence.json)
+(2026-10-25) records Step 5 Intelligence Index 43.73 and Terminal-Bench 4.0
+0.333, versus GPT-OSS 120B 11.60/0 and Llama 4 Maverick 9.30/0. That evidence
+supports a capability floor rather than indiscriminate free routing; it does
+not establish an optimal cut point or a task success guarantee. Q depends on
+the served population and weights: inspect the current `/capacity` scores
+before enabling. This separate floor is **never suspended** for a tiny/empty
+population; a missing score is denied. In task-ranking enforce mode, exact
+benchmark/effort trust, primary evidence and operational feasibility still
+apply. Free policy replaces only the paid quality minimum, not these checks.
+Manual exclusions, context caps, credential-readiness mode and arm breakers
+remain authoritative.
+
+Default demotion: fewer than 80% successful **measured outcomes among the last
+10** for an exact `(free provider, arm)` in 24 hours removes that arm. A failed
+run counts as failure. A finished run with a trusted issue baseline counts as
+success on `progressed` and failure on `noChange`, using the existing native
+status-progress collector. Cancelled/unknown outcomes are excluded, not
+successes. All ten failures demote too; there is no best-arm exemption or
+empty-role suspension. Evidence expires after the configured window, allowing
+a bounded re-trial. Ledger retention can shorten available evidence.
+
+This is an **operational progress proxy, not adjudicated review success**.
+The SDK does not expose accepted-artifact/review outcomes. A successful process
+exit alone is not evidence of a correct artifact. The feature does not claim
+to detect failed reviews that native lifecycle/status signals do not expose.
+
+### Enabling example (merge into existing configuration)
+
+```json
+{
+  "enforce": true,
+  "placement": { "freeCostProviders": ["nvidia-nim", "openrouter"] },
+  "freeLanes": {
+    "enabled": true,
+    "minQuality": 0.4,
+    "lowRiskAgentIds": ["dedicated-triage-agent"],
+    "providers": {
+      "nvidia-nim": { "requestsPerMinute": 36, "requestsPerMinutePerSlot": 12 },
+      "openrouter": {
+        "requestsPerMinute": 20,
+        "requestsPerMinutePerSlot": 12,
+        "requestsPerDay": 1000,
+        "requestsPerRun": 100
+      }
+    },
+    "demotion": { "lastRuns": 10, "minSuccessRate": 0.8, "windowHours": 24 }
+  }
+}
+```
+
+Replace the agent ID and validate rate/intensity assumptions for your account.
+The OpenRouter daily example permits at most ten **new admissions** per UTC
+day, not 1,000 agent runs. Only already served, benchmark-qualified,
+adapter-compatible arms qualify. No API key, account, free model or live
+configuration is created by this example. Enabling/editing waits for a matching
+native tick, including the first tick after startup. A stale snapshot cannot
+fall back to `keep` on a managed free default and bypass admission; it defers
+until the native tick refreshes. Disabling stops new free decisions immediately. Roll back with
+`freeLanes.enabled=false`. The flag-off regression also compares decisions,
+capacity, caps, shadow and persisted state against the absent-feature path.
+
 ## Automatic account plan sizing
 
 No provider/plan-size table is needed. The accounts feed can include credential-attributed
@@ -263,7 +631,15 @@ provider is prefixed-only `devin`/`opencode-go`).
 `/capacity.unservable`
 reports refused `{ model, accountId, emitted }` entries; an absent or invalid
 list leaves old routing unchanged and logs one warning. An empty valid list
-refuses all arms. Families without fleet success history route as capped trials (doer and other roles by default;
+refuses all arms. `/capacity.modelInventory` keeps the raw, canonical and
+emitted spelling of every reported id side by side. `rawIdsByAccount` retains
+which account reported each spelling alongside the combined `rawIds` list.
+It reports per-account served present/absent/unknown and linked
+unscored/unservable/readiness evidence; `counts.unservable` counts models
+with refusal evidence, separately from absent-ID account/model pairs.
+It includes explicit unknown markers for protocol/tool/reasoning compatibility and
+configured-model coverage (other-agent adapter configuration is restricted).
+Reporting only; routing reads nothing from it. Families without fleet success history route as capped trials (doer and other roles by default;
 thinkers never; adapter-gated) until measured success graduates them; reactive accounts (vendor publishes no
 meter) require health and fresh ready credential evidence. Shadow decisions are recorded event-time
 from `agent.run.started` when the resolver is absent, and run->account
@@ -632,6 +1008,86 @@ report `floor` (and `floorBlocked: true` while suspended); the body carries
 `reservedFloors` (per-agent floor, applied, blocked) and `floorsSuspended`
 for audit. Weak calibration (no target) returns `agents: []`.
 
+### Blocking-priority allocation (unreleased, default OFF)
+
+Enable through the plugin's company configuration, not a host scheduler:
+
+```json
+{ "allocation": { "blockingPriority": true } }
+```
+
+With complete native issue-relation data, **new** slots use largest-remainder
+weights `(queued + 1) × (1 + min(100, blockingFanOut)) × priorityWeight`.
+`blockingFanOut` is the union of readable, open cards transitively blocked by
+an agent's assigned `todo`/`in_progress` cards. Duplicate paths, cycles and
+the agent's seed cards do not increase it. Open statuses are `backlog`,
+`todo`, `in_progress`, `in_review` and `blocked`; terminal cards do not count.
+The highest priority among the ready cards supplies `priorityWeight`:
+critical 4, high 3, medium 2, low 1 (unknown priority uses medium).
+Agents without ready-card metadata use multiplier 1. Each agent's new share
+stops at its queued demand (or one idle headroom slot for a running routed
+agent, with neutral priority when its queue is empty); kept agents reserve no
+idle headroom. When an agent or serving pool
+saturates, its excess share is redistributed among remaining eligible agents,
+including agents in other kept pools, rather than leaving usable slots idle.
+
+When routed reviewer admissions are present, shared account subsets need an
+additional resource constraint. That combined path awards whole slots by the
+highest `((queued + 1) × priorityWeight) / (newSlots + 1)` (D'Hondt), where
+`priorityWeight` includes the fan-out multiplier above, with agent-ID ties, testing the full
+funding plan before each award. Flexible assignments are rematched rather than
+consuming a constrained peer's only account. Fractional accounts can combine
+inside one pool, never across unrelated pools. The ordinary-only path retains
+largest-remainder shares; the combined path is not a claim of exact Hamilton
+rounding. A fixed 8192-step search/flow budget bounds difficult multi-pool cases:
+if reached, only the already-proven feasible prefix is returned and `/caps`
+reports `allocation.resourceStatus: "search-limited"`. Such a response can
+conservatively underfill; it never invents a slot to finish the search.
+
+Active mode fits allocations to **both** the rounded integer fleet target and
+`maxTotal`, rather than the legacy below-target burst to the ceiling. Existing
+running counts always survive; if they already exceed a bound, no new slots
+are granted. Kept/pinned agents compete with routed agents before reserving
+pool-constrained shares. Smoothing cannot retain slots beyond the remaining
+target, and a reserved floor that would raise the selected allocation is
+reported blocked instead of overriding the priority decision. The flag does
+not reorder an agent's own queue or preempt running work.
+
+Only the already-declared `issues.read` capability is used. Ready-card reads
+share the ordinary demand cache; three additional status-list reads complete
+the graph once per capacity tick. Active counts and weights share that tick's
+ready-card snapshot; each new tick refreshes it even inside the ordinary demand
+TTL. Concurrent requests share the pending snapshot, including failed attempts.
+The two newest tick snapshots are retained per company so an API request for the
+still-published tick cannot evict the next tick's in-progress snapshot; older
+requests cannot displace those newer entries. The capacity target uses the same
+validated snapshot as active caps. An unavailable graph retains ordinary demand
+refreshes for both the target and caps, as well as the legacy allocator. No
+resolver-hook I/O, new permission, database access, egress or background job is added.
+
+**Host compatibility gate:** the SDK `Issue` type exposes optional `blockedBy`
+and `blocks` arrays, but that does not guarantee they are returned. In the
+host source inspected for this change, `issues.list` omits relations by
+default and `issues.get` enriches labels/watchdogs only. The SDK list input
+also does not expose/forward the server's `includeBlockedBy` option. This host
+therefore **cannot activate** the weighting using `issues.read` alone. The
+plugin requires a nonempty open-card snapshot with a complete `blockedBy`
+direction (or a complete `blocks` direction) whose entries have nonempty string
+IDs. If both directions are complete, their readable open edges must agree.
+It never treats absent or malformed fields, contradictory directions, or an
+empty snapshot as proof of native relation support. Do not enable expecting an operational improvement until
+a native SDK/host contract supplies those fields. No core patch or undeclared
+RPC parameter is used to bypass this gate.
+
+When requested, `/caps` reports `allocation.blockingPriority: true` only when
+the snapshot is usable, with per-agent `allocationPriority` containing
+`blockingFanOut`, `cardPriority` and `weight`. Failed reads or unavailable
+relation arrays report `allocation: { blockingPriority: false,
+error: "priority-unavailable" }` and retain the **exact legacy allocation**.
+The existing demand-read failure still returns `capsError: issues-unavailable`
+and no recommendation. Setting the flag to false (or omitting it) makes no
+additional reads and preserves the existing response shape and allocation.
+
 ### Reserved per-agent floors
 
 `caps.reservedFloors` maps an agent id to `{ base, perQueued, max }`, empty
@@ -737,6 +1193,39 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   1 or 2 that can hold arrivals for up to two hours, longer than the host's
   deferral budget; `/capacity` shows `inFlight` against `cap` so it is
   visible. The guard errs towards spending less, never more.
+
+### Deferral-exhaustion
+
+The host clamps a plugin defer to [1s, 60s] and retries a deferred run as a
+new run under a new id up to 12 times (`RUN_MODEL_RESOLVE_MAX_ATTEMPTS`),
+then freezes the card. The per-runId deferred marks above therefore reset
+every retry and can never see the chain end. `exhaustion.enabled`
+(default `false`) counts consecutive **capacity** deferrals per issue+agent
+instead, but only when both stable identifiers are present; calls without
+one never share a synthetic streak. Stale credential-snapshot deferrals are
+an evidence wait rather than capacity pressure and do not consume this
+budget. From `exhaustion.finalAnswerFromAttempt` (default 11, 1-based) the
+hook stops deferring and answers with the cheapest selectable free-overflow
+arm (free-cost providers first, then trial arms, then the lowest burn), else
+a bounded keep on the agent default model. Every non-defer answer, including
+an exhaustion recovery, clears the streak so a later retry chain earns a new
+grace period.
+
+Only the pace-guard pool cap and the transient 5h reserve are relaxed at
+exhaustion. Never bypassed -- for either a selected arm or bounded keep --
+are trial role/adapter/family gates, credential readiness, the arm breaker,
+role exclusions, the review reserve, known metered-headroom evidence,
+reactive in-flight caps, and metered plan position. A healthy
+admission-excluded account is never selected; a spent weekly meter and a
+metered pool ahead of plan are never selected. The keep is allowed only when
+the default model's serving account passes those hard gates; for
+non-review runs it also cannot use a review-reserve-held account. Otherwise
+the hook keeps deferring (strand rather than burn excluded, exhausted, or
+held quota). The reviewer pace-hold defer answers the same way from the
+final attempt. Decisions record `deferral-exhausted: <prior reason> ->
+<arm|kept model>`; a failed scan appends per-account skip reasons to the
+defer reason. With `enabled: false`, terminal defers retain their existing
+behavior. Memory-only, no new capability, egress, secret or env key.
 
 ### Review reserve
 
