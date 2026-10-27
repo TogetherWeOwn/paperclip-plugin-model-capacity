@@ -112,6 +112,9 @@ import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSu
 import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
 import { validateReviewDemand, normalizeReviewDemand, createReviewDemandReader } from './review-demand.mjs';
 import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps, paidTrialLedger } from './free-lanes.mjs';
+import {
+  FAILURE_CLUSTER_STATE_KEY, evaluateClusters, normalizeClusterState, updateFailureClusters,
+} from './failure-clusters.mjs';
 
 const NS = 'model-capacity';
 const AA_KEY = 'aa-snapshot-v1';
@@ -523,6 +526,25 @@ export function validateConfigShape(raw) {
       }
     }
   }
+  // Failure-cluster alerts are a strict opt-in: enabled requires an explicit
+  // assignee agent id, otherwise the block is inert (zero issue writes).
+  const fc = raw.failureClusterAlert;
+  if (fc != null) {
+    if (typeof fc !== 'object' || Array.isArray(fc)) {
+      errors.push('failureClusterAlert must be an object');
+    } else {
+      if ('enabled' in fc && typeof fc.enabled !== 'boolean') errors.push('failureClusterAlert.enabled must be a boolean');
+      if ('assigneeAgentId' in fc && typeof fc.assigneeAgentId !== 'string') {
+        errors.push('failureClusterAlert.assigneeAgentId must be a string');
+      }
+      for (const key of Object.keys(fc)) {
+        if (key !== 'enabled' && key !== 'assigneeAgentId') errors.push(`failureClusterAlert.${key} is not a known key`);
+      }
+      if (fc.enabled === true && !(typeof fc.assigneeAgentId === 'string' && fc.assigneeAgentId.length > 0)) {
+        errors.push('failureClusterAlert.assigneeAgentId is required when enabled');
+      }
+    }
+  }
   return errors;
 }
 
@@ -671,6 +693,17 @@ export function resolveConfig(raw = {}) {
     enforce: raw.enforce === true,
     credentialReadiness: {
       enforce: raw.credentialReadiness?.enforce === true,
+    },
+    // Failure-cluster alerts: fail closed. Enabled only when the operator
+    // explicitly sets enabled:true with a non-empty assignee agent id;
+    // anything else performs zero issue writes (no state I/O either).
+    failureClusterAlert: {
+      enabled: raw.failureClusterAlert?.enabled === true
+        && typeof raw.failureClusterAlert?.assigneeAgentId === 'string'
+        && raw.failureClusterAlert.assigneeAgentId.length > 0,
+      assigneeAgentId: typeof raw.failureClusterAlert?.assigneeAgentId === 'string'
+        ? raw.failureClusterAlert.assigneeAgentId
+        : '',
     },
     // Trial lanes and arms: families without fleet success history route
     // through adapters that opt in for roles that opt in (default doer +
@@ -1045,6 +1078,63 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return { pools, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
+  // Failure-cluster single-flight: event ingestion and the per-minute tick
+  // share one chain per company so persisted counters, transition
+  // signatures and singleton writes serialize (duplicate/out-of-order
+  // delivery stays safe, restarts resume from ctx.state).
+  const clusterChains = new Map(); // companyId -> Promise
+  const chainCluster = (companyId, fn) => {
+    const prev = clusterChains.get(companyId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    clusterChains.set(companyId, next.catch(() => {}));
+    return next;
+  };
+  // Per-minute cluster maintenance (exits, write retries). Fully contained:
+  // it never throws, and the job callback runs it even when the shadow tick
+  // itself fails, so a troubled feed cannot stall alert exits.
+  const runClusterMaintenance = async (companyId) => {
+    const alert = lastConfig.get(companyId)?.failureClusterAlert;
+    if (!alert || alert.enabled !== true) return;
+    try {
+      await chainCluster(companyId, () => updateFailureClusters({
+        ctx,
+        companyId,
+        alert: lastConfig.get(companyId)?.failureClusterAlert,
+        nowMs: clock(),
+        event: null,
+        stateKey: scopeKey,
+      }));
+    } catch (error) {
+      ctx.logger.error('model-capacity: failure-cluster maintenance failed', { companyId, error: error?.message ?? String(error) });
+    }
+  };
+  // Aggregate cluster status for health: per enabled company, the active
+  // accounts with counts plus any unresolved alert-write error. Counts and
+  // account keys only; never run payloads or secrets.
+  const summarizeFailureClusters = async () => {
+    const nowMs = clock();
+    const companies = [];
+    let activeTotal = 0;
+    let writeErrors = 0;
+    for (const companyId of [...configured].sort()) {
+      const alert = lastConfig.get(companyId)?.failureClusterAlert;
+      if (!alert || alert.enabled !== true) continue;
+      let state;
+      try {
+        state = normalizeClusterState(await ctx.state.get(scopeKey(companyId, FAILURE_CLUSTER_STATE_KEY)));
+      } catch {
+        continue;
+      }
+      const evalResult = evaluateClusters(state, nowMs);
+      const counts = {};
+      for (const account of evalResult.active) counts[account] = evalResult.accounts[account].count;
+      const writeError = state.lastWriteError !== null;
+      if (evalResult.active.length > 0) activeTotal += evalResult.active.length;
+      if (writeError) writeErrors += 1;
+      companies.push({ companyId, active: evalResult.active, counts, writeError });
+    }
+    return { activeTotal, writeErrors, summary: { activeClusters: activeTotal, writeErrors, companies } };
+  };
   const caches = new Map(); // companyId -> { identity, cache }
   const configRevisions = new Map(); // companyId -> { generation, identity, policyIdentity, policyGeneration }
   // Config contains secret references, never resolved secret values. Canonical
@@ -5868,11 +5958,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (results.some(r => r.status === 'rejected')) throw new Error('aa-refresh-failed');
       });
       ctx.jobs.register('shadow-tick', async job => {
-        const results = await Promise.allSettled([...configured].sort().map(companyId =>
-          runShadowTick(companyId, job).catch(error => {
+        const results = await Promise.allSettled([...configured].sort().map(async companyId => {
+          try {
+            await runShadowTick(companyId, job);
+          } catch (error) {
             ctx.logger.error('model-capacity: shadow tick failed', { companyId, error: error?.message ?? String(error) });
             throw error;
-          })));
+          } finally {
+            await runClusterMaintenance(companyId);
+          }
+        }));
         if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
       });
       // Run facts come from agent.run.* events only (started, finished,
@@ -5927,6 +6022,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         st.lastAtMs = entry.at;
         st.lastRunId = entry.runId;
         runEventStats.set(companyId, st);
+        // Alert-only failure-cluster ingest (failed events only, opt-in
+        // only). Contained: a cluster failure must never break the ledger
+        // or the event-time shadow path above.
+        if (status === 'failed' && lastConfig.get(companyId)?.failureClusterAlert?.enabled === true) {
+          try {
+            await chainCluster(companyId, () => updateFailureClusters({
+              ctx,
+              companyId,
+              alert: lastConfig.get(companyId).failureClusterAlert,
+              nowMs: clock(),
+              event,
+              stateKey: scopeKey,
+            }));
+          } catch (error) {
+            ctx.logger.error('model-capacity: failure-cluster ingest failed', { companyId, error: error?.message ?? String(error) });
+          }
+        }
         // Event-time shadow decision (memory-only; see
         // recordEventTimeShadow): covers runs that start when the resolver
         // is absent, so the ledger has no minute-long blind spot.
@@ -5982,15 +6094,32 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const enforcing = [...enforceCompanies].filter(c => configured.has(c)).length;
       // A build that did not pin a real lane host cannot read the feed.
       const laneHostPinned = !isPlaceholderLaneHost();
-      return {
-        status: configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok',
-        message: !laneHostPinned
-          ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
-          : enforcing > 0
-            ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
-            : 'Shadow only; no runs are changed.',
-        details: { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id },
-      };
+      const baseStatus = configured.size === 0 || !laneHostPinned ? 'degraded' : 'ok';
+      const baseMessage = !laneHostPinned
+        ? 'Lane host not pinned by this build (public placeholder); lane reads cannot succeed.'
+        : enforcing > 0
+          ? `Enforcing run models for ${enforcing} of ${configured.size} companies; the rest stay shadow.`
+          : 'Shadow only; no runs are changed.';
+      const baseDetails = { configuredCompanies: configured.size, enforcingCompanies: enforcing, laneHostPinned, manifest: manifest.id };
+      // Failure-cluster health (opt-in companies only): error while any
+      // cluster is active or an alert write is failing. Best-effort reads:
+      // an unreadable company is skipped, never fatal to health itself.
+      let clusters = null;
+      if (ctx && typeof ctx.state?.get === 'function') {
+        try {
+          clusters = await summarizeFailureClusters();
+        } catch {
+          clusters = null;
+        }
+      }
+      if (clusters !== null) baseDetails.failureClusters = clusters.summary;
+      if (clusters !== null && (clusters.activeTotal > 0 || clusters.writeErrors > 0)) {
+        const parts = [];
+        if (clusters.activeTotal > 0) parts.push(`${clusters.activeTotal} failure cluster${clusters.activeTotal === 1 ? '' : 's'} active`);
+        if (clusters.writeErrors > 0) parts.push(`${clusters.writeErrors} alert write${clusters.writeErrors === 1 ? '' : 's'} failing`);
+        return { status: 'error', message: `${parts.join('; ')}. ${baseMessage}`, details: baseDetails };
+      }
+      return { status: baseStatus, message: baseMessage, details: baseDetails };
     },
 
     async onApiRequest(input) {

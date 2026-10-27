@@ -106,6 +106,24 @@
  *   reasoning compatibility and configured-model coverage (other-agent
  *   adapter configuration is restricted). Pure reporting; routing reads
  *   nothing from it. No capability, egress, secret or env-key change.
+ * v0.2.71 = ALERT-ONLY FAILURE-CLUSTER DETECTOR: failed-run events feed
+ *   per-account counters in plugin state; >= 3 allowlisted failures for one
+ *   account inside a 15-minute event-time window creates/updates exactly one
+ *   stable-origin managed alert issue (transition-only writes, never per
+ *   run) and reports error through plugin health until the cluster clears.
+ *   Opt-in via `failureClusterAlert` (disabled by default; writes only with
+ *   an explicit assignee agent id). Alert-only: no disabling, no routing
+ *   change, no enforce-flag touch. Adds exactly `issues.create` +
+ *   `issues.update` (create/update field allowlists + ownership checks in
+ *   failure-clusters.mjs); no other capability, egress, secret or env key.
+ * v0.2.72 = POLICY-CACHE INVALIDATION ON CONFIG CHANGE: per-company config
+ *   generations fence the cached routing policy; a source replacement at
+ *   unchanged TTL refetches, a config change retires the live view (the
+ *   resolve hook defers instead of routing on a stale snapshot), and a late
+ *   old-generation tick cannot publish. Cache hits never refresh source
+ *   observation time or extend evidence/authorization expiry. Company and
+ *   source identity isolate entries. No capability, egress, secret or
+ *   env-key change.
  * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
  *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
  *   never the bare id CLIProxy 400s or routes to another provider);
@@ -367,7 +385,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.70';
+export const PLUGIN_VERSION = '0.2.72';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -735,6 +753,14 @@ const CONFIG_SCHEMA = {
         enforce: { type: 'boolean', default: false },
       },
     },
+    failureClusterAlert: {
+      type: 'object', additionalProperties: false,
+      description: 'Alert-only failure-cluster detector (default off). When enabled with an assignee agent id, >= 3 allowlisted failures for one account inside 15 minutes creates/updates one managed alert issue and reports error through health until the cluster clears. Disabled or unassigned: zero issue writes.',
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        assigneeAgentId: { type: 'string', default: '' },
+      },
+    },
     exhaustion: {
       type: 'object', additionalProperties: false,
       description: 'Deferral-exhaustion (Design B): the host retries a deferred run as a new runId up to 12 times and then freezes the card. When enabled, the hook stops deferring on the last attempts of the chain (default from attempt 11) and answers with the cheapest selectable free-overflow arm under the existing trial caps, else a bounded keep; metered pools ahead of plan are never selected. Disabled (default): every terminal still defers, exactly as before.',
@@ -905,6 +931,13 @@ export function buildManifest({ modelResolve = false } = {}) {
     // PLUGIN_CAPABILITIES enum, so an unknown one rejects the whole manifest.
     // The queued-run read below stays optional and degrades to running-only.
     'issues.read',
+    // Alert-only failure-cluster singleton (v0.2.71): create/update exactly
+    // one stable-origin managed alert issue on cluster transitions. Gated by
+    // the disabled-by-default `failureClusterAlert` block, field allowlists
+    // and per-write ownership checks (see failure-clusters.mjs). No comment,
+    // checkout, wakeup, interaction, document or relation writes.
+    'issues.create',
+    'issues.update',
     'api.routes.register',
     // No database capabilities: run facts come from SDK surfaces only
     // (agent.run.* events, issues.get, agents.get, the host-aggregated
