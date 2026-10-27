@@ -51,6 +51,8 @@ async function harness() {
   const events = new Map();
   const requests = [];
   const writes = [];
+  const agentModels = new Map();
+  let agentGate = null;
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup({
     config: { get: async companyId => structuredClone(configs.get(companyId)) },
@@ -85,7 +87,16 @@ async function harness() {
       }
       return { status, json: async () => structuredClone(body) };
     } },
-    agents: { get: async () => null },
+    agents: { get: async agentId => {
+      if (agentGate && agentGate.agentId === agentId) {
+        const gate = agentGate;
+        agentGate = null;
+        gate.started.resolve();
+        await gate.released.promise;
+      }
+      const model = agentModels.get(agentId);
+      return model ? { adapterConfig: { model } } : null;
+    } },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },
     events: { on: (name, fn) => { events.set(name, fn); } },
@@ -100,6 +111,12 @@ async function harness() {
     gateNextFetch(companyId, ref) {
       const gate = { started: Promise.withResolvers(), released: Promise.withResolvers() };
       sources.get(sourceKey(companyId, ref)).gate = gate;
+      return { started: gate.started.promise, release: gate.released.resolve };
+    },
+    setAgentModel: (agentId, model) => { agentModels.set(agentId, model); },
+    gateNextAgentGet(agentId) {
+      const gate = { agentId, started: Promise.withResolvers(), released: Promise.withResolvers() };
+      agentGate = gate;
       return { started: gate.started.promise, release: gate.released.resolve };
     },
     async configure(raw, companyId = 'acme') {
@@ -120,8 +137,8 @@ async function harness() {
       assert.equal(response.status, 200);
       return response.body;
     },
-    hook: (runId, companyId = 'acme') => plugin.onResolveRunModel({
-      runId, companyId, agentId: 'worker-1', adapterType: 'claude-code', deadlineMs: 1500,
+    hook: (runId, companyId = 'acme', agentId = 'worker-1') => plugin.onResolveRunModel({
+      runId, companyId, agentId, adapterType: 'claude-code', deadlineMs: 1500,
     }),
     startRun: (runId, companyId = 'acme') => events.get('agent.run.started')({
       type: 'agent.run.started', companyId, entityId: runId,
@@ -393,3 +410,162 @@ for (const [name, invalidateEvidence] of [
     }, { hook: 'defer', eventDecided: false, alarm: true });
   });
 }
+
+// Fence pins: each test below parks or yields at one specific invalidation
+// guard so that deleting that guard alone turns the test red, even though
+// the neighbouring guards return the same outward answer.
+const INVALIDATED = {
+  kind: 'defer', retryAfterMs: 60000,
+  reason: 'routing snapshot invalidated by configuration change',
+};
+const decidedRunIds = async d => (await d.api('shadow')).entries.map(row => row.runId);
+
+test('policy cache: an equivalent re-save with reordered passthrough keys does not invalidate the live view', async () => {
+  const d = await harness();
+  d.feed('acme', SECRET_A, lane());
+  await d.configure(config());
+  await d.tick();
+  assert.equal((await d.hook('before-resave')).kind, 'decide');
+
+  // Same values, different key order in the objects config resolution
+  // passes through untouched (the secret reference and the arm entries).
+  const reordered = config();
+  reordered.cliproxy.laneKeySecretRef = {
+    version: SECRET_A.version, secretId: SECRET_A.secretId, type: SECRET_A.type,
+  };
+  reordered.armMap = reordered.armMap.map(entry => ({
+    providers: entry.providers, family: entry.family, effort: entry.effort,
+    model: entry.model, aaSlug: entry.aaSlug,
+  }));
+  await d.configure(reordered);
+  assert.equal((await d.hook('after-resave')).kind, 'decide',
+    'key order alone must not retire the published view');
+  await d.tick();
+  assert.equal((await d.hook('after-resave-tick')).kind, 'decide');
+  assert.equal(d.requests.length, 1,
+    'key order alone must not drop the cached source evidence');
+});
+
+test('policy cache: a policy-only change while the resolver joins the ledger defers without recording', { timeout: 5000 }, async () => {
+  const d = await harness();
+  d.feed('acme', SECRET_A, lane());
+  await d.configure(config());
+  await d.tick();
+  assert.equal((await d.hook('warm-resolver')).kind, 'decide');
+
+  // Policy-only change (enforce stays on, the live budget would still
+  // admit): only the post-ledger currency fence can stop this run.
+  const changed = config();
+  changed.trials.maxInFlightPerAccount = 99;
+  let configuring;
+  const pending = d.hook('resolver-policy-race');
+  // Land the change after the hook passed its early fences and is parked
+  // on the ledger join: the hook's first continuation runs before this
+  // microtask, the ledger continuation runs after it.
+  queueMicrotask(() => { configuring = d.configure(changed); });
+  const result = await pending;
+  await configuring;
+  assert.deepEqual(result, INVALIDATED);
+  await d.tick();
+  assert.ok(!(await decidedRunIds(d)).includes('resolver-policy-race'),
+    'a resolve invalidated at the ledger join records no decision');
+});
+
+test('policy cache: a policy change while reviewer routing joins the ledger defers without recording', { timeout: 5000 }, async () => {
+  const reviewerConfig = () => {
+    const raw = config();
+    raw.roles.keepAgentIds = ['reviewer-1'];
+    raw.reviewerRouting = {
+      agentIds: ['reviewer-1'],
+      arms: [{ provider: 'partner', model: MODEL_A, effort: 'max' }],
+    };
+    return raw;
+  };
+  const d = await harness();
+  d.feed('acme', SECRET_A, lane());
+  await d.configure(reviewerConfig());
+  await d.tick();
+  assert.equal((await d.hook('warm-reviewer', 'acme', 'reviewer-1')).kind, 'decide',
+    'the reviewer arm must route before the race, or the pin proves nothing');
+  await d.tick();
+  assert.ok((await decidedRunIds(d)).includes('warm-reviewer'));
+
+  // The reviewer path yields on its ledger join before it records. The
+  // configure call below applies synchronously (before that continuation
+  // runs), so only the reviewer-route currency fence can stop the record;
+  // the outer hook fence would return the same defer either way.
+  const changed = reviewerConfig();
+  changed.trials.maxInFlightPerAccount = 99;
+  const pending = d.hook('reviewer-policy-race', 'acme', 'reviewer-1');
+  await d.configure(changed);
+  const result = await pending;
+  assert.deepEqual(result, INVALIDATED);
+  await d.tick();
+  assert.ok(!(await decidedRunIds(d)).includes('reviewer-policy-race'),
+    'a reviewer route invalidated at its ledger join records no decision');
+});
+
+test('policy cache: a policy change while a kept decision joins the ledger records nothing', { timeout: 5000 }, async () => {
+  const keptConfig = keepAgentIds => {
+    const raw = config();
+    raw.roles.keepAgentIds = keepAgentIds;
+    return raw;
+  };
+  const d = await harness();
+  d.feed('acme', SECRET_A, lane());
+  d.setAgentModel('kept-1', MODEL_A);
+  await d.configure(keptConfig(['kept-1']));
+  await d.tick();
+  assert.equal((await d.hook('warm-kept', 'acme', 'kept-1')).kind, 'keep');
+  await d.tick();
+  assert.ok((await decidedRunIds(d)).includes('warm-kept'),
+    'a kept run must record before the race, or the pin proves nothing');
+
+  // Land the change after the hook passed its early fences and entered
+  // the kept branch, while the kept recording is parked on its ledger
+  // join: the hook's first continuation runs before this microtask, the
+  // kept-recording continuation runs after it. The outer hook fence
+  // returns the same defer either way; only the kept fence stops the
+  // ledger record.
+  let configuring;
+  const pending = d.hook('kept-policy-race', 'acme', 'kept-1');
+  queueMicrotask(() => { configuring = d.configure(keptConfig([])); });
+  const result = await pending;
+  await configuring;
+  assert.deepEqual(result, INVALIDATED);
+  await d.tick();
+  assert.ok(!(await decidedRunIds(d)).includes('kept-policy-race'),
+    'a kept decision invalidated at its ledger join records nothing');
+});
+
+test('policy cache: a policy change parked in kept-agent resolution cannot publish the old live view', { timeout: 5000 }, async () => {
+  const d = await harness();
+  d.feed('acme', SECRET_A, lane());
+  const original = config();
+  original.roles.keepAgentIds = ['kept-1'];
+  await d.configure(original);
+  await d.tick();
+  assert.equal((await d.hook('occupies-new-budget')).kind, 'decide');
+
+  // Park the tick in the kept-agent model resolution that runs after
+  // every earlier superseded check and before the live view publishes.
+  // Changing policy in that window leaves only the pre-publish fence
+  // between the old-policy view and the hook.
+  const gate = d.gateNextAgentGet('kept-1');
+  const pending = d.tick();
+  try {
+    await gate.started;
+    const changed = structuredClone(original);
+    changed.trials.maxInFlightPerAccount = 1;
+    await d.configure(changed);
+  } finally {
+    gate.release();
+    await pending;
+  }
+  assert.equal((await d.hook('after-parked-tick')).kind, 'defer',
+    'no live view built from the old policy may decide after the change');
+  await d.startRun('after-parked-tick-event');
+  await d.tick();
+  assert.ok(!(await decidedRunIds(d)).includes('after-parked-tick-event'),
+    'the event path must not decide from the unpublished old view either');
+});
