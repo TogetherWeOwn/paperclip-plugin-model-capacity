@@ -1506,9 +1506,48 @@ order whenever they would invert it), and `requiredRatePerHour` is a
 number whenever remaining% and reset are both known -- null (unknown)
 otherwise, never a silent zero.
 
+## Failure-cluster alerts (default off)
+
+Failed-run events feed per-account counters in plugin state. When at
+least 3 allowlisted failures (`claude_auth_required`,
+`claude_transient_upstream`, `adapter_failed`) for one account land
+inside a 15-minute event-time window, the detector creates or updates
+exactly one stable-origin managed alert issue and reports `error`
+through plugin health until the cluster clears:
+
+```json
+"failureClusterAlert": { "enabled": true, "assigneeAgentId": "<devops-agent-id>" }
+```
+
+Disabled (default) or unassigned means zero issue writes. Alert-only:
+transition writes (cluster enter/exit/count-band escalation or de-escalation) on one
+singleton issue, never per-run writes, never disables anything, never
+touches routing or the `enforce` flag. The predicate counts only
+`status: failed` (`timed_out` excluded) with the account extracted from
+the model-decision reason (` on provider:account`). Note the window
+runs over event time (failure time, else publish time), not run
+creation time, so comparisons against a creation-time poll are
+normalized-cluster comparisons, never identical. Adds exactly
+`issues.create` + `issues.update`, with create/update field allowlists
+and per-write ownership checks.
+
+Undelivered transitions persist as one bounded pending snapshot (including
+up to 10 recent transitions), independent of the live event window. If
+issue writes fail through an entire cluster episode, recovery writes a
+cleared catch-up record with its enter/exit history instead of losing the
+alert. Retries use the same rendered content until the next material
+transition, and health keeps reporting a write error until reconciliation
+or delivery succeeds. Queued maintenance re-reads the current alert config
+before starting, so disabling the detector also stops queued passes.
+Timestamp fallback picks the first parseable failure/publish time before
+using receipt time. Missing run identifiers count separately and render as
+`unknown`; deduplication requires a real identifier (replayed identifier-less
+events cannot be distinguished).
+
 ## Layout
 
 - `src/manifest.mjs` -- shadow-default manifest, opt-in `enforceManifest`, `buildManifest` variant flag
+- `src/failure-clusters.mjs` -- alert-only failure-cluster detector: event-time counters, transition evaluation, singleton reconciliation
 - `src/cliproxy.mjs`, `src/aa.mjs` -- edge clients (pure + guards)
 - `src/lane-host.mjs` -- build-time lane host pin (public placeholder; replaced at package build)
 - `scripts/check-public-pin.mjs` -- CI-only: fails if the committed pin is not the placeholder (not shipped; an overlaid build fails it by design)
