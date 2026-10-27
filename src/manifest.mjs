@@ -116,6 +116,14 @@
  *   change, no enforce-flag touch. Adds exactly `issues.create` +
  *   `issues.update` (create/update field allowlists + ownership checks in
  *   failure-clusters.mjs); no other capability, egress, secret or env key.
+ * v0.2.72 = POLICY-CACHE INVALIDATION ON CONFIG CHANGE: per-company config
+ *   generations fence the cached routing policy; a source replacement at
+ *   unchanged TTL refetches, a config change retires the live view (the
+ *   resolve hook defers instead of routing on a stale snapshot), and a late
+ *   old-generation tick cannot publish. Cache hits never refresh source
+ *   observation time or extend evidence/authorization expiry. Company and
+ *   source identity isolate entries. No capability, egress, secret or
+ *   env-key change.
  * v0.2.66 = synthetic.new lanes, spent at their regeneration rate:
  *   synthetic / synthetic-infinite are prefixed-only (emit synthetic/<id>,
  *   never the bare id CLIProxy 400s or routes to another provider);
@@ -377,7 +385,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.71';
+export const PLUGIN_VERSION = '0.2.72';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

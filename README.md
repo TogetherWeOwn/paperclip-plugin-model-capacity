@@ -442,6 +442,20 @@ real traffic follows that budget only with quota-aware credential selection in t
 Plain round-robin cannot guarantee per-account traffic shares. This release neither
 modifies proxy strategy nor redeploys it.
 
+## Routing cache lifecycle
+
+Lane snapshots are isolated by company and resolved source configuration, including
+endpoint, path, secret reference and TTL. Changing a source at the same TTL cannot
+reuse its previous snapshot. Cache hits preserve the original source observation
+and credential expiry; a tick does not make old evidence fresh.
+
+Accepted policy/source changes retire the derived routing view until a compatible
+tick publishes. During that gap, enforced routing defers rather than treating a
+missing cache as permission to run. Explicit issue model overrides and the existing
+enforcement-switch semantics remain unchanged. Config generations fence outstanding
+reads and late view publication, including a change away from and back to an earlier
+policy. This uses the existing plugin jobs, not agent wakes or a second scheduler.
+
 ## Credit pools (free grants and allowed paid types)
 
 A weekly-spent account is normally excluded until its window resets. Providers
