@@ -1531,6 +1531,19 @@ normalized-cluster comparisons, never identical. Adds exactly
 `issues.create` + `issues.update`, with create/update field allowlists
 and per-write ownership checks.
 
+Undelivered transitions persist as one bounded pending snapshot (including
+up to 10 recent transitions), independent of the live event window. If
+issue writes fail through an entire cluster episode, recovery writes a
+cleared catch-up record with its enter/exit history instead of losing the
+alert. Retries use the same rendered content until the next material
+transition, and health keeps reporting a write error until reconciliation
+or delivery succeeds. Queued maintenance re-reads the current alert config
+before starting, so disabling the detector also stops queued passes.
+Timestamp fallback picks the first parseable failure/publish time before
+using receipt time. Missing run identifiers count separately and render as
+`unknown`; deduplication requires a real identifier (replayed identifier-less
+events cannot be distinguished).
+
 ## Layout
 
 - `src/manifest.mjs` -- shadow-default manifest, opt-in `enforceManifest`, `buildManifest` variant flag

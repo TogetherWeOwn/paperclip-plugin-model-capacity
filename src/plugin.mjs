@@ -1099,7 +1099,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       await chainCluster(companyId, () => updateFailureClusters({
         ctx,
         companyId,
-        alert,
+        alert: lastConfig.get(companyId)?.failureClusterAlert,
         nowMs: clock(),
         event: null,
         stateKey: scopeKey,

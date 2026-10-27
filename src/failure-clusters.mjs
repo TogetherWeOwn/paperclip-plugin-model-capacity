@@ -120,11 +120,11 @@ export function extractClusterSignal(event, nowMs) {
   const account = typeof reasonText === 'string' ? (reasonText.match(ACCOUNT_PATTERN)?.[1] ?? null) : null;
   if (account === null) return { qualifying: false, reason: 'account-not-extracted' };
 
-  const atMs = parseTimeMs(firstString([
+  const atMs = [
     payload.finishedAt, payload.finished_at, run.finishedAt, run.finished_at, event?.occurredAt,
-  ])) ?? nowMs;
+  ].map(parseTimeMs).find(ms => ms !== null) ?? nowMs;
   const clampedAtMs = atMs > nowMs || atMs < 0 ? nowMs : atMs;
-  const runId = firstString([event?.entityId, payload.runId, payload.run_id, run.id, run.runId, payload.id]) ?? 'unknown';
+  const runId = firstString([event?.entityId, payload.runId, payload.run_id, run.id, run.runId, payload.id]);
   return { qualifying: true, account, errorCode, atMs: clampedAtMs, runId };
 }
 
@@ -139,6 +139,7 @@ export function emptyClusterState() {
     lastWriteError: null,
     lastWriteAttemptMs: 0,
     transitions: [],
+    pendingWrite: null,
   };
 }
 
@@ -154,30 +155,15 @@ export function normalizeClusterState(raw) {
       const events = [];
       for (const evt of entry.events) {
         if (!evt || typeof evt !== 'object') continue;
-        if (typeof evt.runId !== 'string' || typeof evt.atMs !== 'number' || !Number.isFinite(evt.atMs)) continue;
+        if ((evt.runId !== null && typeof evt.runId !== 'string') || typeof evt.atMs !== 'number' || !Number.isFinite(evt.atMs)) continue;
         if (typeof evt.errorCode !== 'string') continue;
         events.push({ runId: evt.runId, atMs: evt.atMs, errorCode: evt.errorCode });
       }
       accounts[account] = { events };
     }
   }
-  const prevBands = {};
-  if (raw.prevBands && typeof raw.prevBands === 'object' && !Array.isArray(raw.prevBands)) {
-    for (const [account, band] of Object.entries(raw.prevBands)) {
-      if (typeof account === 'string' && typeof band === 'string') prevBands[account] = band;
-    }
-  }
-  const transitions = [];
-  if (Array.isArray(raw.transitions)) {
-    for (const entry of raw.transitions) {
-      if (!entry || typeof entry !== 'object' || typeof entry.atMs !== 'number' || !Number.isFinite(entry.atMs)) continue;
-      if (typeof entry.type !== 'string' || !Array.isArray(entry.accounts)) continue;
-      const accountsList = entry.accounts
-        .filter(a => a && typeof a === 'object' && typeof a.account === 'string' && typeof a.count === 'number')
-        .map(a => ({ account: a.account, count: a.count }));
-      transitions.push({ atMs: entry.atMs, type: entry.type, accounts: accountsList });
-    }
-  }
+  const prevBands = normalizeBands(raw.prevBands);
+  const transitions = normalizeTransitions(raw.transitions);
   return {
     version: 1,
     accounts,
@@ -192,6 +178,42 @@ export function normalizeClusterState(raw) {
       ? raw.lastWriteAttemptMs
       : 0,
     transitions,
+    pendingWrite: normalizePendingWrite(raw.pendingWrite),
+  };
+}
+
+function normalizeBands(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).filter(([, band]) => typeof band === 'string'));
+}
+
+function normalizeTransitions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const transitions = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || typeof entry.atMs !== 'number' || !Number.isFinite(entry.atMs)) continue;
+    if (typeof entry.type !== 'string' || !Array.isArray(entry.accounts)) continue;
+    const accounts = entry.accounts
+      .filter(a => a && typeof a === 'object' && typeof a.account === 'string' && typeof a.count === 'number' && Number.isFinite(a.count))
+      .map(a => ({ account: a.account, count: a.count }));
+    transitions.push({ atMs: entry.atMs, type: entry.type, accounts });
+  }
+  return transitions.slice(-FAILURE_CLUSTER_MAX_TRANSITIONS);
+}
+
+function normalizePendingWrite(raw) {
+  const desired = raw?.desired;
+  if (!raw || !Array.isArray(raw.active) || !desired
+    || typeof desired.title !== 'string' || typeof desired.description !== 'string'
+    || !['in_progress', 'done'].includes(desired.status) || !['high', 'medium'].includes(desired.priority)) return null;
+  const active = raw.active.filter(a => typeof a === 'string');
+  const bands = normalizeBands(raw.bands);
+  return {
+    active,
+    bands,
+    sig: transitionSig(active, bands),
+    transitions: normalizeTransitions(raw.transitions),
+    desired: { title: desired.title, description: desired.description, status: desired.status, priority: desired.priority },
   };
 }
 
@@ -294,7 +316,7 @@ export function renderSingleton({ active, accounts, history, nowMs }) {
         .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
         .map(([code, n]) => `${code}x${n}`)
         .join(', ');
-      const runs = summary.runIds.slice(0, 8).join(', ');
+      const runs = summary.runIds.slice(0, 8).map(id => id ?? 'unknown').join(', ');
       lines.push(`- ${account}: ${formatCount(summary.count, summary.capped)} qualifying failures in the last 15m `
         + `(window ${iso(summary.windowStartMs)}-${iso(summary.windowEndMs)}); errors: ${errors}; runs: ${runs}`);
     }
@@ -391,7 +413,7 @@ export async function updateFailureClusters({ ctx, companyId, alert, nowMs, even
     const signal = extractClusterSignal(event, nowMs);
     if (signal.qualifying) {
       const entry = state.accounts[signal.account] ?? { events: [] };
-      if (!entry.events.some(evt => evt.runId === signal.runId)) {
+      if (signal.runId === null || !entry.events.some(evt => evt.runId === signal.runId)) {
         entry.events.push({ runId: signal.runId, atMs: signal.atMs, errorCode: signal.errorCode });
         if (entry.events.length > FAILURE_CLUSTER_MAX_EVENTS_PER_ACCOUNT) {
           entry.events.sort((a, b) => a.atMs - b.atMs);
@@ -402,31 +424,52 @@ export async function updateFailureClusters({ ctx, companyId, alert, nowMs, even
     }
   }
 
-  const evalResult = evaluateClusters(state, nowMs);
+  // Observe transitions against the latest pending snapshot, not just the
+  // last delivered one: an enter followed by an exit during an outage must
+  // remain a catch-up record even after all its events leave the live window.
+  const previous = state.pendingWrite;
+  const evalResult = evaluateClusters(previous
+    ? { ...state, prevActive: previous.active, prevBands: previous.bands }
+    : state, nowMs);
   // Drop accounts whose window emptied so state cannot accumulate dead keys.
   state.accounts = Object.fromEntries(
     Object.entries(state.accounts).filter(([account]) => evalResult.accounts[account] !== undefined),
   );
-
-  if (!evalResult.writeDue) {
-    // State matches the last successful write: a recorded write error can
-    // only refer to a superseded transition, so clear it instead of
-    // reporting stale failure forever.
-    if (state.lastWriteError !== null) {
-      state.lastWriteError = null;
-      await ctx.state.set(key, state);
-      return { action: 'error-cleared', active: evalResult.active };
+  if (evalResult.writeDue) {
+    const history = [...(previous?.transitions ?? state.transitions)];
+    for (const [type, accounts] of [
+      ['enter', evalResult.entered], ['exit', evalResult.exited],
+      ['escalate', evalResult.escalated], ['deescalate', evalResult.deescalated],
+    ]) {
+      if (accounts.length === 0) continue;
+      history.push({ atMs: nowMs, type, accounts: accounts.map(account => ({
+        account, count: evalResult.accounts[account]?.count ?? 0,
+      })) });
     }
-    await ctx.state.set(key, state);
-    return { action: 'noop', active: evalResult.active };
+    const transitions = history.slice(-FAILURE_CLUSTER_MAX_TRANSITIONS);
+    state.pendingWrite = {
+      active: evalResult.active,
+      bands: evalResult.bands,
+      sig: evalResult.sig,
+      transitions,
+      desired: renderSingleton({ active: evalResult.active, accounts: evalResult.accounts, history: transitions, nowMs }),
+    };
   }
-
-  const desired = renderSingleton({
-    active: evalResult.active,
-    accounts: evalResult.accounts,
-    history: state.transitions,
-    nowMs,
-  });
+  // Persist the exact desired content BEFORE issuing a write. Retries keep
+  // its render timestamp stable, including after an ambiguous write response
+  // or a restart. Failed/deferred writes never discard their transition log.
+  await ctx.state.set(key, state);
+  const pending = state.pendingWrite;
+  if (pending === null) return { action: 'noop', active: evalResult.active };
+  const desired = pending.desired;
+  const delivered = () => {
+    state.prevActive = pending.active;
+    state.prevBands = pending.bands;
+    state.lastTransitionSig = pending.sig;
+    state.transitions = pending.transitions;
+    state.lastWriteError = null;
+    state.pendingWrite = null;
+  };
 
   try {
     const existing = await reconcileSingleton({ issues: ctx.issues, companyId, storedIssueId: state.singletonIssueId });
@@ -434,10 +477,7 @@ export async function updateFailureClusters({ ctx, companyId, alert, nowMs, even
     if (existing !== null
       && singletonContentEqual(existing, desired)
       && existing.assigneeAgentId === alert.assigneeAgentId) {
-      state.prevActive = evalResult.active;
-      state.prevBands = evalResult.bands;
-      state.lastTransitionSig = evalResult.sig;
-      state.lastWriteError = null;
+      delivered();
       await ctx.state.set(key, state);
       return { action: 'already-current', active: evalResult.active, issueId: existing.id };
     }
@@ -476,28 +516,11 @@ export async function updateFailureClusters({ ctx, companyId, alert, nowMs, even
       issueId = existing.id;
     }
     state.lastWriteAttemptMs = nowMs;
-    state.lastWriteError = null;
-    state.prevActive = evalResult.active;
-    state.prevBands = evalResult.bands;
-    state.lastTransitionSig = evalResult.sig;
-    const historyEntry = (type, accounts) => ({
-      atMs: nowMs,
-      type,
-      accounts: accounts.map(account => ({
-        account,
-        count: evalResult.accounts[account]?.count ?? 0,
-      })),
-    });
-    if (evalResult.entered.length > 0) state.transitions.push(historyEntry('enter', evalResult.entered));
-    if (evalResult.exited.length > 0) state.transitions.push(historyEntry('exit', evalResult.exited));
-    if (evalResult.escalated.length > 0) state.transitions.push(historyEntry('escalate', evalResult.escalated));
-    if (evalResult.deescalated.length > 0) state.transitions.push(historyEntry('deescalate', evalResult.deescalated));
-    if (state.transitions.length > FAILURE_CLUSTER_MAX_TRANSITIONS) {
-      state.transitions = state.transitions.slice(state.transitions.length - FAILURE_CLUSTER_MAX_TRANSITIONS);
-    }
+    delivered();
     await ctx.state.set(key, state);
     return { action: existing === null ? 'created' : 'updated', active: evalResult.active, issueId };
   } catch (error) {
+    state.pendingWrite = pending;
     state.lastWriteError = { atMs: nowMs, message: String(error?.message ?? error).slice(0, 300) };
     state.lastWriteAttemptMs = nowMs;
     await ctx.state.set(key, state);

@@ -185,6 +185,29 @@ test('event time prefers finishedAt, then publish time, then receipt; future cla
   assert.equal(extractClusterSignal(future, T0).atMs, T0);
 });
 
+test('invalid finishedAt falls through to the first parseable event time', () => {
+  const event = failedEvent({ runId: 'stale', at: T0 - 20 * 60000 });
+  event.payload.finishedAt = 'not-a-time';
+  assert.equal(extractClusterSignal(event, T0).atMs, T0 - 20 * 60000);
+  event.payload.run = { finished_at: new Date(T0 - 1000).toISOString() };
+  assert.equal(extractClusterSignal(event, T0).atMs, T0 - 1000);
+  delete event.entityId;
+  delete event.payload.runId;
+  assert.equal(extractClusterSignal(event, T0).runId, null);
+});
+
+test('invalid finishedAt cannot turn a stale published failure into a cluster', async () => {
+  const store = fakeStore();
+  const issues = fakeIssues();
+  const { run } = driveCtx({ store, issues });
+  await run(failedEvent({ runId: 'fresh-1' }));
+  await run(failedEvent({ runId: 'fresh-2' }));
+  const stale = failedEvent({ runId: 'stale', at: T0 - 20 * 60000 });
+  stale.payload.finishedAt = 'garbage';
+  assert.equal((await run(stale, T0)).action, 'noop');
+  assert.equal(issues.store.size, 0);
+});
+
 // --- evaluation ---
 
 test('threshold boundary: 2 failures idle, the 3rd enters', () => {
@@ -419,6 +442,21 @@ test('duplicate delivery of the same run counts once and writes once', async () 
   assert.deepEqual(issues.calls.update, []);
 });
 
+test('identifier-less failures count separately across reloads; known ids still dedup', async () => {
+  const store = fakeStore();
+  const issues = fakeIssues();
+  const first = driveCtx({ store, issues });
+  await first.run(failedEvent({ runId: 'known' }));
+  await first.run(failedEvent({ runId: 'known' }));
+  await first.run(failedEvent());
+  const second = driveCtx({ store, issues });
+  assert.equal((await second.run(failedEvent())).action, 'created');
+  const state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
+  assert.deepEqual(state.accounts[ACCT].events.map(e => e.runId), ['known', null, null]);
+  assert.equal(issues.calls.create.length, 1);
+  assert.match(issues.calls.create[0].description, /runs: known, unknown, unknown/);
+});
+
 test('out-of-order late events still count inside the window', async () => {
   const store = fakeStore();
   const issues = fakeIssues();
@@ -610,20 +648,71 @@ test('write failure records, backs off, retries, and clears on success', async (
   assert.equal(issues.calls.create.length, 2);
 });
 
-test('stale write errors clear once nothing is pending', async () => {
+test('failed enter survives window expiry and restart as a catch-up record', async () => {
   const store = fakeStore();
   const issues = fakeIssues({ failCreate: 'boom' });
   const { run } = driveCtx({ store, issues });
   await run(failedEvent({ runId: 'r1' }));
   await run(failedEvent({ runId: 'r2', at: T0 + 1000 }));
   await run(failedEvent({ runId: 'r3', at: T0 + 2000 }));
+  const later = T0 + FAILURE_CLUSTER_WINDOW_MS + 5000;
+  assert.equal((await run(null, later)).action, 'write-failed');
   let state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
   assert.ok(state.lastWriteError !== null);
-  // The cluster evaporates before any write lands: nothing pending, error clears.
-  const cleared = await run(null, T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
-  assert.equal(cleared.action, 'error-cleared');
+  assert.deepEqual(state.pendingWrite.transitions.map(t => t.type), ['enter', 'exit']);
+  assert.equal(state.pendingWrite.transitions[0].accounts[0].count, 3);
+  assert.equal(state.pendingWrite.desired.status, 'done');
+  assert.equal(issues.store.size, 0);
+  // A new client over serialized persisted state retries even with no live cluster.
+  await store.state.set(stateKey('acme', 'failure-cluster-v1'), JSON.parse(JSON.stringify(state)));
+  const recovered = fakeIssues();
+  const restarted = driveCtx({ store, issues: recovered });
+  assert.equal((await restarted.run(null, later + 60000)).action, 'created');
+  const issue = [...recovered.store.values()][0];
+  assert.equal(issue.status, 'done');
+  assert.match(issue.description, /enter kimi:kimi-lane-1 \(3\)/);
+  assert.match(issue.description, /exit kimi:kimi-lane-1 \(0\)/);
   state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
   assert.equal(state.lastWriteError, null);
+  assert.equal(state.pendingWrite, null);
+  assert.deepEqual(state.transitions.map(t => t.type), ['enter', 'exit']);
+  assert.equal((await restarted.run(null, later + 120000)).action, 'noop');
+  assert.equal(recovered.calls.create.length, 1);
+});
+
+test('failed exit is retained if the same account re-enters before recovery', async () => {
+  const store = fakeStore();
+  const issues = fakeIssues();
+  const { run } = driveCtx({ store, issues });
+  for (const id of ['a', 'b', 'c']) await run(failedEvent({ runId: id }));
+  const update = issues.client.update;
+  issues.client.update = async () => { throw new Error('outage'); };
+  const later = T0 + FAILURE_CLUSTER_WINDOW_MS + 5000;
+  assert.equal((await run(null, later)).action, 'write-failed');
+  for (const id of ['d', 'e', 'f']) await run(failedEvent({ runId: id, at: later + 1000 }));
+  issues.client.update = update;
+  assert.equal((await run(null, later + 60000)).action, 'updated');
+  const state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
+  assert.deepEqual(state.transitions.map(t => t.type), ['enter', 'exit', 'enter']);
+  assert.equal(state.lastWriteError, null);
+  assert.equal([...issues.store.values()][0].status, 'in_progress');
+});
+
+test('ambiguous create response reconciles the persisted snapshot without rewriting', async () => {
+  const store = fakeStore();
+  const issues = fakeIssues();
+  const create = issues.client.create;
+  issues.client.create = async input => { await create(input); throw new Error('response-lost'); };
+  const { run } = driveCtx({ store, issues });
+  for (const id of ['a', 'b', 'c']) await run(failedEvent({ runId: id }));
+  const state = await store.state.get(stateKey('acme', 'failure-cluster-v1'));
+  assert.ok(state.pendingWrite !== null);
+  await store.state.set(stateKey('acme', 'failure-cluster-v1'), JSON.parse(JSON.stringify(state)));
+  const restarted = driveCtx({ store, issues });
+  assert.equal((await restarted.run(null, T0 + 60000)).action, 'already-current');
+  assert.equal(issues.calls.create.length, 1);
+  assert.equal(issues.calls.update.length, 0);
+  assert.equal((await store.state.get(stateKey('acme', 'failure-cluster-v1'))).lastWriteError, null);
 });
 
 // --- manifest, schema, config ---
@@ -685,6 +774,7 @@ function pluginHarness({ config = {}, now = T0, issuesClient = null } = {}) {
     plugin,
     handlers,
     jobs,
+    context: fake,
     setNow: (ms) => { currentNow = ms; },
     breakConfig: () => { fake.config.get = async () => { throw new Error('config-unavailable'); }; },
     boot: async () => {
@@ -766,6 +856,45 @@ test('tick maintenance runs even when the shadow tick itself fails', async () =>
   assert.equal(issues.calls.update[0].patch.status, 'done');
 });
 
+test('queued maintenance re-reads alert config after disable', async () => {
+  const issues = fakeIssues();
+  const harness = pluginHarness({
+    config: { failureClusterAlert: ALERT }, issuesClient: issues.client,
+  });
+  await harness.boot();
+  const onFailed = harness.handlers.get('agent.run.failed');
+  for (const id of ['a', 'b', 'c']) await onFailed(failedEvent({ runId: id }));
+  let release, entered, queued;
+  const hold = new Promise(resolve => { release = resolve; });
+  const blocked = new Promise(resolve => { entered = resolve; });
+  const tickFailed = new Promise(resolve => { queued = resolve; });
+  const get = harness.context.state.get;
+  let pause = true;
+  harness.context.state.get = async key => {
+    if (pause && JSON.stringify(key).includes('failure-cluster-v1')) {
+      pause = false;
+      entered();
+      await hold;
+    }
+    return get(key);
+  };
+  // A duplicate event holds the company chain without needing an issue write.
+  const ingest = onFailed(failedEvent({ runId: 'c' }));
+  await blocked;
+  harness.setNow(T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
+  harness.breakConfig();
+  harness.context.logger.error = message => {
+    if (message.includes('shadow tick failed')) queued();
+  };
+  const tick = assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  await tickFailed;
+  await harness.plugin.onConfigChanged({ failureClusterAlert: { enabled: false } }, { companyId: 'acme' });
+  release();
+  await Promise.all([ingest, tick]);
+  assert.equal(issues.calls.create.length, 1);
+  assert.equal(issues.calls.update.length, 0);
+});
+
 test('health reports error while a cluster is active, base status once clear', async () => {
   const issues = fakeIssues();
   const harness = pluginHarness({
@@ -805,4 +934,11 @@ test('health reports error while alert writes fail', async () => {
   assert.equal(health.status, 'error');
   assert.match(health.message, /1 alert write failing/);
   assert.equal(health.details.failureClusters.writeErrors, 1);
+  harness.setNow(T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
+  harness.breakConfig();
+  await assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  const expired = await harness.plugin.onHealth();
+  assert.equal(expired.details.failureClusters.activeClusters, 0);
+  assert.equal(expired.details.failureClusters.writeErrors, 1);
+  assert.equal(expired.status, 'error');
 });
