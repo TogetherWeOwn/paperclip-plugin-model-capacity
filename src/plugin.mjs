@@ -2409,7 +2409,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // resetsAtMs is parsed once in the lane client (ISO, epoch ms, or
       // epoch s); never re-parse the raw shape here.
       const resetAtMs = account.weekly?.resetsAtMs ?? null;
-      const planTargetUsedPct = 1 - (account.burnFloor?.floor ?? 0);
+      // Match floorBarUsed's meter precedence: a finite regenerating bar
+      // owns the floor, so that reserve cannot reduce the weekly endpoint.
+      const weeklyFloor = Number.isFinite(account.regenUsed) ? 0 : (account.burnFloor?.floor ?? 0);
+      const planTargetUsedPct = 1 - weeklyFloor;
       const remaining = weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null;
       const spendableRemaining = weeklyUsed != null ? Math.max(0, planTargetUsedPct - weeklyUsed) : null;
       // Unknown reset means unknown horizon: null, never a silent 168h.

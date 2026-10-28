@@ -585,6 +585,61 @@ test('weekly plan prices only spendable quota above the configured level floor',
   assert.equal(a.planTargetUsedPct, 0.85);
 });
 
+test('weekly hard hold: a regenerating-meter floor cannot reduce the weekly target or block healthy work', async () => {
+  for (const regenUsed of [0.1, 0]) {
+    // Half the week elapsed, 30% weekly used: twenty points BEHIND plan.
+    // The 80% floor governs the regenerating balance, not the weekly quota.
+    const d = drive({ config: { enforce: true, burnMode: { floors: { 'claude:*': 0.8 } } },
+      accounts: [claudeLane(0.3, 84, { meterInfo: { weeklyUsed: regenUsed } }), geminiLane(0.3, 84)] });
+    await d.setup();
+    await d.tick();
+    const cap = (await d.api('capacity')).body;
+    const a = cap.accounts.find(a => a.accountId === 'claude:a1');
+    assert.equal(a.health, 'healthy');
+    assert.notEqual(a.burnMode, true, 'the account is ordinarily paced, not burn-exempt');
+    assert.equal(a.burnFloor.floor, 0.8);
+    assert.equal(a.burnFloor.remaining, 1 - regenUsed);
+    assert.equal(a.planTargetUsedPct, 1, 'a regenerating floor leaves the weekly endpoint at 100%');
+    assert.ok(Math.abs(a.planAhead - (-0.2)) < 1e-10, `plan ahead ${a.planAhead}`);
+    assert.ok(Math.abs(a.spendableRemaining - 0.7) < 1e-10, `spendable ${a.spendableRemaining}`);
+    assert.ok(Math.abs(a.requiredRatePerHour - 0.7 / 84) < 1e-10, `required ${a.requiredRatePerHour}`);
+    const pool = cap.paceGuard.rawPools.find(p => p.pool === 'claude');
+    assert.ok(!(pool.hardHeldAccountIds ?? []).includes('claude:a1'));
+    assert.equal(cap.paceGuard.roleSafety.length, 0, 'an eligible peer prevents empty-role safety from hiding a false hold');
+    // The peer's trial family can take two runs; healthy weekly capacity
+    // must still serve when those trial slots are occupied.
+    const runIds = [0, 1, 2].map(i => `regen-floor-${regenUsed}-${i}`);
+    const models = [];
+    for (const id of runIds) {
+      const out = await d.hook(id);
+      assert.equal(out.kind, 'decide');
+      models.push(out.model);
+    }
+    assert.ok(models.some(model => model.startsWith('claude')), `models ${models}`);
+
+    // The fix must not remove the regenerating meter's own exhaustion gate.
+    for (const id of runIds) await d.fire(runEvent(id, TICK + 30000, 'agent.run.finished'));
+    d.setAccounts([claudeLane(0.3, 84, { meterInfo: { weeklyUsed: 0.2 } }), geminiLane(0.3, 84)]);
+    d.setNow(TICK + 60000);
+    await d.tick();
+    assert.equal((await d.api('capacity')).body.accounts.find(a => a.accountId === 'claude:a1').health, 'exhausted');
+    assert.match((await d.hook(`regen-floor-reached-${regenUsed}`)).model, /^gemini/);
+  }
+});
+
+test('weekly hard hold: a regenerating-meter floor does not exempt a genuinely ahead weekly account', async () => {
+  const d = drive({ config: { enforce: true, burnMode: { floors: { 'claude:*': 0.8 } } },
+    accounts: [claudeLane(0.65, 84, { meterInfo: { weeklyUsed: 0.1 } }), geminiLane(0.3, 84)] });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const a = cap.accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(a.health, 'healthy');
+  assert.ok(Math.abs(a.planAhead - 0.15) < 1e-10, `plan ahead ${a.planAhead}`);
+  assert.deepEqual(cap.paceGuard.rawPools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
+  assert.match((await d.hook('regen-weekly-ahead')).model, /^gemini/);
+});
+
 test('weekly hard hold: burn opt-in bypasses the hold without disabling it for ordinary accounts', async () => {
   const d = drive({ config: { enforce: true, burnMode: { accounts: ['claude:*'] } },
     accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });

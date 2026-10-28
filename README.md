@@ -1151,7 +1151,10 @@ A routing safety exception never authorizes a different role's pinned work.
 `elapsedFraction * (1 - configuredFloor)`, reaching **100% minus the explicit
 floor at reset**, with no additional pacing remainder. The existing
 `burnMode.floors` account matchers supply the level floor (also for accounts
-not in burn mode); no match means zero floor. Required rate and concurrency
+not in burn mode) only when that floor governs the weekly meter. When a
+regenerating bar is present, the floor governs that bar instead and does not
+reduce the weekly target. No weekly floor means a zero floor for this plan.
+Required rate and concurrency
 need use `max(0, 1 - floor - weeklyUsed) / hoursToPaceReset`, while reported
 `remainingPct` stays the true raw remainder. `/capacity.accounts` exposes
 `planTargetUsedPct` and `spendableRemaining`. Credit fallback still paces its
