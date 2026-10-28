@@ -432,11 +432,11 @@ function boundedPriorityShares(entries, available, pools) {
 export function allocateKeptAndRoutedCaps({
   target, maxTotal = 75, demandFactor = 1, agents = [], keepAgentIds = [],
   keptByAgent = {}, accounts = [], perAccount = [], pacePools = [], unavailableAccountIds = [],
-  reviewerAccountIdsByAgent = {}, blockingPriority = false,
+  reviewerAccountIdsByAgent = {}, reviewerPaceByAgent = {}, blockingPriority = false,
 } = {}) {
   if (Object.keys(reviewerAccountIdsByAgent).length > 0) {
     return allocateMultiPoolReviewers({ target, maxTotal, demandFactor, agents, keepAgentIds,
-      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, blockingPriority });
+      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority });
   }
   const keptIds = new Set(keepAgentIds);
   const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
@@ -566,7 +566,7 @@ export function allocateKeptAndRoutedCaps({
 // small integer round-robin is bounded by maxTotal, not by PR backlog size.
 function allocateMultiPoolReviewers(input) {
   const { target, maxTotal, demandFactor, agents, keepAgentIds, keptByAgent,
-    accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, blockingPriority } = input;
+    accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority } = input;
   const reviewIds = new Set(Object.keys(reviewerAccountIdsByAgent));
   const fixedIds = keepAgentIds.filter(id => !reviewIds.has(id));
   const otherRunning = agents.filter(a => !fixedIds.includes(a.agentId)).reduce((s, a) => s + (a.running ?? 0), 0);
@@ -574,7 +574,13 @@ function allocateMultiPoolReviewers(input) {
     target: blockingPriority ? 0 : Math.max(0, (target ?? maxTotal) - otherRunning), maxTotal: Math.max(1, maxTotal - otherRunning),
     keepAgentIds: fixedIds, agents: agents.filter(a => fixedIds.includes(a.agentId)) });
   const accountPool = new Map(accounts.map(a => [a.accountId, a.pool]));
-  const unavailable = new Set([...unavailableAccountIds, ...pacePools.flatMap(p => p.hardHeldAccountIds ?? [])]);
+  const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
+  const exemptByAgent = new Map(Object.keys(reviewerAccountIdsByAgent).map(id => [id,
+    new Set(reviewerPaceByAgent?.[id]?.holdSuspendedAccountIds ?? [])]));
+  const exemptions = new Set([...exemptByAgent.values()].flatMap(ids => [...ids]));
+  const unavailable = new Set([...unavailableAccountIds, ...[...hardHeld].filter(id => !exemptions.has(id))]);
+  const reviewerAdmissions = Object.fromEntries(Object.entries(reviewerAccountIdsByAgent).map(([agentId, ids]) => [agentId,
+    ids.filter(id => !hardHeld.has(id) || exemptByAgent.get(agentId)?.has(id))]));
   const burn = new Set(pacePools.flatMap(p => p.burnAccountIds ?? []));
   const paced = new Map(pacePools.map(p => [p.pool, p]));
   const accountLeft = new Map();
@@ -589,7 +595,15 @@ function allocateMultiPoolReviewers(input) {
     if (!burn.has(a.accountId)) pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
   }
   for (const [pool, n] of pacedLeft) {
-    const cap = paced.get(pool)?.cap;
+    const rawCap = paced.get(pool)?.cap;
+    // Exemptions only increase the shared soft-cap budget; individual
+    // admissions below still prevent every other role using held lanes.
+    const localCaps = Object.entries(reviewerPaceByAgent ?? {}).flatMap(([id, verdict]) =>
+      [...(exemptByAgent.get(id) ?? [])].some(account => accountPool.get(account) === pool)
+        ? (verdict.pools ?? []).filter(p => p.pool === pool).map(p => p.cap) : []);
+    const cap = localCaps.length > 0
+      ? (localCaps.some(c => !Number.isFinite(c)) || !Number.isFinite(rawCap) ? null : Math.max(rawCap, ...localCaps))
+      : rawCap;
     const bounded = Number.isFinite(cap) ? Math.max(0, Math.min(n, cap)) : n;
     poolLeft.set(pool, Math.max(0, Math.floor((poolLeft.get(pool) ?? 0) - n + bounded)));
     pacedLeft.set(pool, bounded);
@@ -616,7 +630,7 @@ function allocateMultiPoolReviewers(input) {
     .sort((a, b) => reviewerAccountIdsByAgent[a.agentId].length - reviewerAccountIdsByAgent[b.agentId].length
       || a.agentId.localeCompare(b.agentId));
   const spend = row => {
-    const ids = [...new Set(reviewerAccountIdsByAgent[row.agentId])];
+    const ids = [...new Set(reviewerAdmissions[row.agentId])];
     for (const pool of new Set(ids.map(id => accountPool.get(id)))) {
       if ((poolLeft.get(pool) ?? 0) < 1) continue;
       // Sustainable slots are fractional. Combine admitted fractions inside
@@ -653,8 +667,8 @@ function allocateMultiPoolReviewers(input) {
     const rows = allocateDemandCaps(0, agents, maxTotal).map(a => ({ ...a, allocationWeight: weights.get(a.agentId) }));
     const admissions = new Map(rows.filter(row => noHeadroomIds.has(row.agentId)).map(row => {
       const servingId = keptByAgent[row.agentId]?.accountId;
-      return [row.agentId, [...new Set(reviewIds.has(row.agentId) ? reviewerAccountIdsByAgent[row.agentId]
-        : [...accountLeft.keys()].filter(id => accountPool.get(id) === accountPool.get(servingId))
+      return [row.agentId, [...new Set(reviewIds.has(row.agentId) ? reviewerAdmissions[row.agentId]
+        : hardHeld.has(servingId) ? [] : [...accountLeft.keys()].filter(id => !hardHeld.has(id) && accountPool.get(id) === accountPool.get(servingId))
           .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b)))]];
     }));
     const { extras, resourceStatus } = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds,

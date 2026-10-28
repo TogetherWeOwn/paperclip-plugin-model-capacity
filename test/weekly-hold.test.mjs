@@ -127,3 +127,39 @@ test('a role-local routing exception cannot reopen globally pinned capacity for 
   });
   assert.equal(out.kept.find(a => a.agentId === 'other-role-pin').allocated, 0);
 });
+
+for (const blockingPriority of [false, true]) {
+  test(`role-local exception shares one soft-cap slot without admitting other roles (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const out = allocateKeptAndRoutedCaps({ target: 5, blockingPriority,
+      agents: [{ agentId: 'review', running: 0, queued: 2 }, { agentId: 'peer', running: 0, queued: 1 },
+        { agentId: 'fixed', running: 0, queued: 1, allocationWeight: 404 }], keepAgentIds: ['fixed'],
+      keptByAgent: { fixed: { accountId: 'ahead' } },
+      reviewerAccountIdsByAgent: { review: ['ahead'], peer: ['ahead'] },
+      reviewerPaceByAgent: { review: { holdSuspendedAccountIds: ['ahead'], pools: [{ pool: 'shared', cap: 1 }] } },
+      accounts: [{ accountId: 'ahead', pool: 'shared' }, { accountId: 'behind', pool: 'shared' }],
+      perAccount: [{ accountId: 'ahead', slots: 2 }, { accountId: 'behind', slots: 2 }],
+      pacePools: [{ pool: 'shared', cap: 1, hardHeldAccountIds: ['ahead'] }],
+    });
+    const row = id => [...out.kept, ...out.routed].find(a => a.agentId === id);
+    assert.equal(row('review').allocated, 1);
+    assert.equal(row('peer').allocated, 0);
+    assert.equal(row('fixed').allocated, 0);
+  });
+}
+
+for (const blockingPriority of [false, true]) {
+  test(`reviewer exceptions share capacity and cannot bypass breakers (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const input = { target: 4, blockingPriority,
+      agents: [{ agentId: 'a', running: 0, queued: 2 }, { agentId: 'b', running: 0, queued: 2 }],
+      reviewerAccountIdsByAgent: { a: ['ahead'], b: ['ahead'] },
+      reviewerPaceByAgent: Object.fromEntries(['a', 'b'].map(id => [id,
+        { holdSuspendedAccountIds: ['ahead'], pools: [{ pool: 'shared', cap: 1 }] }])),
+      accounts: [{ accountId: 'ahead', pool: 'shared' }], perAccount: [{ accountId: 'ahead', slots: 4 }],
+      pacePools: [{ pool: 'shared', cap: 0, hardHeldAccountIds: ['ahead'] }] };
+    const total = result => result.kept.reduce((n, row) => n + row.allocated, 0);
+    assert.equal(total(allocateKeptAndRoutedCaps(input)), 1);
+    assert.equal(total(allocateKeptAndRoutedCaps({ ...input, unavailableAccountIds: ['ahead'] })), 0);
+  });
+}

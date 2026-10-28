@@ -43,7 +43,7 @@ const metaLane = (key, used, hoursLeft, extra = {}) => ({
   ...extra,
 });
 
-function drive({ config = {}, accounts }) {
+function drive({ config = {}, accounts, heartbeats = [] }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -59,7 +59,7 @@ function drive({ config = {}, accounts }) {
         json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts }, now),
       }),
     },
-    agents: { get: async () => null },
+    agents: { get: async () => null, getQueuedRunCounts: async () => heartbeats },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -80,6 +80,7 @@ function drive({ config = {}, accounts }) {
     }),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     fire: e => handlers.get(e.type)(e),
+    updateCapacity: fn => fn(store.get(skey({ ...AA_STATE_KEY, stateKey: 'capacity-v1' }))),
   };
 }
 
@@ -401,4 +402,30 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   assert.equal(ulast.routed, false);
   assert.equal(ulast.fallback, 'keep');
   assert.equal(ulast.deferred ?? false, false);
+});
+
+
+test('role-empty reviewer routes and receives its soft-capped slot without reopening another pinned role', async () => {
+  const d = drive({
+    config: { ...BASE, roles: { keepAgentIds: ['reviewer-1', 'other-pin'] },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[0]] } },
+    accounts: [claudeLane(0.85, 120)],
+    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }, { agentId: 'other-pin', queued: 1 }],
+  });
+  await d.setup();
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  assert.deepEqual(capacity.paceGuard.rawPools[0].hardHeldAccountIds, ['claude:a1']);
+  assert.ok(capacity.paceGuard.roleSafety.some(r => r.accountIds.includes('claude:a1')));
+  const route = await d.hook('reviewer-run');
+  assert.equal(route.kind, 'decide');
+  assert.match(route.reason, /claude:a1/);
+  // Supply calibrated sizing; admission and pace verdicts come from the real tick.
+  d.updateCapacity(cap => {
+    cap.target = 2; cap.calibration = 'measured'; cap.perAccount[0].slots = 2;
+    cap.keptByAgent['other-pin'] = { accountId: 'claude:a1' };
+  });
+  const caps = (await d.api('caps')).body;
+  assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 1, JSON.stringify(caps));
+  assert.equal(caps.agents.find(a => a.agentId === 'other-pin')?.allocated, 0, JSON.stringify(caps));
 });

@@ -4326,6 +4326,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return [agentId, (reviewerLive.accounts ?? []).filter(a => config.reviewerRouting.arms.some(arm =>
         admissionOf.has(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`))).map(a => a.accountId)];
     }));
+    // Capture the same role-local pace verdict used by the reviewer hook.
+    // It is scoped to each reviewer and never changes the global pool report.
+    const reviewerPaceByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
+      const role = roleOf({ roles: { thinkerAgentIds: reviewerLive.thinkerAgentIds, doerAgentIds: reviewerLive.doerAgentIds } }, agentId);
+      const verdict = allocationOrderFromLive(reviewerLive, companyId, null, role,
+        normalizeExcludedFamilies(reviewerLive.excludeFamilies?.[role] ?? []), true, true);
+      const admitted = new Set(reviewerAccountIdsByAgent[agentId]);
+      return [agentId, { holdSuspendedAccountIds: verdict.holdSuspendedAccountIds.filter(id => admitted.has(id)),
+        pools: verdict.pools }];
+    }));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
         const access = roleAccess?.[v.accountId];
@@ -4628,6 +4638,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
+      reviewerPaceByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
       // Ledger accounting: non-terminal records excluded by age (older than
@@ -6255,6 +6266,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
             reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
               ? cap.reviewerAccountIdsByAgent[id] : []])),
+          reviewerPaceByAgent: reviewAdmissionFresh ? cap.reviewerPaceByAgent ?? {} : {},
         };
         // Probe the SAME account/pool/fleet guards without committing slots.
         // Weight each once-only head share by usable post-heartbeat capacity:
