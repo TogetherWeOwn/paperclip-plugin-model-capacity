@@ -429,3 +429,26 @@ test('role-empty reviewer routes and receives its soft-capped slot without reope
   assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 1, JSON.stringify(caps));
   assert.equal(caps.agents.find(a => a.agentId === 'other-pin')?.allocated, 0, JSON.stringify(caps));
 });
+
+test('policy-only reviewer hard hold is retained in global pools and denies queued caps', async () => {
+  const d = drive({
+    config: { ...BASE, taskRanking: { mode: 'enforce' },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1]] } },
+    accounts: [metaLane('review', 0.85, 120), claudeLane(0.1, 120)],
+    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }],
+  });
+  await d.setup();
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const reviewerPace = capacity.reviewerPaceByAgent['reviewer-1'];
+  assert.deepEqual(reviewerPace.holdSuspendedAccountIds, []);
+  assert.deepEqual(reviewerPace.pools.find(p => p.pool === 'meta')?.hardHeldAccountIds, ['meta:review']);
+  assert.equal((await d.hook('review-held')).kind, 'defer');
+  d.updateCapacity(cap => {
+    cap.target = 2; cap.calibration = 'measured';
+    cap.perAccount.find(a => a.accountId === 'meta:review').slots = 2;
+  });
+  const caps = (await d.api('caps')).body;
+  assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 0, JSON.stringify(caps));
+  assert.deepEqual(capacity.paceGuard.rawPools.find(p => p.pool === 'meta')?.hardHeldAccountIds, ['meta:review']);
+});

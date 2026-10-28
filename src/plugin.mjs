@@ -3813,7 +3813,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
       return orderAccountsWithPacing(
-        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
+        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (opts.allAccounts === true || routesRun(v, true)
           || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
@@ -4489,6 +4489,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // (the role only affects placement quality, never the guard).
     const paceReportOrder = allocationOrder('doer', null, true, { applyReserve: false });
     const paceReport = paceReportOrder.pools;
+    // Global hold facts must not depend on any role's routable frontier. In
+    // particular, a policy-only reviewer may have no eligible doer arms.
+    const rawPacePools = allocationOrder('doer', null, true, { applyReserve: false, allAccounts: true }).rawPools;
     const paceRoleSafety = ROLES.flatMap(role => {
       const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: false });
       return holdSuspendedAccountIds.length > 0 ? [{ code: 'role-empty-hold-suspended', role,
@@ -4662,7 +4665,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
         // Role-local admission exceptions are not global quota permission.
-        rawPools: paceReportOrder.rawPools,
+        rawPools: rawPacePools,
         // Burn-mode accounts (see burnmode.mjs): never capped or held.
         burnAccounts: [...burnAccountIds],
         // Fresh starts with no decided or actual account yet are
