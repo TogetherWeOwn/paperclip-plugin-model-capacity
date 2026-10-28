@@ -109,3 +109,8 @@ test('unknown weekly allowance is not alternate role capacity for empty-role saf
   assert.deepEqual(r.holdSuspendedAccountIds, ['only']);
   assert.ok(ids(r).includes('only'));
 });
+
+test('floating-point noise at exactly ten points ahead does not prolong a weekly hold', () => {
+  const r = order([lane('edge', { planAhead: 0.8 - 0.7 }), lane('peer', { planAhead: -0.1 })]);
+  assert.ok(ids(r).includes('edge'));
+});

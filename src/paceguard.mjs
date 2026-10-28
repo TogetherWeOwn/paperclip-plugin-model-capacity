@@ -147,8 +147,9 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     if (members.length === 0) { entry.state = 'burn'; continue; }
     // A known weekly lead needs neither calibration nor a duration estimate.
     // Keep this gate independent of the soft cap's fail-open measurement rules.
+    // Numerical slack keeps 0.8 - 0.7 inside a ten-point band.
     const hardHeld = members.filter(v => v.holdExempt !== true && !isReactiveAccount(v) && finite(v.planAhead)
-      && finite(pacing.holdAheadPts) && v.planAhead > pacing.holdAheadPts);
+      && finite(pacing.holdAheadPts) && v.planAhead - pacing.holdAheadPts > 1e-12);
     const hardIds = new Set(hardHeld.map(v => v.accountId));
     if (hardIds.size > 0) {
       entry.hardHeldAccountIds = [...hardIds];
