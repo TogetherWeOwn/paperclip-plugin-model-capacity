@@ -569,6 +569,8 @@ test('weekly hard hold: role-empty suspension is reported and keeps ordinary pac
   await d.tick();
   const cap = (await d.api('capacity')).body;
   assert.ok(cap.paceGuard.roleSafety.some(w => w.role === 'doer' && w.accountIds.includes('claude:a1')));
+  assert.equal(cap.paceGuard.rawPools.find(p => p.pool === 'claude').cap, 0);
+  assert.deepEqual(cap.paceGuard.rawPools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
   assert.equal((await d.hook('safety-first')).kind, 'decide');
   assert.equal((await d.hook('safety-second')).kind, 'defer');
 });

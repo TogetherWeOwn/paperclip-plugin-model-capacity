@@ -114,3 +114,16 @@ test('floating-point noise at exactly ten points ahead does not prolong a weekly
   const r = order([lane('edge', { planAhead: 0.8 - 0.7 }), lane('peer', { planAhead: -0.1 })]);
   assert.ok(ids(r).includes('edge'));
 });
+
+test('a role-local routing exception cannot reopen globally pinned capacity for another role', async () => {
+  const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+  const local = order([lane('ahead')]);
+  assert.ok(ids(local).includes('ahead'), 'the requesting role keeps its safety exception');
+  const out = allocateKeptAndRoutedCaps({ target: 10,
+    agents: [{ agentId: 'other-role-pin', running: 0, queued: 3 }], keepAgentIds: ['other-role-pin'],
+    keptByAgent: { 'other-role-pin': { accountId: 'ahead' } },
+    accounts: [{ accountId: 'ahead', pool: 'ahead' }], perAccount: [{ accountId: 'ahead', slots: 4 }],
+    pacePools: local.rawPools ?? local.pools,
+  });
+  assert.equal(out.kept.find(a => a.agentId === 'other-role-pin').allocated, 0);
+});

@@ -183,6 +183,7 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // The reserve hold applies first for the same reason: held accounts never
   // reach the guard or the sort for non-review runs.
   let verdicts = paceGuardPools(unheld, { pacing, poolKeyOf });
+  const rawVerdicts = verdicts; // global consumers must never inherit this role's exemptions
   const taskEnforce = taskRanking?.mode === 'enforce';
   const routable = unheld.filter(v => !v.held && (!taskEnforce || (v.taskFeasible !== false && v.roleEligible !== false)));
   const roleCapacity = routable.filter(v => v.roleEligible !== false && (isReactiveAccount(v) || v.remainingKnown !== false));
@@ -273,5 +274,5 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   const heldPub = reserveHeld.map(v => ({
     accountId: v.accountId, pool: v.pool ?? null, headroomPct: v.headroomPct ?? null,
   }));
-  return { order, paced: pacedVerdicts.map(pub), pools: verdicts.map(pub), reserveHeld: heldPub, holdSuspendedAccountIds };
+  return { order, paced: pacedVerdicts.map(pub), pools: verdicts.map(pub), reserveHeld: heldPub, holdSuspendedAccountIds, rawPools: rawVerdicts.map(pub) };
 }

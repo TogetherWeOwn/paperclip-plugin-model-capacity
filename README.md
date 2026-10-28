@@ -1143,7 +1143,9 @@ is not permission to spend ahead. `/capacity.paceGuard.roleSafety` reports
 `hardHeldAccountIds` and state `hard-held` (all non-burn accounts held) or
 `lanes-paced` (mixed); existing runs are never cancelled. `/caps` preserves
 running floors but cannot create new fixed-model or reviewer slots on a
-hard-held account.
+hard-held account. `paceGuard.rawPools` retains role-independent hold facts for
+global `/caps` consumers; `paceGuard.pools` is the doer-role admission view.
+A routing safety exception never authorizes a different role's pinned work.
 
 **Plan endpoint:** the linear target is
 `elapsedFraction * (1 - configuredFloor)`, reaching **100% minus the explicit

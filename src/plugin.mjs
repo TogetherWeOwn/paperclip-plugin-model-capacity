@@ -4474,7 +4474,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
-    const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
+    const paceReportOrder = allocationOrder('doer', null, true, { applyReserve: false });
+    const paceReport = paceReportOrder.pools;
     const paceRoleSafety = ROLES.flatMap(role => {
       const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: false });
       return holdSuspendedAccountIds.length > 0 ? [{ code: 'role-empty-hold-suspended', role,
@@ -4646,6 +4647,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
+        // Role-local admission exceptions are not global quota permission.
+        rawPools: paceReportOrder.rawPools,
         // Burn-mode accounts (see burnmode.mjs): never capped or held.
         burnAccounts: [...burnAccountIds],
         // Fresh starts with no decided or actual account yet are
@@ -6244,7 +6247,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           keptByAgent: cap.keptByAgent ?? {},
           accounts: cap.accounts ?? [],
           perAccount: cap.perAccount ?? [],
-          pacePools: cap.paceGuard?.pools ?? [],
+          pacePools: cap.paceGuard?.rawPools ?? cap.paceGuard?.pools ?? [],
           unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
           reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
             reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
