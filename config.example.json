@@ -59,6 +59,7 @@
     }
   },
   "pacing": {
+    "holdAheadPts": 0.10,
     "deadband": 0.02,
     "rungCooldownMs": 600000,
     "guardHighPct": 0.8,

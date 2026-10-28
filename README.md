@@ -1107,32 +1107,63 @@ example entry); no agent loses a running slot.
 
 ### Pace guard
 
-Ordering alone never stops spend: an account ahead of plan sorts into the
-last need band, but when every account that can serve a run is ahead, one is
-still picked, and a fleet ahead of plan keeps burning (a Claude lane went 78%
-to 90% in two hours). The guard adds the brake. Per provider pool (lanes
-that share one credential bucket):
+Ordering alone never stops spend. The guard has two layers, evaluated on
+**each account's own weekly position**, not its pool's average:
 
-    ahead  = mean(weeklyUsed - elapsedFraction) over the pool's lanes > marginPct
-    slots  = sum over lanes of targetShare x meanRunDurationHours
-    cap    = max(1, ceil(slots))
+1. **Weekly hard hold** (`pacing.holdAheadPts`, default `0.10`): if
+   `weeklyUsed - linearTarget > holdAheadPts`, the account receives **zero new
+   slots**, even when idle. `0.10` means ten percentage points of the whole
+   weekly allowance, not ten percent of the remainder. Equality is inside the
+   band; the next native tick releases the account when time or a reset brings
+   its lead back within the band. `null` disables only this layer. Values must
+   be finite numbers in `[0, 1]` or `null`; invalid config is rejected, not
+   silently interpreted as disabled. `pacing.guard.enabled: false` disables
+   both layers.
+2. **Ordinary pace cap**: above `pacing.guard.marginPct` (default `0.02`),
+   account allowance is `targetShare * meanRunDurationHours` (with measured
+   rate correction); on/behind-plan siblings contribute at least one slot.
+   A pool's cap is `max(1, ceil(sum(allowances)))`, except that hard-held
+   accounts contribute zero and an entirely hard-held non-burn pool has cap
+   **zero**. At the cap, only ahead lanes leave the allocation order; behind
+   siblings can still serve.
 
-A pool that is ahead and already has `cap` runs in flight is **paced**: its
-lanes leave the allocation order, so the run goes to another pool, or, when
-no other pool decides it, the hook answers `defer` with a `pace guard: ...`
-reason and `pacing.guard.retryAfterMs` -- even when an unpaced pool is left
-but has nothing to decide (a full trial slot, say): the paced pool is a real
-minutes-scale hold, and the reason names both holds. A pool that is not
-ahead is never touched. `slots` is the same term as the per-account concurrency target, so
-the cap follows the plan: it shrinks as an account spends ahead and widens as
-the plan catches up. The minimum of 1 keeps a lightly-ahead account serving.
+Burn-mode accounts are an explicit operator choice to spend and bypass both
+layers. Reactive (unmetered) accounts are not weekly-held. A known weekly lead
+is sufficient for a hard hold even if run duration or target share is unknown;
+unknown weekly position itself never creates a hard hold.
+
+**Role-empty safety:** if hard holds would remove every otherwise eligible
+account for a role, suspend *only* those hard holds for that role, using the
+same empty-role safety pattern as eligibility gates. The ordinary pace cap
+still applies, so this does not become unlimited burn. Health, headroom,
+review reserves, role exclusions, readiness, trial and breaker gates retain
+authority. This is a structural role-capacity check: a temporarily full peer
+is not permission to spend ahead. `/capacity.paceGuard.roleSafety` reports
+`role-empty-hold-suspended`, role, account IDs and reason. Pool verdicts name
+`hardHeldAccountIds` and state `hard-held` (all non-burn accounts held) or
+`lanes-paced` (mixed); existing runs are never cancelled. `/caps` preserves
+running floors but cannot create new fixed-model or reviewer slots on a
+hard-held account.
+
+**Plan endpoint:** the linear target is
+`elapsedFraction * (1 - configuredFloor)`, reaching **100% minus the explicit
+floor at reset**, with no additional pacing remainder. The existing
+`burnMode.floors` account matchers supply the level floor (also for accounts
+not in burn mode); no match means zero floor. Required rate and concurrency
+need use `max(0, 1 - floor - weeklyUsed) / hoursToPaceReset`, while reported
+`remainingPct` stays the true raw remainder. `/capacity.accounts` exposes
+`planTargetUsedPct` and `spendableRemaining`. Credit fallback still paces its
+own credit balance. This is a target, not a guarantee: demand, task sizes,
+five-hour limits, review reserves, health and configured floors can prevent
+using every remaining unit. No reserve, exhaustion guard or credential gate
+is weakened by this change.
 
 The enforcing hook, the event-time shadow path and the shadow tick all order
 accounts through `orderAccountsWithPacing` with the same plan positions and
 knobs, so they hold and release a pool alike (a run being decided never
 counts against its own pool, and neither do runs the hook deferred). A held run gets no shadow decision;
 `shadow.skippedPaced` counts them. `/capacity` carries `paceGuard`
-(`enabled`, `marginPct`, `retryAfterMs`, `unattributedInFlight`, and one
+(`enabled`, `holdAheadPts`, `roleSafety`, `marginPct`, `retryAfterMs`, `unattributedInFlight`, and one
 entry per pool with `planAhead`, `pacedSlots`, `cap`, `inFlight` and
 `state`: `paced`, `ahead`, `on-plan`, `not-measured`) and each account
 carries `planAhead`.
@@ -1143,7 +1174,7 @@ Config (`pacing.guard`): `enabled` (default true), `marginPct` (default
 defer (60s) on purpose: a slot frees when a run finishes, and the host
 gives up on a run after a fixed number of deferrals.
 
-Fails open (the existing caps apply): a pool with ANY lane of unknown reset,
+The ordinary cap fails open (hard holds on known positions remain): a pool with ANY lane of unknown reset,
 weekly reading or target share (leaving that lane out would size the cap from
 the others alone), a pool that includes a reactive (unmetered) lane, or no
 run duration. A lane whose every arm is breaker-open is not part of the
@@ -1164,10 +1195,10 @@ Limits, measured on the fleet simulation (`test/pace-sim.test.mjs`):
   hour (E = weekly share one run costs, D = mean run hours), against a plan
   rate of 0.6%/h for a week. At E = 0.5% / D = 0.5h (1%/h) a lone lane is out
   of quota at hour 99, at E = 1% at hour 50, at E = 2% at hour 25. Pacing
-  those needs a rate gate (fractional slots as a duty cycle); the guard
-  does not have one.
-- A pool is judged on the mean of its lanes. A pool of one lane far ahead and
-  one far behind reads on plan; steering by lane needs the lane feed.
+  those needs the weekly hard hold above; the minimum still applies when
+  hard holding is disabled or suspended by role-empty safety.
+- Both layers judge accounts individually; a spent sibling never hides an
+  account behind its own plan.
 - The cap counts runs that are executing, read from the run ledger at the time
   of the decision: a finished run frees its slot at its terminal event, and a
   run the hook deferred (waiting, not running) is not counted, or two waiting

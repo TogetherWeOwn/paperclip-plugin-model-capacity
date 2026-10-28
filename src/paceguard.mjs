@@ -19,15 +19,18 @@
  * every pool is paced, is deferred. Below the cap, or when not ahead, the
  * guard changes nothing.
  *
- * Fail open: a pool with any lane of unknown plan position or share, whose
- * lanes include a reactive (unmetered) account, or that has no run duration
- * to convert shares into slots is never paced; the existing caps apply. The
- * minimum of 1 in flight keeps a lightly-ahead account serving instead of
- * stalling it; the price is that a deeply-ahead account (slots below 1) can
- * spend above plan until its headroom reserve takes it out.
+ * The ordinary cap fails open for unknown position/share, reactive pool
+ * members, or missing run duration. Independently, known weekly leads can
+ * still be hard-held without any slot calibration. The
+ * minimum of 1 applies only to the ordinary cap. A configured holdAheadPts
+ * adds an independent zero-slot hold on each known, deeply-ahead lane; burn
+ * and reactive lanes are exempt. The caller applies per-role empty-capacity
+ * safety by marking only that role's suspended accounts holdExempt.
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+
+export const DEFAULT_HOLD_AHEAD_PTS = 0.10;
 
 export const DEFAULT_PACE_GUARD = Object.freeze({
   enabled: true,
@@ -142,6 +145,19 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     out.push(entry);
     if (!enabled) continue;
     if (members.length === 0) { entry.state = 'burn'; continue; }
+    // A known weekly lead needs neither calibration nor a duration estimate.
+    // Keep this gate independent of the soft cap's fail-open measurement rules.
+    const hardHeld = members.filter(v => v.holdExempt !== true && !isReactiveAccount(v) && finite(v.planAhead)
+      && finite(pacing.holdAheadPts) && v.planAhead > pacing.holdAheadPts);
+    const hardIds = new Set(hardHeld.map(v => v.accountId));
+    if (hardIds.size > 0) {
+      entry.hardHeldAccountIds = [...hardIds];
+      entry.pacedAccountIds = [...hardIds];
+      entry.ahead = true;
+      entry.paced = hardHeld.length === members.length;
+      entry.state = entry.paced ? 'hard-held' : 'lanes-paced';
+      if (entry.paced) { entry.cap = 0; entry.pacedSlots = 0; entry.planAhead = mean(hardHeld.map(v => v.planAhead)); }
+    }
     if (members.some(isReactiveAccount)) continue;
     // One lane of unknown position or share makes the whole pool unmeasured:
     // leaving it out would size the cap from the other lanes alone and
@@ -157,20 +173,20 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
       // review runs on a lane calibrated by cheap ones), shrink its slots by
       // required/measured so the cap follows the real burn.
       const factor = rateCorrection(v);
-      const slots = v.targetShare * hours * (ahead ? factor : 1);
+      const slots = hardIds.has(v.accountId) ? 0 : v.targetShare * hours * (ahead ? factor : 1);
       return {
-        accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: ahead ? slots : Math.max(1, slots), ahead, paced: false,
+        accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: hardIds.has(v.accountId) ? 0 : ahead ? slots : Math.max(1, slots), ahead, paced: hardIds.has(v.accountId),
         ...(ahead && factor < 1 ? { rateCorrection: factor } : {}),
       };
     });
     entry.planAhead = mean(positions);
     entry.pacedSlots = laneVerdicts.reduce((s, l) => s + l.pacedSlots, 0);
     const single = members.length === 1;
-    const allowance = single ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
+    const allowance = single && hardIds.size === 0 ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
     // The epsilon keeps an exact integer of slots from rounding up on
     // float noise (0.2 x 10 is 2.0000000000000004).
-    entry.cap = Math.max(1, Math.ceil(allowance - 1e-9));
-    entry.ahead = laneVerdicts.some(l => l.ahead);
+    entry.cap = hardHeld.length === members.length ? 0 : Math.max(1, Math.ceil(allowance - 1e-9));
+    entry.ahead = hardIds.size > 0 || laneVerdicts.some(l => l.ahead);
     const atCap = inFlight >= entry.cap;
     if (entry.ahead && atCap) {
       for (const l of laneVerdicts) if (l.ahead) l.paced = true;
@@ -178,7 +194,7 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     entry.pacedAccountIds = laneVerdicts.filter(l => l.paced).map(l => l.accountId);
     entry.paced = entry.pacedAccountIds.length > 0 && entry.pacedAccountIds.length === members.length;
     if (!single) entry.laneVerdicts = laneVerdicts;
-    entry.state = entry.paced ? 'paced'
+    entry.state = hardHeld.length === members.length ? 'hard-held' : entry.paced ? 'paced'
       : entry.pacedAccountIds.length > 0 ? 'lanes-paced'
         : entry.ahead ? 'ahead' : 'on-plan';
   }

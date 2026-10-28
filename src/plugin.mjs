@@ -89,7 +89,7 @@ import {
   isAggregatorAccount, isFallbackOnlyView, nativeQualifiedModels,
   hasHeadroom, crossAccountDominated, canonicalKey,
 } from './cross-account.mjs';
-import { normalizePaceGuard } from './paceguard.mjs';
+import { normalizePaceGuard, DEFAULT_HOLD_AHEAD_PTS } from './paceguard.mjs';
 import {
   REVIEW_RESERVE_STATE_KEY, REVIEW_FOLDED_CAP, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
   priceReviewBurn, priorProviderReserveState,
@@ -225,6 +225,12 @@ export function validateConfigShape(raw) {
   }
   for (const [k, v] of Object.entries(raw.eeeWeights ?? {})) {
     if (typeof v !== 'number' || !(v >= 0)) errors.push(`eeeWeights.${k} must be a non-negative number`);
+  }
+  if (pacing != null && (typeof pacing !== 'object' || Array.isArray(pacing))) errors.push('pacing must be an object');
+  if (pacing != null && typeof pacing === 'object' && 'holdAheadPts' in pacing
+    && pacing.holdAheadPts !== null && !(typeof pacing.holdAheadPts === 'number'
+      && Number.isFinite(pacing.holdAheadPts) && pacing.holdAheadPts >= 0 && pacing.holdAheadPts <= 1)) {
+    errors.push('pacing.holdAheadPts must be null or a finite number in [0, 1]');
   }
   if (pacing && (pacing.guardHighPct <= pacing.guardRejoinPct)) errors.push('pacing.guardHighPct must exceed pacing.guardRejoinPct');
   if (pacing != null && typeof pacing === 'object' && !Array.isArray(pacing) && 'guard' in pacing) {
@@ -629,6 +635,7 @@ export function resolveConfig(raw = {}) {
     weights: { ...DEFAULT_WEIGHTS, ...(raw.weights ?? {}) },
     taskRanking: normalizeTaskRanking(raw.taskRanking),
     pacing: {
+      holdAheadPts: raw.pacing?.holdAheadPts === undefined ? DEFAULT_HOLD_AHEAD_PTS : raw.pacing.holdAheadPts,
       deadband: raw.pacing?.deadband ?? DEFAULT_PACING.deadband,
       cooldownMs: raw.pacing?.rungCooldownMs ?? DEFAULT_PACING.cooldownMs,
       guardHigh: raw.pacing?.guardHighPct ?? DEFAULT_PACING.guardHigh,
@@ -2402,7 +2409,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // resetsAtMs is parsed once in the lane client (ISO, epoch ms, or
       // epoch s); never re-parse the raw shape here.
       const resetAtMs = account.weekly?.resetsAtMs ?? null;
+      const planTargetUsedPct = 1 - (account.burnFloor?.floor ?? 0);
       const remaining = weeklyUsed != null ? Math.max(0, 1 - weeklyUsed) : null;
+      const spendableRemaining = weeklyUsed != null ? Math.max(0, planTargetUsedPct - weeklyUsed) : null;
       // Unknown reset means unknown horizon: null, never a silent 168h.
       // Internal math that needs a finite horizon falls back to 168h
       // separately; the reported required rate stays honest.
@@ -2525,12 +2534,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // remaining fraction and the reset are both known it is a number.
       // Null (unknown) only when an input is missing -- never a 0 that
       // would read as "burn nothing".
-      let required = remaining != null && hoursToPaceReset != null
-        ? requiredRatePerHour({ remainingPct: remaining, hoursToReset: hoursToPaceReset })
+      let required = spendableRemaining != null && hoursToPaceReset != null
+        ? requiredRatePerHour({ remainingPct: spendableRemaining, hoursToReset: hoursToPaceReset })
         : null;
       const startMs = resetAtMs != null && !Number.isNaN(resetAtMs) ? windowStartMs(resetAtMs) : null;
       let positionError = weeklyUsed != null && startMs != null && paceResetAtMs != null
-        ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs })
+        ? scheduleError({ usedPct: weeklyUsed, nowMs, periodStartMs: startMs, periodEndMs: paceResetAtMs, targetUsedPct: planTargetUsedPct })
         : 0;
       // A burn account is never ahead: its plan is "spent by the horizon".
       if (burnOn && positionError > 0) positionError = 0;
@@ -2726,6 +2735,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         bypassedCooldown: bypassCooldown,
         requiredRatePerHour: required,
         planAhead,
+        planTargetUsedPct,
+        spendableRemaining,
         weeklyElapsed,
         fiveHourElapsed,
         hoursTo5hReset,
@@ -3481,7 +3492,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Credit lanes pace the credit pool, not the spent weekly window:
         // the C* need uses the credit fraction (else a full window) over
         // the credit reset horizon, so the fleet target counts the credits.
-        remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.remainingPct ?? 0),
+        remainingPct: a.creditType != null ? (a.creditFraction ?? 1) : (a.spendableRemaining ?? 0),
         // The C* need is the same term as targetShare (requiredRate / E):
         // both pace to the burn end, so the fleet target moves with the
         // allowance the horizon grants. burnHorizonMs is set only when a
@@ -3748,7 +3759,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
     // The pace guard's knobs, shared by the tick, the live view (hook and
     // event-time path) and the /capacity report.
-    const paceOpts = { ...config.pacing.guard, meanRunDurationHours: config.concurrency.meanRunDurationHours };
+    const paceOpts = { ...config.pacing.guard, holdAheadPts: config.pacing.holdAheadPts, meanRunDurationHours: config.concurrency.meanRunDurationHours };
     // Fleet quality of the arm each account would run for this role (see
     // placementArm): the placement blend ranks accounts by it, so unspent
     // allowance breaks ties between similar arms instead of picking the
@@ -3805,6 +3816,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
           remainingPct: v.remainingPct,
+          remainingKnown: v.remainingPct != null,
           reactive: v.reactive === true,
           guardActive: v.guardActive === true,
           measuredRatePerHour: v.measuredRatePerHour,
@@ -4463,6 +4475,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
     const paceReport = allocationOrder('doer', null, true, { applyReserve: false }).pools;
+    const paceRoleSafety = ROLES.flatMap(role => {
+      const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: false });
+      return holdSuspendedAccountIds.length > 0 ? [{ code: 'role-empty-hold-suspended', role,
+        accountIds: holdSuspendedAccountIds, message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' }] : [];
+    });
     if (config.taskRanking.mode !== 'off') {
       const policyBucket = view => ({ funding: view?.creditFallback ? 'credit-fallback' : 'plan',
         burn: view?.burnMode === true, burnFirst: view?.burnMode === true && view?.burnFloor != null,
@@ -4624,6 +4641,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       runsSource: 'events',
       paceGuard: {
         enabled: paceOpts.enabled,
+        holdAheadPts: paceOpts.holdAheadPts,
+        roleSafety: paceRoleSafety,
         marginPct: paceOpts.marginPct,
         retryAfterMs: paceOpts.retryAfterMs,
         pools: paceReport,
@@ -5059,6 +5078,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     if (p.paced === false && (p.pacedAccountIds?.length ?? 0) > 0) {
       const lanes = (p.laneVerdicts ?? []).filter(l => l.paced)
         .map(l => `${l.accountId} ${Math.round(l.planAhead * 1000) / 10}% ahead of plan`);
+      if (lanes.length === 0) lanes.push(...(p.hardHeldAccountIds ?? []).map(id => `${id} weekly hard-held`));
       return `${p.pool} lanes ${lanes.join(', ')}; ${p.inFlight} of ${p.cap} in flight`;
     }
     return `${p.pool} ${Math.round(p.planAhead * 1000) / 10}% ahead of plan, ${p.inFlight} of ${p.cap} in flight`;
@@ -5337,6 +5357,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         : [],
     );
     const margin = typeof live?.paceGuard?.marginPct === 'number' ? live.paceGuard.marginPct : 0.02;
+    // Exhaustion cannot relax a weekly hard hold, even when an operator
+    // configured the ordinary-cap margin wider than the hard-hold band.
+    const hold = live?.paceGuard?.enabled === true ? live.paceGuard.holdAheadPts : null;
+    const exhaustionMargin = typeof hold === 'number' && Number.isFinite(hold) ? Math.min(margin, hold) : margin;
     const capBase = new Map((live?.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
     const acctPending = pendingByAccount(live, companyId, selfId);
     const budget = effectiveTrialBudget(live, companyId, selfId);
@@ -5383,7 +5407,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // pool needs no more runs this window, whatever the host budget says.
       // Reactive accounts carry no plan position (never ahead); burn-mode
       // accounts are operator-flagged to spend.
-      const ahead = !view.reactive && view.burn !== true && view.planAhead != null && view.planAhead > margin;
+      const ahead = !view.reactive && view.burn !== true && view.planAhead != null && view.planAhead > exhaustionMargin;
       if (ahead) {
         skips.push(`${accountId} ahead of plan ${Math.round(view.planAhead * 1000) / 10}%`);
         continue;
@@ -5518,7 +5542,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // Reserve quota is for review runs: a non-review keep must not
           // spend a held account, even at exhaustion.
           if (heldIds.has(accountId)) { heldOnly = true; continue; }
-          const ahead = !a.reactive && a.burn !== true && a.planAhead != null && a.planAhead > margin;
+          const ahead = !a.reactive && a.burn !== true && a.planAhead != null && a.planAhead > exhaustionMargin;
           if (ahead || (!a.reactive && !a.remainingKnown)
             || (!a.reactive && a.headroomSource === 'weekly')) continue;
           if (a.reactive

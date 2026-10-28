@@ -439,7 +439,8 @@ export function allocateKeptAndRoutedCaps({
       keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, blockingPriority });
   }
   const keptIds = new Set(keepAgentIds);
-  const unavailableAccounts = new Set(unavailableAccountIds);
+  const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
+  const unavailableAccounts = new Set([...unavailableAccountIds, ...hardHeld]);
   const accountPool = new Map(accounts.map(account => [account.accountId, account.pool]));
   // Burn-mode accounts are exempt from the pace guard, so the pool's paced cap
   // bounds only the paced accounts' slots; burn slots add on top of it.
@@ -459,7 +460,7 @@ export function allocateKeptAndRoutedCaps({
   for (const agent of agents) {
     if (!keptIds.has(agent.agentId)) continue;
     const serving = keptByAgent[agent.agentId];
-    const pool = serving?.accountId == null ? '' : accountPool.get(serving.accountId);
+    const pool = serving?.accountId == null || hardHeld.has(serving.accountId) ? '' : accountPool.get(serving.accountId);
     const key = typeof pool === 'string' ? pool : '';
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(agent);
@@ -573,7 +574,7 @@ function allocateMultiPoolReviewers(input) {
     target: blockingPriority ? 0 : Math.max(0, (target ?? maxTotal) - otherRunning), maxTotal: Math.max(1, maxTotal - otherRunning),
     keepAgentIds: fixedIds, agents: agents.filter(a => fixedIds.includes(a.agentId)) });
   const accountPool = new Map(accounts.map(a => [a.accountId, a.pool]));
-  const unavailable = new Set(unavailableAccountIds);
+  const unavailable = new Set([...unavailableAccountIds, ...pacePools.flatMap(p => p.hardHeldAccountIds ?? [])]);
   const burn = new Set(pacePools.flatMap(p => p.burnAccountIds ?? []));
   const paced = new Map(pacePools.map(p => [p.pool, p]));
   const accountLeft = new Map();

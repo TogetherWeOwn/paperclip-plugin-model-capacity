@@ -171,7 +171,7 @@ test('hook: a custom margin and retry interval are honoured', async () => {
 });
 
 test('hook: with a second pool behind plan, the run goes there; with none left it defers', async () => {
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
   await d.setup();
   await d.tick();
   const models = [];
@@ -399,7 +399,7 @@ test('a deferred run that later runs anyway (the hook keeps it) counts as execut
 
 test('an unmeasured lane in the pool makes the whole pool fail open', async () => {
   const unknownReset = { ...claudeLane(0.5, 48), accountKey: 'a2', lane: 'claude-2', weekly: { used: 0.5, resetsAt: null } };
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), unknownReset] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), unknownReset] });
   await d.setup();
   await d.tick();
   const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
@@ -408,7 +408,7 @@ test('an unmeasured lane in the pool makes the whole pool fail open', async () =
 });
 
 test('a paced pool plus a trial-full unpaced pool defers on the guard retry', async () => {
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
   await d.setup();
   await d.tick();
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
@@ -546,4 +546,66 @@ test('manifest: the pacing.guard schema defaults match the code defaults', () =>
   assert.equal(g.properties.enabled.default, DEFAULT_PACE_GUARD.enabled);
   assert.equal(g.properties.marginPct.default, DEFAULT_PACE_GUARD.marginPct);
   assert.equal(g.properties.retryAfterMs.default, DEFAULT_PACE_GUARD.retryAfterMs);
+});
+
+test('weekly hard hold: hook and capacity keep a deeply ahead idle lane at zero until the plan catches up', async () => {
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  let cap = (await d.api('capacity')).body;
+  assert.equal(cap.paceGuard.holdAheadPts, 0.10);
+  assert.equal(cap.paceGuard.pools.find(p => p.pool === 'claude').cap, 0);
+  assert.match((await d.hook('held-first')).model, /^gemini/);
+  d.setAccounts([claudeLane(0.83, 30), geminiLane(0.3, 48)]);
+  d.setNow(TICK + 60000);
+  await d.tick();
+  cap = (await d.api('capacity')).body;
+  assert.notEqual(cap.paceGuard.pools.find(p => p.pool === 'claude').cap, 0);
+});
+
+test('weekly hard hold: role-empty suspension is reported and keeps ordinary pacing', async () => {
+  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.ok(cap.paceGuard.roleSafety.some(w => w.role === 'doer' && w.accountIds.includes('claude:a1')));
+  assert.equal((await d.hook('safety-first')).kind, 'decide');
+  assert.equal((await d.hook('safety-second')).kind, 'defer');
+});
+
+test('weekly plan prices only spendable quota above the configured level floor', async () => {
+  const d = drive({ config: { burnMode: { floors: { 'claude:*': 0.15 } } }, accounts: [claudeLane(0.4, 84)] });
+  await d.setup();
+  await d.tick();
+  const a = (await d.api('capacity')).body.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(a.planAhead - (-0.025)) < 1e-10, `plan ahead ${a.planAhead}`);
+  assert.ok(Math.abs(a.requiredRatePerHour - 0.45 / 84) < 1e-10, `required ${a.requiredRatePerHour}`);
+  assert.equal(a.planTargetUsedPct, 0.85);
+});
+
+test('weekly hard hold: burn opt-in bypasses the hold without disabling it for ordinary accounts', async () => {
+  const d = drive({ config: { enforce: true, burnMode: { accounts: ['claude:*'] } },
+    accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  assert.match((await d.hook('burn-first')).model, /^claude/);
+  assert.equal((await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude').state, 'burn');
+});
+
+test('weekly hard hold: invalid threshold is rejected before it can replace routing policy', async () => {
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: 'off' } }, accounts: AHEAD() });
+  await assert.rejects(d.setup(), /invalid-config/);
+});
+
+test('weekly hard hold: deferral exhaustion cannot bypass a hold below a custom soft-cap margin', async () => {
+  const d = drive({ config: { enforce: true, exhaustion: { enabled: true }, pacing: { guard: { marginPct: 1 } } },
+    accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  await d.hook('trial-1');
+  await d.hook('trial-2');
+  for (let i = 0; i < 14; i++) {
+    const out = await d.hook(`waiting-${i}`, { issueId: 'same-work', agentDefaultModel: 'claude-opus-5-5' });
+    assert.equal(out.kind, 'defer', `attempt ${i}: ${JSON.stringify(out)}`);
+  }
 });

@@ -320,6 +320,7 @@ test('/caps keeps a pinned Reviewer within its Meta pace cap, not the fresh Code
     nowMs: TICK,
     config: {
       enforce: true,
+      pacing: { holdAheadPts: null }, // isolate the ordinary pace-cap budget
       concurrency: { maxTotal: 75, meanRunDurationHours: 1.1 },
       roles: { keepAgentIds: ['reviewer'] },
     },

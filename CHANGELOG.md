@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+
+### Weekly pacing (0.2.73 — 2026-10-28)
+- Add a default ten-percentage-point weekly ahead hold (`pacing.holdAheadPts`; `null` opts out): idle ahead accounts receive zero new slots instead of immediately reopening the one-job minimum. Burn mode remains exempt. Per-role empty-capacity safety suspends only hard holds, retains ordinary pacing, and is reported in `/capacity.paceGuard.roleSafety`. Shared-pool caps exclude held account allowance and preserve existing running work.
+- Price the weekly linear endpoint, required rate and concurrency need at 100% minus the existing explicit account floor (`burnMode.floors`), with no extra pacing remainder; report target and spendable quota without changing raw remaining readings. No new capabilities, jobs, egress, host automation or production changes.
+
 ### Added
 - Alert-only failure-cluster detector (default off): failed-run events feed per-account counters in plugin state; >= 3 allowlisted failures (`claude_auth_required`, `claude_transient_upstream`, `adapter_failed`) for one account inside a 15-minute event-time window creates or updates exactly one stable-origin managed alert issue and reports `error` through plugin health until the cluster clears. Writes happen on cluster enter/exit/count-band transitions only, never per run; `timed_out` runs are excluded and the account keeps the legacy ` on provider:account` extraction. Opt in with `failureClusterAlert: { enabled: true, assigneeAgentId }`; disabled or unassigned performs zero issue writes. Adds exactly `issues.create` + `issues.update` with create/update field allowlists and per-write ownership checks; no comment, checkout, wakeup, interaction, document or relation writes, no routing or enforce-flag change, no new job, egress, secret or env key.
 - Read-only `modelInventory` on `/capacity`: raw, canonical and emitted spellings of every reported model id side by side, per-account served present/absent/unknown (an absent served list reads unknown, fail-open as routing does), linked unscored/unservable/readiness evidence, and explicit unknown markers for protocol/tool/reasoning compatibility and configured-model coverage (other-agent adapter configuration is restricted). Pure reporting; routing reads nothing from it. No new capability, egress, secret or env key.

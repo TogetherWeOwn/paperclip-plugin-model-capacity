@@ -182,14 +182,25 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   // placement scores and shortfalls below see only the pools that can serve.
   // The reserve hold applies first for the same reason: held accounts never
   // reach the guard or the sort for non-review runs.
-  const verdicts = paceGuardPools(unheld, { pacing, poolKeyOf });
+  let verdicts = paceGuardPools(unheld, { pacing, poolKeyOf });
+  const taskEnforce = taskRanking?.mode === 'enforce';
+  const routable = unheld.filter(v => !v.held && (!taskEnforce || (v.taskFeasible !== false && v.roleEligible !== false)));
+  const roleCapacity = routable.filter(v => v.roleEligible !== false && (isReactiveAccount(v) || v.remainingKnown !== false));
+  const hardHeldIds = new Set(verdicts.flatMap(p => p.hardHeldAccountIds ?? []));
+  // Same empty-role safety pattern as eligibility gates: suspend only this
+  // gate for this role, not health, reserves, exclusions or the soft cap.
+  const holdSuspendedAccountIds = roleCapacity.length > 0
+    && roleCapacity.every(v => hardHeldIds.has(v.accountId))
+    ? roleCapacity.map(v => v.accountId) : [];
+  if (holdSuspendedAccountIds.length > 0) {
+    const exempt = new Set(holdSuspendedAccountIds);
+    verdicts = paceGuardPools(unheld.map(v => ({ ...v, holdExempt: exempt.has(v.accountId) })), { pacing, poolKeyOf });
+  }
   // Per-lane verdicts: only the lanes the guard holds leave the order (a
   // lane behind its own plan keeps serving while an ahead sibling is held;
   // burn lanes are never held).
   const pacedVerdicts = verdicts.filter(p => (p.pacedAccountIds?.length ?? 0) > 0);
   const pacedIds = new Set(pacedVerdicts.flatMap(p => p.pacedAccountIds));
-  const taskEnforce = taskRanking?.mode === 'enforce';
-  const routable = unheld.filter(v => !v.held && (!taskEnforce || (v.taskFeasible !== false && v.roleEligible !== false)));
   const qualified = pacedIds.size > 0 ? routable.filter(v => v.burn === true || !pacedIds.has(v.accountId)) : routable;
   // Aggregator fallback (owner rule 2026-09-17): a Devin lane serving
   // only models a qualified native also serves sorts after every need band.
@@ -262,5 +273,5 @@ export function orderAccountsWithPacing(views, { reservePct = 0.05, rateDeadband
   const heldPub = reserveHeld.map(v => ({
     accountId: v.accountId, pool: v.pool ?? null, headroomPct: v.headroomPct ?? null,
   }));
-  return { order, paced: pacedVerdicts.map(pub), pools: verdicts.map(pub), reserveHeld: heldPub };
+  return { order, paced: pacedVerdicts.map(pub), pools: verdicts.map(pub), reserveHeld: heldPub, holdSuspendedAccountIds };
 }

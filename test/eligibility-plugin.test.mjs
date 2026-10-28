@@ -390,7 +390,7 @@ test('pinned runs count against their serving account at once, before the next t
   // otherwise take. Pinned hooks between ticks must add pressure on m1 so
   // water-filling sends the doer elsewhere; without the kept decision the
   // doer still lands on m1.
-  const cfg = { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
+  const cfg = { enforce: true, pacing: { holdAheadPts: null }, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
   const control = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
   await control.setup();
   await control.tick();
