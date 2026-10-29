@@ -26,10 +26,11 @@ export function planGatewayConnections({registry: raw, baseUrl, batch, allAgents
   const batches=Object.fromEntries(poolKeys.map(k=>[k,agentList(batch[k])]));
   return registry.accounts.map(account=>{
     const poolMemberships=Object.keys(account.pools);
-    const agentIds=agentList(poolMemberships.flatMap(k=>batches[k]));
+    if (!poolMemberships.length) throw new Error('account must join a pool');
+    const agentIds=allAgents ? [] : agentList(poolMemberships.flatMap(k=>batches[k]));
     const models=[...new Set(Object.values(account.pools).map(p=>`${account.prefix}/${p.model}`))].sort().map(id=>({id}));
     if (models.length > 200) throw new Error('too many routing models');
-    return {accountKey:account.accountKey,input:{name:account.connectionName,provider:account.provider,method:'api_key',ownership:'shared',routing:{kind:'gateway',protocol:account.protocol,baseUrl:url,auth:'bearer',models},agentIds,allAgents}};
+    return {accountKey:account.accountKey,inputWithoutSecret:{name:account.connectionName,provider:account.provider,method:'api_key',ownership:'shared',routing:{kind:'gateway',protocol:account.protocol,baseUrl:url,auth:'bearer',models},agentIds,allAgents}};
   });
 }
 
@@ -38,7 +39,9 @@ export function planGatewayConnections({registry: raw, baseUrl, batch, allAgents
 // immediately before binding. Unknown/missing evidence always fails closed.
 export function planSessionAdoption({agentIds, sessionsByAgent, sessionPlans={}}) {
   const agents=agentList(agentIds);
-  if (!sessionsByAgent || typeof sessionsByAgent !== 'object' || !sessionPlans || typeof sessionPlans !== 'object') throw new Error('session evidence required');
+  if (!agents.length) throw new Error('agent batch must not be empty');
+  const plainObject = value => value !== null && typeof value === 'object' && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+  if (!plainObject(sessionsByAgent) || !plainObject(sessionPlans) || Object.keys(sessionsByAgent).some(id=>!agents.includes(id)) || Object.keys(sessionPlans).some(id=>!agents.includes(id))) throw new Error('invalid session evidence or plan');
   const blockers=[], resets=[];
   for(const agentId of agents) {
     const sessions=Object.hasOwn(sessionsByAgent,agentId) ? sessionsByAgent[agentId] : undefined;
