@@ -427,6 +427,15 @@ function buildLeaderboardRow(rec) {
   // Only map scores representing the identical evaluation and unit. In
   // particular gdpval-aa-normalized is not the legacy fractional score.
   const scoreFields = {
+    'gpqa-diamond': 'gpqa',
+    critpt: 'critpt',
+    'tau2-bench': 'tau2',
+    'tau3-banking': 'tauBanking',
+    'terminalbench-hard': 'terminalbenchHard',
+    'terminalbench-2-1': 'terminalbenchV21',
+    'mmmu-pro': 'mmmuPro',
+    'aa-analyst-agent': 'analystAgent',
+    'itbench-aa': 'itbenchSre',
     'terminalbench-4-0': 'terminalbenchV40',
     scicode: 'scicode',
     'humanitys-last-exam': 'hle',

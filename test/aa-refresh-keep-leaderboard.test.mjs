@@ -85,7 +85,7 @@ function drive({ boardHtml, apiText = apiOnlyText, apiStatus = 200 }) {
     },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
-  return { store, jobs, fake, plugin, errors, infos, skey, setNow: ms => { now = ms; } };
+  return { store, jobs, fake, plugin, errors, infos, skey, setNow: ms => { now = ms; }, setSources: sources => { if ('apiStatus' in sources) apiStatus = sources.apiStatus; if ('boardHtml' in sources) boardHtml = sources.boardHtml; } };
 }
 
 test('2026-10-17 fixture parses the current initialModels page', () => {
@@ -467,4 +467,25 @@ test('refresh persists and logs operator-visible summary', async () => {
   assert.equal(summary.oldestCarriedAgeHours,24);
   assert.ok(summary.coverage.carriedBenchmarkRows>0);
   assert.ok(infos.some(([msg, fields])=>msg.includes('AA refresh summary') && fields.coverage?.carriedBenchmarkRows>0));
+});
+
+
+test('API failure stores full raw leaderboard for a subsequent leaderboard failure', async () => {
+  const board = JSON.stringify({initialModels:[{slug:GOOD_SLUGS[0], contextWindowTokens:128000, intelligenceIndex:99, price1mInputTokens:3, medianOutputTokensPerSecond:45, scores:{critpt:0.4}}]});
+  const {store, jobs, fake, plugin, skey, setSources} = drive({boardHtml:board, apiStatus:500});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET}, aa:{apiKeySecretRef:SECRET}}, {companyId:'acme'});
+  const key = skey({scopeKind:'company', scopeId:'acme', namespace:'model-capacity', stateKey:'aa-snapshot-v1'});
+  store.set(key, {fetchedAt:'2026-10-16T04:17:00Z', intelligenceIndexVersion:'5.0', rows:[{slug:GOOD_SLUGS[0], intelligenceIndex:12}], leaderboardSlugs:[]});
+  await assert.rejects(jobs.get('aa-refresh')({}), /aa-refresh-failed/);
+  const first = store.get(key);
+  assert.equal(first.rows.find(r=>r.slug===GOOD_SLUGS[0]).intelligenceIndex, 12, 'unknown generation index must not be published');
+  const raw = first.leaderboardRows.find(r=>r.slug===GOOD_SLUGS[0]);
+  assert.equal(raw.contextWindowTokens,128000);
+  assert.equal(raw.intelligenceIndex,99);
+  assert.equal(raw.price1mInputTokens,3);
+  assert.equal(raw.medianOutputTokensPerSecond,45);
+  setSources({apiStatus:200, boardHtml:'invalid'});
+  await jobs.get('aa-refresh')({});
+  assert.equal(store.get(key).rows.find(r=>r.slug===GOOD_SLUGS[0]).contextWindowTokens,128000);
 });

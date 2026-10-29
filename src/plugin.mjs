@@ -5844,7 +5844,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const priorRows = stampAaObservations(previous.rows ?? [], previous.fetchedAt ?? null, 'previous-snapshot');
         const merged = mergeAaRows(priorRows, boardRows);
         patch.rows = markStaleBenchmarks(merged.rows, nowIso);
-        patch.leaderboardRows = boardRows;
+        // Preserve the full source separately; only benchmark fields enter the
+        // current generation until the API version can be established.
+        patch.leaderboardRows = stampAaObservations(freshBoard, nowIso, 'public-leaderboard');
         patch.leaderboardSlugs = merged.leaderboardSlugs;
         patch.leaderboardAt = nowIso;
       }

@@ -35,3 +35,20 @@ test('fidelity gate rejects missing required baseline fields', async () => {
   const incomplete = { capacity: {}, ladders: {} };
   assert.throws(() => assertFidelity(incomplete, incomplete), /fidelity/i);
 });
+
+test('buildSuccessor refreshes recorded pages and leaderboard rather than cloning baseline', async () => {
+  const {readFile} = await import('node:fs/promises');
+  const {buildSuccessor} = await import('../scripts/aa-replay.mjs');
+  const pages = await Promise.all([1,2,3,4].map(n => readFile(new URL(`./fixtures/aa-free-20261029-page-${n}.json`, import.meta.url),'utf8')));
+  const leaderboard = await readFile(new URL('./fixtures/aa-leaderboard-20261029.html', import.meta.url),'utf8');
+  const nowMs = Date.parse('2026-10-29T12:00:00Z');
+  const snapshot = {fetchedAt:'2026-10-01T00:00:00Z',intelligenceIndexVersion:'4.0',rows:[{slug:'obsolete-test-model',intelligenceIndex:1}],leaderboardSlugs:[]};
+  const next = await buildSuccessor({config:{},states:{},snapshot,nowMs,pages,leaderboard});
+  assert.equal(next.fetchedAt,new Date(nowMs).toISOString());
+  assert.equal(next.intelligenceIndexVersion,JSON.parse(pages[0]).intelligence_index_version);
+  assert.equal(next.pagesFetched,4);
+  assert.ok(next.rows.length >= 718);
+  assert.ok(next.rows.some(r=>r.slug==='jt-35b-flash' && r.gpqa!=null));
+  assert.ok(!next.rows.some(r=>r.slug==='obsolete-test-model'));
+  assert.equal(next.leaderboardRows.find(r=>r.slug==='jt-35b-flash').fieldSources.gpqa,'public-leaderboard');
+});

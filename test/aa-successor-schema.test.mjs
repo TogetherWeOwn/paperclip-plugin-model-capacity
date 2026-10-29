@@ -97,3 +97,17 @@ test('recorded free pages pass complete fetch traversal and size bounds', async 
   assert.equal(result.pagesFetched,4);
   assert.equal(parseAaFreeList(result.text).rows.length,718);
 });
+
+
+test('recorded leaderboard maps every verified matching nested evaluation', async () => {
+  const {readFile} = await import('node:fs/promises');
+  const text = await readFile(new URL('./fixtures/aa-leaderboard-20261029.html', import.meta.url), 'utf8');
+  const source = JSON.parse(text).initialModels;
+  const rows = new Map(parseAaLeaderboardHtml(text).map(row => [row.slug,row]));
+  const fields = {'gpqa-diamond':'gpqa', critpt:'critpt', 'tau2-bench':'tau2', 'tau3-banking':'tauBanking', 'terminalbench-hard':'terminalbenchHard', 'terminalbench-2-1':'terminalbenchV21', 'mmmu-pro':'mmmuPro', 'aa-analyst-agent':'analystAgent', 'itbench-aa':'itbenchSre'};
+  for (const [key, field] of Object.entries(fields)) {
+    const examples = source.filter(row => typeof row.scores?.[key] === 'number');
+    assert.ok(examples.length > 0, `recorded fixture has ${key}`);
+    for (const row of examples) assert.equal(rows.get(row.slug)[field], row.scores[key], `${row.slug} ${field}`);
+  }
+});

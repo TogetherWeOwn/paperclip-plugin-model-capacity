@@ -74,3 +74,27 @@ test('rejects a short nonfinal page even if metadata claims more pages', async (
   assert.equal(result.error,'aa-incomplete-snapshot');
   assert.equal(result.text,undefined);
 });
+
+test('cumulative byte limit rejects individually valid pages exceeding the total cap', async () => {
+  const pages = [1,2,3,4].map(n => page(n));
+  const sizes = pages.map(p => Buffer.byteLength(JSON.stringify(p)));
+  const cap = Math.max(...sizes) + 10;
+  assert.ok(sizes[0] + sizes[1] > cap);
+  const result = await fetchAaFreeList({http:client(pages), apiKey:'test', maxResponseBytes:cap});
+  assert.equal(result.ok,false);
+  assert.equal(result.error,'aa-response-too-large');
+  assert.equal(result.text,undefined);
+});
+
+test('later pages receive only the remaining total deadline', async () => {
+  const pages = [1,2].map(n => ({...page(n),pagination:{page:n,total_pages:2,page_size:1,has_more:n===1}}));
+  const http = {fetch: async url => {
+    const n=Number(new URL(url).searchParams.get('page'));
+    await new Promise(resolve => setTimeout(resolve,80));
+    return {status:200,text:async()=>JSON.stringify(pages[n-1])};
+  }};
+  const result = await fetchAaFreeList({http,apiKey:'test',timeoutMs:130});
+  assert.equal(result.ok,false);
+  assert.equal(result.text,undefined);
+  assert.match(result.error,/aa-request-(failed|timeout)/);
+});
