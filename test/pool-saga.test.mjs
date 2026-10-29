@@ -107,7 +107,7 @@ test('updates an adopted disabled pool with expectedRevision without marking it 
   await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath});
   assert.deepEqual(api.writes,['pool']); assert.equal(api.pools[0].revision,2);
   const journal=await readFile(journalPath,'utf8'); assert.doesNotMatch(journal,/"kind":"pool"/);
-  await generator.rollbackPoolSaga({api,journalPath}); assert.equal(api.pools.length,1);
+  await assert.rejects(generator.rollbackPoolSaga({api,journalPath}),/completed journal/i); assert.equal(api.pools.length,1);
 });
 
 test('refuses to update an enabled pool with drift', async t => {
@@ -115,5 +115,24 @@ test('refuses to update an enabled pool with drift', async t => {
   await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)});
   api.pools[0].enabled=true; api.pools[0].members=[]; api.writes=[];
   await assert.rejects(generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)}));
+  assert.deepEqual(api.writes,[]);
+});
+
+test('rollback refuses a completed journal before deleting any live objects', async t => {
+  const api=new FakeApi(), journalPath=await scratch(t);
+  await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath});
+  api.writes=[];
+  await assert.rejects(generator.rollbackPoolSaga({api,journalPath}),/completed journal/i);
+  assert.deepEqual(api.writes,[]);
+  assert.equal(api.pools.length,1);
+  assert.equal(api.connections.length,1);
+});
+
+test('rollback refuses incomplete journals containing updates before deleting objects', async t => {
+  const {writeFile}=await import('node:fs/promises');
+  const api=new FakeApi(), journalPath=await scratch(t);
+  api.connections=[{id:id(11),name:'One'}];
+  await writeFile(journalPath,[{type:'header',version:1,companyId},{type:'created',kind:'connection',id:id(11)},{type:'updated',id:id(13),revision:2,name:'builder'}].map(x=>JSON.stringify(x)).join('\n')+'\n');
+  await assert.rejects(generator.rollbackPoolSaga({api,journalPath}),/updated objects/i);
   assert.deepEqual(api.writes,[]);
 });

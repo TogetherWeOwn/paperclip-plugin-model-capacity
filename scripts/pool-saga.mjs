@@ -129,6 +129,10 @@ export async function checkPoolDrift({api,registry,qualityVerdicts}) {
 export async function rollbackPoolSaga({api,journalPath}) {
   const lines=(await readFile(journalPath,'utf8')).split('\n').filter(Boolean).map(JSON.parse);
   if(lines[0]?.type!=='header' || lines[0].version!==1) throw new Error('invalid journal');
+  // Until update compensation is implemented, never remove dependencies of an
+  // adopted pool or undo a successful run based on a stale journal.
+  if(lines.some(e=>e.type==='complete')) throw new Error('cannot rollback completed journal');
+  if(lines.some(e=>e.type==='updated')) throw new Error('cannot rollback journal containing updated objects; manual reconciliation required');
   const entries=lines.filter(e=>e.type==='created');
   if(entries.some(e=>!['pool','grant','connection'].includes(e.kind) || typeof e.id!=='string' || (e.kind==='pool' && (!Number.isInteger(e.revision) || e.revision<1)))) throw new Error('invalid journal object');
   for(const entry of entries.reverse()) {
