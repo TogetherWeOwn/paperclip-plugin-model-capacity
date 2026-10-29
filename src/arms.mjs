@@ -338,6 +338,13 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
       unscored.push({ model: b.model, reason: 'no-aa-match', tried });
       continue;
     }
+    // Carried history, not a served model: a lane that still lists the id must
+    // not resurrect an arm the feed retired (the classic guard alone would let
+    // buildAccountLadders bind it dynamically instead).
+    if (row.historicalOnly) {
+      unscored.push({ model: b.model, reason: 'slug-prior-only', tried });
+      continue;
+    }
     if (!effortAllowed(b.family, b.effort)) {
       unscored.push({ model: b.model, reason: 'effort-inexpressible', tried });
       continue;
@@ -479,7 +486,11 @@ export const taskArmId = (model, effort) => `${taskSlugBases(model).at(-1) ?? mo
 export function discoverTaskArms(aaRows, servedModels, { armMap = DEFAULT_ARM_MAP, overrides = {}, effortSupport = {}, bannedModels = [] } = {}) {
   const counts = new Map();
   for (const r of aaRows ?? []) if (typeof r?.slug === 'string') counts.set(r.slug, (counts.get(r.slug) ?? 0) + 1);
-  const rows = (aaRows ?? []).filter(r => r?.slug && counts.get(r.slug) === 1);
+  const unique = (aaRows ?? []).filter(r => r?.slug && counts.get(r.slug) === 1);
+  // Historical rows are reporting evidence, never candidates: task ranking
+  // would otherwise keep scoring a retired slug on its carried benchmarks.
+  const historical = unique.filter(r => r.historicalOnly);
+  const rows = unique.filter(r => !r.historicalOnly);
   const arms = [], unscored = [];
   for (const model of new Set([...(servedModels ?? [])].map(canonicalModelName).filter(Boolean))) {
     const bases = taskSlugBases(model);
@@ -502,8 +513,15 @@ export function discoverTaskArms(aaRows, servedModels, { armMap = DEFAULT_ARM_MA
       }
       return null;
     };
-    const matched = rows.filter(r => target ? r.slug === target : identityOf(r) != null);
-    if (matched.length === 0) { unscored.push({ model, reason: 'no-aa-match', tried: target ? [target] : bases }); continue; }
+    const matches = r => (target ? r.slug === target : identityOf(r) != null);
+    const matched = rows.filter(matches);
+    if (matched.length === 0) {
+      // The row exists but the feed stopped serving it: say so instead of
+      // reporting a bare no-match, exactly like the classic resolver does.
+      const retired = historical.some(matches);
+      unscored.push({ model, reason: retired ? 'slug-prior-only' : 'no-aa-match', tried: target ? [target] : bases });
+      continue;
+    }
     const byEffort = new Map();
     for (const r of matched) {
       const identity = identityOf(r);

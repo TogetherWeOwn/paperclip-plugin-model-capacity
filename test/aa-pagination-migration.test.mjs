@@ -72,6 +72,51 @@ test('a slug absent from the snapshot is carried as historicalOnly and never res
   assert.equal(resolveArms(back, map).arms.length, 1);
 });
 
+// Review finding 1: gating only the classic table reroutes a retired model
+// into a dynamic arm, because buildAccountLadders covers classic arms only for
+// the classic path. A lane that still lists the id must not resurrect it.
+test('a historical-only row resolves no dynamic arm either', async () => {
+  const { carryForwardBenchmarks } = await import('../src/aa.mjs');
+  const { buildDynamicBindings, resolveDynamicArms } = await import('../src/arms.mjs');
+  const carried = carryForwardBenchmarks([], [{ slug: 'retired-model', scicode: 0.9 }], '2026-10-01T00:00:00Z');
+  const { bindings } = buildDynamicBindings(['retired-model'], {});
+  assert.equal(bindings.length, 1, 'the lane still serves the id');
+  const { arms, unscored } = resolveDynamicArms(carried, bindings);
+  assert.equal(arms.length, 0, 'a retired slug must not come back as a dynamic arm');
+  assert.deepEqual(unscored.map(u => [u.model, u.reason]), [['retired-model', 'slug-prior-only']]);
+  // Served again is still routine: the row loses the marker and resolves.
+  const back = carryForwardBenchmarks([{ slug: 'retired-model', scicode: 0.91 }], carried, '2026-10-02T00:00:00Z');
+  assert.equal(resolveDynamicArms(back, bindings).arms.length, 1);
+});
+
+// Review finding 2: task ranking is the third consumer of snapshot rows.
+test('task discovery never scores a historical-only row', async () => {
+  const { carryForwardBenchmarks } = await import('../src/aa.mjs');
+  const { discoverTaskArms } = await import('../src/arms.mjs');
+  const carried = carryForwardBenchmarks([], [{ slug: 'retired-model', scicode: 0.9 }], '2026-10-01T00:00:00Z');
+  const { arms, unscored } = discoverTaskArms(carried, ['retired-model'], {});
+  assert.equal(arms.length, 0, 'task ranking must not recruit a retired slug');
+  assert.deepEqual(unscored.map(u => [u.model, u.reason]), [['retired-model', 'slug-prior-only']]);
+  const back = carryForwardBenchmarks([{ slug: 'retired-model', scicode: 0.91 }], carried, '2026-10-02T00:00:00Z');
+  assert.equal(discoverTaskArms(back, ['retired-model'], {}).arms.length, 1);
+});
+
+// Review finding 3: a kept layer must never hand the marker to a row the fresh
+// feed serves, or a re-served slug stays blocked forever (contrary to C3).
+test('gap fill marks kept-only slugs and never leaks the marker onto fresh rows', async () => {
+  const { mergeAaRowsGapFill } = await import('../src/aa.mjs');
+  const merged = mergeAaRowsGapFill(
+    [{ slug: 'live-model', scicode: 0.8 }],
+    [{ slug: 'live-model', scicode: 0.7, historicalOnly: true }, { slug: 'retired-model', scicode: 0.9 }],
+  );
+  const live = merged.rows.find(r => r.slug === 'live-model');
+  const retired = merged.rows.find(r => r.slug === 'retired-model');
+  assert.equal(live.historicalOnly, undefined, 'the fresh feed serves this slug: no marker');
+  assert.equal(live.scicode, 0.8, 'fresh API value still wins');
+  assert.equal(retired.historicalOnly, true, 'kept-only slug is carried history');
+  assert.equal(retired.scicode, 0.9, 'and still keeps its values for reporting');
+});
+
 test('rejects a changed final page size that can skip rows', async () => {
   const { readFileSync } = await import('node:fs');
   const pages = [1,2,3,4].map(n => JSON.parse(readFileSync(new URL(`./fixtures/aa-free-20261029-page-${n}.json`, import.meta.url))));

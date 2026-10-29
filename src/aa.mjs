@@ -502,6 +502,14 @@ export function parseAaLeaderboardHtml(html) {
 }
 
 /**
+ * Fields that describe where a row came from rather than what it measured.
+ * `historicalOnly` is derived from presence in the current feed, so a stale
+ * layer must never hand it to a row the fresh layer serves -- that would keep
+ * a re-served slug blocked forever (2026-10-29 review finding).
+ */
+const MERGE_META_FIELDS = Object.freeze(['slug', 'fieldObservedAt', 'fieldSources', 'historicalOnly']);
+
+/**
  * Merge free-API rows with leaderboard rows per slug. The leaderboard wins
  * for fields it has (non-null); the API fills the gaps; slugs present in
  * only one source still appear. Returns { rows, duplicateSlugs,
@@ -526,7 +534,7 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
       continue;
     }
     for (const [k, v] of Object.entries(row)) {
-      if (['slug', 'fieldObservedAt', 'fieldSources'].includes(k)) continue;
+      if (MERGE_META_FIELDS.includes(k)) continue;
       if (v != null) {
         base[k] = v;
         if (row.fieldObservedAt?.[k] != null) base.fieldObservedAt = { ...base.fieldObservedAt, [k]: row.fieldObservedAt[k] };
@@ -546,6 +554,11 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
  * layer must never overwrite fresh API values (intelligence index, prices,
  * codingIndex) while the leaderboard is failing. Returns the same shape
  * as mergeAaRows, with leaderboardSlugs taken from the kept layer.
+ *
+ * A slug that only the KEPT layer has is not served by the fresh API: it is
+ * carried history, so it is marked `historicalOnly` and cannot resolve into an
+ * arm. The row itself still appears, so ladders and reporting keep their rows
+ * through a leaderboard outage (2026-10-17).
  */
 export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
   const bySlug = new Map();
@@ -562,11 +575,11 @@ export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
     leaderboardSlugs.add(row.slug);
     const base = bySlug.get(row.slug);
     if (!base) {
-      bySlug.set(row.slug, { ...row });
+      bySlug.set(row.slug, { ...row, historicalOnly: true });
       continue;
     }
     for (const [k, v] of Object.entries(row)) {
-      if (['slug', 'fieldObservedAt', 'fieldSources'].includes(k)) continue;
+      if (MERGE_META_FIELDS.includes(k)) continue;
       if (v != null && base[k] == null) {
         base[k] = v;
         if (row.fieldObservedAt?.[k] != null) base.fieldObservedAt = { ...base.fieldObservedAt, [k]: row.fieldObservedAt[k] };
