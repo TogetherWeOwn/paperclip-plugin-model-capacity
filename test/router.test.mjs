@@ -214,3 +214,15 @@ test('eligible accounts with out-of-range quota readings are rejected', () => {
     }
   }
 });
+
+test('five-hour pace hold retries at catch-up using configured deadband', () => {
+  const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:.4,weeklyPeriodStartMs:now-48*3600000,weeklyResetsAtMs:now+72*3600000,fiveHourUsed:.9,fiveHourResetsAtMs:now+3600000,measuredFiveHourRatePerHour:.5})}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{a:'pace-held'}});
+  f.config.pacing={deadband:.04};
+  assert.equal(route(f).retryAt,new Date(now+18*60000).toISOString());
+});
+test('pace-held retry waits for both windows to catch up', () => {
+  const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:.6,weeklyPeriodStartMs:now-50*3600000,weeklyResetsAtMs:now+50*3600000,fiveHourUsed:.9,fiveHourResetsAtMs:now+3600000,measuredFiveHourRatePerHour:.5})}});
+  f.config.pacing={deadband:.096};
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{a:'pace-held'}});
+});

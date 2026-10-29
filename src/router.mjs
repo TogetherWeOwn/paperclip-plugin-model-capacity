@@ -64,7 +64,7 @@ function staleDelay(account, now, recheck) {
   const k = clamp(Math.floor((now - since) / recheck), 0, 30);
   return now + Math.min(30 * MINUTE, recheck * 2 ** k);
 }
-function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour = .99) {
+function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour = .99, deadband = .02) {
   const validReset = t => Number.isFinite(t) && t > now && ['passive', 'live', 'cached'].includes(account.quality);
   if (reason === 'weekly-exhausted' && validReset(account.weeklyResetsAtMs)) {
     if (account.fiveHourUsed >= hardCapFiveHour && validReset(account.fiveHourResetsAtMs)) return {at: Math.max(account.weeklyResetsAtMs, account.fiveHourResetsAtMs), credible: true};
@@ -72,10 +72,13 @@ function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour
   }
   if (reason === 'five-hour-exhausted' && validReset(account.fiveHourResetsAtMs)) return {at: account.fiveHourResetsAtMs, credible: true};
   if (reason === 'pace-held') {
-    let t = account.nextEligibleAtMs;
-    if (!Number.isFinite(t) && Number.isFinite(account.weeklyPeriodStartMs) && Number.isFinite(account.weeklyResetsAtMs) && Number.isFinite(account.weeklyUsed)) {
-      t = account.weeklyPeriodStartMs + (account.weeklyUsed - (account.deadband ?? .02)) * (account.weeklyResetsAtMs - account.weeklyPeriodStartMs);
-    }
+    const solve = (used, start, end) => Number.isFinite(used) && Number.isFinite(start) && Number.isFinite(end) && end > start
+      ? Math.ceil(start + (used - deadband) * (end - start)) : null;
+    const times = [
+      solve(account.weeklyUsed, account.weeklyPeriodStartMs, account.weeklyResetsAtMs),
+      solve(account.fiveHourUsed, account.fiveHourResetsAtMs - 5 * HOUR, account.fiveHourResetsAtMs),
+    ].filter(Number.isFinite);
+    const t = times.length ? Math.max(...times) : account.nextEligibleAtMs;
     return {at: clamp(Number.isFinite(t) ? t : now + recheck, now + MINUTE, now + 30 * MINUTE), credible: true};
   }
   if (reason === 'credential-unavailable') return {at: clamp(Number.isFinite(account.nextEligibleAtMs) ? account.nextEligibleAtMs : now + recheck, now + MINUTE, now + 6 * HOUR), credible: true};
@@ -131,7 +134,7 @@ export function routeDecision(params, snapshot, config = {}) {
     if (reason) {
       skipped[i.id] = reason;
       if (reason === 'unmapped-member') retries.push({at:now + MINUTE, credible:false});
-      else retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99));
+      else retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99, config.pacing?.deadband ?? .02));
     }
   }
   if (pin && eligible.length) return {kind:'selected', memberId:pin};
