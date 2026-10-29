@@ -11,7 +11,7 @@ function connectionPlan(a) {
 function sameModels(a,b) {
   return Array.isArray(a) && Array.isArray(b) && isDeepStrictEqual([...a].sort(),[...b].sort());
 }
-async function discover(api, raw) {
+async function discover(api, raw, {allowWrongPluginKey=false}={}) {
   const registry=normalizeRegistry(raw);
   const connections=await api.listConnections(registry.companyId);
   const pools=await api.listPools(registry.companyId);
@@ -31,7 +31,7 @@ async function discover(api, raw) {
   for(const {poolKey} of registry.pools) {
     const found=pools.filter(p=>p.name===poolKey);
     if(found.length>1) throw new Error(`ambiguous pool: ${poolKey}`);
-    if(found.length && found[0].pluginKey!==PLUGIN_KEY) throw new Error(`wrong pluginKey: ${poolKey}`);
+    if(!allowWrongPluginKey && found.length && found[0].pluginKey!==PLUGIN_KEY) throw new Error(`wrong pluginKey: ${poolKey}`);
   }
   return {registry,accounts,pools};
 }
@@ -106,8 +106,14 @@ export async function applyPoolSaga({api,registry,qualityVerdicts,journalPath}) 
   } finally { await handle.close(); }
 }
 
-export async function checkPoolDrift({api,registry,qualityVerdicts}) {
-  const state=await discover(api,registry); const drift=[];
+export async function checkPoolDrift({api,registry,qualityVerdicts,expectedEnabled=false}) {
+  if(typeof expectedEnabled!=='boolean') throw new Error('expectedEnabled must be boolean');
+  const state=await discover(api,registry,{allowWrongPluginKey:true}); const drift=[];
+  for(const {poolKey} of state.registry.pools) {
+    const existing=state.pools.find(p=>p.name===poolKey);
+    if(!existing) drift.push({type:'missing-pool',poolKey});
+    else if(existing.pluginKey!==PLUGIN_KEY) drift.push({type:'plugin-key-drift',poolKey});
+  }
   for(const x of state.accounts) {
     if(!x.connection) drift.push({type:'missing-connection',accountKey:x.account.accountKey});
     else if(x.connection.status!=='connected' || x.connection.provider!==x.account.provider || x.connection.method!=='api_key' || !sameModels(x.connection.routing?.models,x.desired.routing.models)) drift.push({type:'connection-drift',accountKey:x.account.accountKey});
@@ -115,12 +121,17 @@ export async function checkPoolDrift({api,registry,qualityVerdicts}) {
   }
   if(state.accounts.every(x=>x.connection && x.grant)) {
     const desired=buildPoolPlan(registry,rowsFor(state.accounts).map(x=>({...x,status:'connected'})),qualityVerdicts);
+    // Empty desired pools cannot be represented by SaveInput, but their live
+    // counterparts must not silently pass drift checks.
+    for(const {poolKey} of state.registry.pools) {
+      if(!desired.pools.some(p=>p.config.name===poolKey) && state.pools.some(p=>p.name===poolKey)) drift.push({type:'pool-drift',poolKey});
+    }
     for(const pool of desired.pools) {
       const existing=state.pools.find(p=>p.name===pool.config.name);
-      if(!existing) { drift.push({type:'missing-pool',poolKey:pool.config.name}); continue; }
+      if(!existing) continue;
       const ids=new Set((existing.members??[]).map(m=>m.id));
       for(const member of pool.config.members) if(!ids.has(member.id)) drift.push({type:'missing-member',poolKey:pool.config.name,memberId:member.id});
-      if(!comparePool(existing,pool)) drift.push({type:'pool-drift',poolKey:pool.config.name});
+      if(existing.enabled!==expectedEnabled || !comparePool(existing,pool)) drift.push({type:'pool-drift',poolKey:pool.config.name});
     }
   }
   return {ok:drift.length===0,drift};

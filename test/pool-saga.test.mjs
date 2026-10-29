@@ -136,3 +136,33 @@ test('rollback refuses incomplete journals containing updates before deleting ob
   await assert.rejects(generator.rollbackPoolSaga({api,journalPath}),/updated objects/i);
   assert.deepEqual(api.writes,[]);
 });
+
+test('drift check reports wrong plugin key without writes', async t => {
+  const api=new FakeApi(); await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)});
+  api.pools[0].pluginKey='other.plugin'; api.writes=[];
+  const result=await generator.checkPoolDrift({api,registry,qualityVerdicts:verdicts});
+  assert.equal(result.ok,false); assert.ok(result.drift.some(d=>d.type==='plugin-key-drift' && d.poolKey==='builder'));
+  assert.deepEqual(api.writes,[]);
+});
+
+test('drift check compares activation with the requested phase', async t => {
+  const api=new FakeApi(); await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)});
+  assert.equal((await generator.checkPoolDrift({api,registry,qualityVerdicts:verdicts,expectedEnabled:true})).ok,false);
+  api.pools[0].enabled=true;
+  assert.equal((await generator.checkPoolDrift({api,registry,qualityVerdicts:verdicts,expectedEnabled:false})).ok,false);
+  assert.equal((await generator.checkPoolDrift({api,registry,qualityVerdicts:verdicts,expectedEnabled:true})).ok,true);
+});
+
+test('drift check reports a missing fully excluded pool', async t => {
+  const api=new FakeApi(); await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)});
+  api.pools=[]; api.writes=[];
+  const result=await generator.checkPoolDrift({api,registry,qualityVerdicts:{one:{builder:false}}});
+  assert.equal(result.ok,false); assert.ok(result.drift.some(d=>d.type==='missing-pool' && d.poolKey==='builder'));
+  assert.deepEqual(api.writes,[]);
+});
+
+test('drift check refuses an existing pool whose members are all excluded', async t => {
+  const api=new FakeApi(); await generator.applyPoolSaga({api,registry,qualityVerdicts:verdicts,journalPath:await scratch(t)});
+  const result=await generator.checkPoolDrift({api,registry,qualityVerdicts:{one:{builder:false}}});
+  assert.equal(result.ok,false); assert.ok(result.drift.some(d=>d.type==='pool-drift' && d.poolKey==='builder'));
+});
