@@ -139,3 +139,8 @@ test('role and task admission gates remain enforced even if snapshot eligible fl
 test('an empty pool identity is malformed and fails closed', () => {
   const f=mk(); f.params.pool.id=''; assert.equal(route(f).kind,'unavailable');
 });
+
+test('missing snapshot eligibility never admits a member', () => {
+  const f=mk({ids:['a']}); delete f.snapshot.accounts.a.eligible;
+  assert.equal(route(f).kind,'exhausted'); assert.equal(route(f).skipped.a,'account-reading-stale');
+});

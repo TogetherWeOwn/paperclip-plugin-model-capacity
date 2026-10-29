@@ -108,7 +108,7 @@ export function routeDecision(params, snapshot, config = {}) {
     else if (Number.isFinite(a.fiveHourUsed) && a.fiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';
     else if (restrictProbes && i.membership?.probeEligible !== true) reason = 'role-excluded';
     else if (exclusive && !burnActive(a)) reason = 'burn-not-target';
-    else if (a.eligible === false && !(a.skipReason === 'pace-held' && burnActive(a) && !pin && !probe)) reason = allowedReasons.has(a.skipReason) ? a.skipReason : 'account-reading-stale';
+    else if (a.eligible !== true && !(a.eligible === false && a.skipReason === 'pace-held' && burnActive(a) && !pin && !probe)) reason = allowedReasons.has(a.skipReason) ? a.skipReason : 'account-reading-stale';
     if (!reason && a.view) {
       const v = applyInFlightOverlay(a.view, config.overlayDelta?.[i.key] ?? 0);
       const burn = burnActive(a) && !pin && !probe;
