@@ -385,7 +385,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.72';
+export const PLUGIN_VERSION = '0.2.73';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

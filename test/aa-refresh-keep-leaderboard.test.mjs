@@ -39,7 +39,7 @@ const rawAcct = () => ({
   quality: 'live',
 });
 
-function drive({ boardHtml, apiText = apiOnlyText }) {
+function drive({ boardHtml, apiText = apiOnlyText, apiStatus = 200 }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -62,8 +62,9 @@ function drive({ boardHtml, apiText = apiOnlyText }) {
     secrets: { resolve: async () => 'test-key' },
     http: {
       fetch: async (url) => {
-        if (String(url).includes('/api/v2/data/llms/models')) {
-          return { status: 200, headers: { get: () => null }, text: async () => apiText };
+        if (String(url).includes('/api/v2/language/models/free')) {
+          const api = JSON.parse(apiText);
+          return { status: apiStatus, headers: { get: () => null }, text: async () => JSON.stringify({ ...api, intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, has_more: false } }) };
         }
         if (String(url).includes('/leaderboards/models')) {
           return { status: 200, headers: { get: () => null }, text: async () => boardHtml };
@@ -162,8 +163,8 @@ test('leaderboard fetch failure also keeps prior leaderboard rows', async () => 
   const { store, jobs, fake, plugin, skey } = drive({ boardHtml: null });
   // Null board html simulates a failed fetch body; override fetch for this case.
   fake.http.fetch = async (url) => {
-    if (String(url).includes('/api/v2/data/llms/models')) {
-      return { status: 200, headers: { get: () => null }, text: async () => apiOnlyText };
+    if (String(url).includes('/api/v2/language/models/free')) {
+      return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(apiOnlyText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, has_more: false } }) };
     }
     if (String(url).includes('/leaderboards/models')) {
       return { status: 500, headers: { get: () => null }, text: async () => '' };
@@ -370,4 +371,52 @@ test('target-zero-with-headroom alarm fires through the tick when calibrated cap
   assert.equal(alarms.length, 1, `target-0 alarm logged once (got ${alarms.length}): ${JSON.stringify(errors)}`);
   assert.equal(alarms[0][1].code, 'target-zero-with-headroom');
   assert.deepEqual(alarms[0][1].healthyAccounts, ['claude:a1']);
+});
+
+
+test('API failure retains old freshness, publishes fresh leaderboard, and fails the job', async () => {
+  const html = readFileSync(join(HERE, 'fixtures', 'aa-leaderboard-20261017.html'), 'utf8');
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:html,apiStatus:410});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:'2026-10-01T00:00:00.000Z',rows:GOOD_ROWS,leaderboardRows:[],leaderboardSlugs:[]});
+  await assert.rejects(jobs.get('aa-refresh')({}), /aa-refresh-failed/);
+  const state=store.get(skey(key));
+  assert.equal(state.fetchedAt,'2026-10-01T00:00:00.000Z');
+  assert.ok(state.leaderboardRows.length > 0);
+  assert.equal(state.lastError,'aa-http-failed');
+});
+
+test('new index major publishes fresh data without carrying old benchmarks, prices, slugs or stale leaderboard', async () => {
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:'<html>no data</html>'});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:'2026-10-01T00:00:00.000Z',intelligenceIndexVersion:'4.0',rows:[...GOOD_ROWS, {slug:'old-only', scicode:0.9}],leaderboardRows:GOOD_ROWS,leaderboardSlugs:GOOD_SLUGS});
+  await jobs.get('aa-refresh')({});
+  const state=store.get(skey(key));
+  assert.equal(state.intelligenceIndexVersion,'5.0');
+  assert.equal(state.fetchedAt,new Date(TICK).toISOString());
+  assert.equal(state.rows.find(r => r.slug === GOOD_SLUGS[0]).scicode, null);
+  assert.equal(state.rows.find(r => r.slug === GOOD_SLUGS[0]).intelligenceIndexCostPerTask, null);
+  assert.ok(!state.rows.some(r => r.slug === 'old-only'));
+  assert.deepEqual(state.leaderboardSlugs, []);
+});
+
+
+test('refresh job reports pages, coverage and previous snapshot age', async () => {
+  const html=readFileSync(join(HERE, 'fixtures', 'aa-leaderboard-20261017.html'), 'utf8');
+  const {store,jobs,fake,plugin,skey}=drive({boardHtml:html});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:new Date(TICK-7200000).toISOString(),rows:[...GOOD_ROWS, {slug:'only-old', scicode:0.5, fieldObservedAt:{scicode:new Date(TICK-86400000).toISOString()}}]});
+  const result=await jobs.get('aa-refresh')({});
+  assert.equal(result[0].pagesFetched,1);
+  assert.equal(result[0].previousSnapshotAgeHours,2);
+  assert.equal(result[0].oldestCarriedAgeHours,24);
+  assert.ok(result[0].coverage.totalRows >= 3);
+  assert.ok(result[0].coverage.benchmarkRows > 0);
+  assert.ok(result[0].coverage.configuredArms > 0);
 });

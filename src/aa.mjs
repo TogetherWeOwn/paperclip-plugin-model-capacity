@@ -3,7 +3,7 @@
  *
  * Owner rule: free AA API only. Endpoint and auth mirror the existing
  * model-selection free-list sync: GET
- * https://artificialanalysis.ai/api/v2/data/llms/models with `x-api-key`.
+ * https://artificialanalysis.ai/api/v2/language/models/free with `x-api-key`.
  * The key comes from a Paperclip secret ref resolved at call time; it is
  * never cached, logged, or written to state.
  *
@@ -11,7 +11,7 @@
  * effort suffix) is the max effort row.
  */
 
-export const AA_FREE_LIST_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models';
+export const AA_FREE_LIST_URL = 'https://artificialanalysis.ai/api/v2/language/models/free';
 
 /**
  * Second source: the public leaderboard page embeds the FULL flat field
@@ -140,7 +140,7 @@ export function buildAaFetchArgs({ url = AA_FREE_LIST_URL, apiKey } = {}) {
  * as the existing free-list sync so operators already know what each code
  * means: the caller keeps the prior snapshot on any failure.
  */
-export async function fetchAaFreeList({ http, apiKey, url = AA_FREE_LIST_URL, timeoutMs = 60000, maxResponseBytes = 8 * 1024 * 1024 }) {
+async function fetchAaFreePage({ http, apiKey, url = AA_FREE_LIST_URL, timeoutMs = 60000, maxResponseBytes = 8 * 1024 * 1024 }) {
   let args;
   try {
     args = buildAaFetchArgs({ url, apiKey });
@@ -192,13 +192,50 @@ export async function fetchAaFreeList({ http, apiKey, url = AA_FREE_LIST_URL, ti
   return { ok: true, text };
 }
 
+/** Fetch and validate every page before exposing a candidate snapshot. */
+export async function fetchAaFreeList({ http, apiKey, url = AA_FREE_LIST_URL, timeoutMs = 60000, maxResponseBytes = 8 * 1024 * 1024 }) {
+  // Hard safety bounds are independent of the provider's page size/count.
+  const maxPages = 64;
+  const deadline = Date.now() + timeoutMs;
+  let version, totalPages, totalBytes = 0;
+  const data = [];
+  const slugs = new Set();
+  for (let page = 1; page <= maxPages; page++) {
+    let pageUrl;
+    try { const u = new URL(url); u.searchParams.set('page', String(page)); pageUrl = u.toString(); }
+    catch { return { ok: false, error: 'aa-url-rejected', retryable: false }; }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, error: 'aa-request-timeout', retryable: true };
+    const response = await fetchAaFreePage({ http, apiKey, url: pageUrl, timeoutMs: remaining, maxResponseBytes });
+    if (!response.ok) return response;
+    totalBytes += new TextEncoder().encode(response.text).length;
+    if (totalBytes > maxResponseBytes) return { ok: false, error: 'aa-response-too-large', retryable: false };
+    let parsed;
+    try { parsed = JSON.parse(response.text); } catch { return { ok: false, error: 'aa-parse-failed', retryable: false }; }
+    const meta = parsed?.pagination;
+    const invalid = () => ({ ok: false, error: 'aa-incomplete-snapshot', retryable: false });
+    if (!meta || !Number.isInteger(meta.page) || meta.page !== page || !Number.isInteger(meta.total_pages)
+      || meta.total_pages < 1 || meta.total_pages > maxPages || typeof meta.has_more !== 'boolean'
+      || meta.has_more !== (page < meta.total_pages) || !Array.isArray(parsed.data)
+      || parsed.data.length === 0 || parsed.intelligence_index_version == null) return invalid();
+    if (page === 1) { version = parsed.intelligence_index_version; totalPages = meta.total_pages; }
+    if (parsed.intelligence_index_version !== version || meta.total_pages !== totalPages) return invalid();
+    for (const row of parsed.data) {
+      if (!row || typeof row.slug !== 'string' || !row.slug || slugs.has(row.slug)) return invalid();
+      slugs.add(row.slug); data.push(row);
+    }
+    if (!meta.has_more) return { ok: true, text: JSON.stringify({ data, intelligence_index_version: version }), pagesFetched: page };
+  }
+  return { ok: false, error: 'aa-incomplete-snapshot', retryable: false };
+}
+
 /** Normalize one free-API row (nested evaluations/pricing) to flat fields. */
 function normalizeFreeRow(entry) {
   const slug = str(entry.slug);
   if (!slug) return null;
   const ev = entry.evaluations && typeof entry.evaluations === 'object' ? entry.evaluations : {};
   const pricing = entry.pricing && typeof entry.pricing === 'object' ? entry.pricing : entry;
-  const row = { slug };
+  const row = { slug, agenticIndex: null };
   for (const field of new Set([...Object.values(FREE_EVAL_FIELD_MAP), 'apexAgents', 'omniscience'])) {
     row[field] = null;
   }
@@ -212,9 +249,17 @@ function normalizeFreeRow(entry) {
     'medianOutputTokensPerSecond', 'price1mInputTokens', 'price1mOutputTokens']) {
     if (row[field] == null && entry[field] !== undefined) row[field] = num(entry[field]);
   }
-  row.intelligenceIndexCostPerTask = num(entry.intelligenceIndexCostPerTask ?? pricing.intelligenceIndexCostPerTask);
+  row.intelligenceIndexCostPerTask = num(entry.artificial_analysis_intelligence_index_cost?.cost_per_task?.total_cost ?? entry.intelligenceIndexCostPerTask ?? pricing.intelligenceIndexCostPerTask);
+  row.price1mInputTokens = num(pricing.price_1m_input_tokens ?? entry.price1mInputTokens);
+  row.price1mOutputTokens = num(pricing.price_1m_output_tokens ?? entry.price1mOutputTokens);
+  row.cacheHitPrice = num(pricing.price_1m_cache_hit_tokens ?? entry.cacheHitPrice);
+  row.cacheWritePrice = num(pricing.price_1m_cache_write_tokens ?? entry.cacheWritePrice);
   row.contextWindowTokens = num(entry.contextWindowTokens);
-  row.medianOutputTokensPerSecond = num(entry.medianOutputTokensPerSecond ?? entry.median_output_tokens_per_second);
+  const performance = entry.performance ?? {};
+  row.medianOutputTokensPerSecond = num(performance.median_output_tokens_per_second ?? entry.medianOutputTokensPerSecond ?? entry.median_output_tokens_per_second);
+  row.medianTimeToFirstTokenSeconds = num(performance.median_time_to_first_token_seconds);
+  row.medianTimeToFirstAnswerTokenSeconds = num(performance.median_time_to_first_answer_token_seconds);
+  row.medianEndToEndResponseTimeSeconds = num(performance.median_end_to_end_response_time_seconds);
   row.name = str(entry.name);
   return row;
 }
@@ -377,6 +422,22 @@ function buildLeaderboardRow(rec) {
   for (const key of LEADERBOARD_STRING_FIELDS) row[key] = typeof rec[key] === 'string' ? rec[key] : null;
   for (const key of LEADERBOARD_BOOLEAN_FIELDS) row[key] = typeof rec[key] === 'boolean' ? rec[key] : null;
   for (const key of LEADERBOARD_NUMERIC_FIELDS) row[key] = num(rec[key]);
+  // Only map scores representing the identical evaluation and unit. In
+  // particular gdpval-aa-normalized is not the legacy fractional score.
+  const scoreFields = {
+    'terminalbench-4-0': 'terminalbenchV40',
+    scicode: 'scicode',
+    'humanitys-last-exam': 'hle',
+    'artificial-analysis-long-context-reasoning': 'lcr',
+    ifbench: 'ifbench',
+    'omniscience-accuracy': 'omniscienceAccuracy',
+    'omniscience-non-hallucination': 'omniscienceNonHallucination',
+  };
+  if (rec.scores && typeof rec.scores === 'object') {
+    for (const [source, field] of Object.entries(scoreFields)) {
+      if (row[field] == null) row[field] = num(rec.scores[source]);
+    }
+  }
   const known = new Set(LEADERBOARD_NUMERIC_FIELDS);
   const unexpected = Object.keys(rec).filter(k => typeof rec[k] === 'number' && !known.has(k) && k !== 'id');
   if (unexpected.length > 0) row.schemaWarnings = unexpected.map(k => `unregistered-source-field:${k}`);
@@ -555,6 +616,33 @@ export function carryForwardCosts(mergedRows = [], prevRows = [], carriedFrom = 
   });
 }
 
+/** Preserve exact-evaluation evidence that the successor no longer supplies. */
+export function carryForwardBenchmarks(rows = [], previousRows = [], previousAt = null) {
+  const fields = ['terminalbenchHard', 'terminalbenchV21', 'terminalbenchV40', 'tau2', 'tauBanking',
+    'scicode', 'apexAgents', 'omniscience', 'omniscienceAccuracy', 'omniscienceNonHallucination',
+    'lcr', 'gpqa', 'hle', 'ifbench', 'gdpvalNormalized', 'mmmuPro', 'itbenchSre', 'analystAgent', 'critpt'];
+  const previous = new Map(previousRows.filter(r => r && typeof r.slug === 'string').map(r => [r.slug, r]));
+  const result = rows.map(r => ({ ...r }));
+  const present = new Set(result.map(r => r.slug));
+  for (const old of previous.values()) if (!present.has(old.slug) && fields.some(k => old[k] != null)) result.push({ slug: old.slug });
+  return result.map(row => {
+    const old = previous.get(row.slug);
+    const { staleBenchmarkFields: _oldStale, ...next } = row;
+    if (!old) return next;
+    const stale = {};
+    for (const field of fields) {
+      if (next[field] == null && old[field] != null) {
+        next[field] = old[field];
+        next.fieldObservedAt = { ...next.fieldObservedAt, [field]: old.fieldObservedAt?.[field] ?? previousAt };
+        if (old.fieldSources?.[field] != null) next.fieldSources = { ...next.fieldSources, [field]: old.fieldSources[field] };
+        stale[field] = true;
+      }
+    }
+    if (Object.keys(stale).length) next.staleBenchmarkFields = stale;
+    return next;
+  });
+}
+
 /** Parse fetched text into normalized rows; null when the shape is unknown. */
 export function parseAaFreeList(text) {
   let parsed;
@@ -577,7 +665,7 @@ export function parseAaFreeList(text) {
       seen.add(row.slug);
     }
   }
-  return rows.length > 0 ? { rows, duplicateSlugs: [...duplicates] } : null;
+  return rows.length > 0 ? { rows, duplicateSlugs: [...duplicates], intelligenceIndexVersion: parsed?.intelligence_index_version ?? null } : null;
 }
 
 /** Stamp numeric fields at source observation time, before merging sources.
