@@ -417,6 +417,13 @@ export function resolveArms(aaRows, armMap = DEFAULT_ARM_MAP, { bannedModels = [
       skipped.push({ aaSlug: binding.aaSlug, reason: 'slug-absent-from-snapshot' });
       continue;
     }
+    // A slug the feed stopped serving keeps its benchmark history but must
+    // never route: carried pre-migration values would hold the arm eligible
+    // forever.
+    if (row.historicalOnly) {
+      skipped.push({ aaSlug: binding.aaSlug, reason: 'slug-prior-only' });
+      continue;
+    }
     if (!effortAllowed(binding.family, binding.effort)) {
       skipped.push({ aaSlug: binding.aaSlug, reason: 'effort-inexpressible' });
       continue;

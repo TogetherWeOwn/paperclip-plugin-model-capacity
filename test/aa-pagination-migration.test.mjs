@@ -54,6 +54,24 @@ test('carry forward uncovered benchmarks and slugs without changing their origin
   assert.equal(second[0].staleBenchmarkFields.scicode,true);
 });
 
+// A slug the feed stopped serving keeps its history for reporting but must
+// never resolve into an arm; once it is served again the marker disappears.
+test('a slug absent from the snapshot is carried as historicalOnly and never resolves', async () => {
+  const { carryForwardBenchmarks } = await import('../src/aa.mjs');
+  const { resolveArms } = await import('../src/arms.mjs');
+  const map = [{ aaSlug: 'retired', model: 'm', effort: 'max', family: 'claude', providers: ['claude'] }];
+  const carried = carryForwardBenchmarks([], [{ slug: 'retired', scicode: 0.9 }], '2026-10-01T00:00:00Z');
+  assert.equal(carried[0].historicalOnly, true, 'history kept, marked historical-only');
+  assert.equal(carried[0].scicode, 0.9, 'the value is still available for reporting');
+  const { arms, skipped } = resolveArms(carried, map);
+  assert.equal(arms.length, 0, 'a retired slug must not stay eligible forever');
+  assert.deepEqual(skipped, [{ aaSlug: 'retired', reason: 'slug-prior-only' }]);
+  // Served again: the marker must not survive on a present row.
+  const back = carryForwardBenchmarks([{ slug: 'retired', scicode: 0.91 }], carried, '2026-10-02T00:00:00Z');
+  assert.equal(back[0].historicalOnly, undefined);
+  assert.equal(resolveArms(back, map).arms.length, 1);
+});
+
 test('rejects a changed final page size that can skip rows', async () => {
   const { readFileSync } = await import('node:fs');
   const pages = [1,2,3,4].map(n => JSON.parse(readFileSync(new URL(`./fixtures/aa-free-20261029-page-${n}.json`, import.meta.url))));

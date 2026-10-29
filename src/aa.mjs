@@ -637,10 +637,15 @@ export function carryForwardBenchmarks(rows = [], previousRows = [], previousAt 
   const previous = new Map(previousRows.filter(r => r && typeof r.slug === 'string').map(r => [r.slug, r]));
   const result = rows.map(r => ({ ...r }));
   const present = new Set(result.map(r => r.slug));
-  for (const old of previous.values()) if (!present.has(old.slug) && fields.some(k => old[k] != null)) result.push({ slug: old.slug });
+  // A slug the feed no longer serves keeps its benchmark history but is
+  // `historicalOnly`: it must never resolve into an arm, or a retired model
+  // stays eligible forever on carried pre-migration values.
+  for (const old of previous.values()) if (!present.has(old.slug) && fields.some(k => old[k] != null)) result.push({ slug: old.slug, historicalOnly: true });
   return result.map(row => {
     const old = previous.get(row.slug);
     const { staleBenchmarkFields: _oldStale, ...next } = row;
+    // Present rows are served by the feed: never inherit the marker.
+    if (!row.historicalOnly) delete next.historicalOnly;
     if (!old) return next;
     const stale = {};
     for (const field of fields) {
