@@ -805,6 +805,128 @@ test('weekly soft cap: an unready configured reviewer sibling cannot enter raw p
     'raw pool membership must apply the same reviewer credential-readiness gate as admission');
 });
 
+const policyReviewerConfig = () => ({
+  enforce: true, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
+  concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+  roles: { keepAgentIds: ['fixed', 'reviewer-1'] },
+  reviewerRouting: { agentIds: ['reviewer-1'], arms: [
+    { provider: 'claude', model: 'claude-opus-5-5', effort: 'max' },
+  ] },
+});
+const policyReviewerSibling = (over = {}) => claudeLane(0.1, 84, {
+  accountKey: 'policy-peer', lane: 'claude-policy-peer', models: ['claude-opus-5-5'],
+  weekly: { used: 0.1, resetsAt: null }, ...over,
+});
+
+async function policyReviewerSnapshot(d) {
+  const capacity = (await d.api('capacity')).body;
+  d.updateCapacity(cap => {
+    cap.target = 8; cap.calibration = 'measured';
+    cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+  });
+  const caps = (await d.api('caps')).body;
+  const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+  const review = capacity.reviewerPaceByAgent['reviewer-1'].pools.find(p => p.pool === 'claude');
+  return { capacity, raw: { lanes: raw?.lanes, cap: raw?.cap,
+    allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated },
+  review: { lanes: review?.lanes, cap: review?.cap } };
+}
+
+async function measuredPolicyReviewer({ breakerArmIds = [] } = {}) {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({ config: policyReviewerConfig(), accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }] });
+  await d.setup();
+  if (breakerArmIds.length > 0) {
+    const cfg = sanitizeBreakers();
+    const store = createBreakerStore();
+    for (const armId of breakerArmIds) {
+      for (const atMs of [TICK - 120000, TICK - 60000]) {
+        recordArmFailure(store, 'claude:policy-peer', armId, { atMs, errorText: 'auth_unavailable' }, atMs, cfg);
+      }
+    }
+    d.seed({ ...AA_STATE_KEY, stateKey: 'breaker-v1' }, breakerStoreToJSON(store, { nowMs: TICK, cfg }));
+  }
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const ready = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([ready]);
+  await d.tick();
+  const before = await policyReviewerSnapshot(d);
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.raw, { lanes: 1, cap: 1, allocated: 1 });
+  assert.deepEqual(before.review, { lanes: 1, cap: 1 });
+  return { d, ready };
+}
+
+async function addPolicyReviewerSibling({ d, ready }, sibling) {
+  const observedAt = new Date(TICK + 31 * 60000).toISOString();
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...ready, observedAt }, ...(sibling ? [{ ...sibling, observedAt }] : [])]);
+  await d.tick();
+  return policyReviewerSnapshot(d);
+}
+
+test('weekly soft cap: a ready breaker-open policy sibling cannot enter raw membership', async t => {
+  const probe = drive({ config: policyReviewerConfig(), accounts: [
+    claudeLane(0.55, 84.5, { models: ['claude-opus-5-5'] }), policyReviewerSibling(),
+  ] });
+  await probe.setup();
+  await probe.tick();
+  const ladder = (await probe.api('ladder')).body.ladders['claude:policy-peer'];
+  const policyArms = ladder.policyReviewerArms ?? [];
+  assert.ok(policyArms.length > 0, 'the real ladder publishes configured reviewer arms');
+  const armIds = [...new Set([...(ladder.rungs ?? []), ...policyArms].map(a => a.armId))];
+  assert.ok(armIds.length > 0);
+  t.diagnostic(`seeded sibling breaker identities: ${armIds.join(', ')}`);
+  const fixture = await measuredPolicyReviewer({ breakerArmIds: armIds });
+  const after = await addPolicyReviewerSibling(fixture, policyReviewerSibling());
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+  const blocked = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+  assert.ok(blocked.rungs.length > 0, 'the real ladder retains diagnostic rows for blocked arms');
+  for (const row of blocked.rungs) {
+    assert.equal(row.breaker, 'open', `breaker ${row.armId}`);
+    assert.equal(row.credentialEvidence?.readyCredentials, 1, `ready ${row.armId}`);
+  }
+  assert.ok(blocked.policyReviewerArms.length > 0);
+  for (const row of blocked.policyReviewerArms) assert.equal(row.credentialEvidence?.readyCredentials, 1, `policy ready ${row.armId}`);
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 },
+    'ready credentials do not qualify a policy arm whose breaker is open');
+});
+
+test('weekly soft cap: a ready closed-breaker policy sibling remains a raw member', async () => {
+  const fixture = await measuredPolicyReviewer();
+  const after = await addPolicyReviewerSibling(fixture, policyReviewerSibling());
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1', 'claude:policy-peer']);
+  assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+    'a ready policy-only sibling with an unknown reset legitimately keeps the pool fail-open');
+});
+
+for (const unreadySibling of [false, true]) {
+  test(`weekly soft cap: live reviewer membership retains the ready lane's cap (unreadySibling=${unreadySibling})`, async () => {
+    const fixture = await measuredPolicyReviewer();
+    const sibling = unreadySibling ? policyReviewerSibling({ credentialAvailability: { version: 1, models: [] } }) : null;
+    const after = await addPolicyReviewerSibling(fixture, sibling);
+    assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 });
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+    const runIds = [`review-policy-${unreadySibling}-first`, `review-policy-${unreadySibling}-second`];
+    const decisions = [];
+    for (const runId of runIds) decisions.push(await fixture.d.hook(runId, { agentId: 'reviewer-1' }));
+    assert.equal(decisions[0].kind, 'decide');
+    await fixture.d.tick();
+    const entries = (await fixture.d.api('shadow')).body.entries;
+    for (const [i, decision] of decisions.entries()) {
+      if (decision.kind === 'decide') assert.equal(entries.find(e => e.runId === runIds[i])?.accountId, 'claude:a1');
+    }
+    assert.deepEqual({ review: after.review, decisions: decisions.map(d => d.kind) },
+      { review: { lanes: 1, cap: 1 }, decisions: ['decide', 'defer'] },
+      'an unready policy sibling cannot reopen the live reviewer pool or admit a second run');
+  });
+}
+
 test('weekly hard hold: routing headroom cannot erase global holds or reopen fixed-model caps', async () => {
   const d = drive({
     config: { enforce: true, pacing: { guardHighPct: 0.99, guardRejoinPct: 0.98 },
