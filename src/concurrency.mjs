@@ -655,7 +655,12 @@ function allocateMultiPoolReviewers(input) {
       let rawBudget = rawPacedLeft.get(pool) ?? 0;
       let localBudget = agentPacedLeft.get(row.agentId)?.get(pool) ?? Infinity;
       const charges = [];
-      for (const id of ids.filter(id => accountPool.get(id) === pool)) {
+      // Spend this reviewer's own restored (hold-suspended) capacity first:
+      // it is usable by no other role, so consuming shared raw slots ahead of
+      // it would strand a slot the next reviewer could still have funded.
+      const admitted = ids.filter(id => accountPool.get(id) === pool)
+        .sort((a, b) => Number(hardHeld.has(b)) - Number(hardHeld.has(a)));
+      for (const id of admitted) {
         const n = Math.min(need, accountLeft.get(id) ?? 0,
           burn.has(id) ? Infinity : Math.min(pacedBudget, localBudget, hardHeld.has(id) ? Infinity : rawBudget));
         if (n <= 0) continue;

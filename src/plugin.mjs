@@ -3813,10 +3813,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
       const universalPools = opts.universalPools === true;
+      // A configured policy model is not an admission. Raw pool membership
+      // must apply the same reviewer credential-readiness gate as
+      // reviewerArmAdmission, or an unready sibling resizes a qualified cap.
+      const hasReadyPolicyArm = v => {
+        const policy = ladders[v.accountId]?.policyReviewerArms ?? [];
+        return config.credentialReadiness.enforce
+          ? policy.some(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
+          : policy.length > 0;
+      };
       return orderAccountsWithPacing(
         accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
-          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0)
-          || (universalPools && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
+          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && hasReadyPolicyArm(v))
+          || (universalPools && hasReadyPolicyArm(v)))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
