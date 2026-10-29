@@ -97,7 +97,7 @@ export function routeDecision(params, snapshot, config = {}) {
   const hardCap = Number.isFinite(router.hardCapWeekly) ? router.hardCapWeekly : .995;
   const skipped = {}, retries = [], eligible = [];
   const burnConfig = config.burn ?? router.burn ?? {};
-  const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(burnConfig.endAtUsedPct) || a.weeklyUsed < burnConfig.endAtUsedPct);
+  const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
   const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && infos.some(i => burnActive(i.account));
   for (const i of infos) {
     const a = i.account;
