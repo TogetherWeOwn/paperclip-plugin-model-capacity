@@ -5,6 +5,14 @@ should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
+## Native router registry (not yet wired)
+
+The `router` block in `config.example.json` documents the future native pool
+registry. Its company and owner UUIDs are placeholders, not real identities;
+replace them before using a generator. `enabled` defaults to `false`, and this
+branch does not yet register the native router or implement the operator CLI.
+Pool `thresholdPercent` is ignored by this plugin; pacing is reset-relative.
+
 **v0.2.5 = SHADOW BY DEFAULT, enforce-capable opt-in.** The default
 manifest (`manifest`, the one `package.json` points at) holds NO
 `run.model.resolve` capability and no `modelRouting`: the plugin observes

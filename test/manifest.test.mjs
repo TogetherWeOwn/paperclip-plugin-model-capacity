@@ -131,3 +131,19 @@ test('reviewer schema declares every normalized knob (manifest/validator/example
   }
   assert.deepEqual(validateConfigShape({ reviewer: example.reviewer }), []);
 });
+
+test('router registry is configurable with per-membership probe eligibility and safe defaults', async () => {
+  const router = manifest.instanceConfigSchema.properties.router;
+  assert.equal(router.type, 'object');
+  assert.equal(router.additionalProperties, false);
+  assert.equal(router.properties.enabled.default, false);
+  assert.equal(router.properties.allowMessages.default, false);
+  const account = router.properties.accounts.items;
+  assert.deepEqual(account.required, ['accountKey','prefix','provider','protocol','harnessProfile','connectionName','pools']);
+  assert.equal(account.properties.probeEligible, undefined);
+  assert.equal(account.properties.pools.additionalProperties.properties.probeEligible.default, false);
+  const example = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../config.example.json', import.meta.url)));
+  assert.equal(example.router.enabled, false);
+  assert.equal(example.router.accounts.length, 0);
+  assert.equal(example.router.pools.length, 0);
+});

@@ -422,6 +422,45 @@ const CONFIG_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
+    router: {
+      type: 'object', additionalProperties: false,
+      required: ['companyId', 'ownerUserId', 'accounts', 'pools'],
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        allowMessages: { type: 'boolean', default: false },
+        companyId: { type: 'string', format: 'uuid' },
+        ownerUserId: { type: 'string', format: 'uuid' },
+        staleSnapshotMs: { type: 'integer', minimum: 1, default: 180000 },
+        accountStaleMs: { type: 'integer', minimum: 1, default: 900000 },
+        recheckMs: { type: 'integer', minimum: 1, default: 300000 },
+        hardCapWeekly: { type: 'number', minimum: 0, maximum: 1, default: 0.995 },
+        hardCapFiveHour: { type: 'number', minimum: 0, maximum: 1, default: 0.99 },
+        accounts: {
+          type: 'array', items: {
+            type: 'object', additionalProperties: false,
+            required: ['accountKey','prefix','provider','protocol','harnessProfile','connectionName','pools'],
+            properties: {
+              accountKey: { type: 'string', minLength: 1 },
+              prefix: { type: 'string', minLength: 1 },
+              provider: { type: 'string', enum: ['openai', 'anthropic'] },
+              protocol: { type: 'string', enum: ['responses', 'messages'] },
+              harnessProfile: { type: 'string', enum: ['codex', 'acpx'] },
+              acpxAgent: { type: 'string', enum: ['claude'] },
+              connectionName: { type: 'string', minLength: 1, maxLength: 160 },
+              feedExempt: { type: 'boolean', default: false },
+              pools: { type: 'object', additionalProperties: {
+                type: 'object', additionalProperties: false, required: ['model'],
+                properties: { model: { type: 'string', minLength: 1 }, probeEligible: { type: 'boolean', default: false } },
+              } },
+            },
+          },
+        },
+        pools: { type: 'array', items: {
+          type: 'object', additionalProperties: false, required: ['poolKey', 'role'],
+          properties: { poolKey: { type: 'string', minLength: 1, maxLength: 160 }, role: { type: 'string', enum: ['doer', 'thinker', 'reviewer'] } },
+        } },
+      },
+    },
     cliproxy: {
       type: 'object', additionalProperties: false,
       properties: {

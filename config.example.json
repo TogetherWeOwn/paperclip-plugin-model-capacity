@@ -1,4 +1,17 @@
 {
+  "router": {
+    "enabled": false,
+    "allowMessages": false,
+    "companyId": "00000000-0000-4000-8000-000000000001",
+    "ownerUserId": "00000000-0000-4000-8000-000000000002",
+    "staleSnapshotMs": 180000,
+    "accountStaleMs": 900000,
+    "recheckMs": 300000,
+    "hardCapWeekly": 0.995,
+    "hardCapFiveHour": 0.99,
+    "accounts": [],
+    "pools": []
+  },
   "cliproxy": {
     "accountsPath": "/telemetry/cliproxy/live/accounts.json",
     "laneKeySecretRef": null,
