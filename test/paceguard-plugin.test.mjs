@@ -750,6 +750,61 @@ test('weekly soft cap: an unservable unknown-reset sibling cannot reopen fixed-m
     'a zero-slot lane with no served model must not erase the finite raw cap');
 });
 
+test('weekly soft cap: an unready configured reviewer sibling cannot enter raw pool membership', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { enforce: true, credentialReadiness: { enforce: true },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+      roles: { keepAgentIds: ['fixed', 'reviewer-1'] },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [
+        { provider: 'claude', model: 'claude-opus-5-5', effort: 'max' },
+      ] } },
+    accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const ready = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([ready]);
+  await d.tick();
+  const read = async () => {
+    const capacity = (await d.api('capacity')).body;
+    d.updateCapacity(cap => {
+      cap.target = 8; cap.calibration = 'measured';
+      cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+    });
+    const caps = (await d.api('caps')).body;
+    const pool = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+    return { capacity, summary: { lanes: pool?.lanes, cap: pool?.cap,
+      allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated } };
+  };
+  const before = await read();
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.summary, { lanes: 1, cap: 1, allocated: 1 });
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...ready, observedAt: new Date(TICK + 31 * 60000).toISOString() },
+    claudeLane(0.1, 84, { ...onlyOpus, accountKey: 'unready', lane: 'claude-unready',
+      weekly: { used: 0.1, resetsAt: null }, observedAt: new Date(TICK + 31 * 60000).toISOString(),
+      credentialAvailability: { version: 1, models: [] } })]);
+  await d.tick();
+  const after = await read();
+  assert.equal(after.capacity.accounts.find(a => a.accountId === 'claude:unready').health, 'healthy');
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1'],
+    'the configured policy model is not an admission without ready credentials');
+  const ordinary = after.capacity.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.deepEqual({ lanes: ordinary.lanes, cap: ordinary.cap }, { lanes: 1, cap: 1 });
+  assert.equal((await d.hook('ready-review-policy-peer')).kind, 'decide');
+  assert.equal((await d.hook('unready-review-policy-peer')).kind, 'defer');
+  await d.tick();
+  assert.equal((await d.api('shadow')).body.entries.find(e => e.runId === 'ready-review-policy-peer')?.accountId, 'claude:a1');
+  assert.deepEqual(after.summary, { lanes: 1, cap: 1, allocated: 1 },
+    'raw pool membership must apply the same reviewer credential-readiness gate as admission');
+});
+
 test('weekly hard hold: routing headroom cannot erase global holds or reopen fixed-model caps', async () => {
   const d = drive({
     config: { enforce: true, pacing: { guardHighPct: 0.99, guardRejoinPct: 0.98 },

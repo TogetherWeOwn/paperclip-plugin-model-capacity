@@ -482,6 +482,25 @@ for (const blockingPriority of [false, true]) {
   });
 }
 
+test('ready policy-only reviewers remain raw pool members with credential readiness enforced', async () => {
+  const d = drive({
+    config: { ...BASE, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1]] } },
+    accounts: [metaLane('review', 0.85, 120), claudeLane(0.1, 120)],
+    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }],
+  });
+  await d.setup();
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'meta');
+  assert.deepEqual({ lanes: raw?.lanes, cap: raw?.cap, hardHeld: raw?.hardHeldAccountIds },
+    { lanes: 1, cap: 0, hardHeld: ['meta:review'] });
+  assert.deepEqual(capacity.reviewerPaceByAgent['reviewer-1'].holdSuspendedAccountIds, []);
+  assert.equal((await d.hook('ready-policy-review-held')).kind, 'defer');
+  d.updateCapacity(cap => { cap.target = 2; cap.calibration = 'measured'; });
+  assert.equal((await d.api('caps')).body.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 0);
+});
+
 test('policy-only reviewer hard hold is retained in global pools and denies queued caps', async () => {
   const d = drive({
     config: { ...BASE, taskRanking: { mode: 'enforce' },

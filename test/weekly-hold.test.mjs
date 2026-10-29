@@ -175,6 +175,64 @@ for (const blockingPriority of [false, true]) {
 }
 
 for (const blockingPriority of [false, true]) {
+  for (const heldFirst of [false, true]) {
+    test(`overlapping reviewer admissions retain both funded slots (priority=${blockingPriority}, heldFirst=${heldFirst})`, async () => {
+      const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+      const input = { target: 2, blockingPriority,
+        agents: [{ agentId: 'a', running: 0, queued: 1 }, { agentId: 'b', running: 0, queued: 1 }],
+        reviewerAccountIdsByAgent: {
+          a: heldFirst ? ['held', 'shared-unheld'] : ['shared-unheld', 'held'],
+          b: ['shared-unheld', 'other-unheld'],
+        },
+        reviewerPaceByAgent: {
+          a: { holdSuspendedAccountIds: ['held'], pools: [{ pool: 'shared', cap: 2 }] },
+          b: { holdSuspendedAccountIds: [], pools: [{ pool: 'shared', cap: 1 }] },
+        },
+        accounts: ['held', 'shared-unheld', 'other-unheld'].map(accountId => ({ accountId, pool: 'shared' })),
+        perAccount: ['held', 'shared-unheld', 'other-unheld'].map(accountId => ({ accountId, slots: 1 })),
+        pacePools: [{ pool: 'shared', cap: 1, hardHeldAccountIds: ['held'] }],
+      };
+      const rows = result => [...result.kept, ...result.routed];
+      const fenced = allocateKeptAndRoutedCaps({ ...input,
+        reviewerPaceByAgent: { ...input.reviewerPaceByAgent,
+          a: { holdSuspendedAccountIds: [], pools: [{ pool: 'shared', cap: 1 }] } } });
+      assert.equal(rows(fenced).reduce((sum, row) => sum + row.allocated, 0), 1,
+        'without the exception the single raw pool slot remains the limit');
+      const out = rows(allocateKeptAndRoutedCaps(input));
+      assert.deepEqual(Object.fromEntries(out.map(row => [row.agentId, row.allocated])), { a: 1, b: 1 },
+        'fund A from its held exception so B can still use the ordinary pool slot');
+      assert.equal(out.reduce((sum, row) => sum + row.allocated, 0), 2);
+    });
+  }
+
+  test(`unequal reviewer-local caps stay bound to their own agent (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const accounts = [
+      lane('held-a', { pool: 'shared', targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.04 }),
+      lane('held-b', { pool: 'shared', targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.01 }),
+    ];
+    const raw = pools(accounts);
+    const aPace = order(accounts.map(a => ({ ...a, roleEligible: a.accountId === 'held-a' })));
+    const bPace = order(accounts.map(a => ({ ...a, roleEligible: a.accountId === 'held-b' })));
+    assert.deepEqual(raw[0].hardHeldAccountIds, ['held-a', 'held-b']);
+    assert.deepEqual(aPace.holdSuspendedAccountIds, ['held-a']);
+    assert.deepEqual(bPace.holdSuspendedAccountIds, ['held-b']);
+    // Both C* allowances are 20 * 0.2 = 4, but A's measured-rate correction is 1/4.
+    assert.deepEqual([raw[0].cap, aPace.pools[0].cap, bPace.pools[0].cap], [0, 1, 4]);
+    const out = allocateKeptAndRoutedCaps({ target: 4, blockingPriority,
+      agents: [{ agentId: 'a', running: 0, queued: 4 }, { agentId: 'b', running: 0, queued: 0 }],
+      reviewerAccountIdsByAgent: { a: ['held-a'], b: ['held-b'] },
+      reviewerPaceByAgent: { a: aPace, b: bPace }, accounts,
+      perAccount: [{ accountId: 'held-a', slots: 4 }, { accountId: 'held-b', slots: 4 }], pacePools: raw,
+    });
+    const rows = [...out.kept, ...out.routed];
+    assert.equal(rows.find(a => a.agentId === 'a').allocated, 1,
+      'A cannot borrow idle B\'s four-slot exception past its own local cap of one');
+    assert.equal(rows.reduce((sum, row) => sum + row.allocated, 0), 1);
+  });
+}
+
+for (const blockingPriority of [false, true]) {
   test(`reviewer exceptions share capacity and cannot bypass breakers (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const input = { target: 4, blockingPriority,
