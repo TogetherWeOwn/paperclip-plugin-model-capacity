@@ -203,3 +203,14 @@ test('five-hour binding deficit changes the selected member', () => {
   f.snapshot.accounts.a.view.measuredFiveHourRatePerHour=.01;
   assert.equal(route(f).memberId,'a');
 });
+
+test('eligible accounts with out-of-range quota readings are rejected', () => {
+  for (const field of ['weeklyUsed', 'fiveHourUsed']) {
+    for (const used of [-.1, 1.1]) {
+      const f = mk({accounts:{a:mkAccount({[field]:used})}});
+      assert.equal(route(f).memberId, 'b', `${field}=${used} must not win`);
+      f.params.candidates = f.params.candidates.slice(0, 1);
+      assert.equal(route(f).skipped.a, 'account-reading-stale');
+    }
+  }
+});

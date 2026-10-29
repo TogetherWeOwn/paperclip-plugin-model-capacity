@@ -108,7 +108,7 @@ export function routeDecision(params, snapshot, config = {}) {
     const a = i.account;
     let reason = null;
     if (!poolKey || !snapshot.poolRoles?.[poolKey] || !i.key || !a) reason = 'unmapped-member';
-    else if (!['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE)) reason = 'account-reading-stale';
+    else if (!['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE) || [a.weeklyUsed, a.fiveHourUsed].some(u => u != null && (!Number.isFinite(u) || u < 0 || u > 1))) reason = 'account-reading-stale';
     else if (a.credentialReady === false) reason = 'credential-unavailable';
     else if (Number.isFinite(a.weeklyUsed) && a.weeklyUsed >= hardCap) reason = 'weekly-exhausted';
     else if (Number.isFinite(a.fiveHourUsed) && a.fiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';
