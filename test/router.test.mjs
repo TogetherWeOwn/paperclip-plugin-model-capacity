@@ -149,3 +149,57 @@ test('in-flight projection enforces the five-hour hard cap before its meter catc
   const f=mk({ids:['a'],accounts:{a:mkAccount({fiveHourUsed:.98,fiveHourResetsAtMs:now+3600000,inFlightBase:1,meanRunFiveHourPct:.02})}});
   assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'five-hour-exhausted'}});
 });
+
+test('invalid request time fails closed without inventing an epoch retry', () => {
+  for (const value of [null, undefined, 'not-a-date', '+275760-09-13T00:00:00.000Z']) {
+    const f = mk(); f.params.now = value;
+    const r = route(f);
+    assert.equal(r.kind, 'unavailable');
+    assert.deepEqual(r.skipped, {a:'quota-snapshot-stale',b:'quota-snapshot-stale'});
+  }
+});
+test('future-skewed snapshot and account readings fail closed', () => {
+  const f=mk(); f.snapshot.atMs=now+24*3600000;
+  assert.equal(route(f).skipped.a,'quota-snapshot-stale');
+  const g=mk(); g.snapshot.accounts.a.observedAtMs=now+24*3600000;
+  assert.equal(route(g).memberId,'b');
+  g.snapshot.accounts.b.observedAtMs=now+24*3600000;
+  assert.deepEqual(route(g).skipped,{a:'account-reading-stale',b:'account-reading-stale'});
+});
+test('aged snapshot and individual observation are rejected', () => {
+  const f=mk(); f.snapshot.atMs=now-180001;
+  assert.deepEqual(route(f).skipped,{a:'quota-snapshot-stale',b:'quota-snapshot-stale'});
+  const g=mk(); g.snapshot.accounts.a.observedAtMs=now-900001;
+  assert.equal(route(g).memberId,'b');
+});
+test('retry bounds hold for missing resets, out-of-range usage and distant resets', () => {
+  for (const used of [1.5, -1]) {
+    const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:used,eligible:false,skipReason:'weekly-exhausted',weeklyResetsAtMs:null})}});
+    const t=Date.parse(route(f).retryAt); assert.ok(t>=now+60000 && t<=now+7*86400000);
+  }
+  const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:1,weeklyResetsAtMs:now+30*86400000})}});
+  assert.equal(route(f).retryAt,new Date(now+7*86400000).toISOString());
+});
+test('derived pace hold skips an ahead and fast member without a one-run escape', () => {
+  const f=mk({accounts:{a:mkAccount({weeklyUsed:.8,weeklyPeriodStartMs:now-24*3600000,measuredRatePerHour:.1}), b:mkAccount({weeklyUsed:.1,weeklyPeriodStartMs:now-24*3600000})}});
+  assert.equal(route(f).memberId,'b');
+  f.params.candidates=f.params.candidates.slice(0,1);
+  assert.equal(route(f).skipped.a,'pace-held');
+});
+test('missing member index resolves prefix using a sibling pool identity', () => {
+  const f=mk(); delete f.snapshot.memberIndex.a;
+  assert.equal(route(f).memberId,'a');
+});
+test('placement wins near ties while a material deficit lead wins beyond the band', () => {
+  const f=mk({accounts:{a:mkAccount({measuredRatePerHour:.002,placementQ:0}),b:mkAccount({measuredRatePerHour:.002000001,placementQ:100})}});
+  assert.equal(route(f).memberId,'b');
+  f.snapshot.accounts.b.view.weeklyMeasuredRatePerHour=.007;
+  assert.equal(route(f).memberId,'a');
+});
+
+test('five-hour binding deficit changes the selected member', () => {
+  const f=mk({accounts:{a:mkAccount({fiveHourUsed:.9, fiveHourResetsAtMs:now+3600000, measuredFiveHourRatePerHour:.099})}});
+  assert.equal(route(f).memberId,'b');
+  f.snapshot.accounts.a.view.measuredFiveHourRatePerHour=.01;
+  assert.equal(route(f).memberId,'a');
+});

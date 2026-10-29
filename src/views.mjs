@@ -5,7 +5,7 @@ const nonNegative = n => Number.isFinite(n) ? Math.max(0, n) : 0;
 
 export function snapshotAccountView(accountKey, account, { nowMs, accountStaleMs = 15 * 60_000 } = {}) {
   const fresh = ['passive', 'live', 'cached'].includes(account.quality) && Number.isFinite(account.observedAtMs)
-    && Number.isFinite(nowMs) && nowMs - account.observedAtMs <= accountStaleMs;
+    && Number.isFinite(nowMs) && nowMs - account.observedAtMs >= -60_000 && nowMs - account.observedAtMs <= accountStaleMs;
   const inFlight = nonNegative(account.inFlightBase);
   const view = {
     accountId: accountKey,
@@ -16,6 +16,7 @@ export function snapshotAccountView(accountKey, account, { nowMs, accountStaleMs
     usedPct: account.weeklyUsed ?? null,
     resetAtMs: account.weeklyResetsAtMs ?? null,
     measuredRatePerHour: account.measuredRatePerHour ?? null,
+    measuredFiveHourRatePerHour: account.measuredFiveHourRatePerHour ?? null,
     targetShare: account.targetShare ?? null,
     inFlight, laneInFlight: account.laneInFlight ?? inFlight,
     placementQ: account.placementQ ?? null,
@@ -39,15 +40,27 @@ export function applyInFlightOverlay(view, delta) {
   const projectedUsed = Number.isFinite(view.weeklyUsed)
     ? view.weeklyUsed + inFlight * nonNegative(view.meanRunWeeklyPct) : null;
   const hours = (view.resetAtMs - view.nowMs) / 3_600_000;
-  const requiredRatePerHour = projectedUsed != null && Number.isFinite(hours) && hours > 0
+  const weeklyRequiredRatePerHour = projectedUsed != null && Number.isFinite(hours) && hours > 0
     ? Math.max(0, 1 - projectedUsed) / hours : null;
-  const planAhead = projectedUsed != null && Number.isFinite(view.weeklyPeriodStartMs) && Number.isFinite(view.resetAtMs)
+  const weeklyPlanAhead = projectedUsed != null && Number.isFinite(view.weeklyPeriodStartMs) && Number.isFinite(view.resetAtMs)
     ? scheduleError({ usedPct: projectedUsed, nowMs: view.nowMs, periodStartMs: view.weeklyPeriodStartMs, periodEndMs: view.resetAtMs }) : null;
   const projectedFiveHourUsed = Number.isFinite(view.fiveHourUsed)
     ? view.fiveHourUsed + inFlight * nonNegative(view.meanRunFiveHourPct) : null;
-  return { ...view, inFlight, projectedFiveHourUsed, laneInFlight: Math.max(0, nonNegative(view.laneInFlight) + (Number.isFinite(delta) ? delta : 0)),
+  const fiveHours = (view.fiveHourResetsAtMs - view.nowMs) / 3_600_000;
+  const fiveRequired = projectedFiveHourUsed != null && Number.isFinite(fiveHours) && fiveHours > 0
+    ? Math.max(0, 1 - projectedFiveHourUsed) / fiveHours : null;
+  const weeklyMeasured = view.weeklyMeasuredRatePerHour ?? view.measuredRatePerHour;
+  const fiveMeasured = view.measuredFiveHourRatePerHour;
+  const weeklyDeficit = weeklyRequiredRatePerHour != null && Number.isFinite(weeklyMeasured) ? weeklyRequiredRatePerHour - weeklyMeasured : null;
+  const fiveDeficit = fiveRequired != null && Number.isFinite(fiveMeasured) ? fiveRequired - fiveMeasured : null;
+  const useFive = fiveDeficit != null && (weeklyDeficit == null || fiveDeficit < weeklyDeficit);
+  const requiredRatePerHour = useFive ? fiveRequired : weeklyRequiredRatePerHour;
+  const measuredRatePerHour = useFive ? fiveMeasured : weeklyMeasured;
+  const planAhead = useFive ? scheduleError({ usedPct: projectedFiveHourUsed, nowMs: view.nowMs, periodStartMs: view.fiveHourResetsAtMs - 5 * 3_600_000, periodEndMs: view.fiveHourResetsAtMs }) : weeklyPlanAhead;
+  return { ...view, inFlight, projectedFiveHourUsed,
+    weeklyMeasuredRatePerHour: weeklyMeasured, bindingWindow: useFive ? 'five-hour' : 'weekly', measuredRatePerHour, laneInFlight: Math.max(0, nonNegative(view.laneInFlight) + (Number.isFinite(delta) ? delta : 0)),
     projectedUsed, headroomPct: projectedUsed == null ? null : 1 - projectedUsed,
     remainingPct: projectedUsed == null ? null : Math.max(0, 1 - projectedUsed),
-    requiredRatePerHour, deficit: requiredRatePerHour == null || !Number.isFinite(view.measuredRatePerHour)
-      ? null : requiredRatePerHour - view.measuredRatePerHour, planAhead };
+    requiredRatePerHour, deficit: requiredRatePerHour == null || !Number.isFinite(measuredRatePerHour)
+      ? null : requiredRatePerHour - measuredRatePerHour, planAhead };
 }

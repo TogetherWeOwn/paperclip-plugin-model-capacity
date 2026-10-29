@@ -55,3 +55,16 @@ test('view carries selector cost, provider, fallback, and lane fields unchanged'
   const v=snapshotAccountView('a',a,{nowMs:now});
   for (const field of ['freeCost','provider','models','fallbackOnly','creditFallback','meter','guardActive','laneInFlight']) assert.deepEqual(v[field],a[field],field);
 });
+
+test('five-hour and weekly deficits use the more restrictive window', () => {
+  const now = 1_800_000_000_000;
+  const common = {quality:'live', observedAtMs:now, credentialReady:true, weeklyUsed:.5, weeklyResetsAtMs:now+50*3600000, measuredRatePerHour:.004, fiveHourUsed:.9, fiveHourResetsAtMs:now+3600000, measuredFiveHourRatePerHour:.099};
+  const five = snapshotAccountView('a', common, {nowMs:now});
+  assert.equal(five.bindingWindow,'five-hour');
+  assert.ok(Math.abs(five.planAhead-.1)<1e-10);
+  assert.ok(Math.abs(five.requiredRatePerHour-.1)<1e-10);
+  assert.ok(Math.abs(five.deficit-.001)<1e-10);
+  const weekly = snapshotAccountView('a', {...common, fiveHourUsed:.1}, {nowMs:now});
+  assert.equal(weekly.bindingWindow,'weekly');
+  assert.ok(Math.abs(weekly.requiredRatePerHour-.01)<1e-10);
+});

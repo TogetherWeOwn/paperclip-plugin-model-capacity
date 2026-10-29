@@ -14,7 +14,11 @@ const clamp = (n, low, high) => Math.min(high, Math.max(low, n));
 const candidatesOf = p => Array.isArray(p?.candidates) ? p.candidates : [];
 const memberId = c => c?.member?.id;
 const allSkipped = (candidates, reason) => Object.fromEntries(candidates.map(c => [memberId(c), reason]));
-const nowOf = params => { const n = Date.parse(params?.now); return Number.isFinite(n) ? n : 0; };
+const nowOf = params => {
+  const n = typeof params?.now === 'string' ? Date.parse(params.now) : NaN;
+  return Number.isFinite(n) && Number.isFinite(new Date(n + 7 * DAY).getTime()) ? n : NaN;
+};
+const freshAt = (at, now, maxAge) => Number.isFinite(at) && now - at >= -60_000 && now - at <= maxAge;
 const wait = (now, skipped, retry = now + MINUTE) => ({kind: 'exhausted', retryAt: new Date(clamp(retry, now + MINUTE, now + 7 * DAY)).toISOString(), skipped});
 const unavailable = skipped => ({kind: 'unavailable', skipped});
 const validPool = p => p && typeof p.id === 'string' && p.id.trim().length > 0 && typeof p.name === 'string' && p.name.trim().length > 0 && p.pluginKey === PLUGIN_KEY && Array.isArray(p.members);
@@ -83,8 +87,10 @@ export function routeDecision(params, snapshot, config = {}) {
   const now = nowOf(params), candidates = candidatesOf(params), router = config.router ?? {};
   if (!validPool(params?.pool)) return unavailable(allSkipped(candidates, 'unmapped-member'));
   if (!candidates.length) return unavailable({});
+  // A pure decision cannot construct a future retry without a trustworthy clock.
+  if (!Number.isFinite(now)) return unavailable(allSkipped(candidates, 'quota-snapshot-stale'));
   if (router.enabled === false) return wait(now, allSkipped(candidates, 'router-disabled'));
-  if (!snapshot || !Number.isFinite(snapshot.atMs) || now - snapshot.atMs > (router.staleSnapshotMs ?? 180_000)) return wait(now, allSkipped(candidates, 'quota-snapshot-stale'));
+  if (!snapshot || !freshAt(snapshot.atMs, now, router.staleSnapshotMs ?? 180_000)) return wait(now, allSkipped(candidates, 'quota-snapshot-stale'));
   const pin = params.pinnedMemberId;
   if (pin && !candidates.some(c => memberId(c) === pin)) return unavailable(allSkipped(candidates, 'unmapped-member'));
   const poolKeys = new Set(candidates.map(c => snapshot.memberIndex?.[memberId(c)]?.poolKey).filter(k => typeof k === 'string'));
@@ -102,7 +108,7 @@ export function routeDecision(params, snapshot, config = {}) {
     const a = i.account;
     let reason = null;
     if (!poolKey || !snapshot.poolRoles?.[poolKey] || !i.key || !a) reason = 'unmapped-member';
-    else if (!['passive', 'live', 'cached'].includes(a.quality) || !Number.isFinite(a.observedAtMs) || now - a.observedAtMs > (router.accountStaleMs ?? 15 * MINUTE)) reason = 'account-reading-stale';
+    else if (!['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE)) reason = 'account-reading-stale';
     else if (a.credentialReady === false) reason = 'credential-unavailable';
     else if (Number.isFinite(a.weeklyUsed) && a.weeklyUsed >= hardCap) reason = 'weekly-exhausted';
     else if (Number.isFinite(a.fiveHourUsed) && a.fiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';
@@ -131,9 +137,17 @@ export function routeDecision(params, snapshot, config = {}) {
   if (pin && eligible.length) return {kind:'selected', memberId:pin};
   if (eligible.length) {
     const selected = orderAccountsWithPacing(eligible, {reservePct: 1 - hardCap, placement: config.placement ?? DEFAULT_PLACEMENT, pacing: null}).order;
-    // Explicit deficit precedence; the existing placement/shortfall order breaks ties.
-    selected.sort((a,b) => Number(b.burn) - Number(a.burn) || (b.deficit ?? 0) - (a.deficit ?? 0));
-    if (selected.length) return {kind:'selected', memberId:selected[0].memberId};
+    // The existing selector supplies placement order. Apply burn first, then
+    // restrict to accounts within the relative rate deadband of the best
+    // deficit; placement breaks those near ties without a non-transitive sort.
+    if (selected.length) {
+      const burn = selected.some(v => v.burn);
+      const group = selected.filter(v => v.burn === burn);
+      const best = Math.max(...group.map(v => Number.isFinite(v.deficit) ? v.deficit : 0));
+      const band = Math.abs(best) * (config.pacing?.rateDeadbandRel ?? .15);
+      const winner = group.find(v => (Number.isFinite(v.deficit) ? v.deficit : 0) >= best - band);
+      return {kind:'selected', memberId:winner.memberId};
+    }
   }
   for (const i of infos) if (!skipped[i.id]) {skipped[i.id] = 'weekly-exhausted'; retries.push(nextTime(i.account, 'weekly-exhausted', now, recheck));}
   const credible = retries.filter(r => r.credible);
