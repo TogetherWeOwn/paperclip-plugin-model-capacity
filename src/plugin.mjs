@@ -89,7 +89,7 @@ import {
   isAggregatorAccount, isFallbackOnlyView, nativeQualifiedModels,
   hasHeadroom, crossAccountDominated, canonicalKey,
 } from './cross-account.mjs';
-import { normalizePaceGuard, DEFAULT_HOLD_AHEAD_PTS } from './paceguard.mjs';
+import { normalizePaceGuard, DEFAULT_HOLD_AHEAD_PTS, paceGuardPools } from './paceguard.mjs';
 import {
   REVIEW_RESERVE_STATE_KEY, REVIEW_FOLDED_CAP, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
   priceReviewBurn, priorProviderReserveState,
@@ -3812,9 +3812,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const applyReserve = opts.applyReserve !== false && reviewReserveView.enabled === true;
       const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
+      const universalPools = opts.universalPools === true;
       return orderAccountsWithPacing(
-        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (opts.allAccounts === true || routesRun(v, true)
-          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
+        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
+          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0)
+          || (universalPools && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -4489,11 +4491,36 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // (the role only affects placement quality, never the guard).
     const paceReportOrder = allocationOrder('doer', null, true, { applyReserve: false });
     const paceReport = paceReportOrder.pools;
-    // Global hold facts must not depend on any role's routable frontier. In
-    // particular, a policy-only reviewer may have no eligible doer arms.
-    const rawPacePools = allocationOrder('doer', null, true, { applyReserve: false, allAccounts: true }).rawPools;
+    // Keep spendable soft-cap membership qualified, including policy-only
+    // reviewers. Universal weekly hold facts must survive routing exclusions,
+    // but an unservable or low-headroom ordinary lane must not resize this cap.
+    const qualifiedRaw = allocationOrder('doer', null, true, { applyReserve: false, universalPools: true }).rawPools;
+    const pressure = freshPressure();
+    const globalPace = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, poolOf: poolOfKey }).pools;
+    const globalViews = accountViews.filter(v => v.health === 'healthy' && freeProvider(v, config.freeLanes) == null)
+      .map(v => ({ ...v, burn: v.burnMode === true,
+        inFlight: pressure.pools[v.pool] ?? 0, paceInFlight: globalPace[v.pool] ?? 0,
+        laneInFlight: pressure.byAccount[v.accountId] ?? 0 }));
+    const globalPaceOpts = { pacing: paceOpts, poolKeyOf: v => v.pool != null ? `pool:${v.pool}` : `acct:${v.accountId}` };
+    const globalHeldIds = new Set(paceGuardPools(globalViews, globalPaceOpts).flatMap(p => p.hardHeldAccountIds ?? []));
+    const rawByPool = new Map(qualifiedRaw.map(p => [p.pool, { ...p }]));
+    // Hold-only pools contribute zero allowance; merging their facts must not
+    // import unknown measurements from lanes excluded by routing's gates.
+    for (const { key, ...held } of paceGuardPools(globalViews.filter(v => globalHeldIds.has(v.accountId)), globalPaceOpts)) {
+      const existing = rawByPool.get(held.pool);
+      if (!existing) rawByPool.set(held.pool, held);
+      else {
+        existing.hardHeldAccountIds = [...new Set([...(existing.hardHeldAccountIds ?? []), ...held.hardHeldAccountIds])];
+        existing.pacedAccountIds = [...new Set([...(existing.pacedAccountIds ?? []), ...held.hardHeldAccountIds])];
+        existing.ahead = true;
+        if (existing.state === 'on-plan' || existing.state === 'ahead') existing.state = 'lanes-paced';
+      }
+    }
+    const rawPacePools = [...rawByPool.values()];
     const paceRoleSafety = ROLES.flatMap(role => {
-      const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: false });
+      // Report the reserve-applied non-review admission: review-held pools
+      // are not spare capacity for ordinary roles.
+      const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: true });
       return holdSuspendedAccountIds.length > 0 ? [{ code: 'role-empty-hold-suspended', role,
         accountIds: holdSuspendedAccountIds, message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' }] : [];
     });
@@ -4931,8 +4958,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   function withDuplicatePass(allocate) {
     const held = allocate(false);
     const full = allocate(true);
+    // The full frontier controls permission: a first-pass candidate that the
+    // full pass hard-holds (and does not suspend there) must not revive via
+    // the first pass's own role-empty safety. Allowed candidates keep their
+    // first-pass position so duplicate preference survives.
+    const suspended = new Set(full.holdSuspendedAccountIds ?? []);
+    const hardHeld = new Set((full.pools ?? []).flatMap(p => p.hardHeldAccountIds ?? []));
+    const allowed = new Set((full.order ?? []).map(v => v.accountId));
+    const filtered = (held.order ?? []).filter(v =>
+      !hardHeld.has(v.accountId) || suspended.has(v.accountId) || allowed.has(v.accountId));
     return {
-      order: [...held.order, ...full.order],
+      ...full,
+      order: [...filtered, ...(full.order ?? [])],
       paced: full.paced,
       pools: full.pools,
       reserveHeld: full.reserveHeld,

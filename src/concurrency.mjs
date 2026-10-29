@@ -586,21 +586,33 @@ function allocateMultiPoolReviewers(input) {
   const accountLeft = new Map();
   const poolLeft = new Map();
   const pacedLeft = new Map();
+  const rawPacedLeft = new Map();
+  const agentPacedLeft = new Map();
   for (const a of perAccount) {
     const pool = accountPool.get(a.accountId);
     if (unavailable.has(a.accountId) || typeof pool !== 'string' || !Number.isFinite(a.slots)) continue;
     const n = Math.max(0, a.slots * demandFactor);
     accountLeft.set(a.accountId, n);
     poolLeft.set(pool, (poolLeft.get(pool) ?? 0) + n);
-    if (!burn.has(a.accountId)) pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
+    if (!burn.has(a.accountId)) {
+      pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
+      if (!hardHeld.has(a.accountId)) rawPacedLeft.set(pool, (rawPacedLeft.get(pool) ?? 0) + n);
+    }
   }
   for (const [pool, n] of pacedLeft) {
     const rawCap = paced.get(pool)?.cap;
-    // Exemptions only increase the shared soft-cap budget; individual
-    // admissions below still prevent every other role using held lanes.
-    const localCaps = Object.entries(reviewerPaceByAgent ?? {}).flatMap(([id, verdict]) =>
-      [...(exemptByAgent.get(id) ?? [])].some(account => accountPool.get(account) === pool)
-        ? (verdict.pools ?? []).filter(p => p.pool === pool).map(p => p.cap) : []);
+    // Restored allowance can only fund a suspended account for its own role.
+    // Unheld accounts still share the raw cap, even when another role's
+    // exception increases the total pool budget.
+    const rawSlots = rawPacedLeft.get(pool) ?? 0;
+    rawPacedLeft.set(pool, Number.isFinite(rawCap) ? Math.max(0, Math.min(rawSlots, rawCap)) : rawSlots);
+    const localCaps = Object.entries(reviewerPaceByAgent ?? {}).flatMap(([id, verdict]) => {
+      if (![...(exemptByAgent.get(id) ?? [])].some(account => accountPool.get(account) === pool)) return [];
+      const caps = (verdict.pools ?? []).filter(p => p.pool === pool).map(p => p.cap);
+      if (!agentPacedLeft.has(id)) agentPacedLeft.set(id, new Map());
+      agentPacedLeft.get(id).set(pool, caps.some(c => !Number.isFinite(c)) ? Infinity : Math.max(0, ...caps));
+      return caps;
+    });
     const cap = localCaps.length > 0
       ? (localCaps.some(c => !Number.isFinite(c)) || !Number.isFinite(rawCap) ? null : Math.max(rawCap, ...localCaps))
       : rawCap;
@@ -619,7 +631,10 @@ function allocateMultiPoolReviewers(input) {
     for (const id of ids) {
       const used = Math.min(charge, accountLeft.get(id));
       accountLeft.set(id, accountLeft.get(id) - used);
-      if (!burn.has(id)) pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
+      if (!burn.has(id)) {
+        pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
+        if (!hardHeld.has(id)) rawPacedLeft.set(pool, Math.max(0, (rawPacedLeft.get(pool) ?? 0) - used));
+      }
       charge -= used;
       if (charge <= 0) break;
     }
@@ -637,18 +652,27 @@ function allocateMultiPoolReviewers(input) {
       // one pool without rounding every account up or discarding its share.
       let need = 1;
       let pacedBudget = pacedLeft.get(pool) ?? 0;
+      let rawBudget = rawPacedLeft.get(pool) ?? 0;
+      let localBudget = agentPacedLeft.get(row.agentId)?.get(pool) ?? Infinity;
       const charges = [];
       for (const id of ids.filter(id => accountPool.get(id) === pool)) {
-        const n = Math.min(need, accountLeft.get(id) ?? 0, burn.has(id) ? Infinity : pacedBudget);
+        const n = Math.min(need, accountLeft.get(id) ?? 0,
+          burn.has(id) ? Infinity : Math.min(pacedBudget, localBudget, hardHeld.has(id) ? Infinity : rawBudget));
         if (n <= 0) continue;
         charges.push([id, n]); need -= n;
-        if (!burn.has(id)) pacedBudget -= n;
+        if (!burn.has(id)) {
+          pacedBudget -= n;
+          localBudget -= n;
+          if (!hardHeld.has(id)) rawBudget -= n;
+        }
         if (need <= 0) break;
       }
       if (need > 0) continue;
       for (const [id, n] of charges) accountLeft.set(id, accountLeft.get(id) - n);
       poolLeft.set(pool, poolLeft.get(pool) - 1);
       pacedLeft.set(pool, pacedBudget);
+      rawPacedLeft.set(pool, rawBudget);
+      if (agentPacedLeft.has(row.agentId)) agentPacedLeft.get(row.agentId).set(pool, localBudget);
       return true;
     }
     return false;
@@ -672,7 +696,7 @@ function allocateMultiPoolReviewers(input) {
           .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b)))]];
     }));
     const { extras, resourceStatus } = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds,
-      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn });
+      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn, hardHeld, rawPacedLeft, agentPacedLeft });
     const entries = rows.map(({ allocationWeight, ...row }, i) => ({ ...row,
       allocated: row.running + extras[i], maxConcurrentRuns: row.running + extras[i],
       reason: extras[i] > 0 ? 'proportional' : 'floor-running',

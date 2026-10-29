@@ -4,25 +4,31 @@ const MAX_WORK = 8192;
 const SEARCH_LIMIT = Symbol('priority-resource-search-limit');
 
 /** Fractional account flow inside ONE pool; each requested run still costs 1. */
-function coversPool(needs, idsByAgent, accountLeft, pacedLeft, poolLeft, burn, step) {
+function coversPool(needs, idsByAgent, accountLeft, pacedLeft, poolLeft, burn, step,
+  { hardHeld, rawPacedLeft, agentPacedLeft }) {
   const required = [...needs.values()].reduce((sum, n) => sum + n, 0);
   if (required > poolLeft) return false;
   const ids = [...new Set([...needs.keys()].flatMap(i => idsByAgent.get(i)))];
-  const graph = Array.from({ length: needs.size + ids.length + 3 }, () => []);
-  const source = graph.length - 3, paced = source + 1, sink = source + 2;
+  const graph = Array.from({ length: needs.size * 2 + ids.length + 4 }, () => []);
+  const source = graph.length - 4, paced = source + 1, rawPaced = source + 2, sink = source + 3;
   const add = (from, to, cap) => {
     const forward = { to, cap, reverse: graph[to].length };
     graph[from].push(forward);
     graph[to].push({ to: from, cap: 0, reverse: graph[from].length - 1 });
   };
-  const accountNodes = new Map(ids.map((id, i) => [id, needs.size + i]));
+  const accountNodes = new Map(ids.map((id, i) => [id, needs.size * 2 + i]));
   let index = 0;
   for (const [i, n] of needs) {
+    const localPaced = needs.size + index;
     add(source, index, n);
-    for (const id of idsByAgent.get(i)) add(index, accountNodes.get(id), n);
+    add(index, localPaced, Math.min(n, agentPacedLeft.get(i) ?? n));
+    for (const id of idsByAgent.get(i)) add(burn.has(id) ? index : localPaced, accountNodes.get(id), n);
     index++;
   }
-  for (const id of ids) add(accountNodes.get(id), burn.has(id) ? sink : paced, accountLeft.get(id) ?? 0);
+  for (const id of ids) add(accountNodes.get(id), burn.has(id) ? sink : hardHeld.has(id) ? paced : rawPaced, accountLeft.get(id) ?? 0);
+  // Only restored accounts bypass the raw budget. Ordinary account flow can
+  // never borrow another role's exception, including during rematching.
+  add(rawPaced, paced, rawPacedLeft);
   add(paced, sink, pacedLeft);
   let flow = 0;
   while (flow < required) {
@@ -61,7 +67,8 @@ function coversPool(needs, idsByAgent, accountLeft, pacedLeft, poolLeft, burn, s
  * A search limit retains only the already-proved feasible prefix and reports it.
  */
 export function allocatePriorityResourceSlots({ rows, available, noHeadroomIds, admissions,
-  accountPool, accountLeft, poolLeft, pacedLeft, burn }) {
+  accountPool, accountLeft, poolLeft, pacedLeft, burn, hardHeld = new Set(),
+  rawPacedLeft = pacedLeft, agentPacedLeft = new Map() }) {
   const extras = rows.map(() => 0);
   const limits = rows.map(row => noHeadroomIds.has(row.agentId) ? row.queued : Math.max(row.queued, 1));
   const weights = rows.map(row => (row.queued + 1) * (row.queued > 0 ? row.allocationWeight : 1));
@@ -84,7 +91,9 @@ export function allocatePriorityResourceSlots({ rows, available, noHeadroomIds, 
     if (fitCache.has(key)) return fitCache.get(key);
     step();
     const result = coversPool(new Map([...needs].filter(([, n]) => n > 0)), byPool.get(pool),
-      accountLeft, pacedLeft.get(pool) ?? 0, poolLeft.get(pool) ?? 0, burn, step);
+      accountLeft, pacedLeft.get(pool) ?? 0, poolLeft.get(pool) ?? 0, burn, step,
+      { hardHeld, rawPacedLeft: rawPacedLeft.get(pool) ?? 0,
+        agentPacedLeft: new Map([...needs.keys()].map(i => [i, agentPacedLeft.get(rows[i].agentId)?.get(pool) ?? Infinity])) });
     fitCache.set(key, result);
     return result;
   };
