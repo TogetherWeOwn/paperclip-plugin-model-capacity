@@ -92,7 +92,7 @@ export function routeDecision(params, snapshot, config = {}) {
   const poolKey = poolKeys.size === 1 ? [...poolKeys][0] : null;
   const infos = (pin ? candidates.filter(c => memberId(c) === pin) : candidates).map(c => candidateInfo(c, snapshot, config, poolKey));
   const kind = taskKeyKind(params.taskKey), probe = !pin && (kind === 'heartbeat' || kind === 'lifecycle');
-  const restrictProbes = probe && infos.some(i => i.membership?.probeEligible === true);
+  const restrictProbes = probe && registry(config).some(a => a.pools?.[poolKey]?.probeEligible === true);
   const recheck = Number.isFinite(router.recheckMs) && router.recheckMs > 0 ? router.recheckMs : 5 * MINUTE;
   const hardCap = Number.isFinite(router.hardCapWeekly) ? router.hardCapWeekly : .995;
   const skipped = {}, retries = [], eligible = [];

@@ -97,3 +97,24 @@ test('two exhausted windows on one member wait until both have reset', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:1,weeklyResetsAtMs:now+3600000,fiveHourUsed:1,fiveHourResetsAtMs:now+7200000})}});
   assert.equal(route(f).retryAt,new Date(now+7200000).toISOString());
 });
+
+test('stale-only retry backs off across ticks and caps at thirty minutes', () => {
+  for (const [elapsed, delay] of [[0,5],[5,10],[10,20],[15,30],[120,30]]) {
+    const f=mk({ids:['a'],accounts:{a:mkAccount({quality:'unknown',staleSinceMs:now-elapsed*60000})}});
+    assert.equal(route(f).retryAt,new Date(now+delay*60000).toISOString());
+  }
+});
+test('probe restriction is based on configured membership even if host drops the probe member', () => {
+  const f=mk({ids:['b'],taskKey:'__heartbeat__',memberOrder:['a','b']});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+300000).toISOString(),skipped:{b:'role-excluded'}});
+});
+test('probe pool with no configured probe members falls back to normal ranking', () => {
+  const f=mk({ids:['b'],taskKey:'__heartbeat__'});
+  f.config.router.accounts[0].pools.builder.probeEligible=false;
+  assert.equal(route(f).memberId,'b');
+});
+test('overlay finish after a post-tick run was already finished does not subtract base', async () => {
+  const {createOverlay,overlayStart,overlayFinish,overlayCount} = await import('../src/overlay.mjs');
+  let s=overlayStart(createOverlay(),'a','r2'); s=overlayFinish(s,'a','r2'); s=overlayFinish(s,'a','r2');
+  assert.equal(overlayCount(s,'a',1),1);
+});
