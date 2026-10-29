@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {fetchAaFreeList, parseAaFreeList} from '../src/aa.mjs';
 
-const page = (n, changes = {}) => ({ intelligence_index_version: '5.0', pagination: {page:n,total_pages:4,has_more:n<4}, data:[{slug:`model-${n}`,evaluations:{artificial_analysis_intelligence_index:30+n}}], ...changes });
+const page = (n, changes = {}) => ({ intelligence_index_version: '5.0', pagination: {page:n,total_pages:4,page_size:1,has_more:n<4}, data:[{slug:`model-${n}`,evaluations:{artificial_analysis_intelligence_index:30+n}}], ...changes });
 function client(pages, failPage = 0, status = 500) {
   const seen = [];
   return { seen, fetch: async url => {
@@ -30,11 +30,11 @@ for (const status of [410,401,403,429,500]) for (const failPage of [2,4]) {
   });
 }
 for (const [name, changes] of [
-  ['wrong page',{pagination:{page:1,total_pages:4,has_more:true}}],
+  ['wrong page',{pagination:{page:1,total_pages:4,page_size:1,has_more:true}}],
   ['inconsistent version',{intelligence_index_version:'4.0'}],
   ['duplicate slug',{data:[{slug:'model-1'}]}],
-  ['inconsistent total',{pagination:{page:2,total_pages:5,has_more:true}}],
-  ['premature end',{pagination:{page:2,total_pages:4,has_more:false}}],
+  ['inconsistent total',{pagination:{page:2,total_pages:5,page_size:1,has_more:true}}],
+  ['premature end',{pagination:{page:2,total_pages:4,page_size:1,has_more:false}}],
 ]) test(`rejects ${name}`, async () => {
   const pages=[1,2,3,4].map(n=>page(n)); pages[1]=page(2,changes);
   const result=await fetchAaFreeList({http:client(pages),apiKey:'test'});
@@ -52,4 +52,25 @@ test('carry forward uncovered benchmarks and slugs without changing their origin
   const second = carryForwardBenchmarks([{slug:'missing',scicode:null}],first,'2026-10-20T00:00:00Z');
   assert.equal(second[0].fieldObservedAt.scicode,'2026-10-01T00:00:00Z');
   assert.equal(second[0].staleBenchmarkFields.scicode,true);
+});
+
+test('rejects a changed final page size that can skip rows', async () => {
+  const { readFileSync } = await import('node:fs');
+  const pages = [1,2,3,4].map(n => JSON.parse(readFileSync(new URL(`./fixtures/aa-free-20261029-page-${n}.json`, import.meta.url))));
+  pages[3].pagination.page_size = 210;
+  pages[3].data.splice(0, 30);
+  const result = await fetchAaFreeList({http:client(pages),apiKey:'test'});
+  assert.equal(result.ok,false);
+  assert.equal(result.error,'aa-incomplete-snapshot');
+  assert.equal(result.text,undefined);
+});
+
+test('rejects a short nonfinal page even if metadata claims more pages', async () => {
+  const { readFileSync } = await import('node:fs');
+  const pages = [1,2,3,4].map(n => JSON.parse(readFileSync(new URL(`./fixtures/aa-free-20261029-page-${n}.json`, import.meta.url))));
+  pages[1].data.pop();
+  const result = await fetchAaFreeList({http:client(pages),apiKey:'test'});
+  assert.equal(result.ok,false);
+  assert.equal(result.error,'aa-incomplete-snapshot');
+  assert.equal(result.text,undefined);
 });

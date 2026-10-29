@@ -197,7 +197,7 @@ export async function fetchAaFreeList({ http, apiKey, url = AA_FREE_LIST_URL, ti
   // Hard safety bounds are independent of the provider's page size/count.
   const maxPages = 64;
   const deadline = Date.now() + timeoutMs;
-  let version, totalPages, totalBytes = 0;
+  let version, totalPages, pageSize, totalBytes = 0;
   const data = [];
   const slugs = new Set();
   for (let page = 1; page <= maxPages; page++) {
@@ -216,10 +216,12 @@ export async function fetchAaFreeList({ http, apiKey, url = AA_FREE_LIST_URL, ti
     const invalid = () => ({ ok: false, error: 'aa-incomplete-snapshot', retryable: false });
     if (!meta || !Number.isInteger(meta.page) || meta.page !== page || !Number.isInteger(meta.total_pages)
       || meta.total_pages < 1 || meta.total_pages > maxPages || typeof meta.has_more !== 'boolean'
+      || !Number.isSafeInteger(meta.page_size) || meta.page_size < 1
       || meta.has_more !== (page < meta.total_pages) || !Array.isArray(parsed.data)
-      || parsed.data.length === 0 || parsed.intelligence_index_version == null) return invalid();
-    if (page === 1) { version = parsed.intelligence_index_version; totalPages = meta.total_pages; }
-    if (parsed.intelligence_index_version !== version || meta.total_pages !== totalPages) return invalid();
+      || parsed.data.length === 0 || parsed.data.length > meta.page_size
+      || (meta.has_more && parsed.data.length !== meta.page_size) || parsed.intelligence_index_version == null) return invalid();
+    if (page === 1) { version = parsed.intelligence_index_version; totalPages = meta.total_pages; pageSize = meta.page_size; }
+    if (parsed.intelligence_index_version !== version || meta.total_pages !== totalPages || meta.page_size !== pageSize) return invalid();
     for (const row of parsed.data) {
       if (!row || typeof row.slug !== 'string' || !row.slug || slugs.has(row.slug)) return invalid();
       slugs.add(row.slug); data.push(row);
@@ -616,11 +618,13 @@ export function carryForwardCosts(mergedRows = [], prevRows = [], carriedFrom = 
   });
 }
 
+export const BENCHMARK_FIELDS = Object.freeze(['terminalbenchHard', 'terminalbenchV21', 'terminalbenchV40', 'tau2', 'tauBanking',
+    'scicode', 'apexAgents', 'omniscience', 'omniscienceAccuracy', 'omniscienceNonHallucination',
+    'lcr', 'gpqa', 'hle', 'ifbench', 'gdpvalNormalized', 'mmmuPro', 'itbenchSre', 'analystAgent', 'critpt']);
+
 /** Preserve exact-evaluation evidence that the successor no longer supplies. */
 export function carryForwardBenchmarks(rows = [], previousRows = [], previousAt = null) {
-  const fields = ['terminalbenchHard', 'terminalbenchV21', 'terminalbenchV40', 'tau2', 'tauBanking',
-    'scicode', 'apexAgents', 'omniscience', 'omniscienceAccuracy', 'omniscienceNonHallucination',
-    'lcr', 'gpqa', 'hle', 'ifbench', 'gdpvalNormalized', 'mmmuPro', 'itbenchSre', 'analystAgent', 'critpt'];
+  const fields = BENCHMARK_FIELDS;
   const previous = new Map(previousRows.filter(r => r && typeof r.slug === 'string').map(r => [r.slug, r]));
   const result = rows.map(r => ({ ...r }));
   const present = new Set(result.map(r => r.slug));
@@ -637,6 +641,19 @@ export function carryForwardBenchmarks(rows = [], previousRows = [], previousAt 
         if (old.fieldSources?.[field] != null) next.fieldSources = { ...next.fieldSources, [field]: old.fieldSources[field] };
         stale[field] = true;
       }
+    }
+    if (Object.keys(stale).length) next.staleBenchmarkFields = stale;
+    return next;
+  });
+}
+
+/** Mark selected benchmark observations not fetched in this refresh as stale. */
+export function markStaleBenchmarks(rows, observedAt) {
+  return rows.map(row => {
+    const { staleBenchmarkFields: _stale, ...next } = row;
+    const stale = {};
+    for (const field of BENCHMARK_FIELDS) {
+      if (next[field] != null && next.fieldObservedAt?.[field] !== observedAt) stale[field] = true;
     }
     if (Object.keys(stale).length) next.staleBenchmarkFields = stale;
     return next;

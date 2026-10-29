@@ -171,7 +171,7 @@ function drive(feed) {
     http: {
       fetch: async (url) => {
         if (String(url).includes('/api/v2/language/models/free')) {
-          return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(feed.apiText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, has_more: false } }) };
+          return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(feed.apiText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false } }) };
         }
         if (String(url).includes('/leaderboards/models')) {
           return { status: 200, headers: { get: () => null }, text: async () => feed.boardHtml };
@@ -218,7 +218,7 @@ test('refresh that nulls one family costs keeps that family ladders and the targ
     http: {
       fetch: async (url) => {
         if (String(url).includes('/api/v2/language/models/free')) {
-          return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(feed.apiText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, has_more: false } }) };
+          return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(feed.apiText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false } }) };
         }
         if (String(url).includes('/leaderboards/models')) {
           return { status: 200, headers: { get: () => null }, text: async () => feed.boardHtml };
