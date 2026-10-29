@@ -49,3 +49,9 @@ test('run-id overlay is deduplicated and resets exactly at snapshot boundaries',
   assert.equal(overlayCount(s, 'a', 1), 0);
   s = overlayFinish(s, 'a', 'unknown'); assert.equal(overlayCount(s, 'a', 1), 0);
 });
+
+test('view carries selector cost, provider, fallback, and lane fields unchanged', () => {
+  const a={...account, freeCost:true, provider:'example', models:['example/model'], fallbackOnly:false, creditFallback:true, meter:'metered', guardActive:true, laneInFlight:2};
+  const v=snapshotAccountView('a',a,{nowMs:now});
+  for (const field of ['freeCost','provider','models','fallbackOnly','creditFallback','meter','guardActive','laneInFlight']) assert.deepEqual(v[field],a[field],field);
+});

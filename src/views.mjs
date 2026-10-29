@@ -22,7 +22,9 @@ export function snapshotAccountView(accountKey, account, { nowMs, accountStaleMs
     burnFirst: account.burnFirst, reactive: account.reactive, meter: account.meter,
     quality: account.quality, provider: account.provider, models: account.models,
     fallbackOnly: account.fallbackOnly, creditFallback: account.creditFallback,
-    guardActive: account.guardActive,
+    guardActive: account.guardActive, freeCost: account.freeCost,
+    calibration: account.calibration, taskCostProxy: account.taskCostProxy,
+    estimatedApiEquivalentPerAcceptedTask: account.estimatedApiEquivalentPerAcceptedTask,
     meanRunWeeklyPct: nonNegative(account.meanRunWeeklyPct),
     nowMs, weeklyPeriodStartMs: account.weeklyPeriodStartMs ?? null,
   };
