@@ -18,6 +18,7 @@ export function buildPoolPlan(raw, connectionRows, qualityVerdicts) {
     const grants = matching.filter(row => row.provider === account.provider && row.method === 'api_key' && row.ownership === 'shared');
     if (grants.length > 1) throw new Error(`ambiguous grant: ${account.connectionName}`);
     if (grants.length !== 1) throw new Error(`connection or shared grant missing: ${account.connectionName}`);
+    if (grants[0].status !== 'connected') throw new Error(`connection unavailable: ${account.connectionName}`);
     resolved.set(account.accountKey, grants[0]);
   }
   const excluded = [], pools = [];

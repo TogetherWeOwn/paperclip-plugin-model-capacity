@@ -7,8 +7,8 @@ const registry = () => ({companyId:'10000000-0000-4000-8000-000000000001',ownerU
   {accountKey:'claude-1',prefix:'claude1',provider:'anthropic',protocol:'messages',harnessProfile:'acpx',connectionName:'Claude',pools:{builder:{model:'model'}}}
 ]});
 const rows = () => [
-  {id:'10000000-0000-4000-8000-000000000011',grantId:'10000000-0000-4000-8000-000000000012',name:'Codex',provider:'openai',method:'api_key',ownership:'shared'},
-  {id:'10000000-0000-4000-8000-000000000021',grantId:'10000000-0000-4000-8000-000000000022',name:'Claude',provider:'anthropic',method:'api_key',ownership:'shared'}
+  {id:'10000000-0000-4000-8000-000000000011',grantId:'10000000-0000-4000-8000-000000000012',name:'Codex',provider:'openai',method:'api_key',ownership:'shared',status:'connected'},
+  {id:'10000000-0000-4000-8000-000000000021',grantId:'10000000-0000-4000-8000-000000000022',name:'Claude',provider:'anthropic',method:'api_key',ownership:'shared',status:'connected'}
 ];
 const verdicts = () => ({'codex-1':{builder:true,thinker:true},'claude-1':{builder:true}});
 
@@ -37,4 +37,11 @@ test('unfinished operator CLI fails closed rather than silently claiming success
   const {spawnSync}=await import('node:child_process');
   const r=spawnSync(process.execPath,[new URL('../scripts/generate-pool.mjs',import.meta.url).pathname,'--apply'],{encoding:'utf8'});
   assert.notEqual(r.status,0); assert.match(r.stderr,/not implemented/i);
+});
+
+test('planning rejects connections with missing or non-connected status', () => {
+  for (const status of [undefined, 'revoked', 'expired', 'needs_attention']) {
+    const discovered = rows(); discovered[0].status = status;
+    assert.throws(() => buildPoolPlan(registry(), discovered, verdicts()), /connection.*unavailable/i);
+  }
 });

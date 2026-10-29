@@ -30,3 +30,28 @@ test('pool inspection rejects unprefixed models and incomplete bindings', () => 
   assert.throws(()=>validatePoolMember({...member,profile:{...member.profile,model:'gpt-6.1-terra'}},a));
   assert.throws(()=>validatePoolMember({...member,binding:{...member.binding,grantId:undefined}},a));
 });
+
+test('normalization exports unambiguous account-prefix lookups', () => {
+  const r = normalizeRegistry(fixture());
+  assert.deepEqual(r.prefixByAccount, {'codex-1':'codex1'});
+  assert.deepEqual(r.accountByPrefix, {codex1:'codex-1'});
+});
+
+test('rejects duplicate connection names and invalid pool roles', () => {
+  const duplicate = fixture(); duplicate.accounts.push({...structuredClone(duplicate.accounts[0]), accountKey:'other', prefix:'other'});
+  assert.throws(() => normalizeRegistry(duplicate), /duplicate/);
+  const badRole = fixture(); badRole.pools[0].role = 'invalid';
+  assert.throws(() => normalizeRegistry(badRole), /pool/);
+});
+
+test('member validation rejects responsible-user bindings and harness mismatches', () => {
+  const a = fixture().accounts[0];
+  const binding = {mode:'shared',provider:'openai',method:'api_key',connectionId:'10000000-0000-4000-8000-000000000001',grantId:'20000000-0000-4000-8000-000000000002'};
+  const codex = {binding,profile:{provider:'codex',model:'codex1/model'}};
+  assert.throws(() => validatePoolMember({...codex,binding:{...binding,mode:'responsible_user'}},a),/binding/);
+  assert.throws(() => validatePoolMember({...codex,profile:{...codex.profile,acpxAgent:'claude'}},a),/harness/);
+  const anthropic = {...a,provider:'anthropic',harnessProfile:'acpx'};
+  const acpx = {binding:{...binding,provider:'anthropic'},profile:{provider:'acpx',model:'codex1/model'}};
+  assert.throws(() => validatePoolMember(acpx,anthropic),/harness/);
+  assert.throws(() => validatePoolMember({...acpx,profile:{...acpx.profile,acpxAgent:'grok'}},anthropic),/harness/);
+});

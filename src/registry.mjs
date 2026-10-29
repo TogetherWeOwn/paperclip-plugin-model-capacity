@@ -61,7 +61,9 @@ export function normalizeRegistry(raw) {
     });
     return {...a, pools:Object.fromEntries(memberships)};
   });
-  return {...raw, accounts, poolRoles:Object.fromEntries(roles), memberIndex:Object.fromEntries(index)};
+  return {...raw, accounts, poolRoles:Object.fromEntries(roles), memberIndex:Object.fromEntries(index),
+    prefixByAccount:Object.fromEntries(accounts.map(a => [a.accountKey, a.prefix])),
+    accountByPrefix:Object.fromEntries(accounts.map(a => [a.prefix, a.accountKey]))};
 }
 
 export function validatePoolMember(member, account) {
