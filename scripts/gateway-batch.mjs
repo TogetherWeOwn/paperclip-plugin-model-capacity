@@ -25,6 +25,7 @@ export function planGatewayConnections({registry: raw, baseUrl, batch, allAgents
   if (Object.keys(batch).length !== poolKeys.length || poolKeys.some(k=>!Object.hasOwn(batch,k))) throw new Error('batch must contain exactly the configured pools');
   const batches=Object.fromEntries(poolKeys.map(k=>[k,agentList(batch[k])]));
   return registry.accounts.map(account=>{
+    if (account.connectionName.length > 160) throw new Error('invalid connectionName');
     const poolMemberships=Object.keys(account.pools);
     if (!poolMemberships.length) throw new Error('account must join a pool');
     const agentIds=allAgents ? [] : agentList(poolMemberships.flatMap(k=>batches[k]));

@@ -54,3 +54,11 @@ test('fleet-wide plans do not misleadingly list individual installs',()=>{
  const [plan]=planGatewayConnections({registry,baseUrl:'https://gateway.example',batch:{builder:[a],thinker:[b]},allAgents:true,allAgentsApproved:true});
  assert.deepEqual(plan.inputWithoutSecret.agentIds,[]);
 });
+
+test('gateway plan rejects names longer than the host create schema permits',()=>{
+ const options={registry:structuredClone(registry),baseUrl:'https://gateway.example',batch:{builder:[a],thinker:[]}};
+ options.registry.accounts[0].connectionName='x'.repeat(161);
+ assert.throws(()=>planGatewayConnections(options),/connectionName/i);
+ options.registry.accounts[0].connectionName='x'.repeat(160);
+ assert.equal(planGatewayConnections(options)[0].inputWithoutSecret.name.length,160);
+});
