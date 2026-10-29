@@ -49,3 +49,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   console.error('Pool generator operator CLI is not implemented; no changes were made.');
   process.exitCode = 1;
 }
+
+// Fake-API-only building blocks; the operator CLI remains disabled until all
+// live-session, installation and agent selectability safety gates are wired.
+export { planPoolSaga, applyPoolSaga, checkPoolDrift, rollbackPoolSaga } from './pool-saga.mjs';

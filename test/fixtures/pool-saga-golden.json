@@ -1,0 +1,4 @@
+{
+  "connection": {"name":"One","provider":"openai","method":"api_key","routing":{"models":["one/model"]}},
+  "pool": {"companyId":"10000000-0000-4000-8000-000000000001","config":{"name":"builder","enabled":false,"mode":"round_robin","thresholdPercent":90,"members":[{"id":"85edad02-43eb-5759-aa97-3b7511046bbe","binding":{"mode":"shared","provider":"openai","method":"api_key","connectionId":"10000000-0000-4000-8000-000000000011","grantId":"10000000-0000-4000-8000-000000000012"},"profile":{"provider":"codex","model":"one/model"}}]}}
+}
