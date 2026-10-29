@@ -293,10 +293,10 @@ export function buildDynamicBindings(servedModels, { coveredModels = [], overrid
 
 /**
  * Join dynamic bindings to AA snapshot rows. A binding matches when its
- * override slug or any slug candidate names a snapshot row; effort must be
- * expressible (muse cap applies to contributor rows). No match -> unscored
- * entry with reason `no-aa-match` (the model stays unrankable and is
- * listed, never silently dropped).
+ * override slug or any slug candidate names a non-historical snapshot row;
+ * effort must be expressible (muse cap applies to contributor rows). No match
+ * -> unscored with `slug-prior-only` if only history matched, otherwise
+ * `no-aa-match` (the model stays unrankable, never silently dropped).
  */
 export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new Map(), bannedModels = [] } = {}) {
   const bySlug = new Map();
@@ -311,9 +311,15 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
     const tried = b.slugCandidates ?? [b.aaSlug];
     let slug = null;
     let row = null;
+    let historical = false;
     for (const candidate of tried) {
       if ((counts.get(candidate) ?? 0) > 1) continue;
       const hit = bySlug.get(candidate);
+      // History cannot route, but must not mask a later fresh alias either.
+      if (hit?.historicalOnly) {
+        historical = true;
+        continue;
+      }
       if (hit) {
         slug = candidate;
         row = hit;
@@ -321,6 +327,14 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
       }
     }
     if (!row) {
+      // History is decisive. The unscored allowlist admits a model AA has no
+      // data for; a slug AA served and then retired is a different thing, and
+      // converting its carried history into a null-score trial arm would
+      // resurrect it anyway (the entry may predate the retirement).
+      if (historical) {
+        unscored.push({ model: b.model, reason: 'slug-prior-only', tried });
+        continue;
+      }
       const entries = unscoredAllowlist.get(b.model) ?? [];
       if (entries.length && !isBannedModel(b.model, bannedModels)) {
         if (PROVEN_FAMILIES.includes(inferFamily(b.model))) {
@@ -336,13 +350,6 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
         }
       }
       unscored.push({ model: b.model, reason: 'no-aa-match', tried });
-      continue;
-    }
-    // Carried history, not a served model: a lane that still lists the id must
-    // not resurrect an arm the feed retired (the classic guard alone would let
-    // buildAccountLadders bind it dynamically instead).
-    if (row.historicalOnly) {
-      unscored.push({ model: b.model, reason: 'slug-prior-only', tried });
       continue;
     }
     if (!effortAllowed(b.family, b.effort)) {

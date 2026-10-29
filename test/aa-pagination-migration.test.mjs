@@ -89,6 +89,62 @@ test('a historical-only row resolves no dynamic arm either', async () => {
   assert.equal(resolveDynamicArms(back, bindings).arms.length, 1);
 });
 
+test('dynamic resolution skips historical aliases and tries the next fresh candidate', async () => {
+  const { carryForwardBenchmarks } = await import('../src/aa.mjs');
+  const { buildDynamicBindings, resolveDynamicArms } = await import('../src/arms.mjs');
+  for (const [model, freshSlug] of [
+    ['foo-1m', 'foo'], ['foo.2', 'foo-2'], ['foo-20261029', 'foo'],
+    ['foo-free', 'foo'], ['foo-contributor', 'foo-xhigh'],
+  ]) {
+    const { bindings } = buildDynamicBindings([model]);
+    let rows = [{ slug: model, scicode: 0.9 }];
+    // Repeated refreshes keep the old alias but must not let it mask the fresh one.
+    for (const now of ['2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z']) {
+      rows = carryForwardBenchmarks([{ slug: freshSlug, scicode: 0.91 }], rows, now);
+      assert.equal(rows.find(r => r.slug === model).historicalOnly, true);
+      for (const input of [rows, [...rows].reverse()]) {
+        const { arms, unscored } = resolveDynamicArms(input, bindings);
+        assert.equal(arms.length, 1, `${model} must fall through to ${freshSlug}`);
+        assert.equal(arms[0].aaSlug, freshSlug);
+        assert.equal(arms[0].row.scicode, 0.91);
+        assert.equal(arms[0].row.historicalOnly, undefined);
+        assert.deepEqual(unscored, []);
+      }
+    }
+  }
+});
+
+test('dynamic historical alias skips preserve no-match reasons and explicit overrides', async () => {
+  const { buildDynamicBindings, resolveDynamicArms } = await import('../src/arms.mjs');
+  const retired = { slug: 'foo-1m', scicode: 0.9, historicalOnly: true };
+  const { bindings } = buildDynamicBindings(['foo-1m']);
+  for (const rows of [[retired], [retired, { slug: 'foo', historicalOnly: true }]]) {
+    const result = resolveDynamicArms(rows, bindings);
+    assert.deepEqual(result.arms, []);
+    assert.deepEqual(result.unscored, [{ model: 'foo-1m', reason: 'slug-prior-only', tried: ['foo-1m', 'foo'] }]);
+  }
+  assert.equal(resolveDynamicArms([], bindings).unscored[0].reason, 'no-aa-match');
+  const override = buildDynamicBindings(['foo-1m'], { overrides: { 'foo-1m': 'foo-1m' } });
+  const result = resolveDynamicArms([retired, { slug: 'foo', scicode: 0.91 }], override.bindings);
+  assert.deepEqual(result.arms, [], 'an explicit override must not fall back to an unconfigured alias');
+  assert.deepEqual(result.unscored, [{ model: 'foo-1m', reason: 'slug-prior-only', tried: ['foo-1m'] }]);
+});
+
+// The unscored allowlist admits a family AA has never scored. It must not
+// admit a model AA scored and then retired: that entry may predate the
+// retirement, and a null-score trial arm would route the retired model again.
+test('a stale unscored admission cannot resurrect a retired slug', async () => {
+  const { buildDynamicBindings, resolveDynamicArms } = await import('../src/arms.mjs');
+  const retired = { slug: 'swe-2', scicode: 0.9, historicalOnly: true };
+  const { bindings } = buildDynamicBindings(['devin/swe-2']);
+  const unscoredAllowlist = new Map([['swe-2', [{ servedId: 'devin/swe-2', reason: 'documented trial' }]]]);
+  const result = resolveDynamicArms([retired], bindings, { unscoredAllowlist });
+  assert.deepEqual(result.arms, [], 'a retired slug must not come back as a trial arm');
+  assert.deepEqual(result.unscored.map(u => [u.model, u.reason]), [['swe-2', 'slug-prior-only']]);
+  // Same allowlist, no AA history at all: admission still works as before.
+  assert.equal(resolveDynamicArms([], bindings, { unscoredAllowlist }).arms.length, 1);
+});
+
 // Review finding 2: task ranking is the third consumer of snapshot rows.
 test('task discovery never scores a historical-only row', async () => {
   const { carryForwardBenchmarks } = await import('../src/aa.mjs');
