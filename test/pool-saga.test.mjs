@@ -166,3 +166,9 @@ test('drift check refuses an existing pool whose members are all excluded', asyn
   const result=await generator.checkPoolDrift({api,registry,qualityVerdicts:{one:{builder:false}}});
   assert.equal(result.ok,false); assert.ok(result.drift.some(d=>d.type==='pool-drift' && d.poolKey==='builder'));
 });
+
+test('apply rejects a fully excluded configured pool before any writes', async t => {
+  const api=new FakeApi();
+  await assert.rejects(generator.applyPoolSaga({api,registry,qualityVerdicts:{one:{builder:false}},journalPath:await scratch(t)}),/no eligible members.*builder/i);
+  assert.deepEqual(api.writes,[]);
+});

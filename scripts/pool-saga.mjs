@@ -66,7 +66,10 @@ export async function applyPoolSaga({api,registry,qualityVerdicts,journalPath}) 
   for(const x of state.accounts) {
     if(x.connection && (x.connection.status!=='connected' || x.connection.provider!==x.account.provider || x.connection.method!=='api_key' || !sameModels(x.connection.routing?.models,x.desired.routing.models))) throw new Error(`connection drift or unavailable: ${x.account.connectionName}`);
   }
-  buildPoolPlan(registry,state.accounts.map(x=>({id:x.connection?.id??placeholder,grantId:x.grant?.id??placeholder,name:x.account.connectionName,provider:x.account.provider,method:'api_key',ownership:'shared',status:'connected'})),qualityVerdicts);
+  const preflight=buildPoolPlan(registry,state.accounts.map(x=>({id:x.connection?.id??placeholder,grantId:x.grant?.id??placeholder,name:x.account.connectionName,provider:x.account.provider,method:'api_key',ownership:'shared',status:'connected'})),qualityVerdicts);
+  for (const {poolKey} of state.registry.pools) {
+    if (!preflight.pools.some(p=>p.config.name===poolKey)) throw new Error(`no eligible members for pool: ${poolKey}`);
+  }
   // Creating dependencies alongside an existing pool could make rollback unsafe.
   if(state.pools.some(p=>state.registry.pools.some(q=>q.poolKey===p.name)) && state.accounts.some(x=>!x.connection || !x.grant)) throw new Error('existing pool with missing dependency requires manual reconciliation');
   const handle=await open(journalPath,'wx',0o600);
