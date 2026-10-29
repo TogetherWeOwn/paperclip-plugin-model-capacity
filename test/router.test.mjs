@@ -144,3 +144,8 @@ test('missing snapshot eligibility never admits a member', () => {
   const f=mk({ids:['a']}); delete f.snapshot.accounts.a.eligible;
   assert.equal(route(f).kind,'exhausted'); assert.equal(route(f).skipped.a,'account-reading-stale');
 });
+
+test('in-flight projection enforces the five-hour hard cap before its meter catches up', () => {
+  const f=mk({ids:['a'],accounts:{a:mkAccount({fiveHourUsed:.98,fiveHourResetsAtMs:now+3600000,inFlightBase:1,meanRunFiveHourPct:.02})}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'five-hour-exhausted'}});
+});

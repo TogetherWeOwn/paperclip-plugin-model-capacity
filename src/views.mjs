@@ -10,7 +10,9 @@ export function snapshotAccountView(accountKey, account, { nowMs, accountStaleMs
   const view = {
     accountId: accountKey,
     health: fresh && account.credentialReady === true ? 'healthy' : 'unavailable',
-    weeklyUsed: account.weeklyUsed ?? null,
+    weeklyUsed: account.weeklyUsed ?? null, fiveHourUsed: account.fiveHourUsed ?? null,
+    fiveHourResetsAtMs: account.fiveHourResetsAtMs ?? null,
+    meanRunFiveHourPct: nonNegative(account.meanRunFiveHourPct),
     usedPct: account.weeklyUsed ?? null,
     resetAtMs: account.weeklyResetsAtMs ?? null,
     measuredRatePerHour: account.measuredRatePerHour ?? null,
@@ -41,7 +43,9 @@ export function applyInFlightOverlay(view, delta) {
     ? Math.max(0, 1 - projectedUsed) / hours : null;
   const planAhead = projectedUsed != null && Number.isFinite(view.weeklyPeriodStartMs) && Number.isFinite(view.resetAtMs)
     ? scheduleError({ usedPct: projectedUsed, nowMs: view.nowMs, periodStartMs: view.weeklyPeriodStartMs, periodEndMs: view.resetAtMs }) : null;
-  return { ...view, inFlight, laneInFlight: Math.max(0, nonNegative(view.laneInFlight) + (Number.isFinite(delta) ? delta : 0)),
+  const projectedFiveHourUsed = Number.isFinite(view.fiveHourUsed)
+    ? view.fiveHourUsed + inFlight * nonNegative(view.meanRunFiveHourPct) : null;
+  return { ...view, inFlight, projectedFiveHourUsed, laneInFlight: Math.max(0, nonNegative(view.laneInFlight) + (Number.isFinite(delta) ? delta : 0)),
     projectedUsed, headroomPct: projectedUsed == null ? null : 1 - projectedUsed,
     remainingPct: projectedUsed == null ? null : Math.max(0, 1 - projectedUsed),
     requiredRatePerHour, deficit: requiredRatePerHour == null || !Number.isFinite(view.measuredRatePerHour)

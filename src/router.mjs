@@ -114,7 +114,8 @@ export function routeDecision(params, snapshot, config = {}) {
       const burn = burnActive(a) && !pin && !probe;
       const ahead = Number.isFinite(v.planAhead) && v.planAhead > (config.pacing?.deadband ?? .02);
       const fast = Number.isFinite(v.measuredRatePerHour) && Number.isFinite(v.requiredRatePerHour) && v.measuredRatePerHour > v.requiredRatePerHour * (1 + (config.pacing?.rateDeadbandRel ?? .15));
-      if (v.roleEligible === false) reason = 'role-excluded';
+      if (v.projectedFiveHourUsed != null && v.projectedFiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';
+      else if (v.roleEligible === false) reason = 'role-excluded';
       else if (v.taskFeasible === false) reason = 'outcome-gated';
       else if (ahead && fast && !burn) reason = 'pace-held';
       else if (v.health !== 'healthy') reason = a.credentialReady === false ? 'credential-unavailable' : 'account-reading-stale';
