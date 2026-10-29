@@ -130,3 +130,12 @@ test('exclusive burn at the default hard cap expires rather than excluding healt
   f.config.burn={mode:'exclusive'};
   assert.equal(route(f).memberId,'a');
 });
+
+test('role and task admission gates remain enforced even if snapshot eligible flag drifts', () => {
+  const f=mk(); f.snapshot.accounts.a.view.roleEligible=false; f.snapshot.accounts.b.view.taskFeasible=false;
+  const r=route(f); assert.equal(r.kind,'exhausted');
+  assert.deepEqual(r.skipped,{a:'role-excluded',b:'outcome-gated'});
+});
+test('an empty pool identity is malformed and fails closed', () => {
+  const f=mk(); f.params.pool.id=''; assert.equal(route(f).kind,'unavailable');
+});

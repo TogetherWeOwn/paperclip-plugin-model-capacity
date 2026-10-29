@@ -16,7 +16,7 @@ const allSkipped = (candidates, reason) => Object.fromEntries(candidates.map(c =
 const nowOf = params => { const n = Date.parse(params?.now); return Number.isFinite(n) ? n : 0; };
 const wait = (now, skipped, retry = now + MINUTE) => ({kind: 'exhausted', retryAt: new Date(clamp(retry, now + MINUTE, now + 7 * DAY)).toISOString(), skipped});
 const unavailable = skipped => ({kind: 'unavailable', skipped});
-const validPool = p => p && typeof p.id === 'string' && typeof p.name === 'string' && p.pluginKey === PLUGIN_KEY && Array.isArray(p.members);
+const validPool = p => p && typeof p.id === 'string' && p.id.trim().length > 0 && typeof p.name === 'string' && p.name.trim().length > 0 && p.pluginKey === PLUGIN_KEY && Array.isArray(p.members);
 const registry = config => Array.isArray(config?.router?.accounts) ? config.router.accounts : [];
 
 export function taskKeyKind(key) {
@@ -115,7 +115,9 @@ export function routeDecision(params, snapshot, config = {}) {
       const burn = burnActive(a) && !pin && !probe;
       const ahead = Number.isFinite(v.planAhead) && v.planAhead > (config.pacing?.deadband ?? .02);
       const fast = Number.isFinite(v.measuredRatePerHour) && Number.isFinite(v.requiredRatePerHour) && v.measuredRatePerHour > v.requiredRatePerHour * (1 + (config.pacing?.rateDeadbandRel ?? .15));
-      if (ahead && fast && !burn) reason = 'pace-held';
+      if (v.roleEligible === false) reason = 'role-excluded';
+      else if (v.taskFeasible === false) reason = 'outcome-gated';
+      else if (ahead && fast && !burn) reason = 'pace-held';
       else if (v.health !== 'healthy') reason = a.credentialReady === false ? 'credential-unavailable' : 'account-reading-stale';
       else if (v.headroomPct != null && v.headroomPct <= 1 - hardCap) reason = 'weekly-exhausted';
       else eligible.push({...v, pool: poolKey, burn, held:false, memberId:i.id, accountId:i.key});
