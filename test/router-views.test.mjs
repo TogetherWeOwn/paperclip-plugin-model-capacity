@@ -37,3 +37,15 @@ test('stale or credential-unready accounts use existing unhealthy vocabulary', (
   assert.notEqual(snapshotAccountView('a', {...account, quality: 'unknown'}, {nowMs: now}).health, 'healthy');
   assert.notEqual(snapshotAccountView('a', {...account, credentialReady: false}, {nowMs: now}).health, 'healthy');
 });
+
+test('run-id overlay is deduplicated and resets exactly at snapshot boundaries', async () => {
+  const { createOverlay, overlayStart, overlayFinish, overlayCount, resetOverlay } = await import('../src/overlay.mjs');
+  let s = createOverlay();
+  s = overlayStart(s, 'a', 'r2'); s = overlayStart(s, 'a', 'r2');
+  assert.equal(overlayCount(s, 'a', 1), 2);
+  s = overlayFinish(s, 'a', 'r1'); assert.equal(overlayCount(s, 'a', 1), 1);
+  s = resetOverlay(); assert.equal(overlayCount(s, 'a', 1), 1);
+  s = overlayFinish(s, 'a', 'r2'); s = overlayFinish(s, 'a', 'r2');
+  assert.equal(overlayCount(s, 'a', 1), 0);
+  s = overlayFinish(s, 'a', 'unknown'); assert.equal(overlayCount(s, 'a', 1), 0);
+});

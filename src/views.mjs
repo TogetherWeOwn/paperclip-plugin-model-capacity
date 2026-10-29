@@ -4,7 +4,7 @@ import { scheduleError } from './pacing.mjs';
 const nonNegative = n => Number.isFinite(n) ? Math.max(0, n) : 0;
 
 export function snapshotAccountView(accountKey, account, { nowMs, accountStaleMs = 15 * 60_000 } = {}) {
-  const fresh = account.quality !== 'unknown' && Number.isFinite(account.observedAtMs)
+  const fresh = ['passive', 'live', 'cached'].includes(account.quality) && Number.isFinite(account.observedAtMs)
     && Number.isFinite(nowMs) && nowMs - account.observedAtMs <= accountStaleMs;
   const inFlight = nonNegative(account.inFlightBase);
   const view = {

@@ -61,9 +61,12 @@ function staleDelay(account, now, recheck) {
   const k = clamp(Math.floor((now - since) / recheck), 0, 30);
   return now + Math.min(30 * MINUTE, recheck * 2 ** k);
 }
-function nextTime(account, reason, now, recheck) {
+function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour = .99) {
   const validReset = t => Number.isFinite(t) && t > now && ['passive', 'live', 'cached'].includes(account.quality);
-  if (reason === 'weekly-exhausted' && validReset(account.weeklyResetsAtMs)) return {at: account.weeklyResetsAtMs, credible: true};
+  if (reason === 'weekly-exhausted' && validReset(account.weeklyResetsAtMs)) {
+    if (account.fiveHourUsed >= hardCapFiveHour && validReset(account.fiveHourResetsAtMs)) return {at: Math.max(account.weeklyResetsAtMs, account.fiveHourResetsAtMs), credible: true};
+    return {at: account.weeklyResetsAtMs, credible: true};
+  }
   if (reason === 'five-hour-exhausted' && validReset(account.fiveHourResetsAtMs)) return {at: account.fiveHourResetsAtMs, credible: true};
   if (reason === 'pace-held') {
     let t = account.nextEligibleAtMs;
@@ -100,7 +103,7 @@ export function routeDecision(params, snapshot, config = {}) {
     const a = i.account;
     let reason = null;
     if (!poolKey || !snapshot.poolRoles?.[poolKey] || !i.key || !a) reason = 'unmapped-member';
-    else if (a.quality === 'unknown' || !Number.isFinite(a.observedAtMs) || now - a.observedAtMs > (router.accountStaleMs ?? 15 * MINUTE)) reason = 'account-reading-stale';
+    else if (!['passive', 'live', 'cached'].includes(a.quality) || !Number.isFinite(a.observedAtMs) || now - a.observedAtMs > (router.accountStaleMs ?? 15 * MINUTE)) reason = 'account-reading-stale';
     else if (a.credentialReady === false) reason = 'credential-unavailable';
     else if (Number.isFinite(a.weeklyUsed) && a.weeklyUsed >= hardCap) reason = 'weekly-exhausted';
     else if (Number.isFinite(a.fiveHourUsed) && a.fiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';
@@ -120,7 +123,7 @@ export function routeDecision(params, snapshot, config = {}) {
     if (reason) {
       skipped[i.id] = reason;
       if (reason === 'unmapped-member') retries.push({at:now + MINUTE, credible:false});
-      else retries.push(nextTime(a, reason, now, recheck));
+      else retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99));
     }
   }
   if (pin && eligible.length) return {kind:'selected', memberId:pin};

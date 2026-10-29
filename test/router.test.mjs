@@ -79,3 +79,21 @@ test('pure synchronous decision works with deeply frozen input', () => {
   const f=mk(); const freeze = o => {if(o && typeof o==='object' && !Object.isFrozen(o)) {Object.values(o).forEach(freeze); Object.freeze(o);} return o;};
   freeze(f); const result=route(f); assert.equal(result.kind,'selected'); assert.equal(result instanceof Promise,false);
 });
+
+test('pace held members wait for catch-up, never weekly reset or one-run escape', () => {
+  const f=mk({ids:['a'],accounts:{a:mkAccount({eligible:false,skipReason:'pace-held',nextEligibleAtMs:now+10*60000})}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+10*60000).toISOString(),skipped:{a:'pace-held'}});
+});
+test('exclusive burn holds other members and wakes no later than expiry', () => {
+  const f=mk({accounts:{b:mkAccount({eligible:false,skipReason:'weekly-exhausted',weeklyUsed:1,burn:{active:true,expiresAtMs:now+3600000}})}});
+  f.config.burn={mode:'exclusive'};
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'burn-not-target',b:'weekly-exhausted'}});
+});
+test('an unknown quality label never grants a usable quota reading', () => {
+  const f=mk({ids:['a'], accounts:{a:mkAccount({quality:null})}});
+  assert.equal(route(f).skipped.a,'account-reading-stale');
+});
+test('two exhausted windows on one member wait until both have reset', () => {
+  const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:1,weeklyResetsAtMs:now+3600000,fiveHourUsed:1,fiveHourResetsAtMs:now+7200000})}});
+  assert.equal(route(f).retryAt,new Date(now+7200000).toISOString());
+});
