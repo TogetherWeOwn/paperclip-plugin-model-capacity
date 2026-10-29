@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.73
+### Fixed
+- Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.
+- Preserve missing benchmark and cost observations with their original timestamps, while publishing a new intelligence-index major as a fresh generation without carrying prior-major data. Report pages, static arm coverage and previous snapshot age.
+
 ## Unreleased
 ### Added
 - Alert-only failure-cluster detector (default off): failed-run events feed per-account counters in plugin state; >= 3 allowlisted failures (`claude_auth_required`, `claude_transient_upstream`, `adapter_failed`) for one account inside a 15-minute event-time window creates or updates exactly one stable-origin managed alert issue and reports `error` through plugin health until the cluster clears. Writes happen on cluster enter/exit/count-band transitions only, never per run; `timed_out` runs are excluded and the account keeps the legacy ` on provider:account` extraction. Opt in with `failureClusterAlert: { enabled: true, assigneeAgentId }`; disabled or unassigned performs zero issue writes. Adds exactly `issues.create` + `issues.update` with create/update field allowlists and per-write ownership checks; no comment, checkout, wakeup, interaction, document or relation writes, no routing or enforce-flag change, no new job, egress, secret or env key.

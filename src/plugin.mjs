@@ -36,7 +36,7 @@ import {
   isReactiveAccount,
   CliproxyCache,
 } from './cliproxy.mjs';
-import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill, carryForwardCosts, stampAaObservations } from './aa.mjs';
+import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill, carryForwardCosts, carryForwardBenchmarks, markStaleBenchmarks, BENCHMARK_FIELDS, stampAaObservations } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
   canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId,
@@ -5819,22 +5819,43 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx.logger.info('model-capacity: AA refresh skipped (no key configured)', { companyId });
       return { status: 'skipped', reason: 'no-aa-key' };
     }
+    const previousTimestamp = Date.parse(previous.fetchedAt ?? '');
+    const previousSnapshotAgeHours = Number.isFinite(previousTimestamp) ? Math.max(0, (clock() - previousTimestamp) / 3600000) : null;
     const apiKey = await ctx.secrets.resolve(config.aa.apiKeySecretRef, { companyId, configPath: 'aa.apiKeySecretRef' });
     const [fetched, board] = await Promise.all([
       fetchAaFreeList({ http: ctx.http, apiKey }),
       fetchAaLeaderboard({ http: ctx.http }),
     ]);
-    if (!fetched.ok || !fetched.text) {
-      await ctx.state.set(scopeKey(companyId, AA_KEY), { ...previous, lastAttemptAt: nowIso, lastError: fetched.error ?? 'aa-fetch-failed' });
-      ctx.logger.error('model-capacity: AA refresh failed; keeping prior snapshot', { companyId, error: fetched.error });
-      return { status: 'error', error: fetched.error };
-    }
-    const parsed = parseAaFreeList(fetched.text);
+    const parsed = fetched.ok && fetched.text ? parseAaFreeList(fetched.text) : null;
+    const priorVersion = previous.intelligenceIndexVersion;
+    const currentVersion = parsed?.intelligenceIndexVersion;
+    const major = v => String(v).split('.')[0];
+    const versionMismatch = priorVersion != null && currentVersion != null && major(priorVersion) !== major(currentVersion);
     if (!parsed) {
-      await ctx.state.set(scopeKey(companyId, AA_KEY), { ...previous, lastAttemptAt: nowIso, lastError: 'aa-parse-failed' });
-      ctx.logger.error('model-capacity: AA parse failed; keeping prior snapshot', { companyId });
-      return { status: 'error', error: 'aa-parse-failed' };
+      const error = fetched.error ?? 'aa-parse-failed';
+      const freshBoard = board.ok && board.html ? parseAaLeaderboardHtml(board.html) : null;
+      const patch = {};
+      if (freshBoard?.length) {
+        // The leaderboard carries no provable index generation when the API failed.
+        // Only exact-evaluation benchmarks can safely update the old generation.
+        const boardRows = stampAaObservations(freshBoard.map(row => Object.fromEntries(
+          Object.entries(row).filter(([key]) => key === 'slug' || BENCHMARK_FIELDS.includes(key))
+        )), nowIso, 'public-leaderboard');
+        const priorRows = stampAaObservations(previous.rows ?? [], previous.fetchedAt ?? null, 'previous-snapshot');
+        const merged = mergeAaRows(priorRows, boardRows);
+        patch.rows = markStaleBenchmarks(merged.rows, nowIso);
+        // Preserve the full source separately; only benchmark fields enter the
+        // current generation until the API version can be established.
+        patch.leaderboardRows = stampAaObservations(freshBoard, nowIso, 'public-leaderboard');
+        patch.leaderboardSlugs = merged.leaderboardSlugs;
+        patch.leaderboardAt = nowIso;
+      }
+      await ctx.state.set(scopeKey(companyId, AA_KEY), { ...previous, ...patch, lastAttemptAt: nowIso, lastError: error });
+      ctx.logger.error('model-capacity: AA API refresh failed; retaining previous API freshness', { companyId, error, previousSnapshotAgeHours, cachedRows: previous.rows?.length ?? 0 });
+      return { companyId, status: 'error', error, previousSnapshotAgeHours, cachedRows: previous.rows?.length ?? 0 };
     }
+    // A new major is a fresh generation: never blend prior API, leaderboard or carried evidence.
+    const compatiblePrevious = versionMismatch ? {} : previous;
     // Second source is best-effort but NEVER zeroing: a leaderboard fetch
     // or parse failure keeps the PREVIOUS snapshot's raw leaderboard layer
     // (2026-10-17: a parse failure stored API-only rows with
@@ -5859,15 +5880,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         leaderboardRows = stampAaObservations(boardParsed, nowIso, 'public-leaderboard');
       }
     }
-    const prevSlugs = Array.isArray(previous.leaderboardSlugs) ? previous.leaderboardSlugs : [];
-    const prevRows = Array.isArray(previous.rows) ? previous.rows : [];
-    const prevLeaderboardRows = (Array.isArray(previous.leaderboardRows) ? previous.leaderboardRows : [])
+    const prevSlugs = Array.isArray(compatiblePrevious.leaderboardSlugs) ? compatiblePrevious.leaderboardSlugs : [];
+    const prevRows = Array.isArray(compatiblePrevious.rows) ? compatiblePrevious.rows : [];
+    const prevLeaderboardRows = (Array.isArray(compatiblePrevious.leaderboardRows) ? compatiblePrevious.leaderboardRows : [])
       .filter(r => r && typeof r.slug === 'string');
     const keptRows = prevLeaderboardRows.length > 0
       ? prevLeaderboardRows
       : prevRows.filter(r => r && typeof r.slug === 'string' && prevSlugs.includes(r.slug));
     const freshApiRows = stampAaObservations(parsed.rows, nowIso, 'free-api');
-    const datedKeptRows = stampAaObservations(keptRows, previous.leaderboardAt ?? previous.fetchedAt ?? null, 'public-leaderboard');
+    const datedKeptRows = stampAaObservations(keptRows, compatiblePrevious.leaderboardAt ?? compatiblePrevious.fetchedAt ?? null, 'public-leaderboard');
     let merged;
     let leaderboardAt;
     let keptPreviousLeaderboard = false;
@@ -5885,7 +5906,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         merged = { ...merged, leaderboardSlugs: [...prevSlugs] };
         keptPreviousLeaderboard = true;
       }
-      leaderboardAt = previous.leaderboardAt ?? null;
+      leaderboardAt = compatiblePrevious.leaderboardAt ?? null;
     } else {
       merged = mergeAaRows(freshApiRows, leaderboardRows);
       if (merged.leaderboardSlugs.length === 0 && prevSlugs.length > 0) {
@@ -5899,7 +5920,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       leaderboardAt = leaderboardRows.length > 0 && !keptPreviousLeaderboard
         ? nowIso
-        : (previous.leaderboardAt ?? null);
+        : (compatiblePrevious.leaderboardAt ?? null);
     }
     // Cost carry (2026-10-22): a refresh can keep every row but drop the cost
     // fields for some slugs -- the leaderboard check passes, so the keep path
@@ -5908,13 +5929,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // snapshot's merged rows (fresh values always win; carried rows are marked
     // costCarriedFrom). The raw layer below stays raw: the next refresh
     // carries from these merged rows again.
-    const carriedRows = carryForwardCosts(merged.rows, prevRows, previous.fetchedAt ?? 'previous-snapshot');
+    const carriedRows = markStaleBenchmarks(carryForwardCosts(carryForwardBenchmarks(merged.rows, prevRows, compatiblePrevious.fetchedAt), prevRows, compatiblePrevious.fetchedAt ?? 'previous-snapshot'), nowIso);
     const carriedSlugs = carriedRows.filter(r => r?.costCarriedFrom != null).map(r => r.slug);
+    const carriedTimes = carriedRows.flatMap(row => [
+      ...Object.keys(row.staleBenchmarkFields ?? {}).map(field => row.fieldObservedAt?.[field]),
+      ...Object.values(row.costFieldObservedAt ?? {}),
+    ]).map(value => Date.parse(value ?? '')).filter(Number.isFinite);
+    const oldestCarriedAgeHours = carriedTimes.length ? Math.max(0, (clock() - carriedTimes.reduce((earliest, time) => Math.min(earliest, time), Infinity)) / 3600000) : null;
+    const coverage = { totalRows: carriedRows.length, configuredArms: resolveArms(carriedRows, config.armMap).arms.length, benchmarkRows: carriedRows.filter(row => ['scicode', 'terminalbenchV40', 'hle', 'lcr', 'ifbench', 'gpqa'].some(field => row[field] != null)).length, carriedBenchmarkRows: carriedRows.filter(row => Object.keys(row.staleBenchmarkFields ?? {}).length > 0).length };
+    const refreshSummary = { pagesFetched: fetched.pagesFetched, previousSnapshotAgeHours, oldestCarriedAgeHours, coverage };
     // The raw layer carried into the next snapshot: freshly parsed rows on
     // success, the kept layer on failure (never the merged rows).
     const storedLeaderboardRows = keptPreviousLeaderboard ? datedKeptRows : leaderboardRows;
     await ctx.state.set(scopeKey(companyId, AA_KEY), {
       fetchedAt: nowIso,
+      intelligenceIndexVersion: parsed.intelligenceIndexVersion,
+      pagesFetched: fetched.pagesFetched,
+      refreshSummary,
       rows: carriedRows,
       duplicateSlugs: merged.duplicateSlugs,
       leaderboardSlugs: merged.leaderboardSlugs,
@@ -5925,6 +5956,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       lastLeaderboardError: leaderboardError,
       ...(keptPreviousLeaderboard ? { leaderboardKeptFromPrevious: true } : {}),
     });
+    ctx.logger.info('model-capacity: AA refresh summary', { companyId, ...refreshSummary });
     if (leaderboardError) {
       ctx.logger.error('model-capacity: AA leaderboard failed; kept prior leaderboard rows', {
         companyId, leaderboardError, keptPreviousLeaderboard,
@@ -5941,7 +5973,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       });
     }
     return {
-      status: 'ok', rows: merged.rows.length,
+      companyId, status: 'ok', rows: carriedRows.length, pagesFetched: fetched.pagesFetched, previousSnapshotAgeHours, oldestCarriedAgeHours,
+      coverage,
       leaderboardRows: storedLeaderboardRows.length,
       leaderboardError, keptPreviousLeaderboard,
       costCarriedSlugs: carriedSlugs,
@@ -5955,7 +5988,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx = context;
       ctx.jobs.register('aa-refresh', async job => {
         const results = await Promise.allSettled([...configured].sort().map(companyId => runAaRefresh(companyId)));
-        if (results.some(r => r.status === 'rejected')) throw new Error('aa-refresh-failed');
+        if (results.some(r => r.status === 'rejected' || (r.status === 'fulfilled' && r.value?.status === 'error'))) throw new Error('aa-refresh-failed');
+        return results.map(r => r.value);
       });
       ctx.jobs.register('shadow-tick', async job => {
         const results = await Promise.allSettled([...configured].sort().map(async companyId => {

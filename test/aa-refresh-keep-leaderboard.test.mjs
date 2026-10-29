@@ -39,7 +39,7 @@ const rawAcct = () => ({
   quality: 'live',
 });
 
-function drive({ boardHtml, apiText = apiOnlyText }) {
+function drive({ boardHtml, apiText = apiOnlyText, apiStatus = 200 }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -62,8 +62,9 @@ function drive({ boardHtml, apiText = apiOnlyText }) {
     secrets: { resolve: async () => 'test-key' },
     http: {
       fetch: async (url) => {
-        if (String(url).includes('/api/v2/data/llms/models')) {
-          return { status: 200, headers: { get: () => null }, text: async () => apiText };
+        if (String(url).includes('/api/v2/language/models/free')) {
+          const api = JSON.parse(apiText);
+          return { status: apiStatus, headers: { get: () => null }, text: async () => JSON.stringify({ ...api, intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false } }) };
         }
         if (String(url).includes('/leaderboards/models')) {
           return { status: 200, headers: { get: () => null }, text: async () => boardHtml };
@@ -84,7 +85,7 @@ function drive({ boardHtml, apiText = apiOnlyText }) {
     },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
-  return { store, jobs, fake, plugin, errors, infos, skey, setNow: ms => { now = ms; } };
+  return { store, jobs, fake, plugin, errors, infos, skey, setNow: ms => { now = ms; }, setSources: sources => { if ('apiStatus' in sources) apiStatus = sources.apiStatus; if ('boardHtml' in sources) boardHtml = sources.boardHtml; } };
 }
 
 test('2026-10-17 fixture parses the current initialModels page', () => {
@@ -162,8 +163,8 @@ test('leaderboard fetch failure also keeps prior leaderboard rows', async () => 
   const { store, jobs, fake, plugin, skey } = drive({ boardHtml: null });
   // Null board html simulates a failed fetch body; override fetch for this case.
   fake.http.fetch = async (url) => {
-    if (String(url).includes('/api/v2/data/llms/models')) {
-      return { status: 200, headers: { get: () => null }, text: async () => apiOnlyText };
+    if (String(url).includes('/api/v2/language/models/free')) {
+      return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ ...JSON.parse(apiOnlyText), intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false } }) };
     }
     if (String(url).includes('/leaderboards/models')) {
       return { status: 500, headers: { get: () => null }, text: async () => '' };
@@ -370,4 +371,121 @@ test('target-zero-with-headroom alarm fires through the tick when calibrated cap
   assert.equal(alarms.length, 1, `target-0 alarm logged once (got ${alarms.length}): ${JSON.stringify(errors)}`);
   assert.equal(alarms[0][1].code, 'target-zero-with-headroom');
   assert.deepEqual(alarms[0][1].healthyAccounts, ['claude:a1']);
+});
+
+
+test('API failure retains old freshness, publishes fresh leaderboard, and fails the job', async () => {
+  const html = readFileSync(join(HERE, 'fixtures', 'aa-leaderboard-20261017.html'), 'utf8');
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:html,apiStatus:410});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:'2026-10-01T00:00:00.000Z',rows:GOOD_ROWS,leaderboardRows:[],leaderboardSlugs:[]});
+  await assert.rejects(jobs.get('aa-refresh')({}), /aa-refresh-failed/);
+  const state=store.get(skey(key));
+  assert.equal(state.fetchedAt,'2026-10-01T00:00:00.000Z');
+  assert.ok(state.leaderboardRows.length > 0);
+  assert.equal(state.lastError,'aa-http-failed');
+});
+
+test('new index major publishes fresh data without carrying old benchmarks, prices, slugs or stale leaderboard', async () => {
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:'<html>no data</html>'});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:'2026-10-01T00:00:00.000Z',intelligenceIndexVersion:'4.0',rows:[...GOOD_ROWS, {slug:'old-only', scicode:0.9}],leaderboardRows:GOOD_ROWS,leaderboardSlugs:GOOD_SLUGS});
+  await jobs.get('aa-refresh')({});
+  const state=store.get(skey(key));
+  assert.equal(state.intelligenceIndexVersion,'5.0');
+  assert.equal(state.fetchedAt,new Date(TICK).toISOString());
+  assert.equal(state.rows.find(r => r.slug === GOOD_SLUGS[0]).scicode, null);
+  assert.equal(state.rows.find(r => r.slug === GOOD_SLUGS[0]).intelligenceIndexCostPerTask, null);
+  assert.ok(!state.rows.some(r => r.slug === 'old-only'));
+  assert.deepEqual(state.leaderboardSlugs, []);
+});
+
+
+test('refresh job reports pages, coverage and previous snapshot age', async () => {
+  const html=readFileSync(join(HERE, 'fixtures', 'aa-leaderboard-20261017.html'), 'utf8');
+  const {store,jobs,fake,plugin,skey}=drive({boardHtml:html});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:new Date(TICK-7200000).toISOString(),rows:[...GOOD_ROWS, {slug:'only-old', scicode:0.5, fieldObservedAt:{scicode:new Date(TICK-86400000).toISOString()}}]});
+  const result=await jobs.get('aa-refresh')({});
+  assert.equal(result[0].pagesFetched,1);
+  assert.equal(result[0].previousSnapshotAgeHours,2);
+  assert.equal(result[0].oldestCarriedAgeHours,24);
+  assert.ok(result[0].coverage.totalRows >= 3);
+  assert.ok(result[0].coverage.benchmarkRows > 0);
+  assert.ok(result[0].coverage.configuredArms > 0);
+});
+
+test('failed API cannot blend unknown-major leaderboard index or cost into old generation', async () => {
+  const html = readFileSync(join(HERE, 'fixtures', 'aa-leaderboard-20261017.html'), 'utf8');
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:html,apiStatus:500});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:'2026-10-01T00:00:00.000Z',intelligenceIndexVersion:4,rows:[{slug:'claude-opus-5-5',intelligenceIndex:12,intelligenceIndexCostPerTask:2,scicode:0.1,staleBenchmarkFields:{scicode:true}},{slug:'other',intelligenceIndex:11,intelligenceIndexCostPerTask:3}]});
+  await assert.rejects(jobs.get('aa-refresh')({}), /aa-refresh-failed/);
+  const state=store.get(skey(key));
+  const opus=state.rows.find(r=>r.slug==='claude-opus-5-5');
+  assert.equal(state.intelligenceIndexVersion,4);
+  assert.equal(opus.intelligenceIndex,12);
+  assert.equal(opus.intelligenceIndexCostPerTask,2);
+  assert.equal(state.rows.find(r=>r.slug==='other').intelligenceIndex,11);
+  assert.equal(opus.scicode,0.668981481481482);
+  assert.equal(opus.fieldObservedAt.scicode,new Date(TICK).toISOString());
+  assert.ok(!opus.staleBenchmarkFields?.scicode);
+});
+
+test('kept leaderboard observations are marked stale and summarized when API values are fresh', async () => {
+  const apiText=JSON.stringify({data:[{slug:'claude-opus-5-5',evaluations:{artificial_analysis_intelligence_index:50},pricing:{price_1m_input_tokens:4,price_1m_output_tokens:20},artificial_analysis_intelligence_index_cost:{cost_per_task:{total_cost:5}}}]});
+  const {store,jobs,fake,plugin,skey} = drive({boardHtml:'<html>no data</html>',apiText});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  const old=new Date(TICK-39*3600000).toISOString();
+  store.set(skey(key),{fetchedAt:old,intelligenceIndexVersion:'5.0',rows:[{slug:'claude-opus-5-5',scicode:0.5}],leaderboardRows:[{slug:'claude-opus-5-5',scicode:0.5}],leaderboardSlugs:['claude-opus-5-5'],leaderboardAt:old});
+  const result=await jobs.get('aa-refresh')({});
+  assert.equal(store.get(skey(key)).rows[0].staleBenchmarkFields.scicode,true);
+  assert.equal(result[0].coverage.carriedBenchmarkRows,1);
+  assert.equal(result[0].oldestCarriedAgeHours,39);
+});
+
+test('refresh persists and logs operator-visible summary', async () => {
+  const {store,jobs,fake,plugin,skey,infos} = drive({boardHtml:'<html>no data</html>'});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET},aa:{apiKeySecretRef:SECRET}},{companyId:'acme'});
+  const key={scopeKind:'company',scopeId:'acme',namespace:'model-capacity',stateKey:'aa-snapshot-v1'};
+  store.set(skey(key),{fetchedAt:new Date(TICK-7200000).toISOString(),rows:[{slug:'old',scicode:0.5,fieldObservedAt:{scicode:new Date(TICK-86400000).toISOString()}}]});
+  await jobs.get('aa-refresh')({});
+  const summary=store.get(skey(key)).refreshSummary;
+  assert.equal(summary.pagesFetched,1);
+  assert.equal(summary.previousSnapshotAgeHours,2);
+  assert.equal(summary.oldestCarriedAgeHours,24);
+  assert.ok(summary.coverage.carriedBenchmarkRows>0);
+  assert.ok(infos.some(([msg, fields])=>msg.includes('AA refresh summary') && fields.coverage?.carriedBenchmarkRows>0));
+});
+
+
+test('API failure stores full raw leaderboard for a subsequent leaderboard failure', async () => {
+  const board = JSON.stringify({initialModels:[{slug:GOOD_SLUGS[0], contextWindowTokens:128000, intelligenceIndex:99, price1mInputTokens:3, medianOutputTokensPerSecond:45, scores:{critpt:0.4}}]});
+  const {store, jobs, fake, plugin, skey, setSources} = drive({boardHtml:board, apiStatus:500});
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({cliproxy:{laneKeySecretRef:SECRET}, aa:{apiKeySecretRef:SECRET}}, {companyId:'acme'});
+  const key = skey({scopeKind:'company', scopeId:'acme', namespace:'model-capacity', stateKey:'aa-snapshot-v1'});
+  store.set(key, {fetchedAt:'2026-10-16T04:17:00Z', intelligenceIndexVersion:'5.0', rows:[{slug:GOOD_SLUGS[0], intelligenceIndex:12}], leaderboardSlugs:[]});
+  await assert.rejects(jobs.get('aa-refresh')({}), /aa-refresh-failed/);
+  const first = store.get(key);
+  assert.equal(first.rows.find(r=>r.slug===GOOD_SLUGS[0]).intelligenceIndex, 12, 'unknown generation index must not be published');
+  const raw = first.leaderboardRows.find(r=>r.slug===GOOD_SLUGS[0]);
+  assert.equal(raw.contextWindowTokens,128000);
+  assert.equal(raw.intelligenceIndex,99);
+  assert.equal(raw.price1mInputTokens,3);
+  assert.equal(raw.medianOutputTokensPerSecond,45);
+  setSources({apiStatus:200, boardHtml:'invalid'});
+  await jobs.get('aa-refresh')({});
+  assert.equal(store.get(key).rows.find(r=>r.slug===GOOD_SLUGS[0]).contextWindowTokens,128000);
 });
