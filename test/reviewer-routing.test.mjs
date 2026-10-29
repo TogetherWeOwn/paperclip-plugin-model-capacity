@@ -43,12 +43,13 @@ const metaLane = (key, used, hoursLeft, extra = {}) => ({
   ...extra,
 });
 
-function drive({ config = {}, accounts, heartbeats = [] }) {
+function drive({ config = {}, accounts, heartbeats = [], issues = [] }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
   const skey = k => JSON.stringify(k);
-  const now = TICK;
+  let now = TICK;
+  let laneAccounts = accounts;
   const io = {
     config: { get: async () => ({ ...config, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
@@ -56,17 +57,19 @@ function drive({ config = {}, accounts, heartbeats = [] }) {
     http: {
       fetch: async () => ({
         status: 200,
-        json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts }, now),
+        json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: laneAccounts }, now),
       }),
     },
     agents: { get: async () => null, getQueuedRunCounts: async () => heartbeats },
-    issues: { get: async () => null, list: async () => [] },
+    issues: { get: async () => null, list: async ({ status } = {}) => issues.filter(row => !status || row.status === status) },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
     logger: { info() {}, error() {} },
   };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   return {
+    setNow: ms => { now = ms; },
+    setAccounts: list => { laneAccounts = list; },
     setup: async () => {
       await plugin.setup(io);
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
@@ -429,6 +432,55 @@ test('role-empty reviewer routes and receives its soft-capped slot without reope
   assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 1, JSON.stringify(caps));
   assert.equal(caps.agents.find(a => a.agentId === 'other-pin')?.allocated, 0, JSON.stringify(caps));
 });
+
+for (const blockingPriority of [false, true]) {
+  test(`caps: an idle reviewer's role-local hold exception cannot fund a disjoint peer (priority=${blockingPriority})`, async () => {
+    const x = claudeLane(0.85, 120.5, { models: ['claude-opus-5-5'] });
+    const y = claudeLane(0.895, 24.5, { lane: 'claude-2', accountKey: 'a2', models: ['claude-haiku-5-5'] });
+    const heartbeats = [{ agentId: 'reviewer-a', queued: 0 }, { agentId: 'reviewer-b', queued: 5 }];
+    const issues = Array.from({ length: 5 }, (_, i) => ({ id: `peer-${i}`, assigneeAgentId: 'reviewer-b',
+      status: 'todo', priority: 'medium', blockedBy: [] }));
+    const d = drive({
+      config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.8 },
+        allocation: { blockingPriority },
+        roles: { keepAgentIds: ['reviewer-a', 'reviewer-b'], thinkerAgentIds: ['reviewer-a'],
+          doerAgentIds: ['reviewer-b'], thinkerFloorRung: 0,
+          excludeFamilies: { thinker: ['haiku'], doer: ['opus'] } },
+        reviewReserve: { agentIds: ['reviewer-a', 'reviewer-b'] },
+        reviewerRouting: { agentIds: ['reviewer-a', 'reviewer-b'], arms: [ARMS[0],
+          { provider: 'claude', model: 'claude-haiku-5-5', effort: 'max' }] } },
+      accounts: [x, y], heartbeats, issues,
+    });
+    await d.setup();
+    await d.tick();
+    d.setNow(TICK + 0.5 * HOUR);
+    d.setAccounts([{ ...x, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() },
+      { ...y, weekly: { ...y.weekly, used: 0.9 }, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() }]);
+    await d.tick();
+    const capacity = (await d.api('capacity')).body;
+    const aPace = capacity.reviewerPaceByAgent['reviewer-a'];
+    const bPace = capacity.reviewerPaceByAgent['reviewer-b'];
+    assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-a'], ['claude:a1']);
+    assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-b'], ['claude:a2']);
+    assert.deepEqual(aPace.holdSuspendedAccountIds, ['claude:a1']);
+    assert.deepEqual(bPace.holdSuspendedAccountIds, []);
+    // Y's measured 0.01/h corrects its 20/3 C* slots to 25/9 (cap 3).
+    // Restoring X adds 7/15 slots, so only A has a local pool cap of 4.
+    assert.deepEqual(capacity.paceGuard.rawPools.find(p => p.pool === 'claude')?.hardHeldAccountIds, ['claude:a1']);
+    assert.deepEqual({ raw: capacity.paceGuard.rawPools.find(p => p.pool === 'claude')?.cap,
+      a: aPace.pools.find(p => p.pool === 'claude')?.cap, b: bPace.pools.find(p => p.pool === 'claude')?.cap },
+    { raw: 3, a: 4, b: 3 });
+    assert.ok(capacity.perAccount.find(a => a.accountId === 'claude:a2').slots > 3);
+    d.updateCapacity(cap => { cap.target = 10; cap.calibration = 'measured'; });
+    const caps = (await d.api('caps')).body;
+    assert.equal(caps.allocation?.blockingPriority ?? false, blockingPriority);
+    const peer = caps.agents.find(a => a.agentId === 'reviewer-b');
+    assert.equal(peer.running, 0);
+    assert.equal(peer.queued, 5);
+    assert.equal(peer.allocated, 3,
+      'the unexempt peer retains its own cap even while the exempt reviewer is idle');
+  });
+}
 
 test('policy-only reviewer hard hold is retained in global pools and denies queued caps', async () => {
   const d = drive({

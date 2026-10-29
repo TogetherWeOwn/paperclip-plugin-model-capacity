@@ -47,7 +47,7 @@ const runEvent = (runId, atMs, type = 'agent.run.started', agentId = 'agent-9') 
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ config = {}, accounts, agentGets = {} }) {
+function drive({ config = {}, accounts, agentGets = {}, heartbeats = [], snapshotRows = aaRows() }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -59,7 +59,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: lane }, now) }) },
-    agents: { get: async (id) => agentGets[id] ?? null },
+    agents: { get: async (id) => agentGets[id] ?? null, getQueuedRunCounts: async () => heartbeats },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -72,7 +72,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     setAccounts: a => { lane = a; },
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: snapshotRows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({}),
@@ -83,6 +83,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
       issueOverrideModel: null, deadlineMs: 1500, ...extra,
     }),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    updateCapacity: fn => fn(store.get(skey({ ...AA_STATE_KEY, stateKey: 'capacity-v1' }))),
     killIo: () => {
       for (const k of ['config', 'state', 'secrets', 'http', 'agents', 'issues']) {
         io[k] = new Proxy({}, { get: () => { throw new Error(`io-forbidden:${k}`); } });
@@ -585,6 +586,31 @@ test('weekly plan prices only spendable quota above the configured level floor',
   assert.equal(a.planTargetUsedPct, 0.85);
 });
 
+test('weekly C* uses exactly the spendable weekly quota above the floor', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { burnMode: { floors: { 'claude:*': 0.15 } },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 2 } },
+    accounts: [claudeLane(0.399, 84.5, onlyOpus)],
+  });
+  await d.setup();
+  await d.tick();
+  await d.fire(runEvent('floor-measured-run', TICK + 60000));
+  await d.fire(runEvent('floor-measured-run', TICK + 120000, 'agent.run.finished'));
+  d.setNow(TICK + 0.5 * HOUR);
+  d.setAccounts([claudeLane(0.4, 84.5, { ...onlyOpus,
+    observedAt: new Date(TICK + 0.5 * HOUR).toISOString() })]);
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const account = capacity.accounts.find(a => a.accountId === 'claude:a1');
+  const perAccount = capacity.perAccount.find(a => a.accountId === 'claude:a1');
+  assert.equal(capacity.calibration, 'measured', JSON.stringify(perAccount));
+  assert.ok(Math.abs(account.spendableRemaining - 0.45) < 1e-10);
+  // One run spent 0.001 of the week. (0.45 / 84) / 0.001 * 2 = 75/7 slots;
+  // using the raw 0.60 remaining would incorrectly grant 100/7 slots.
+  assert.ok(Math.abs(perAccount.slots - 75 / 7) < 1e-9, `weekly floor C* slots ${perAccount.slots}, expected ${75 / 7}`);
+});
+
 test('weekly hard hold: a regenerating-meter floor cannot reduce the weekly target or block healthy work', async () => {
   for (const regenUsed of [0.1, 0]) {
     // Half the week elapsed, 30% weekly used: twenty points BEHIND plan.
@@ -647,6 +673,113 @@ test('weekly hard hold: burn opt-in bypasses the hold without disabling it for o
   await d.tick();
   assert.match((await d.hook('burn-first')).model, /^claude/);
   assert.equal((await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude').state, 'burn');
+});
+
+for (const mode of ['shadow', 'enforce']) {
+  test(`weekly hard hold: duplicate-only peer prevents a native-pass safety exception (ranking=${mode})`, async () => {
+    const fixture = {
+      config: { enforce: true, taskRanking: { mode } },
+      snapshotRows: aaRows().map(row => ({ ...row, terminalbenchV40: 0.9, scicode: 0.9, lcr: 0.9,
+        ifbench: 0.9, omniscienceNonHallucination: 0.9, hle: 0.9, gpqa: 0.9, critpt: 0.9, gdpvalNormalized: 0.9 })),
+      accounts: [claudeLane(0.83, 104.16), claudeLane(0.1, 120, {
+        provider: 'devin', lane: 'devin-1', accountKey: 'd1', models: ['claude-opus-5-5'],
+      })],
+    };
+    const peerOnly = drive({ ...fixture, accounts: fixture.accounts.slice(1) });
+    await peerOnly.setup();
+    await peerOnly.tick();
+    assert.equal((await peerOnly.hook(`eligible-peer-${mode}`)).kind, 'decide',
+      'the peer has a ready, role-eligible arm in the full pass');
+    const d = drive(fixture);
+    await d.setup();
+    await d.tick();
+    const capacity = (await d.api('capacity')).body;
+    assert.ok(Math.abs(capacity.accounts.find(a => a.accountId === 'claude:a1').planAhead - 0.45) < 1e-10);
+    assert.ok(capacity.accounts.find(a => a.accountId === 'devin:d1').planAhead < 0);
+    const route = await d.hook(`duplicate-peer-${mode}`);
+    assert.equal(route.kind, 'decide', JSON.stringify(route));
+    await d.tick();
+    const entry = (await d.api('shadow')).body.entries.find(e => e.runId === `duplicate-peer-${mode}`);
+    assert.equal(entry?.accountId, 'devin:d1', 'full-role duplicate capacity must win over the hard-held native');
+  });
+}
+
+test('weekly soft cap: an unservable unknown-reset sibling cannot reopen fixed-model capacity', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+      roles: { keepAgentIds: ['fixed'] } },
+    accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const servable = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([servable]);
+  await d.tick();
+  const read = async () => {
+    const capacity = (await d.api('capacity')).body;
+    // Calibrate the fleet response and bind the pin; the tick owns all lane sizing and pace facts.
+    d.updateCapacity(cap => {
+      cap.target = 8; cap.calibration = 'measured';
+      cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+    });
+    const caps = (await d.api('caps')).body;
+    const pool = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+    return { capacity, summary: { lanes: pool?.lanes, cap: pool?.cap,
+      allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated } };
+  };
+  const before = await read();
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.summary, { lanes: 1, cap: 1, allocated: 1 });
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...servable, observedAt: new Date(TICK + 31 * 60000).toISOString() },
+    claudeLane(0.1, 84, { accountKey: 'empty', lane: 'claude-empty', models: [],
+      weekly: { used: 0.1, resetsAt: null }, observedAt: new Date(TICK + 31 * 60000).toISOString() })]);
+  await d.tick();
+  const after = await read();
+  const empty = after.capacity.accounts.find(a => a.accountId === 'claude:empty');
+  assert.equal(empty.health, 'healthy');
+  assert.deepEqual(empty.arms, [], 'the tick confirms the added lane has no servable arm');
+  assert.equal(after.capacity.perAccount.find(a => a.accountId === 'claude:empty').slots, 0);
+  assert.deepEqual(after.summary, { lanes: 1, cap: 1, allocated: 1 },
+    'a zero-slot lane with no served model must not erase the finite raw cap');
+});
+
+test('weekly hard hold: routing headroom cannot erase global holds or reopen fixed-model caps', async () => {
+  const d = drive({
+    config: { enforce: true, pacing: { guardHighPct: 0.99, guardRejoinPct: 0.98 },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 2 }, roles: { keepAgentIds: ['fixed'] } },
+    accounts: [claudeLane(0.85, 120, {
+      fiveHour: { used: 0.96, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    }), geminiLane(0.1, 120)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const account = capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(account.health, 'healthy');
+  assert.equal(account.guardActive, false);
+  assert.ok(Math.abs(account.headroomPct - 0.04) < 1e-10, `headroom ${account.headroomPct}`);
+  assert.ok(capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1, JSON.stringify(capacity.perAccount));
+  const route = await d.hook('low-headroom');
+  assert.equal(route.kind, 'decide');
+  assert.match(route.model, /^gemini/, 'the routing headroom exclusion still applies');
+  // Supply fleet calibration and an exact pin, never pool membership or lane slots.
+  d.updateCapacity(cap => {
+    cap.target = 8; cap.calibration = 'measured';
+    cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+  });
+  const caps = (await d.api('caps')).body;
+  const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+  assert.deepEqual({ hardHeld: raw?.hardHeldAccountIds ?? [], cap: raw?.cap ?? null,
+    allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated },
+  { hardHeld: ['claude:a1'], cap: 0, allocated: 0 });
 });
 
 test('weekly hard hold: invalid threshold is rejected before it can replace routing policy', async () => {

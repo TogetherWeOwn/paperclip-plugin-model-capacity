@@ -149,6 +149,32 @@ for (const blockingPriority of [false, true]) {
 }
 
 for (const blockingPriority of [false, true]) {
+  test(`an idle reviewer's restored pool budget is not fungible for another reviewer (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const input = { target: 10, blockingPriority,
+      agents: [{ agentId: 'exempt', running: 0, queued: 0 }, { agentId: 'peer', running: 0, queued: 5 }],
+      reviewerAccountIdsByAgent: { exempt: ['held'], peer: ['unheld'] },
+      reviewerPaceByAgent: {
+        exempt: { holdSuspendedAccountIds: ['held'], pools: [{ pool: 'shared', cap: 4 }] },
+        peer: { holdSuspendedAccountIds: [], pools: [{ pool: 'shared', cap: 3 }] },
+      },
+      accounts: [{ accountId: 'held', pool: 'shared' }, { accountId: 'unheld', pool: 'shared' }],
+      perAccount: [{ accountId: 'held', slots: 1 }, { accountId: 'unheld', slots: 8 }],
+      pacePools: [{ pool: 'shared', cap: 3, hardHeldAccountIds: ['held'] }],
+    };
+    const out = allocateKeptAndRoutedCaps(input);
+    const peer = [...out.kept, ...out.routed].find(a => a.agentId === 'peer');
+    const both = allocateKeptAndRoutedCaps({ ...input,
+      agents: [{ agentId: 'exempt', running: 0, queued: 1 }, { agentId: 'peer', running: 0, queued: 5 }] });
+    const rows = [...both.kept, ...both.routed];
+    assert.equal(rows.find(a => a.agentId === 'exempt').allocated, 1, 'the exemption still serves its own role');
+    assert.equal(rows.find(a => a.agentId === 'peer').allocated, 3);
+    assert.equal(rows.reduce((sum, row) => sum + row.allocated, 0), 4, 'one restored slot, spent once');
+    assert.equal(peer.allocated, 3, 'a peer cannot spend the idle reviewer\'s restored fourth slot');
+  });
+}
+
+for (const blockingPriority of [false, true]) {
   test(`reviewer exceptions share capacity and cannot bypass breakers (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const input = { target: 4, blockingPriority,
