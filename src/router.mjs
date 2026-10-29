@@ -3,6 +3,7 @@
  */
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { applyInFlightOverlay } from './views.mjs';
+import { accountKeyForModel } from './ledger.mjs';
 
 const PLUGIN_KEY = 'togetherweown.model-capacity';
 const MINUTE = 60_000;
@@ -49,9 +50,7 @@ function candidateInfo(c, snapshot, config, poolKey) {
   const indexed = snapshot.memberIndex?.[memberId(c)];
   let key = indexed?.accountKey;
   if (!key) {
-    const model = c?.runtimeConfig?.model;
-    const prefix = typeof model === 'string' && model.includes('/') ? model.slice(0, model.indexOf('/')) : null;
-    key = registry(config).find(a => a.prefix === prefix)?.accountKey;
+    key = accountKeyForModel(c?.runtimeConfig?.model, registry(config));
   }
   return {id: memberId(c), key, account: snapshot.accounts?.[key], membership: registry(config).find(a => a.accountKey === key)?.pools?.[poolKey]};
 }
