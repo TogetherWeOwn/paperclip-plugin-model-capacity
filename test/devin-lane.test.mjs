@@ -24,6 +24,15 @@ test('additional banned model configuration only widens mandatory bans', () => {
   assert.deepEqual(validateConfigShape({ bannedModels: [] }), []);
 });
 
+test('resolveConfig canonicalizes prefixed additional bans rather than dropping them', () => {
+  const config = resolveConfig({ bannedModels: ['devin/kimi-k3', 'kimi-k3', ' nvidia-nim/glm-5 ', null, '', 'devin/'] });
+  assert.deepEqual(config.bannedModels, ['kimi-k3', 'glm-5']);
+  assert.equal(arms.isBannedModel('kimi-k3', config.bannedModels), true);
+  assert.equal(arms.isBannedModel('nvidia-nim/kimi-k3', config.bannedModels), true);
+  assert.equal(arms.isBannedModel('devin/glm-5', config.bannedModels), true);
+  assert.equal(arms.isBannedModel('devin/swe-2', config.bannedModels), false);
+});
+
 test('explicit missing-AA admission preserves null score and rejects proven families', () => {
   const bindings = arms.buildDynamicBindings(['devin/swe-2', 'devin/claude-opus-99-9']).bindings;
   const unscoredAllowlist = new Map([
@@ -85,7 +94,7 @@ test('free-price expiry only accepts exact timezone-explicit real timestamps', a
   }
 });
 
-async function driveDevin({ mode = 'off', until = '2026-11-30T23:59:59Z', free = true, onlySwe = false, twins = false, folding = false, scoredFree = false, cap = 8, unhealthy = false, excludeSol = false, highOnly = false, priceRace = false, dominance = false, trialSettings = {}, configExtra = {}, nativeUnavailable = false, devinModels = null, onlyDevin = false, initialBreakers = null } = {}) {
+async function driveDevin({ mode = 'off', until = '2026-11-30T23:59:59Z', free = true, onlySwe = false, twins = false, folding = false, scoredFree = false, cap = 8, unhealthy = false, excludeSol = false, highOnly = false, priceRace = false, dominance = false, trialSettings = {}, configExtra = {}, nativeUnavailable = false, devinModels = null, onlyDevin = false, initialBreakers = null, aaExtraRows = [] } = {}) {
   const { createModelCapacityPlugin } = await import('../src/plugin.mjs');
   const { withSyntheticReadiness } = await import('./synthetic-readiness.mjs');
   let now = Date.parse('2026-11-01T00:00:00Z');
@@ -123,6 +132,7 @@ async function driveDevin({ mode = 'off', until = '2026-11-30T23:59:59Z', free =
   await plugin.setup(io);
   store.set(JSON.stringify({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(now).toISOString(), rows: [
+      ...aaExtraRows,
       ...(dominance ? [{ slug: 'gpt-5-6-sol', intelligenceIndex: 50, intelligenceIndexCostPerTask: 8 }] : []),
       ...(priceRace ? [{ slug: 'glm-5', intelligenceIndex: 45, intelligenceIndexCostPerTask: 1, terminalbenchV40: .8, scicode: .8, lcr: .8, ifbench: .8, omniscienceNonHallucination: .8, hle: .2, gpqa: .2, critpt: .2, gdpvalNormalized: .2 }] : []),
       { slug: 'kimi-k3', intelligenceIndex: priceRace && priceRace !== 'growth' ? 40 : 55, intelligenceIndexCostPerTask: priceRace || dominance ? 10 : 5, terminalbenchV40: .8, scicode: .8, lcr: .8, ifbench: .8, omniscienceNonHallucination: .8, hle: .2, gpqa: .2, critpt: .2, gdpvalNormalized: .2 },
@@ -352,6 +362,28 @@ test('expired included prices are not exposed by capacity or ladder without a ti
   assert.equal(l.rankingRungs.find(r => r.armId === 'kimi-k3').C, legacy.C);
   assert.equal(l.rungs.find(r => r.armId === 'swe-2').C, null);
 });
+
+for (const mode of ['off', 'enforce']) {
+  for (const [armId, expectedCost] of [['kimi-k3', 5], ['swe-2', null]]) {
+    test(`capacity account arm ${armId} expires its included price without a tick (${mode})`, async () => {
+      const until = '2026-11-01T00:01:00Z';
+      const d = await driveDevin({ mode, scoredFree: true, until });
+      const find = async () => (await d.capacity()).accounts.find(a => a.accountId === 'devin:d').arms.find(a => a.armId === armId);
+      assert.equal((await find()).costEffective, 0);
+      d.setNow(Date.parse(until));
+      assert.equal((await find()).costEffective, 0, 'the offer includes its exact deadline');
+      d.setNow(Date.parse(until) + 1);
+      const expired = await find();
+      assert.equal(expired.costEffective, expectedCost);
+      assert.notEqual(expired.costFree, true);
+      assert.equal(Object.hasOwn(expired, 'costFreeSource'), false);
+      assert.equal(Object.hasOwn(expired, 'freeUntilMs'), false);
+      // Projection must not mutate the cached pre-expiry snapshot.
+      d.setNow(Date.parse(until));
+      assert.equal((await find()).costEffective, 0);
+    });
+  }
+}
 
 // Mutating unscored arms to trial:true forever must fail this lifecycle test.
 test('unscored admission graduates only after sufficient successful terminal outcomes', async () => {
@@ -591,6 +623,38 @@ for (const readiness of [false, true]) {
     assert.notEqual((await d.hook('expired-after-tick', 'reviewer')).model, 'devin/swe-2');
   });
 }
+
+for (const allowlisted of [false, true]) {
+  test(`scored SWE reviewer ignores obsolete unscored admission in enforce mode (allowlisted ${allowlisted})`, async () => {
+    const d = await driveDevin({ mode: 'enforce', onlySwe: true, free: false,
+      aaExtraRows: [{ slug: 'swe-2', intelligenceIndex: 55, intelligenceIndexCostPerTask: 5,
+        terminalbenchV40: .8, scicode: .8, lcr: .8, ifbench: .8, omniscienceNonHallucination: .8 }],
+      trialSettings: { roles: [], adapters: {}, unscoredServedIds: allowlisted
+        ? [{ servedId: 'devin/swe-2', reason: 'obsolete trial entry' }] : [] },
+      configExtra: {
+        taskRanking: { mode: 'enforce', effortSupport: { 'devin/swe-2': ['max'] } },
+        reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2', effort: 'max' }] },
+      },
+    });
+    const policy = (await d.ladder()).ladders['devin:d'].policyReviewerArms[0];
+    assert.equal(policy.aaSlug, 'swe-2');
+    assert.equal(policy.benchmarkTrusted, true);
+    assert.equal((await d.capacity()).reviewer.routing.preview.routed, true);
+    const answer = await d.hook('scored-review', 'reviewer');
+    assert.equal(answer.kind, 'decide');
+    assert.equal(answer.model, 'devin/swe-2');
+    assert.equal(answer.effort, 'max');
+  });
+}
+
+test('enforce reviewer still rejects missing-AA SWE with a stale allowlist entry', async () => {
+  const d = await driveDevin({ mode: 'enforce', onlySwe: true, trialSettings: { roles: ['other'] },
+    configExtra: { reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2', effort: 'max' }] } },
+  });
+  assert.equal((await d.ladder()).ladders['devin:d'].policyReviewerArms[0].aaSlug, null);
+  assert.equal((await d.capacity()).reviewer.routing.preview.routed, false);
+  assert.notEqual((await d.hook('missing-aa-review', 'reviewer')).model, 'devin/swe-2');
+});
 
 test('reviewer model-list fallback cannot borrow another served id admission', async () => {
   const d = await driveDevin({ onlySwe: true, trialSettings: {

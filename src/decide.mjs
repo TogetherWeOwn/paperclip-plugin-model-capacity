@@ -569,7 +569,6 @@ export function decide({
   // preference, with Q left null throughout (never a synthetic score).
   const canary = a => !taskEnforce && escalation === 0 && a.unscoredTrial === true
     && a.trial === true && a.Q === null && a.C === 0;
-  if (fittingByRung.get(0)?.some(canary)) order.sort((a, b) => Number(b === 0) - Number(a === 0));
   for (const rung of order) {
     const fitting = fittingByRung.get(rung);
     if (fitting.length === 0) continue;

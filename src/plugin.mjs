@@ -653,7 +653,7 @@ export function resolveConfig(raw = {}) {
       apiKeySecretRef: raw.aa?.apiKeySecretRef ?? null,
       maxSnapshotAgeHours: raw.aa?.maxSnapshotAgeHours ?? 30,
     },
-    bannedModels: [...new Set((Array.isArray(raw.bannedModels) ? raw.bannedModels : []).filter(m => typeof m === 'string' && m.trim() && !m.includes('/')).map(m => m.trim()))],
+    bannedModels: [...new Set((Array.isArray(raw.bannedModels) ? raw.bannedModels : []).filter(m => typeof m === 'string').map(m => canonicalModelName(m.trim())?.trim()).filter(Boolean))],
     armMap: Array.isArray(raw.armMap) && raw.armMap.length > 0 ? raw.armMap : DEFAULT_ARM_MAP,
     roles: {
       thinkerAgentIds: raw.roles?.thinkerAgentIds ?? [],
@@ -2960,6 +2960,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // them stay byte-identical to the pre-carry shape.
           ...(r.costEstimated ? { costEstimated: true } : {}),
           ...(r.costCarriedFrom != null ? { costCarriedFrom: r.costCarriedFrom } : {}),
+          // The read-time expiry projection needs the same price identity
+          // as the candidate, including whether no paid price exists.
+          ...(r.costFreeSource === 'served-id' ? {
+            costFree: r.costFree, costFreeSource: r.costFreeSource,
+            freeServedId: r.freeServedId, freeUntilMs: r.freeUntilMs, freeReason: r.freeReason,
+            ...(r.unscoredTrial ? { unscoredTrial: true } : {}),
+          } : {}),
           costBase: r.costBase ?? null,
           costMultiplier: r.costMultiplier ?? 1,
           costEffective: r.costEffective ?? r.costBase ?? null,
@@ -5568,7 +5575,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (admission.ok !== true) return admission;
       const config = lastConfig.get(companyId);
       const allowlist = config?.trials.unscoredServedIds ?? [];
-      if (admission.match?.unscoredTrial || allowlist.some(e => e.model === canonicalModelName(arm.model))) {
+      if (admission.match?.unscoredTrial || (!admission.match?.aaSlug
+        && allowlist.some(e => e.model === canonicalModelName(arm.model)))) {
+        // AA-backed matches no longer need unscored admission; stale trial
+        // entries are inert once the model has its own AA identity.
         // The model-list fallback is not trial admission. Missing-AA arms
         // require their own exact served id and a price that is valid NOW,
         // independently of the opt-in credential-readiness filter.
