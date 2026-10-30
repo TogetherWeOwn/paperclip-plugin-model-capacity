@@ -84,7 +84,7 @@ test('borrowed evidence, missing evidence, unsupported efforts and forbidden ide
   assert.equal(out.arms.find(a => a.model === 'new-model').matchType, 'borrowed');
   assert.equal(out.unscored.find(a => a.model === 'unknown').reason, 'no-aa-match');
   assert.equal(out.unscored.find(a => a.model === 'muse-spark-1.3').reason, 'identity-policy');
-  assert.equal(out.unscored.find(a => a.model === 'gpt-6-sol').reason, 'identity-policy');
+  assert.equal(out.unscored.find(a => a.model === 'gpt-6-sol').reason, 'banned-model');
 });
 
 test('fleet normalization counts each arm once, role ladders start before other-role Pareto pruning', () => {

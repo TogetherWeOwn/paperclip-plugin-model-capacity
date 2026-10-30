@@ -676,7 +676,7 @@ test('readiness off keeps the all-cooling arm in the served ladder rungs', async
 });
 
 test('N-T10: newest legacy arm cannot revive after its credential loses readiness', async () => {
-  const older = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  const older = 'gpt-5-sol', newer = 'gpt-6.1-sol';
   const raw = account(older, 'codex', 'newest', 1);
   raw.models.push(newer);
   raw.credentialAvailability.models.push({ ...raw.credentialAvailability.models[0], model: newer, expiresAt: new Date(NOW + 1000).toISOString() });
@@ -698,7 +698,7 @@ test('N-T10: newest legacy arm cannot revive after its credential loses readines
 
 
 test('N3: live newest-version views match the published capacity account views', async () => {
-  const old = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  const old = 'gpt-5-sol', newer = 'gpt-6.1-sol';
   const a = account(old, 'codex', 'first', 1);
   a.models.push(newer);
   a.credentialAvailability.models.push({ ...a.credentialAvailability.models[0], model: newer });

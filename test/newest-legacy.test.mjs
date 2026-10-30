@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import { replayTick } from '../scripts/aa-replay.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
+// Routing fixtures use allowed synthetic versions, retaining the captured
+// product ordering and cohort size without bypassing mandatory model bans.
+const allowedFixtureText = text => String(text)
+  .replaceAll('gpt-6-sol', 'gpt-6.0-sol')
+  .replaceAll('gpt-5.6-terra', 'gpt-5.7-terra');
+
 const nowMs = Date.parse('2026-10-29T12:00:00Z');
 const models = ['muse-spark-1.3-contributor', 'muse-spark-1.4-contributor'];
 const lane = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: [{ lane: 'sample', provider: 'meta', accountKey: 'sample', health: 'healthy', models, observedAt: new Date(nowMs).toISOString(), quality: 'live', weekly: { used: 0.2, resetsAt: '2026-11-05T12:00:00Z' }, fiveHour: { used: 0.1, resetsAt: '2026-10-29T17:00:00Z' } }] }, nowMs);
@@ -54,11 +60,11 @@ test('N3: scoped keep retains only its legacy arm and remains evidence, not excl
 
 test('N-T21 legacy: captured fleet has exact per-account supersession sets and retains each product maximum', async () => {
   const { readFile } = await import('node:fs/promises');
-  const { accounts } = JSON.parse(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url)));
-  const arms = JSON.parse(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url)));
+  const { accounts } = JSON.parse(allowedFixtureText(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url))));
+  const arms = JSON.parse(allowedFixtureText(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url))));
   const expected = [
     ...Array(4).fill(['claude-haiku-4-5-20251001','claude-sonnet-5']),
-    ['gpt-5.6-terra','gpt-6-sol'], ['gpt-5.6-terra'], ['gpt-5.6-terra','gpt-6-sol'], ['gpt-5.6-terra','gpt-6-sol'],
+    ['gpt-5.7-terra','gpt-6.0-sol'], ['gpt-5.7-terra'], ['gpt-5.7-terra','gpt-6.0-sol'], ['gpt-5.7-terra','gpt-6.0-sol'],
     ['gemini-3-flash','gemini-3.1-flash-lite'], ['gemini-3-flash','gemini-3.1-flash-lite'], [],
     ...Array(3).fill(['muse-spark-1.1','muse-spark-1.2']), [], ['glm-4.7-flash'], [],
     ['deepseek-v4-flash-free','muse-spark-1.2-contributor-free'],
@@ -86,7 +92,7 @@ test('N-T21 legacy: captured fleet has exact per-account supersession sets and r
 });
 
 test('N3: cross-account dominance preserves superseded exclusions in the same ladder', async () => {
-  const names = ['gpt-5-sol', 'gpt-6-sol', 'gpt-6.1-sol'];
+  const names = ['gpt-5-sol', 'gpt-6.0-sol', 'gpt-6.1-sol'];
   const account = (key, served) => ({ lane: key, provider: 'fixture', accountKey: key, health: 'healthy', models: served,
     observedAt: new Date(nowMs).toISOString(), quality: 'live',
     weekly: { used: 0.2, resetsAt: '2026-11-05T12:00:00Z' },
@@ -111,8 +117,8 @@ test('N3: cross-account dominance preserves superseded exclusions in the same la
 
 test('X-T03: full-fleet newest and fallback flag matrix preserves supersession boundaries', async t => {
   const { readFile } = await import('node:fs/promises');
-  const { accounts } = JSON.parse(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url)));
-  const arms = JSON.parse(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url)));
+  const { accounts } = JSON.parse(allowedFixtureText(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url))));
+  const arms = JSON.parse(allowedFixtureText(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url))));
   const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
   const served = [...accounts, { id: 'matrix-weak', models: [old, newer] }];
   const fleet = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: served.map(a => ({
@@ -184,7 +190,7 @@ test('X-T03: full-fleet newest and fallback flag matrix preserves supersession b
   const newestOnly = results.get('true:false');
   const expected = [
     ...Array(4).fill(['claude-haiku-4-5-20251001', 'claude-sonnet-5']),
-    ['gpt-5.6-terra', 'gpt-6-sol'], ['gpt-5.6-terra'], ['gpt-5.6-terra', 'gpt-6-sol'], ['gpt-5.6-terra', 'gpt-6-sol'],
+    ['gpt-5.7-terra', 'gpt-6.0-sol'], ['gpt-5.7-terra'], ['gpt-5.7-terra', 'gpt-6.0-sol'], ['gpt-5.7-terra', 'gpt-6.0-sol'],
     ['gemini-3-flash', 'gemini-3.1-flash-lite'], ['gemini-3-flash', 'gemini-3.1-flash-lite'], [],
     ...Array(3).fill(['muse-spark-1.1', 'muse-spark-1.2']), [], ['glm-4.7-flash'], [],
     ['deepseek-v4-flash-free', 'muse-spark-1.2-contributor-free'], [old],

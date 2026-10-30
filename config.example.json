@@ -145,7 +145,9 @@
   },
   "placement": {
     "qualityWeight": 1,
-    "allowanceWeight": 0.35
+    "allowanceWeight": 0.35,
+    "duplicateVersionPunctuationFolding": true,
+    "freeCostServedIds": { "devin/swe-2": { "until": "2026-11-30T23:59:59Z", "reason": "Example only: verify eligibility for this serving integration before enabling" } }
   },
   "enforce": false,
   "credentialReadiness": {
@@ -175,6 +177,7 @@
     "finalAnswerFromAttempt": 11
   },
   "trials": {
+    "unscoredServedIds": [{ "servedId": "devin/swe-2", "reason": "Example only: verify the offer applies to this serving integration before enabling" }],
     "maxInFlightPerAccount": 2,
     "maxInFlightPerFamily": 2,
     "minRuns": 10,
@@ -184,6 +187,7 @@
       "claude-code": ["*"]
     }
   },
+  "bannedModels": [],
   "modelAaOverrides": {},
   "calibration": {
     "referenceArmId": "claude-haiku-5-5",

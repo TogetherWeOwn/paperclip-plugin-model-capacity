@@ -243,7 +243,7 @@ const aaRows = () => ([
   { slug: 'gemini-2-5-flash', intelligenceIndex: 54, intelligenceIndexCostPerTask: 5, price1mInputTokens: 1, price1mOutputTokens: 3 },
   // Same-family pair: newer scores higher at equal cost.
   { slug: 'gpt-6-1-sol', intelligenceIndex: 68, intelligenceIndexCostPerTask: 20, price1mInputTokens: 4, price1mOutputTokens: 20 },
-  { slug: 'gpt-6-sol', intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 4, price1mOutputTokens: 20 },
+  { slug: 'gpt-5-6-sol', intelligenceIndex: 60, intelligenceIndexCostPerTask: 20, price1mInputTokens: 4, price1mOutputTokens: 20 },
 ]);
 
 const rawAcct = (o) => ({
@@ -266,7 +266,7 @@ const codexSol = (over = {}) => rawAcct({
 const devinOldSol = (over = {}) => rawAcct({
   lane: 'devin-lane-1', provider: 'devin', key: 'devin-lane-1',
   meter: 'reactive', quality: 'reactive',
-  models: ['gpt-6-sol'], ...over,
+  models: ['gpt-5.6-sol'], ...over,
 });
 
 const claudeAcct = (over = {}) => rawAcct({
@@ -522,10 +522,10 @@ test('tick: open breaker on the dominator keeps Devin serving end to end', async
   const { shadow, capacity } = await run();
   const byId = accountsById(capacity);
   const devin = byId.get('devin:devin-lane-1');
-  assert.ok(devin.arms.some(a => a.armId === 'gpt-6-sol'), 'open breaker on Codex: Devin keeps old Sol');
+  assert.ok(devin.arms.some(a => a.armId === 'gpt-5.6-sol'), 'open breaker on Codex: Devin keeps old Sol');
   assert.equal(shadow.body.entries.length, 1);
   assert.equal(shadow.body.entries[0].accountId, 'devin:devin-lane-1');
-  assert.match(shadow.body.entries[0].wouldModel, /gpt-6-sol/);
+  assert.match(shadow.body.entries[0].wouldModel, /gpt-5.6-sol/);
 });
 
 test('tick: a Devin sibling dominated on Devin stays out when dominance drops old Sol', async () => {
@@ -537,7 +537,7 @@ test('tick: a Devin sibling dominated on Devin stays out when dominance drops ol
     : r));
   const laneAt = (weekly, now) => [
     codexSol({ weekly, observedAt: new Date(now).toISOString() }),
-    devinOldSol({ models: ['gpt-6-sol', 'kimi-k3'], observedAt: new Date(now).toISOString() }),
+    devinOldSol({ models: ['gpt-5.6-sol', 'kimi-k3'], observedAt: new Date(now).toISOString() }),
   ];
   const at = TICK + 30 * 60000;
   const { run } = drive({

@@ -12,14 +12,14 @@ const metrics = n => ({ terminalbenchV40: n, scicode: n, lcr: n, ifbench: n, omn
   hle: 1 - n, gpqa: 1 - n, critpt: 1 - n, gdpvalNormalized: 1 - n });
 const rows = [
   { slug: 'gpt-6-1-sol-high', intelligenceIndex: 50.2377777519769, intelligenceIndexCostPerTask: solCost, ...metrics(.6), contextWindowTokens: 1000000 },
-  { slug: 'gpt-5-6-terra', intelligenceIndex: 42.0829248239494, intelligenceIndexCostPerTask: terraCost, ...metrics(.9), contextWindowTokens: 1000000 },
+  { slug: 'gpt-6-1-terra', intelligenceIndex: 42.0829248239494, intelligenceIndexCostPerTask: terraCost, ...metrics(.9), contextWindowTokens: 1000000 },
 ];
 const armMap = [
   { aaSlug: 'gpt-6-1-sol-high', model: 'gpt-6.1-sol', effort: 'high', family: 'sol', providers: ['codex'] },
-  { aaSlug: 'gpt-5-6-terra', model: 'gpt-5.6-terra', effort: 'max', family: 'terra', providers: ['codex'] },
+  { aaSlug: 'gpt-6-1-terra', model: 'gpt-6.1-terra', effort: 'max', family: 'terra', providers: ['codex'] },
 ];
 
-async function drive({ mode = 'enforce', served = ['gpt-6.1-sol', 'gpt-5.6-terra'], aaRows = rows,
+async function drive({ mode = 'enforce', served = ['gpt-6.1-sol', 'gpt-6.1-terra'], aaRows = rows,
   config = {}, agents = {}, fiveHourUsed = .1 } = {}) {
   let now = NOW;
   const store = new Map(), jobs = new Map(), events = new Map();
@@ -32,7 +32,7 @@ async function drive({ mode = 'enforce', served = ['gpt-6.1-sol', 'gpt-5.6-terra
   const lane = { observedAt: new Date(now).toISOString(), servedModels: served, accounts: [
     { accountKey: 's', lane: 'one', provider: 'codex', models: ['gpt-6.1-sol'], health: 'healthy', quality: 'live',
       weekly: { used: .1, resetsAt: new Date(now + 7 * 86400000).toISOString() }, fiveHour: { used: fiveHourUsed, resetsAt: new Date(now + 3600000).toISOString() } },
-    { accountKey: 't', lane: 'two', provider: 'codex', models: ['gpt-5.6-terra'], health: 'healthy', quality: 'live',
+    { accountKey: 't', lane: 'two', provider: 'codex', models: ['gpt-6.1-terra'], health: 'healthy', quality: 'live',
       weekly: { used: .1, resetsAt: new Date(now + 7 * 86400000).toISOString() }, fiveHour: { used: fiveHourUsed, resetsAt: new Date(now + 3600000).toISOString() } },
   ] };
   const io = { config: { get: async () => raw }, secrets: { resolve: async () => 'test-key' },
@@ -87,8 +87,8 @@ test('native resolver and event path choose capable Sol high, not costly surplus
 });
 
 test('Terra is retained when Sol is not actually servable; report names the refusal', async () => {
-  const d = await drive({ served: ['gpt-5.6-terra'] });
-  assert.equal((await d.hook()).model, 'gpt-5.6-terra');
+  const d = await drive({ served: ['gpt-6.1-terra'] });
+  assert.equal((await d.hook()).model, 'gpt-6.1-terra');
   const report = await d.capacity();
   const sol = report.taskRanking.candidates.find(c => c.aaSlug === 'gpt-6-1-sol-high' && c.role === 'doer');
   assert.ok(sol.exclusionReasons.includes('unservable-emitted-id'));
@@ -156,11 +156,11 @@ test('a thinker-only frontier arm survives a doer dominance relation on the same
   ], config: { roles: { thinkerAgentIds: ['planner'], thinkerFloorRung: 1,
     minQuality: { doer: null, thinker: null, other: null } },
     trials: { roles: ['doer', 'other', 'thinker:terra'] } } });
-  d.lane.accounts = [{ ...d.lane.accounts[0], models: ['gpt-6.1-sol', 'gpt-5.6-terra'] }];
+  d.lane.accounts = [{ ...d.lane.accounts[0], models: ['gpt-6.1-sol', 'gpt-6.1-terra'] }];
   d.setNow(NOW + 61000); d.lane.observedAt = new Date(NOW + 61000).toISOString();
   await d.tick();
   assert.equal((await d.hook()).model, 'gpt-6.1-sol');
-  assert.equal((await d.hook({ agentId: 'planner', runId: 'planner-run' })).model, 'gpt-5.6-terra');
+  assert.equal((await d.hook({ agentId: 'planner', runId: 'planner-run' })).model, 'gpt-6.1-terra');
 });
 
 test('rollback mode waits for a native view rather than keeping an unvetted default, then restores legacy routing', async () => {
@@ -171,7 +171,7 @@ test('rollback mode waits for a native view rather than keeping an unvetted defa
   assert.equal((await d.hook({ runId: 'during-switch' })).kind, 'defer');
   d.setNow(NOW + 61000); d.lane.observedAt = new Date(NOW + 61000).toISOString();
   await d.tick();
-  assert.equal((await d.hook({ runId: 'after-switch' })).model, 'gpt-5.6-terra');
+  assert.equal((await d.hook({ runId: 'after-switch' })).model, 'gpt-6.1-terra');
 });
 
 test('a configured reviewer with no approved feasible arm defers instead of taking ordinary cheap overflow', async () => {
@@ -191,7 +191,7 @@ for (const token of ['arm:gpt-6-1-sol-high', 'arm:GPT-6-1-Sol-High', 'ARM:GPT-6-
   test(`existing per-arm manual exclusion ${token} retains its meaning after canonical effort identity changes`, async () => {
     const d = await drive({ config: { roles: { excludeFamilies: { doer: [token] },
       thinkerFloorRung: 0, minQuality: { doer: null, thinker: null, other: null } } } });
-    assert.equal((await d.hook()).model, 'gpt-5.6-terra');
+    assert.equal((await d.hook()).model, 'gpt-6.1-terra');
   });
 }
 
@@ -202,15 +202,15 @@ for (const token of ['arm:gpt-6-1-sol-high', 'ARM:GPT-6-1-Sol-High']) {
         minQuality: { doer: null, thinker: null, other: null } },
       reviewerRouting: { agentIds: ['reviewer'], arms: [
         { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
-        { provider: 'codex', model: 'gpt-5.6-terra', effort: 'max' },
+        { provider: 'codex', model: 'gpt-6.1-terra', effort: 'max' },
       ] } } });
     const pick = await d.hook({ agentId: 'reviewer' });
     assert.equal(pick.kind, 'decide');
-    assert.equal(pick.model, 'gpt-5.6-terra');
+    assert.equal(pick.model, 'gpt-6.1-terra');
     await d.fire('excluded-review', 'reviewer');
     await d.tick();
     const observation = (await d.shadow()).entries.find(r => r.runId === 'excluded-review');
-    assert.equal(observation.wouldModel, 'gpt-5.6-terra(max)');
+    assert.equal(observation.wouldModel, 'gpt-6.1-terra(max)');
   });
 }
 
@@ -225,11 +225,11 @@ for (const mode of ['off', 'shadow', 'enforce']) {
           minQuality: { doer: null, thinker: null, other: null } },
         reviewerRouting: { agentIds: ['reviewer'], arms: [
           { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
-          { provider: 'codex', model: 'gpt-5.6-terra', effort: 'max' },
+          { provider: 'codex', model: 'gpt-6.1-terra', effort: 'max' },
         ] } } });
     const pick = await d.hook({ agentId: 'reviewer' });
     assert.equal(pick.kind, 'decide');
-    assert.equal(pick.model, 'gpt-5.6-terra');
+    assert.equal(pick.model, 'gpt-6.1-terra');
   });
 }
 
