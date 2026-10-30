@@ -7,6 +7,7 @@ import { CREDENTIAL_MAX_AGE_MS, credentialEvidenceFor, credentialReadiness } fro
 import { joinRegistryFeed } from './registry.mjs';
 import { accountKeyForModel, isInflight } from './ledger.mjs';
 import { appendUtilReading, appendTickLog, robustRatePerHour, stepRateController, DEFAULT_PACING, RATE_HISTORY_KEEP_MS, RATE_HISTORY_CAP } from './pacing.mjs';
+import { normalizeNativeBurn, nativeAccountBurn } from './burnmode.mjs';
 import { snapshotAccountView } from './views.mjs';
 
 const MINUTE = 60_000, HOUR = 60 * MINUTE, WEEK = 7 * 24 * HOUR;
@@ -76,6 +77,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
   unavailablePoolIds = [], unavailablePoolKeys = [], memberSkipReasons = {}, drift = null}) {
   if (!Number.isFinite(nowMs)) throw new Error('invalid snapshot clock');
   if (!Array.isArray(feed?.accounts) || feed.accounts.some(a => !a || typeof a !== 'object' || Array.isArray(a))) throw new Error('invalid quota feed');
+  const burn = normalizeNativeBurn(config.burn);
   const joined = joinRegistryFeed(registry, feed);
   const parsed = parseLaneBody(feed, nowMs);
   if (!parsed) throw new Error('invalid quota feed');
@@ -132,6 +134,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
       reactive:a?.meter === 'reactive', meter:a?.meter ?? null,
       deadband:pacing.deadband,
     };
+    account.burn = nativeAccountBurn(burn,{...account,accountKey:key},nowMs);
     account.view = snapshotAccountView(key, account, {nowMs,accountStaleMs:staleMs});
     account.requiredRatePerHour = account.view.requiredRatePerHour;
     account.measuredRatePerHour = account.view.measuredRatePerHour;
@@ -157,7 +160,10 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     a.targetShare = totalRequired > 0 ? nonNegative(a.requiredRatePerHour) / totalRequired : 0;
     a.view.targetShare = a.targetShare;
   }
-  const snapshot = freezeSnapshot({version:(previous?.version ?? 0) + 1,atMs:nowMs,accounts,
+  const burnState = burn ? {status:nowMs >= Date.parse(burn.expiresAt) ? 'expired' : 'active',...burn,expiresAtMs:Date.parse(burn.expiresAt),
+    warning:nowMs >= Date.parse(burn.expiresAt) ? 'burn: inactive (expiresAt in past)' : burn.mode === 'exclusive' ? 'burn: exclusive drain enabled' : null} : null;
+  if (burnState?.warning) joined.warnings.push({reason:burnState.status === 'expired' ? 'burn-expired' : 'burn-exclusive',message:burnState.warning});
+  const snapshot = freezeSnapshot({burn:burnState,version:(previous?.version ?? 0) + 1,atMs:nowMs,accounts,
     inFlightRunAccounts,memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,
     memberSkipReasons:skipReasons,unavailablePoolIds:[...unavailablePoolIds],unavailablePoolKeys:[...unavailablePoolKeys],drift});
   return {snapshot,histories:outHistories,controllers:outControllers,warnings:joined.warnings};

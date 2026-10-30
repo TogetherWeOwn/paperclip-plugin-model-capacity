@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { normalizeNativeBurn, validateNativeBurn } from './burnmode.mjs';
 import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
 import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
 import { createRouterAdapter } from './router.mjs';
@@ -193,7 +194,7 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
-  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes), ...validateRouterConfig(raw.router));
+  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes), ...validateRouterConfig(raw.router), ...validateNativeBurn(raw.burn));
   if (raw.allocation != null) {
     const allocation = raw.allocation;
     if (typeof allocation !== 'object' || Array.isArray(allocation)) errors.push('allocation must be an object');
@@ -598,6 +599,7 @@ export function extractRunErrorText(event) {
 export function resolveConfig(raw = {}) {
   const keepAgentIds = (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string');
   return {
+    ...(raw.burn !== undefined ? {burn:normalizeNativeBurn(raw.burn)} : {}),
     ...(raw.router ? {router:{enabled:false,...structuredClone(raw.router)}} : {}),
     cliproxy: {
       // Belt and braces behind the validator: a non-allowlisted baseUrl

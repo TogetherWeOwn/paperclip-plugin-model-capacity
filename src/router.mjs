@@ -141,8 +141,8 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
   const hardCap = Number.isFinite(router.hardCapWeekly) ? router.hardCapWeekly : .995;
   const skipped = {}, retries = [], eligible = [];
   const feedStaleMembers = new Set(snapshot.staleMemberIds ?? []);
-  const burnConfig = config.burn ?? router.burn ?? {};
-  const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
+  const burnConfig = snapshot.burn ?? config.burn ?? router.burn ?? {};
+  const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(a.burn.endAtUsedPct) ? a.burn.endAtUsedPct : Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
   const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && infos.some(i => burnActive(i.account));
   for (const i of infos) {
     const a = i.account;
@@ -172,7 +172,7 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
     if (reason) {
       skipped[i.id] = reason;
       if (reason === 'unmapped-member') retries.push({at:now + MINUTE, credible:false});
-      else retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99, config.pacing?.deadband ?? .02));
+      else if (reason !== 'burn-not-target') retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99, config.pacing?.deadband ?? .02));
     }
   }
   if (pin && eligible.length) return {kind:'selected', memberId:pin};

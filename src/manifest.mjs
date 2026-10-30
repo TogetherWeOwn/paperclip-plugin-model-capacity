@@ -684,6 +684,17 @@ const CONFIG_SCHEMA = {
         },
       },
     },
+    burn: {
+      type: 'object', additionalProperties: false, required: ['expiresAt'],
+      description: 'Native router only: explicit expiring account/provider drain. Past expiry is inactive and visible as a standing warning. Does not change legacy burnMode.',
+      properties: {
+        accountKeys: {type:'array',items:{type:'string',minLength:1},default:[]},
+        providers: {type:'array',items:{type:'string',minLength:1},default:[]},
+        expiresAt: {type:'string',format:'date-time'},
+        endAtUsedPct: {type:'number',exclusiveMinimum:0,maximum:1,default:.995},
+        mode: {type:'string',enum:['prefer','exclusive'],default:'prefer'},
+      },
+    },
     burnMode: {
       type: 'object', additionalProperties: false,
       description: 'Burn mode: named provider accounts spend their quota as fast as possible. Each entry matches an account id (meta:meta-lane-3), its lane/accountKey (meta-lane-3), its feed label or email (case-insensitive), or provider:* (every account of a provider); a leading ! excludes. Burn accounts pace to min(reset, burn horizon, now + horizonMinutes, deadline), are never capped by the pace guard or held by the review reserve, and are preferred by routing. deadlines maps the same matchers to ISO-8601 UTC timestamps: a burn account matching a future deadline paces to the earliest one (past deadlines are ignored). floors maps the same matchers to a remaining share: a matched account at or below it takes no runs, and a burn account above it routes first. Empty burns nothing.',
