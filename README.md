@@ -703,7 +703,7 @@ fixtures use dev-only Zod/Ajv and carry source-checkout/hash provenance.
   build constant and unchanged worker entry shape. `scripts/build-variants.mjs`
   emits both artifacts without installing/publishing them.
 - `src/router.mjs`, `src/registry.mjs`, `src/snapshot.mjs`, `src/views.mjs`,
-  `src/overlay.mjs`, `src/router-adapter.mjs`, `src/quota-refresh.mjs`: native
+  `src/overlay.mjs`, `src/quota-refresh.mjs`: native
   memory-only selection, validated identity, quota state and lifecycle wiring.
 - `src/scorecard.mjs`, `src/burnmode.mjs`, `src/ledger.mjs`: reset-window
   acceptance accounting, explicit expiring native burn, observed model joins.
