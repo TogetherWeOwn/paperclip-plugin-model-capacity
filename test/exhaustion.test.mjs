@@ -148,7 +148,7 @@ const baseConfig = (extra = {}) => ({
   ...extra,
 });
 
-function drive({ accounts, config = {}, nowMs = NOW }) {
+function drive({ accounts, config = {}, nowMs = NOW, rows = aaRows(), servedModels = [NIM_ALIAS, OSS_MODEL, HAIKU, MUSE] }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -177,7 +177,7 @@ function drive({ accounts, config = {}, nowMs = NOW }) {
         status: 200,
         json: async () => ({
           observedAt: new Date(now).toISOString(),
-          servedModels: [NIM_ALIAS, OSS_MODEL, HAIKU, MUSE],
+          servedModels,
           accounts: laneAccounts,
         }),
       }),
@@ -193,7 +193,7 @@ function drive({ accounts, config = {}, nowMs = NOW }) {
       await plugin.setup(io);
       store.set(
         key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
-        { fetchedAt: new Date(NOW).toISOString(), rows: aaRows(), duplicateSlugs: [] },
+        { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] },
       );
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
@@ -769,4 +769,20 @@ test('stale credential evidence does not consume the capacity-retry grace period
   const answer = await d.hook('run-capacity-after-stale-11');
   assert.equal(answer.kind, 'decide', 'only the eleventh capacity defer triggers recovery');
   assert.match(answer.reason, /^deferral-exhausted: no account has headroom right now -> /);
+});
+
+test('N-T16: exhaustion refuses unknown-effort old default even if max arm is kept', async () => {
+  const old = 'claude-haiku-5', newer = HAIKU;
+  const account = { ...claudeBoundedKeep(), models: [old, newer] };
+  const armMap = [{ aaSlug: old, model: old, effort: 'max', family: 'haiku', providers: ['claude'] }];
+  const rows = [{ slug: old, intelligenceIndex: 52, intelligenceIndexCostPerTask: 7 }];
+  const d = drive({ accounts: [account], rows, servedModels: [old, newer], config: baseConfig({ armMap,
+    roles: { minQuality: { doer: null, other: null, thinker: null },
+      newestVersionOnly: { enabled: true, overrides: { keep: [`${old}@max`] } } } }) });
+  await d.setup(); await d.tick();
+  for (let i = 1; i <= 11; i++) {
+    const out = await d.hook(`superseded-exhaustion-${i}`, { agentDefaultModel: old });
+    assert.equal(out.kind, 'defer', `attempt ${i}`);
+    if (i === 11) assert.match(out.reason, /exhaustion scan:.*default model superseded-version/);
+  }
 });

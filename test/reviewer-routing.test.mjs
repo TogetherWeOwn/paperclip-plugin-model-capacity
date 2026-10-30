@@ -43,10 +43,11 @@ const metaLane = (key, used, hoursLeft, extra = {}) => ({
   ...extra,
 });
 
-function drive({ config = {}, accounts }) {
+function drive({ config = {}, accounts, rows = aaRows(), onReviewerAdmission = null }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
+  const warnings = [];
   const skey = k => JSON.stringify(k);
   const now = TICK;
   const io = {
@@ -63,13 +64,15 @@ function drive({ config = {}, accounts }) {
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
-    logger: { info() {}, error() {} },
+    logger: { info() {}, error() {}, warn(message, details) { warnings.push({ message, details }); } },
   };
-  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  const liveViews = new Map();
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false, liveViews, onReviewerAdmission });
   return {
+    warnings, liveViews,
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
@@ -401,4 +404,248 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   assert.equal(ulast.routed, false);
   assert.equal(ulast.fallback, 'keep');
   assert.equal(ulast.deferred ?? false, false);
+});
+
+test('N-T16: kept default superseded on every serving account defers', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  const out = await d.hook('superseded-default', { agentDefaultModel: old });
+  assert.equal(out.kind, 'defer');
+  assert.match(out.reason, /superseded-version/);
+});
+
+test('N-T16: inferred serving universe blocks superseded default while explicit empty serves nowhere', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const armMap = [old, newer].map(model => ({ aaSlug: model, model, effort: 'high', family: 'claude', providers: ['claude'] }));
+  const rows = armMap.map(({ aaSlug }) => ({ slug: aaSlug, intelligenceIndex: 70, intelligenceIndexCostPerTask: 2 }));
+  for (const [models, expectedSource, expectedKind] of [
+    [undefined, 'inferred-provider-arms', 'defer'],
+    [[], 'account-models', 'keep'],
+  ]) {
+    const d = drive({ rows, config: { ...BASE, armMap, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+      accounts: [claudeLane(0.5, 24, { models })] });
+    await d.setup(); await d.tick();
+    const view = d.liveViews.get('acme').accounts[0].newestVersion;
+    assert.equal(view.universeSource, expectedSource);
+    assert.equal(Object.hasOwn(view.identities, old), models === undefined);
+    const out = await d.hook(`universe-${expectedSource}`, { agentDefaultModel: old });
+    assert.equal(out.kind, expectedKind);
+    if (expectedKind === 'defer') assert.match(out.reason, /superseded-version/);
+  }
+});
+
+test('N-T14: unscored superseded listed reviewer model cannot route', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } },
+    reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'high' }] } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  const out = await d.hook('old-reviewer');
+  assert.notEqual(out.kind, 'decide');
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.reviewer.routing.preview.routed, false);
+});
+
+test('N-T14b: listed old reviewer arm honors only its own keep', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  for (const [keep, effort, accepted] of [
+    ['claude-sonnet-5@max', 'max', true],
+    ['claude-sonnet-5@max', 'high', false],
+    ['model:claude-sonnet-5', 'high', true],
+    ['product:claude-sonnet', 'high', true],
+  ]) {
+    const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true, overrides: { keep: [keep] } } },
+      reviewerRouting: { arms: [{ provider: 'claude', model: old, effort }] } },
+      accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+    await d.setup(); await d.tick();
+    const out = await d.hook(`keep-${keep}-${effort}`);
+    assert.equal(out.kind === 'decide', accepted, `${keep} ${effort}`);
+    const capacity = (await d.api('capacity')).body;
+    assert.equal(capacity.reviewer.routing.preview.routed, accepted, `${keep} ${effort} preview`);
+  }
+});
+
+test('N-T16: old-only and unserved defaults stay unchanged', async () => {
+  const old = 'claude-sonnet-5';
+  for (const models of [[old], ['claude-opus-5-5']]) {
+    const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+      accounts: [claudeLane(0.5, 24, { models })] });
+    await d.setup(); await d.tick();
+    assert.equal((await d.hook('allowed-default', { agentDefaultModel: old })).kind, 'keep');
+  }
+});
+
+test('N-T14b(d): requested high is refused despite ready kept max on both consumers', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const armMap = [
+    { aaSlug: 'claude-sonnet-5-max', model: old, effort: 'max', family: 'claude', providers: ['claude'] },
+    { aaSlug: 'claude-sonnet-5-high', model: old, effort: 'high', family: 'claude', providers: ['claude'] },
+  ];
+  const rows = armMap.map((a, i) => ({ slug: a.aaSlug, intelligenceIndex: 80 - i * 10, intelligenceIndexCostPerTask: 2 + i }));
+  for (const mode of ['shadow', 'enforce']) {
+    const admissions = [];
+    const d = drive({ rows, onReviewerAdmission: event => admissions.push(event),
+      config: { ...BASE, armMap, credentialReadiness: { enforce: true }, taskRanking: { mode },
+        roles: { ...BASE.roles, newestVersionOnly: { enabled: true, overrides: { keep: [`${old}@max`] } } },
+        reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'high' },
+          { provider: 'claude', model: old, effort: 'max' }] } },
+      accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+    await d.setup(); await d.tick();
+    function check(consumer) {
+      const high = admissions.find(e => e.consumer === consumer && e.arm.effort === 'high');
+      const max = admissions.find(e => e.consumer === consumer && e.arm.effort === 'max');
+      assert.ok(high, `${mode} ${consumer} high admission`);
+      assert.match(high.result.ok, /^superseded-version:/);
+      assert.deepEqual(high.readyArms.map(a => [a.model, a.effort]), [[old, 'max']]);
+      assert.ok(high.ladderArms.some(a => a.model === old && a.effort === 'max'));
+      assert.ok(high.ladderArms.every(a => a.model === old && a.effort === 'max'));
+      assert.equal(max?.result.ok, true, `${mode} ${consumer} max control`);
+    }
+    check('capacity');
+    admissions.length = 0;
+    const out = await d.hook(`sibling-${mode}`);
+    assert.equal(out.kind, 'decide');
+    assert.equal(out.effort, 'max');
+    check('route');
+    const preview = (await d.api('capacity')).body.reviewer.routing.preview;
+    assert.equal(preview.arm.effort, 'max');
+  }
+});
+
+test('N-T14b(f): unscored unkept requested identity reports supersession to both consumers', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const admissions = [];
+  const d = drive({ rows: [], onReviewerAdmission: event => admissions.push(event),
+    config: { ...BASE, armMap: [], roles: { ...BASE.roles, newestVersionOnly: { enabled: true } },
+      reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'high' }] } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  assert.match(admissions.find(e => e.consumer === 'capacity')?.result.ok, /^superseded-version:/);
+  admissions.length = 0;
+  assert.notEqual((await d.hook('unkept-constructed')).kind, 'decide');
+  assert.match(admissions.find(e => e.consumer === 'route')?.result.ok, /^superseded-version:/);
+});
+
+test('N-T15: policy arm is dropped with warning unless its own dialect is kept', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const armMap = [{ aaSlug: 'claude-sonnet-5-high', model: old, effort: 'high', family: 'claude', providers: ['claude'] }];
+  for (const keep of [null, 'arm:claude-sonnet-5-high', 'claude-sonnet-5@high']) {
+    const d = drive({ config: { ...BASE, armMap, taskRanking: { mode: 'enforce' },
+      roles: { ...BASE.roles, newestVersionOnly: { enabled: true, overrides: { keep: keep ? [keep] : [] } } },
+      reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'high' }] } },
+      accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+    await d.setup(); await d.tick();
+    const policy = (await d.api('ladder')).body.ladders['claude:a1'].policyReviewerArms;
+    assert.equal(policy.some(a => a.model === old && a.effort === 'high'), keep != null, `${keep}`);
+    assert.equal(d.warnings.some(w => w.message.includes('newest-version-policy-arm-superseded')), keep == null, `${keep}`);
+    assert.equal((await d.hook(`policy-${keep}`)).kind === 'decide', keep != null, `${keep}`);
+  }
+});
+
+test('N-T16: superseded scored and unscored capped defaults never run', async () => {
+  const old = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  for (const scored of [true, false]) {
+    const rows = scored ? [{ slug: old, intelligenceIndex: 70, intelligenceIndexCostPerTask: 2 }] : [];
+    const armMap = [{ aaSlug: old, model: old, effort: 'max', family: 'sol', providers: ['codex'] }];
+    const d = drive({ rows, config: { ...BASE, armMap, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+      accounts: [claudeLane(0.5, 24, { provider: 'codex', accountKey: 'a1', models: [old, newer] })] });
+    await d.setup(); await d.tick();
+    const out = await d.hook(`capped-${scored}`, { agentDefaultModel: old });
+    assert.equal(out.kind, 'defer', `${scored}`);
+    assert.match(out.reason, /superseded-version/);
+  }
+});
+
+test('N-T16: one non-superseding serving account keeps the default', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+    accounts: [claudeLane(0.5, 24, { accountKey: 'a1', models: [old, newer] }),
+      claudeLane(0.5, 24, { accountKey: 'a2', models: [old] })] });
+  await d.setup(); await d.tick();
+  assert.equal((await d.hook('mixed-serving', { agentDefaultModel: old })).kind, 'keep');
+});
+
+test('N-T14: old-only account admits reviewer independently of a newer account', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } },
+    reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'high' }] } },
+    accounts: [claudeLane(0.5, 24, { accountKey: 'a1', models: [old, newer] }),
+      claudeLane(0.5, 24, { accountKey: 'a2', models: [old] })] });
+  await d.setup(); await d.tick();
+  const out = await d.hook('old-only-reviewer');
+  assert.equal(out.kind, 'decide');
+  const preview = (await d.api('capacity')).body.reviewer.routing.preview;
+  assert.equal(preview.accountId, 'claude:a2');
+});
+
+test('N-T13: live default cap lookup filters stale superseded ladder arms and is neutral without a view', async () => {
+  const old = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  for (const enabled of [false, true]) {
+    const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled } } },
+      accounts: [claudeLane(0.5, 24, { provider: 'codex', accountKey: 'a1', models: [old, newer] }),
+        claudeLane(0.5, 24, { provider: 'codex', accountKey: 'a2', models: [old] })] });
+    await d.setup(); await d.tick();
+    const live = d.liveViews.get('acme');
+    for (const [index, account] of live.accounts.entries()) {
+      const arm = { armId: old, model: old, family: 'sol', effort: 'max', cap: { maxTokens: index ? 200000 : 100000 } };
+      account.ladderRungs = [{ rung: 0, arms: [arm] }];
+      account.credentialRanking = null;
+    }
+    const result = await d.hook(`cap-filter-${enabled}`, { agentDefaultModel: old });
+    assert.equal(result.kind, 'decide');
+    assert.equal(result.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, enabled ? '200000' : '100000');
+  }
+});
+
+test('N-T14b(a): legacy arm keep admits the old reviewer on hook and capacity', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const armMap = [{ aaSlug: old, model: old, effort: 'max', family: 'claude', providers: ['claude'] }];
+  const rows = [{ slug: old, intelligenceIndex: 70, intelligenceIndexCostPerTask: 2 }];
+  const d = drive({ rows, config: { ...BASE, armMap,
+    roles: { ...BASE.roles, newestVersionOnly: { enabled: true, overrides: { keep: [`arm:${old}`] } } },
+    reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'max' }] } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  assert.equal((await d.hook('legacy-reviewer')).kind, 'decide');
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.reviewer.routing.preview.routed, true);
+  assert.ok(capacity.reviewer.qualifiedAccountIds.includes('claude:a1'));
+});
+
+test('N-T14b(e): constructed unscored listed reviewer identity honors its own task keep', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ rows: [], config: { ...BASE, armMap: [],
+    roles: { ...BASE.roles, newestVersionOnly: { enabled: true, overrides: { keep: [`${old}@max`] } } },
+    reviewerRouting: { arms: [{ provider: 'claude', model: old, effort: 'max' }] } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  const account = d.liveViews.get('acme').accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(account.ladderRungs.flatMap(g => g.arms ?? []).filter(a => a.model === old).length, 0);
+  const out = await d.hook('constructed-reviewer');
+  assert.equal(out.kind, 'decide');
+  assert.equal(out.effort, 'max');
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.reviewer.routing.preview.routed, true);
+  assert.ok(capacity.reviewer.qualifiedAccountIds.includes('claude:a1'));
+});
+
+test('N-T16: central keep guard rejects a default superseded while pinned accounting yields', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+    accounts: [claudeLane(0.5, 24, { models: [old, newer] })] });
+  await d.setup(); await d.tick();
+  const live = d.liveViews.get('acme');
+  const account = live.accounts.find(a => a.accountId === 'claude:a1');
+  const supersessionView = account.newestVersion;
+  account.newestVersion = null;
+  // Simulate the view changing while the pinned-decision accounting awaits.
+  Object.defineProperty(live.keptByAgent, 'reviewer-1', { configurable: true, get() {
+    queueMicrotask(() => { account.newestVersion = supersessionView; });
+    return null;
+  } });
+  const out = await d.hook('keep-guard-race', { agentDefaultModel: old });
+  assert.equal(out.kind, 'defer');
+  assert.equal(out.reason, 'default model superseded-version');
 });

@@ -385,7 +385,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.73';
+export const PLUGIN_VERSION = '0.2.75';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -473,6 +473,33 @@ const CONFIG_SCHEMA = {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },
             other: { type: 'array', default: [], items: { type: 'string' } },
+          },
+        },
+        newestVersionOnly: {
+          type: 'object', additionalProperties: false,
+          description: 'Prefer newest model versions per account and product line. Disabled by default. Overrides can retain specific arms, models or products, alias products, or pin parsed identities.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            overrides: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                keep: { type: 'array', default: [], items: { type: 'string', minLength: 1 }, description: 'Arm IDs, model:<canonicalModel>, product:<productKey>, or arm:<armId> to retain.' },
+                productAliases: { type: 'object', default: {}, additionalProperties: { type: 'string', minLength: 1 } },
+                parsePins: { type: 'object', default: {}, additionalProperties: {
+                  type: 'object', additionalProperties: false, required: ['product', 'version'],
+                  properties: { product: { type: 'string', minLength: 1 }, version: { type: 'array', minItems: 1, items: { type: 'integer', minimum: 0 } } },
+                } },
+              },
+            },
+          },
+        },
+        accountFallback: {
+          type: 'object', additionalProperties: false,
+          description: 'Opt-in account-local fallback for doer and other roles; never relaxes thinker eligibility. minQuality is a fleet Q z-score floor.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            roles: { type: 'array', default: ['doer', 'other'], items: { type: 'string', enum: ['doer', 'other'] } },
+            minQuality: { type: 'number', default: -0.5 },
           },
         },
         minQuality: {

@@ -306,6 +306,20 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 export const ARM_TOKEN_PREFIX = 'arm:';
 export const armToken = (armId) => `${ARM_TOKEN_PREFIX}${String(armId ?? '').toLowerCase()}`;
 
+/** Resolve the per-account relaxation without modifying global exclusions. */
+export function resolveAccountInputs(baseExclusions, admissions, roleBands, role, accountId,
+  { suppressAccountFallback = false, supersessionView = null, newestEnabled = false } = {}) {
+  const admission = admissions?.[role]?.[accountId];
+  if (suppressAccountFallback || (newestEnabled && supersessionView == null) || !admission) {
+    return { excludedFamilies: baseExclusions, fallbackAdmission: null };
+  }
+  return {
+    excludedFamilies: baseExclusions.filter(token => token !== armToken(admission.armId)),
+    fallbackAdmission: { armId: admission.armId, band: roleBands?.[role] ?? roleBands?.doer ?? DEFAULT_ROLE_BANDS.doer,
+      supersessionView, newestEnabled },
+  };
+}
+
 /** True when the arm's family or the arm itself is in the (normalized) exclusion set. */
 function armExcluded(arm, excludedSet) {
   if (excludedSet.size === 0) return false;
@@ -355,6 +369,19 @@ export function roleRungWindow(band, groupCount) {
   const floor = clamp(band?.floorRung ?? 0, 0, topRung);
   const ceiling = band?.ceilingRung == null ? topRung : clamp(band.ceilingRung, floor, topRung);
   return { topRung, floor, ceiling };
+}
+
+/** Seat a fallback candidate inside the role window without mutating shared groups. */
+export function seatFallbackArm(groups, candidate, band) {
+  if (groups.length === 0) return groups;
+  const { floor, ceiling } = roleRungWindow(band, groups.length);
+  if (groups.some((group, index) => index >= floor && index <= ceiling
+    && (group.arms ?? []).some(arm => arm.armId === candidate.armId))) return groups;
+  const existing = groups.flatMap(group => group.arms ?? []).find(arm => arm.armId === candidate.armId);
+  const result = groups.map(group => ({ ...group,
+    arms: (group.arms ?? []).filter(arm => arm.armId !== candidate.armId) }));
+  result[floor].arms.push({ ...(existing ?? candidate), rung: floor });
+  return result;
 }
 
 /**

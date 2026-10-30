@@ -3,12 +3,21 @@
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { createModelCapacityPlugin, resolveConfig } from '../src/plugin.mjs';
 import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 
 const REF = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };
 const COMPANY = 'offline-replay';
 const clone = x => structuredClone(x);
+
+// Only the per-instance epoch is nondeterministic across otherwise identical ticks.
+export function projectForParity(result) {
+  const projected = clone(result);
+  if (Object.hasOwn(projected.capacity, 'reviewAdmissionEpoch')) {
+    projected.capacity.reviewAdmissionEpoch = '<epoch>';
+  }
+  return projected;
+}
 
 function fakeContext({ config, lane, states, demand, nowMs, pages, leaderboard }) {
   const raw = clone(config);
@@ -53,20 +62,35 @@ async function start(options) {
   const fake = fakeContext(options);
   const plugin = createModelCapacityPlugin({ clock: () => options.nowMs, requirePinnedLaneHost: false });
   await plugin.setup(fake.context);
-  await plugin.onConfigChanged(fake.raw, { companyId: COMPANY });
+  const count = options.configNotifications ?? 1;
+  if (!Number.isSafeInteger(count) || count < 1) throw new Error('Invalid configNotifications');
+  for (let i = 0; i < count; i++) await plugin.onConfigChanged(fake.raw, { companyId: COMPANY });
   return fake;
 }
 
-export async function replayTick({ config, lane, states, snapshot, demand, nowMs }) {
+export async function replayTick({ config, lane, states, snapshot, demand, nowMs, configNotifications = 1, includeState = false }) {
   if (!Number.isFinite(nowMs) || !demand || !lane || !config) throw new Error('Missing replay inputs');
-  const fake = await start({ config, lane, states, demand, nowMs });
+  const fake = await start({ config, lane, states, demand, nowMs, configNotifications });
   fake.store.set('aa-snapshot-v1', clone(snapshot));
   try { await fake.jobs.get('shadow-tick')({}); }
   catch (e) { throw new Error(`Offline shadow tick failed: ${JSON.stringify(fake.failures)}`, { cause: e }); }
   const capacity = fake.store.get('capacity-v1');
   const ladders = fake.store.get('ladder-v1');
   if (capacity?.atMs !== nowMs || ladders?.atMs !== nowMs) throw new Error('Offline tick did not publish');
-  return { capacity, ladders, diagnostics: fake.failures };
+  return { capacity, ladders, diagnostics: fake.failures,
+    ...(includeState ? { state: clone(Object.fromEntries(fake.store)) } : {}) };
+}
+
+// Historical fidelity is admissible only for the recorded producer and flags.
+export function assertReplayProvenance(provenance, { replayRevision, replayFeatureState } = {}) {
+  const fields = ['newestVersionOnlyEnabled', 'accountFallbackEnabled'];
+  if (!provenance || typeof provenance.implementationRevision !== 'string' || !provenance.implementationRevision.trim()
+      || typeof provenance.capturedAt !== 'string' || !Number.isFinite(Date.parse(provenance.capturedAt))
+      || typeof replayRevision !== 'string' || replayRevision !== provenance.implementationRevision
+      || !replayFeatureState || fields.some(field => typeof provenance[field] !== 'boolean'
+        || typeof replayFeatureState[field] !== 'boolean' || provenance[field] !== replayFeatureState[field])) {
+    throw new Error('Replay provenance mismatch or missing provenance');
+  }
 }
 
 // Fail closed: a successor comparison is meaningful only when the captured
@@ -94,14 +118,19 @@ export async function buildSuccessor({ config, states, snapshot, nowMs, pages, l
 }
 
 async function main() {
-  const [inputDir, fixtureDir] = process.argv.slice(2);
-  if (!inputDir || !fixtureDir) throw new Error('Usage: node scripts/aa-replay.mjs INPUT_DIR FIXTURE_DIR');
+  const [inputDir, fixtureDir, replayRevision] = process.argv.slice(2);
+  if (!inputDir || !fixtureDir || !replayRevision) throw new Error('Usage: node scripts/aa-replay.mjs INPUT_DIR FIXTURE_DIR REPLAY_REVISION');
   const parse = async path => JSON.parse(await readFile(path, 'utf8'));
   const capture = await parse(`${inputDir}/fresh-state.json`);
   if (capture.configs?.length !== 1) throw new Error('Expected exactly one captured config');
   const states = Object.fromEntries(capture.states.map(s => [s.stateKey, s.value]));
   const lane = await parse(`${inputDir}/lane-body.json`);
   const config = capture.configs[0].config_json;
+  const roles = resolveConfig(config).roles;
+  assertReplayProvenance(capture.provenance, { replayRevision, replayFeatureState: {
+    newestVersionOnlyEnabled: roles.newestVersionOnly.enabled,
+    accountFallbackEnabled: roles.accountFallback.enabled,
+  } });
   const saved = states['capacity-v1'];
   const nowMs = saved.atMs;
   if (states['ladder-v1']?.atMs !== nowMs) throw new Error('Captured capacity and ladder ticks differ');
@@ -113,6 +142,6 @@ async function main() {
   assertFidelity({ capacity: saved, ladders: states['ladder-v1'] }, old);
   const successor = await buildSuccessor({ config, states, snapshot, nowMs, pages, leaderboard });
   const next = await replayTick({ config, lane, states, snapshot: successor, demand, nowMs });
-  console.log(JSON.stringify({ captureTime: capture.capturedAt, laneObservedAt: lane.observedAt, nowMs, demand, old, next, successorSummary: successor.refreshSummary }, null, 2));
+  console.log(JSON.stringify({ provenance: capture.provenance, captureTime: capture.capturedAt, laneObservedAt: lane.observedAt, nowMs, demand, old, next, successorSummary: successor.refreshSummary }, null, 2));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(e => { console.error(e.message); process.exitCode = 1; });

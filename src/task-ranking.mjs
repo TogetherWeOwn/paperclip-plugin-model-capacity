@@ -111,7 +111,7 @@ export function taskCostEvidence(candidates, fleet = candidates, snapshotAt = nu
 /** Each role starts from all candidates, independently of another role's
  * frontier. Fleet normalization deduplicates account copies of each arm. */
 export function buildTaskRanking({ candidatesByAccount = {}, config = normalizeTaskRanking(),
-  minQuality = DEFAULT_MIN_QUALITY, previous = {}, snapshotAt = null, eee = null } = {}) {
+  minQuality = DEFAULT_MIN_QUALITY, previous = {}, snapshotAt = null, eee = null, supersededTaskArmIdsByAccount = null } = {}) {
   const unique = new Map();
   const canNormalize = c => ['exact', 'verified-alias'].includes(c.matchType) && c.effortVerified === true;
   for (const cs of Object.values(candidatesByAccount)) for (const c of cs) {
@@ -164,7 +164,7 @@ export function buildTaskRanking({ candidatesByAccount = {}, config = normalizeT
         const trustReason = trusted(c, f, role);
         const qualityOk = !profile.applies || qFleet >= profile.min;
         const Q = blendQ(s.Q, qEee, profile.alpha);
-        const refusal = (duplicate ? 'duplicate-benchmark-binding' : null) ?? trustReason ?? (!qualityOk ? 'min-quality' : null)
+        const refusal = (c.newestVersionSuperseded ? 'superseded-version' : null) ?? (duplicate ? 'duplicate-benchmark-binding' : null) ?? trustReason ?? (!qualityOk ? 'min-quality' : null)
           ?? c.operationalReasons?.[0] ?? (c.taskCostProxy == null ? 'missing-task-cost' : null);
         return { ...c, taskRanking: true, role, Q, qThinker: Q, qFleet, qFleetThinker: qFleet,
           qAa: s.Q, qFleetAa: f.Q, qEee, qFleetEee, qBlended: Q, blendAlpha: profile.alpha,
@@ -179,14 +179,16 @@ export function buildTaskRanking({ candidatesByAccount = {}, config = normalizeT
           // Free cash is a funding bucket, not a zero resource estimate. The
           // role frontier compares resources within that account/bucket.
           C: c.taskCostProxy, eligible: refusal == null,
-          benchmarkEligible: !duplicate && trustReason == null && qualityOk && c.taskCostProxy != null };
+          benchmarkEligible: !c.newestVersionSuperseded && !duplicate && trustReason == null && qualityOk && c.taskCostProxy != null };
       });
       const prior = previous[accountId]?.roles?.[role] ?? {};
       const gateByArm = localEee ? new Map([...localEee].map(([id, e]) => [id, eeeGateDatum(e)])) : null;
       const ladder = buildLadder(candidates.filter(c => c.benchmarkEligible), prior.rankingRungs ?? prior.rungs ?? [], gateByArm, prior.withinNoise ?? []);
       const rungIds = new Set(ladder.rungs.map(r => r.armId));
       for (const c of candidates) if (c.eligible) c.selectionReason = rungIds.has(c.armId) ? 'eligible' : 'pareto-dominated';
-      return [role, { ...ladder, candidates, rankingRungs: ladder.rungs, previousRungs: prior.rankingRungs ?? prior.rungs ?? [],
+      return [role, { ...ladder, candidates,
+        ...(supersededTaskArmIdsByAccount ? { excludedArmIds: [...(supersededTaskArmIdsByAccount.get(accountId) ?? [])] } : {}),
+        rankingRungs: ladder.rungs, previousRungs: prior.rankingRungs ?? prior.rungs ?? [],
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs: prior.withinNoise ?? [] }];
     }));
     return [accountId, { roles }];

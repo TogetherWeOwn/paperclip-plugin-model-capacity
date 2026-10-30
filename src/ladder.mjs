@@ -115,6 +115,7 @@ function strictlyDominates(a, b) {
  * { armId, Q, C } keep bit-identical behavior.
  */
 function sameFamilyNewerDominates(o, m) {
+  if (o?.newestVersionManaged === true && m?.newestVersionManaged === true) return false;
   const famO = typeof o?.family === 'string' ? o.family.toLowerCase() : null;
   const famM = typeof m?.family === 'string' ? m.family.toLowerCase() : null;
   if (!famO || famO !== famM) return false;

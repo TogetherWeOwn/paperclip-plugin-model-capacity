@@ -441,3 +441,69 @@ test('restart caps retain exactly one persisted running-free floor, not the thre
   assert.equal(triage.allocated, 1);
   assert.equal(triage.maxConcurrentRuns, 1, 'the host cap must preserve the running floor without admitting more work');
 });
+
+test('N-T12: superseded free arm is never routed and rejected legacy evidence is reported once', async () => {
+  for (const mode of ['shadow', 'enforce']) {
+    const d = await drive({ config: { roles: { newestVersionOnly: { enabled: true }, minQuality: { doer: null, other: null, thinker: null } }, taskRanking: { mode } } });
+    d.lane.accounts[0].models.push('nvidia-nim/step-6-preview-nim');
+    d.lane.servedModels.push('nvidia-nim/step-6-preview-nim');
+    d.setNow(NOW + 61000);
+    d.lane.observedAt = new Date(NOW + 61000).toISOString();
+    await d.tick();
+    const cap = await d.api('capacity');
+    const view = cap.newestVersion.accounts['nvidia-nim:n1'];
+    const rejected = view.rejectedCandidates.find(c => c.armId === 'step-5-preview-nim');
+    assert.ok(rejected, JSON.stringify(view));
+    const rows = cap.freeLanes.arms.filter(a => a.accountId === 'nvidia-nim:n1' && a.armId === rejected.armId);
+    assert.equal(rows.length, 1, mode);
+    assert.equal(rows[0].eligible, false);
+    assert.equal(rows[0].reason, 'superseded-version');
+    assert.notEqual((await d.hook()).model, MODEL, mode);
+  }
+});
+
+test('N-T12: free report deduplicates duplicate task bindings by account and arm', async () => {
+  const alias = 'nvidia-nim/step-5-preview-nim-free';
+  const newer = 'nvidia-nim/step-6-preview-nim';
+  const d = await drive({ config: {
+    roles: { newestVersionOnly: { enabled: true } }, taskRanking: { mode: 'enforce' },
+    modelAaOverrides: {
+      'step-5-preview-nim': { slug: 'step-5', effort: 'max' },
+      'step-5-preview-nim-free': { slug: 'step-5', effort: 'max' },
+    },
+  } });
+  d.lane.accounts[0].models.push(alias, newer);
+  d.lane.servedModels.push(alias, newer);
+  d.setNow(NOW + 61000);
+  d.lane.observedAt = new Date(NOW + 61000).toISOString();
+  await d.tick();
+
+  const armId = 'step-5-preview-nim@max';
+  const ladder = d.store.get(skey('ladder-v1')).ladders['nvidia-nim:n1'];
+  const bindings = ladder.taskRoles.doer.candidates.filter(c => c.armId === armId);
+  assert.equal(bindings.length, 2, 'fixture must produce two task candidates for the same arm');
+  assert.ok(bindings.every(c => c.selectionReason === 'superseded-version'));
+  const rows = (await d.api('capacity')).freeLanes.arms.filter(a => a.accountId === 'nvidia-nim:n1' && a.armId === armId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].eligible, false);
+  assert.equal(rows[0].reason, 'superseded-version');
+});
+
+test('N-T12: task-dialect rejection is reported independently of a kept legacy arm', async () => {
+  const d = await drive({ config: { roles: { newestVersionOnly: { enabled: true,
+    overrides: { keep: ['arm:step-5-preview-nim'] } } }, taskRanking: { mode: 'enforce' } } });
+  d.lane.accounts[0].models.push('nvidia-nim/step-6-preview-nim');
+  d.lane.servedModels.push('nvidia-nim/step-6-preview-nim');
+  d.setNow(NOW + 61000);
+  d.lane.observedAt = new Date(NOW + 61000).toISOString();
+  await d.tick();
+  const cap = await d.api('capacity');
+  const view = cap.newestVersion.accounts['nvidia-nim:n1'];
+  assert.ok(!view.rejectedCandidates.some(c => c.armId === 'step-5-preview-nim'));
+  assert.ok(view.supersededTaskArmIds.includes('step-5-preview-nim@max'));
+  const rows = cap.freeLanes.arms.filter(a => a.accountId === 'nvidia-nim:n1' && a.armId === 'step-5-preview-nim@max');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].reason, 'superseded-version');
+  assert.equal(rows[0].eligible, false);
+  assert.notEqual((await d.hook()).model, MODEL);
+});

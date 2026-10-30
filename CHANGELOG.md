@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.75
+### Added
+- Opt-in per-account fallback for `doer` and `other` roles, preserving reviewer and other safety fences. Inspect admitted and suppressed rows in `/capacity.eligibility.accountFallback`; dashboard exclusions remain global. The fallback quality floor is a fleet-relative z-score, not an absolute benchmark.
+- Offline replay provenance and parity checks for staged newest/fallback rollout. Retain pre-newest capture-time provenance and pass historical fidelity before enabling newest; judge a newest-enabled capture only with its matching producer and flags, then check parity before enabling fallback.
+
+## 0.2.74
+### Added
+- Opt-in account-scoped newest-version filtering with scoped keeps, parser overrides, and auditable supersession views. Disabled by default. Strict Pareto and cross-account dominance remain in force.
+
 ## 0.2.73
 ### Fixed
 - Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.

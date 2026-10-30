@@ -177,15 +177,17 @@ export function crossAccountDominated(arms, qualifiedWithHeadroom, opts = {}) {
     const dominators = group.filter(dominatorUsable);
     if (dominators.length === 0) continue;
     for (const m of group) {
-      const mVer = versionTuple(m.model ?? m.armId);
+      const mVer = opts.requireSameProductForNewer === true ? m.parsedVersion : versionTuple(m.model ?? m.armId);
       let winner = null;
       for (const o of dominators) {
         if (o.accountId === m.accountId && o.armId === m.armId) continue;
         const better = o.Q > m.Q && o.C <= m.C;
         let newer = false;
         if (!better && mVer) {
-          const oVer = versionTuple(o.model ?? o.armId);
-          if (oVer && compareVersions(oVer, mVer) > 0 && o.Q >= m.Q && o.C <= m.C) newer = true;
+          const sameProduct = opts.requireSameProductForNewer !== true
+            || (typeof m.productLine === 'string' && m.productLine.length > 0 && m.productLine === o.productLine);
+          const oVer = opts.requireSameProductForNewer === true ? o.parsedVersion : versionTuple(o.model ?? o.armId);
+          if (sameProduct && oVer && compareVersions(oVer, mVer) > 0 && o.Q >= m.Q && o.C <= m.C) newer = true;
         }
         if (better || newer) {
           if (!winner || winner.Q < o.Q || (winner.Q === o.Q && winner.C > o.C)) winner = o;
