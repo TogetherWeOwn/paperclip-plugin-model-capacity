@@ -44,7 +44,7 @@ test('V0 startup ownership mismatch logs ERROR and rejects an otherwise valid-lo
   assert.ok(snapshot.unavailablePoolIds.includes(pool.id));
   const request=library.syntheticRouterRequest(normalizeRegistry(s.cfg.router),'builder',NOW);
   request.pool.id=pool.id; // Defensive: ownership changed after request construction.
-  assert.equal(routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}}).kind,'unavailable');
+  assert.equal(routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}},{syntheticShadow:true}).kind,'unavailable');
   assert.deepEqual(s.host.writes,[]);
 });
 
@@ -56,14 +56,14 @@ test('per-member drift from the real drift checker is applied fail-closed to the
   assert.ok(snapshot.drift.drift.some(d=>d.type==='missing-member' && d.memberId===id));
   const request=library.syntheticRouterRequest(normalizeRegistry(s.cfg.router),'builder',NOW+MINUTE);
   request.pinnedMemberId=id;
-  assert.equal(routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}}).skipped[id],'unmapped-member');
+  assert.equal(routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}},{syntheticShadow:true}).skipped[id],'unmapped-member');
 });
 
-test('missing SDK inspection seam is explicit and unavailable, never silently a clean drift result',async t=>{
+test('A2 default quota path uses operator-check inspection and never fabricates a drift overlay',async t=>{
   const s=await start(t,{withInspector:false});await s.tick();
-  assert.deepEqual(s.quota.get(companyId).unavailablePoolKeys,['builder','thinker']);
-  assert.equal(s.quota.status(companyId).inspection,'unavailable');
-  assert.ok(s.logs.some(l=>l.level==='error' && l.details.reason==='pool-inspection-unavailable'));
+  for(const key of ['unavailablePoolKeys','unavailablePoolIds','drift','expectedPools'])assert.equal(Object.hasOwn(s.quota.get(companyId),key),false);
+  assert.equal(s.quota.status(companyId).inspection,'operator-check');
+  assert.equal(s.logs.some(l=>l.details.reason==='pool-inspection-unavailable'),false);
   const request=library.syntheticRouterRequest(normalizeRegistry(s.cfg.router),'builder',NOW);
   assert.equal(routeDecision(request,s.quota.get(companyId),{...s.cfg,router:{...s.cfg.router,enabled:true}}).kind,'unavailable');
 });
@@ -94,7 +94,7 @@ test('U27 shadow runs the same core per pool with enabled overridden true, recor
     const {id,companyId:cid,pluginKey,revision,...poolConfig}=request.pool;
     assert.equal(cid,companyId);assert.equal(pluginKey,'togetherweown.model-capacity');
     assert.ok(aiConnectionPoolConfigSchema.safeParse(poolConfig).success,'synthetic members conform to real upstream schema');
-    assert.deepEqual(record.decision,routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}}));
+    assert.deepEqual(record.decision,routeDecision(request,snapshot,{...s.cfg,router:{...s.cfg.router,enabled:true}},{syntheticShadow:true}));
     assert.equal(record.wouldSelect,snapshot.memberIndex[record.decision.memberId].accountKey);
     assert.equal(routeDecision(request,snapshot,s.cfg).kind,'exhausted');
     assert.ok(Object.values(routeDecision(request,snapshot,s.cfg).skipped).every(r=>r==='router-disabled'));
@@ -136,4 +136,18 @@ test('ten-second job timeout rejects even when SDK transport ignores AbortSignal
   t.mock.timers.tick(9999);assert.equal(signal.aborted,false);
   t.mock.timers.tick(1);await rejected;assert.equal(signal.aborted,true);
   release({accounts:[]});await Promise.resolve();
+});
+
+test('A2 default job maps bound pool UUIDs from verified tick config without inspecting native resources',async t=>{
+  const {verifiedConfig}=await import('./support/verified-pools.mjs');
+  const s=await start(t,{withInspector:false});
+  const verified=verifiedConfig().router.pools[0];Object.assign(s.cfg.router.pools[0],verified);
+  s.setAgents([{runtimeConfig:{aiConnection:{mode:'router',connectionId:verified.poolId}}}]);
+  await s.tick();
+  assert.equal(s.inspections,0);
+  assert.equal(s.quota.status(companyId).inspection,'operator-check');
+  assert.equal(s.quota.status(companyId).shadowSuppressedReason,null);
+  assert.deepEqual(s.quota.status(companyId).shadow.map(r=>r.poolKey),['thinker']);
+  assert.equal(JSON.stringify(s.quota.get(companyId)).includes(verified.poolId),false,'quota snapshot carries no attestation');
+  assert.deepEqual(s.host.writes,[]);
 });

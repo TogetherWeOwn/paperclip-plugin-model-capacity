@@ -1,10 +1,9 @@
 /** Native quota job coordinator. All IO stays here, never in routeDecision.
- * Upstream's SDK currently has no pool-inspection client. inspectPools is a
- * test/operator seam, NOT an implemented production bridge or a ctx API.
- * Its result must supply the generator's api, batch, baseUrl, qualityVerdicts
- * and expectedEnabled context; the plugin worker has no source for those
- * operator inputs. An SDK reader alone would not close that separate gap.
- * Without it all native pools are unavailable (the retained hook is untouched).
+ * Full drift inspection belongs to the operator's generator --check: upstream
+ * has no SDK inspection client or producer for the generator's operator inputs.
+ * inspectPools remains a TEST/OPERATOR seam only, never a production default.
+ * Without it the tick publishes quota only; current config attestation and
+ * host call metadata are checked by the pure per-call tripwire instead.
  */
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
 import { checkPoolDrift } from '../scripts/pool-saga.mjs';
@@ -77,12 +76,9 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     let previous;
     try {previous=publisher.envelope(companyId)??await state.get(keyFor(companyId));} catch {return failure(companyId,'quota-state-failed');}
     if(!isCurrent())return {status:'superseded'};
-    let pools=[],drift,inspection='ready';
-    if(typeof inspectPools!=='function') {
-      inspection='unavailable';
-      drift={ok:false,drift:registry.pools.map(p=>({type:'pool-inspection-unavailable',poolKey:p.poolKey})),selectableVerdicts:[],primarySignal:'unavailable'};
-      report(companyId,'pool-inspection-unavailable',{},'error');
-    } else {
+    let pools=[],drift,inspection='operator-check';
+    if(typeof inspectPools==='function') {
+      inspection='ready';
       try {
         const input=await inspectPools({companyId,registry,config});
         pools=await input.api.listPools(companyId);
@@ -94,9 +90,6 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
       } catch {return failure(companyId,'pool-inspection-failed');}
     }
     if(!isCurrent())return {status:'superseded'};
-    const wrongPools=pools.filter(p=>registry.pools.some(r=>r.poolKey===p?.name) && !poolHasExpectedPluginKey(p));
-    const unavailablePoolIds=wrongPools.map(p=>p.id);
-    const unavailablePoolKeys=inspection==='unavailable'?registry.pools.map(p=>p.poolKey):wrongPools.map(p=>p.name);
     let built;
     try {built=buildQuotaSnapshot({registry,feed,nowMs:clock(),previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config});}
     catch {return failure(companyId,'quota-feed-invalid');}
@@ -104,25 +97,33 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     // all quota/feed/credential gates, but do not treat deployment drift as a
     // quota decision. Only the published, real-routing snapshot gets that
     // enforcement overlay; neither this view nor shadow can authorize a run.
-    const shadowSnapshot=built.snapshot;
-    built={...built,snapshot:freezeSnapshot({...shadowSnapshot,unavailablePoolIds,unavailablePoolKeys,drift,
-      memberSkipReasons:{...shadowSnapshot.memberSkipReasons,...driftMemberReasons(registry,drift.drift)}})};
+    const quotaState={...built.snapshot};
+    for (const key of ['unavailablePoolIds','unavailablePoolKeys','drift']) delete quotaState[key];
+    const shadowSnapshot=freezeSnapshot(quotaState);
+    built={...built,snapshot:shadowSnapshot};
+    if (drift) {
+      const wrongPools=pools.filter(p=>registry.pools.some(r=>r.poolKey===p?.name) && !poolHasExpectedPluginKey(p));
+      built={...built,snapshot:freezeSnapshot({...shadowSnapshot,drift,
+        unavailablePoolIds:wrongPools.map(p=>p.id),unavailablePoolKeys:wrongPools.map(p=>p.name),
+        memberSkipReasons:{...shadowSnapshot.memberSkipReasons,...driftMemberReasons(registry,drift.drift)}})};
+    }
     for(const warning of built.warnings)report(companyId,warning.reason,{accountKey:warning.accountKey});
-    for(const row of drift.drift)report(companyId,'pool-drift',{type:row.type,...(row.accountKey?{accountKey:row.accountKey}:{}),...(row.poolKey?{poolKey:row.poolKey}:{}),...(row.memberId?{memberId:row.memberId}:{})});
+    for(const row of drift?.drift??[])report(companyId,'pool-drift',{type:row.type,...(row.accountKey?{accountKey:row.accountKey}:{}),...(row.poolKey?{poolKey:row.poolKey}:{}),...(row.memberId?{memberId:row.memberId}:{})});
     let agents;
     try {agents=await listAgents(companyId);if(!Array.isArray(agents))throw new Error();} catch {return failure(companyId,'pool-bindings-unavailable');}
     const boundIds=new Set(agents.filter(a=>a?.runtimeConfig?.aiConnection?.mode==='router').map(a=>a.runtimeConfig.aiConnection.connectionId));
-    const boundKeys=new Set(pools.filter(p=>boundIds.has(p.id)).map(p=>p.name));
-    // Without an inspected pool ID -> key mapping we cannot prove which
-    // configured pools are unbound. Omit synthetic evidence conservatively
-    // instead of double-counting a live pool as a shadow-only selection.
-    const shadowSuppressedReason=[...boundIds].some(id=>!pools.some(p=>p.id===id))?'pool-bindings-unmapped':null;
+    // Operator-attested config supplies the ID -> key map in production.
+    // Unknown live bindings still suppress synthetic evidence conservatively.
+    const shadowPools=inspection==='operator-check'
+      ? registry.pools.filter(p=>p.poolId).map(p=>({id:p.poolId,name:p.poolKey})) : pools;
+    const boundKeys=new Set(shadowPools.filter(p=>boundIds.has(p.id)).map(p=>p.name));
+    const shadowSuppressedReason=[...boundIds].some(id=>!shadowPools.some(p=>p.id===id))?'pool-bindings-unmapped':null;
     if(shadowSuppressedReason)report(companyId,shadowSuppressedReason);
     const atMs=built.snapshot.atMs,shadow=[];
     for(const {poolKey} of registry.pools) {
       if(shadowSuppressedReason || boundKeys.has(poolKey))continue;
       const params=syntheticRouterRequest(registry,poolKey,atMs);
-      const decision=routeDecision(params,shadowSnapshot,{...config,router:{...config.router,enabled:true}});
+      const decision=routeDecision(params,shadowSnapshot,{...config,router:{...config.router,enabled:true}},{syntheticShadow:true});
       shadow.push({poolKey,wouldSelect:decision.kind==='selected'?shadowSnapshot.memberIndex[decision.memberId].accountKey:decision.kind,atMs,decision});
     }
     const shadowHistory=[...(previous?.shadow??[]),...shadow].slice(-SHADOW_CAP);

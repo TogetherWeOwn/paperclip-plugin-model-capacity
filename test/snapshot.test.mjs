@@ -25,7 +25,7 @@ test('snapshot builds immutable R3 accounts, registry joins, selector views and 
   assert.ok(Object.isFrozen(s) && Object.isFrozen(a.view) && Object.isFrozen(s.memberIndex));
   assert.throws(()=>{a.weeklyUsed=.9;},TypeError);
   assert.equal(result.histories.one.weekly.length,1);
-  assert.equal(routeDecision(params(),s,{router:{enabled:true,accounts:registry().accounts}}).kind,'selected');
+  assert.equal(routeDecision(params(),s,{router:{enabled:true,accounts:registry().accounts}},{syntheticShadow:true}).kind,'selected');
 });
 
 test('U14 cached vendor 429 retains last-good utilization; vendor error text is not quota evidence', () => {
@@ -40,7 +40,7 @@ test('U14 observation older than 120 seconds is stale even though snapshot tick 
   assert.equal(s.atMs,NOW); assert.equal(s.accounts.one.eligible,false);
   assert.equal(s.accounts.one.skipReason,'account-reading-stale');
   assert.equal(s.accounts.one.staleSinceMs,NOW);
-  assert.equal(routeDecision(params(),s,{router:{enabled:true}}).skipped[memberIdFor('builder','one')],'account-reading-stale');
+  assert.equal(routeDecision(params(),s,{router:{enabled:true}},{syntheticShadow:true}).skipped[memberIdFor('builder','one')],'account-reading-stale');
 });
 
 test('fresh body cannot refresh stale account; fresh account cannot refresh stale body', () => {

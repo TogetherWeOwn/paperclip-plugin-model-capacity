@@ -54,8 +54,8 @@ test('U27 M1 worker without an inspector or native pools records quota selection
   // Match worker.mjs: no inspectPools injection, and M1 precedes pool creation.
   const s=await start(t,{withInspector:false,withPools:false});await s.tick();
   const native=(await s.capacity()).body.nativeRouter;
-  assert.equal(native.inspection,'unavailable');
-  assert.deepEqual(native.unavailablePoolKeys,['builder','thinker'],'real routing remains fail-closed');
+  assert.equal(native.inspection,'operator-check');
+  assert.deepEqual(native.unavailablePoolKeys,[],'real routing is gated by the per-call tripwire, not a fabricated inspection failure');
   assert.deepEqual(native.shadow.map(r=>r.poolKey),['builder','thinker']);
   for(const r of native.shadow) {
     assert.equal(r.decision.kind,'selected');
@@ -105,7 +105,7 @@ test('worker suppresses synthetic shadow when a live router binding cannot be ma
   assert.deepEqual(native.shadow,[],'an unknown live pool must not be assumed unbound');
   assert.equal(native.shadowSuppressedReason,'pool-bindings-unmapped');
   assert.equal(native.snapshotAtMs,NOW,'binding ambiguity must not prevent fresh quota publication');
-  assert.deepEqual(native.unavailablePoolKeys,['builder','thinker']);
+  assert.deepEqual(native.unavailablePoolKeys,[]);
   s.setNow(NOW+MINUTE);s.setBody(quotaFeed(NOW+MINUTE));await s.tick();
   assert.equal(s.logs.filter(l=>l.details?.reason==='pool-bindings-unmapped').length,1,'suppression warning is rate limited');
   s.context.agents.list=async()=>[];

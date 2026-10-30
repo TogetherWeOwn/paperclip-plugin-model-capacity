@@ -4,7 +4,7 @@
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { applyInFlightOverlay } from './views.mjs';
 import { accountKeyForModel } from './ledger.mjs';
-import { poolHasExpectedPluginKey } from './registry.mjs';
+import { poolHasExpectedPluginKey, verifiedPoolError } from './registry.mjs';
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -29,8 +29,31 @@ export function taskKeyKind(key) {
   return typeof key === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key) ? 'issue' : 'other';
 }
 
+/** Operator --check supplies expected config; the host supplies current call
+ * metadata. Never trust snapshot attestation, nor compare candidate-narrowed
+ * pool.members to the full host memberOrder. No IO or callback-side state. */
+function poolTripwire(params, config, options) {
+  if (options?.syntheticShadow === true) return null;
+  const entries=Array.isArray(config?.router?.pools) ? config.router.pools.filter(p=>p?.poolId===params?.pool?.id) : [];
+  const entry=entries[0];
+  const fail=code=>({code,entry});
+  if (!entry) return fail('unverified-pool');
+  if (entries.length!==1 || !entry.poolId || typeof entry.poolKey!=='string' || !entry.poolKey.trim()
+      || !['doer','thinker','reviewer'].includes(entry.role) || verifiedPoolError(entry)) return fail('invalid-attestation');
+  if (params.pool.pluginKey!==entry.pluginKey) return fail('plugin-key-mismatch');
+  if (params.pool.revision!==entry.expectedRevision) return fail('revision-mismatch');
+  if (!Array.isArray(params.memberOrder) || params.memberOrder.length!==entry.expectedMemberOrder.length
+      || params.memberOrder.some((id,i)=>id!==entry.expectedMemberOrder[i])) return fail('member-order-mismatch');
+  for (const c of candidatesOf(params)) {
+    const expected=entry.members.find(m=>m.memberId===memberId(c));
+    if (!expected) return fail('candidate-member-mismatch');
+    if (c?.member?.binding?.connectionId!==expected.connectionId || c?.member?.binding?.grantId!==expected.grantId) return fail('candidate-binding-mismatch');
+  }
+  return null;
+}
+
 /** Side-effect-free log facts; adapter emits the indicated level, never this core. */
-export function routerDiagnostics(params, snapshot) {
+export function routerDiagnostics(params, snapshot, config = {}, options = {}) {
   const candidates = candidatesOf(params);
   const ids = new Set(candidates.map(memberId));
   const memberOrder = Array.isArray(params?.memberOrder) ? params.memberOrder : [];
@@ -45,6 +68,15 @@ export function routerDiagnostics(params, snapshot) {
   else {
     d.droppedMemberIds = memberOrder.filter(id => !ids.has(id));
     if (d.droppedMemberIds.length && d.level !== 'error') d.level = 'warn';
+  }
+  if (candidates.length && Number.isFinite(nowOf(params)) && config?.router?.enabled !== false) {
+    const trip=poolTripwire(params,config,options);
+    if (trip) {
+      d.level='error';d.tripwire=trip.code;
+      if (typeof trip.entry?.poolKey==='string') d.poolKey=trip.entry.poolKey;
+      if (Number.isSafeInteger(trip.entry?.expectedRevision)) d.expectedRevision=trip.entry.expectedRevision;
+      if (Number.isSafeInteger(params?.pool?.revision)) d.actualRevision=params.pool.revision;
+    }
   }
   return d;
 }
@@ -85,8 +117,8 @@ function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour
   return {at: staleDelay(account, now, recheck), credible: false};
 }
 
-export function routeDecision(params, snapshot, config = {}) {
-  const now = nowOf(params), candidates = candidatesOf(params), router = config.router ?? {};
+export function routeDecision(params, snapshot, config = {}, options = {}) {
+  const now = nowOf(params), candidates = candidatesOf(params), router = config?.router ?? {};
   const inspectedKeys = new Set(candidates.map(c => snapshot?.memberIndex?.[memberId(c)]?.poolKey).filter(Boolean));
   const inspectedUnavailable = snapshot?.unavailablePoolIds?.includes(params?.pool?.id)
     || [...inspectedKeys].some(key => snapshot?.unavailablePoolKeys?.includes(key));
@@ -95,6 +127,7 @@ export function routeDecision(params, snapshot, config = {}) {
   // A pure decision cannot construct a future retry without a trustworthy clock.
   if (!Number.isFinite(now)) return unavailable(allSkipped(candidates, 'quota-snapshot-stale'));
   if (router.enabled === false) return wait(now, allSkipped(candidates, 'router-disabled'));
+  if (poolTripwire(params,config,options)) return unavailable(allSkipped(candidates, 'unmapped-member'));
   if (!snapshot || !freshAt(snapshot.atMs, now, router.staleSnapshotMs ?? 180_000)) return wait(now, allSkipped(candidates, 'quota-snapshot-stale'));
   const pin = params.pinnedMemberId;
   if (pin && !candidates.some(c => memberId(c) === pin)) return unavailable(allSkipped(candidates, 'unmapped-member'));

@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { routeDecision, routerDiagnostics, taskKeyKind } from '../src/router.mjs';
 import { snapshotAccountView } from '../src/views.mjs';
+import { memberIdFor } from '../src/registry.mjs';
+const mid=id=>memberIdFor('builder',id), A=mid('a'), B=mid('b'), C=mid('c');
 
 const now = Date.parse('2026-10-29T12:00:00Z');
 const mkAccount = (overrides = {}) => ({ weeklyUsed: .4, weeklyResetsAtMs: now + 72 * 3600000, quality: 'live', observedAtMs: now, credentialReady: true, measuredRatePerHour: .002, eligible: true, inFlightBase: 0, ...overrides });
@@ -9,70 +11,71 @@ const mk = (options = {}) => {
   const accounts = {a: mkAccount(), b: mkAccount({measuredRatePerHour: .004}), ...(options.accounts ?? {})};
   for (const [key, a] of Object.entries(accounts)) a.view = snapshotAccountView(key, a, {nowMs: now});
   const ids = options.ids ?? ['a', 'b'];
-  const candidates = ids.map(id => ({member: {id}, runtimeConfig: {model: `${id}/model`}, notes: []}));
-  const params = {pool: {id: 'host-pool-id', pluginKey: 'togetherweown.model-capacity', name: 'builder', members: candidates.map(c => c.member), thresholdPercent: 90}, candidates, memberOrder: options.memberOrder ?? ids, taskKey: options.taskKey ?? 'work', now: new Date(now).toISOString(), ...(options.pin ? {pinnedMemberId: options.pin} : {})};
-  const snapshot = {atMs: now, accounts, memberIndex: Object.fromEntries(['a', 'b'].map(id => [id, {accountKey: id, poolKey: 'builder'}])), poolRoles: {builder: 'doer'}};
+  const candidates = ids.map(id => ({member: {id:mid(id),binding:{connectionId:memberIdFor('connection',id),grantId:memberIdFor('grant',id)}}, runtimeConfig: {model: `${id}/model`}, notes: []}));
+  const params = {pool: {id: '40000000-0000-4000-8000-000000000001', revision:7, pluginKey: 'togetherweown.model-capacity', name: 'builder', members: candidates.map(c => c.member), thresholdPercent: 90}, candidates, memberOrder: (options.memberOrder ?? ['a','b']).map(mid), taskKey: options.taskKey ?? 'work', now: new Date(now).toISOString(), ...(options.pin ? {pinnedMemberId: mid(options.pin)} : {})};
+  const snapshot = {atMs: now, accounts, memberIndex: Object.fromEntries(['a', 'b'].map(id => [mid(id), {accountKey: id, poolKey: 'builder'}])), poolRoles: {builder: 'doer'}};
   const config = {router: {enabled: true, accounts: [{accountKey:'a', prefix:'a', pools:{builder:{probeEligible:true}}}, {accountKey:'b', prefix:'b', pools:{builder:{probeEligible:false}}}]}};
+  config.router.pools=[{poolKey:'builder',role:'doer',poolId:params.pool.id,pluginKey:params.pool.pluginKey,expectedRevision:7,expectedMemberOrder:[...params.memberOrder],members:(options.memberOrder??['a','b']).map(accountKey=>({accountKey,memberId:mid(accountKey),connectionId:memberIdFor('connection',accountKey),grantId:memberIdFor('grant',accountKey)}))}];
   return {params, snapshot, config};
 };
 const route = ({params, snapshot, config}) => routeDecision(params, snapshot, config);
 
 test('highest deficit wins and ties are deterministic without depending on host cursor', () => {
-  const f = mk(); assert.deepEqual(route(f), {kind:'selected', memberId:'a'});
+  const f = mk(); assert.deepEqual(route(f), {kind:'selected', memberId:A});
   const tie = mk({accounts:{b:mkAccount() }, ids:['b','a']});
-  assert.equal(route(tie).memberId, 'a');
+  assert.equal(route(tie).memberId, A);
 });
 test('pins override ranking; ineligible pins wait and unmapped pins never switch', () => {
-  const f = mk({pin:'b'}); assert.equal(route(f).memberId, 'b');
+  const f = mk({pin:'b'}); assert.equal(route(f).memberId, B);
   f.snapshot.accounts.b.eligible = false; f.snapshot.accounts.b.skipReason = 'weekly-exhausted'; f.snapshot.accounts.b.nextEligibleAtMs = now + 7200000; f.snapshot.accounts.b.weeklyResetsAtMs = now + 7200000;
-  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+7200000).toISOString(), skipped:{b:'weekly-exhausted'}});
-  delete f.snapshot.memberIndex.b; f.config.router.accounts = f.config.router.accounts.filter(a => a.accountKey !== 'b');
-  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+60000).toISOString(), skipped:{b:'unmapped-member'}});
+  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+7200000).toISOString(), skipped:{[B]:'weekly-exhausted'}});
+  delete f.snapshot.memberIndex[B]; f.config.router.accounts = f.config.router.accounts.filter(a => a.accountKey !== 'b');
+  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+60000).toISOString(), skipped:{[B]:'unmapped-member'}});
 });
 test('precedence keeps zero and invalid pools loud before disabled and stale waits', () => {
   const f = mk(); f.params.candidates=[]; f.config.router.enabled=false;
   assert.deepEqual(route(f), {kind:'unavailable', skipped:{}});
-  f.params.candidates = [{member:{id:'a'},runtimeConfig:{model:'a/model'}}];
-  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+60000).toISOString(), skipped:{a:'router-disabled'}});
-  f.params.pool.pluginKey='wrong'; assert.deepEqual(route(f), {kind:'unavailable', skipped:{a:'unmapped-member'}});
+  f.params.candidates = [{member:{id:A},runtimeConfig:{model:'a/model'}}];
+  assert.deepEqual(route(f), {kind:'exhausted', retryAt:new Date(now+60000).toISOString(), skipped:{[A]:'router-disabled'}});
+  f.params.pool.pluginKey='wrong'; assert.deepEqual(route(f), {kind:'unavailable', skipped:{[A]:'unmapped-member'}});
   f.params.pool.pluginKey='togetherweown.model-capacity'; f.config.router.enabled=true; f.params.pinnedMemberId='missing';
   assert.equal(route(f).kind,'unavailable');
 });
 test('stale snapshot waits all candidates; stale individual does not block fresh candidate', () => {
   const f=mk(); f.snapshot=null;
-  assert.deepEqual(route(f), {kind:'exhausted',retryAt:new Date(now+60000).toISOString(),skipped:{a:'quota-snapshot-stale', b:'quota-snapshot-stale'}});
-  const g=mk(); g.snapshot.accounts.a.quality='unknown'; assert.equal(route(g).memberId,'b');
+  assert.deepEqual(route(f), {kind:'exhausted',retryAt:new Date(now+60000).toISOString(),skipped:{[A]:'quota-snapshot-stale', [B]:'quota-snapshot-stale'}});
+  const g=mk(); g.snapshot.accounts.a.quality='unknown'; assert.equal(route(g).memberId,B);
 });
 test('weekly and five-hour credible resets outrank unknown or expired readings', () => {
   const f=mk({accounts:{a:mkAccount({eligible:false,skipReason:'weekly-exhausted',weeklyUsed:1, weeklyResetsAtMs:now+7200000}),b:mkAccount({eligible:false,skipReason:'five-hour-exhausted',fiveHourUsed:1,fiveHourResetsAtMs:now+3600000})}});
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'weekly-exhausted',b:'five-hour-exhausted'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{[A]:'weekly-exhausted',[B]:'five-hour-exhausted'}});
   f.snapshot.accounts.b.quality='unknown'; assert.equal(route(f).retryAt,new Date(now+7200000).toISOString());
 });
 test('drop detection uses memberOrder, suppresses pin and ambiguous single survivor', () => {
-  const f=mk({memberOrder:['a','b','c']}); assert.deepEqual(routerDiagnostics(f.params,f.snapshot).droppedMemberIds,['c']); assert.equal(routerDiagnostics(f.params,f.snapshot).level,'warn');
-  f.params.pinnedMemberId='a'; f.params.candidates=f.params.candidates.slice(0,1);
-  assert.equal(routerDiagnostics(f.params,f.snapshot).droppedSuppressed,'pinned'); assert.equal(routerDiagnostics(f.params,f.snapshot).level,'info');
-  delete f.params.pinnedMemberId; assert.equal(routerDiagnostics(f.params,f.snapshot).droppedSuppressed,'ambiguous-single-candidate');
+  const f=mk({memberOrder:['a','b','c']}); assert.deepEqual(routerDiagnostics(f.params,f.snapshot,f.config).droppedMemberIds,[C]); assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).level,'warn');
+  f.params.pinnedMemberId=A; f.params.candidates=f.params.candidates.slice(0,1);
+  assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).droppedSuppressed,'pinned'); assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).level,'info');
+  delete f.params.pinnedMemberId; assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).droppedSuppressed,'ambiguous-single-candidate');
 });
 test('pool identity is derived from memberIndex and disagreement fails closed', () => {
-  const f=mk(); f.params.pool.name='editable-label'; assert.equal(route(f).memberId,'a'); assert.equal(routerDiagnostics(f.params,f.snapshot).poolNameMismatch,true);
-  f.snapshot.memberIndex.b.poolKey='thinker'; assert.equal(route(f).kind,'exhausted');
-  assert.equal(routerDiagnostics(f.params,f.snapshot).level,'error');
+  const f=mk(); f.params.pool.name='editable-label'; assert.equal(route(f).memberId,A); assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).poolNameMismatch,true);
+  f.snapshot.memberIndex[B].poolKey='thinker'; assert.equal(route(f).kind,'exhausted');
+  assert.equal(routerDiagnostics(f.params,f.snapshot,f.config).level,'error');
 });
 test('task kinds apply per-membership probes only to heartbeat and lifecycle', () => {
   assert.equal(taskKeyKind('__heartbeat__'),'heartbeat'); assert.equal(taskKeyKind('lifecycle:hi'),'lifecycle');
   assert.equal(taskKeyKind('12345678-1234-1234-1234-123456789abc'),'issue'); assert.equal(taskKeyKind('other'),'other'); assert.equal(taskKeyKind(undefined),'other');
-  const f=mk({taskKey:'lifecycle:hi',accounts:{b:mkAccount({measuredRatePerHour:0})}}); assert.equal(route(f).memberId,'a');
-  f.params.taskKey='12345678-1234-1234-1234-123456789abc'; assert.equal(route(f).memberId,'b');
+  const f=mk({taskKey:'lifecycle:hi',accounts:{b:mkAccount({measuredRatePerHour:0})}}); assert.equal(route(f).memberId,A);
+  f.params.taskKey='12345678-1234-1234-1234-123456789abc'; assert.equal(route(f).memberId,B);
 });
 test('burn priority expires and heartbeat does not gain burn priority', () => {
-  const f=mk({accounts:{b:mkAccount({burn:{active:true,expiresAtMs:now+3600000}})}}); assert.equal(route(f).memberId,'b');
-  f.params.taskKey='__heartbeat__'; assert.equal(route(f).memberId,'a');
-  f.params.taskKey='work'; f.snapshot.accounts.b.burn.expiresAtMs=now-1; assert.equal(route(f).memberId,'a');
+  const f=mk({accounts:{b:mkAccount({burn:{active:true,expiresAtMs:now+3600000}})}}); assert.equal(route(f).memberId,B);
+  f.params.taskKey='__heartbeat__'; assert.equal(route(f).memberId,A);
+  f.params.taskKey='work'; f.snapshot.accounts.b.burn.expiresAtMs=now-1; assert.equal(route(f).memberId,A);
 });
 test('reserve tracks hard cap and thresholdPercent is ignored', () => {
   const f=mk({accounts:{a:mkAccount({weeklyUsed:.96}),b:mkAccount({eligible:false,skipReason:'weekly-exhausted'})}});
-  for (const threshold of [0,90,100]) { f.params.pool.thresholdPercent=threshold; assert.equal(route(f).memberId,'a'); }
+  for (const threshold of [0,90,100]) { f.params.pool.thresholdPercent=threshold; assert.equal(route(f).memberId,A); }
   const g=mk({accounts:{a:mkAccount({weeklyUsed:.996}),b:mkAccount({eligible:false,skipReason:'weekly-exhausted'})}}); assert.equal(route(g).kind,'exhausted');
 });
 test('pure synchronous decision works with deeply frozen input', () => {
@@ -82,16 +85,16 @@ test('pure synchronous decision works with deeply frozen input', () => {
 
 test('pace held members wait for catch-up, never weekly reset or one-run escape', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({eligible:false,skipReason:'pace-held',nextEligibleAtMs:now+10*60000})}});
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+10*60000).toISOString(),skipped:{a:'pace-held'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+10*60000).toISOString(),skipped:{[A]:'pace-held'}});
 });
 test('exclusive burn holds other members and wakes no later than expiry', () => {
   const f=mk({accounts:{b:mkAccount({eligible:false,skipReason:'quality-floor',nextEligibleAtMs:now+7200000,burn:{active:true,expiresAtMs:now+3600000}})}});
   f.config.burn={mode:'exclusive'};
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'burn-not-target',b:'quality-floor'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{[A]:'burn-not-target',[B]:'quality-floor'}});
 });
 test('an unknown quality label never grants a usable quota reading', () => {
   const f=mk({ids:['a'], accounts:{a:mkAccount({quality:null})}});
-  assert.equal(route(f).skipped.a,'account-reading-stale');
+  assert.equal(route(f).skipped[A],'account-reading-stale');
 });
 test('two exhausted windows on one member wait until both have reset', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:1,weeklyResetsAtMs:now+3600000,fiveHourUsed:1,fiveHourResetsAtMs:now+7200000})}});
@@ -106,12 +109,12 @@ test('stale-only retry backs off across ticks and caps at thirty minutes', () =>
 });
 test('probe restriction is based on configured membership even if host drops the probe member', () => {
   const f=mk({ids:['b'],taskKey:'__heartbeat__',memberOrder:['a','b']});
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+300000).toISOString(),skipped:{b:'role-excluded'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+300000).toISOString(),skipped:{[B]:'role-excluded'}});
 });
 test('probe pool with no configured probe members falls back to normal ranking', () => {
   const f=mk({ids:['b'],taskKey:'__heartbeat__'});
   f.config.router.accounts[0].pools.builder.probeEligible=false;
-  assert.equal(route(f).memberId,'b');
+  assert.equal(route(f).memberId,B);
 });
 test('overlay finish after a post-tick run was already finished does not subtract base', async () => {
   const {createOverlay,overlayStart,overlayFinish,overlayCount} = await import('../src/overlay.mjs');
@@ -122,19 +125,19 @@ test('overlay finish after a post-tick run was already finished does not subtrac
 test('burn target stops being active at configured used-percentage boundary', () => {
   const f=mk({accounts:{b:mkAccount({weeklyUsed:.7,burn:{active:true,expiresAtMs:now+3600000}})}});
   f.config.burn={endAtUsedPct:.7,mode:'exclusive'};
-  assert.equal(route(f).memberId,'a');
+  assert.equal(route(f).memberId,A);
 });
 
 test('exclusive burn at the default hard cap expires rather than excluding healthy accounts', () => {
   const f=mk({accounts:{b:mkAccount({weeklyUsed:.995,burn:{active:true,expiresAtMs:now+3600000}})}});
   f.config.burn={mode:'exclusive'};
-  assert.equal(route(f).memberId,'a');
+  assert.equal(route(f).memberId,A);
 });
 
 test('role and task admission gates remain enforced even if snapshot eligible flag drifts', () => {
   const f=mk(); f.snapshot.accounts.a.view.roleEligible=false; f.snapshot.accounts.b.view.taskFeasible=false;
   const r=route(f); assert.equal(r.kind,'exhausted');
-  assert.deepEqual(r.skipped,{a:'role-excluded',b:'outcome-gated'});
+  assert.deepEqual(r.skipped,{[A]:'role-excluded',[B]:'outcome-gated'});
 });
 test('an empty pool identity is malformed and fails closed', () => {
   const f=mk(); f.params.pool.id=''; assert.equal(route(f).kind,'unavailable');
@@ -142,12 +145,12 @@ test('an empty pool identity is malformed and fails closed', () => {
 
 test('missing snapshot eligibility never admits a member', () => {
   const f=mk({ids:['a']}); delete f.snapshot.accounts.a.eligible;
-  assert.equal(route(f).kind,'exhausted'); assert.equal(route(f).skipped.a,'account-reading-stale');
+  assert.equal(route(f).kind,'exhausted'); assert.equal(route(f).skipped[A],'account-reading-stale');
 });
 
 test('in-flight projection enforces the five-hour hard cap before its meter catches up', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({fiveHourUsed:.98,fiveHourResetsAtMs:now+3600000,inFlightBase:1,meanRunFiveHourPct:.02})}});
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{a:'five-hour-exhausted'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+3600000).toISOString(),skipped:{[A]:'five-hour-exhausted'}});
 });
 
 test('invalid request time fails closed without inventing an epoch retry', () => {
@@ -155,22 +158,22 @@ test('invalid request time fails closed without inventing an epoch retry', () =>
     const f = mk(); f.params.now = value;
     const r = route(f);
     assert.equal(r.kind, 'unavailable');
-    assert.deepEqual(r.skipped, {a:'quota-snapshot-stale',b:'quota-snapshot-stale'});
+    assert.deepEqual(r.skipped, {[A]:'quota-snapshot-stale',[B]:'quota-snapshot-stale'});
   }
 });
 test('future-skewed snapshot and account readings fail closed', () => {
   const f=mk(); f.snapshot.atMs=now+24*3600000;
-  assert.equal(route(f).skipped.a,'quota-snapshot-stale');
+  assert.equal(route(f).skipped[A],'quota-snapshot-stale');
   const g=mk(); g.snapshot.accounts.a.observedAtMs=now+24*3600000;
-  assert.equal(route(g).memberId,'b');
+  assert.equal(route(g).memberId,B);
   g.snapshot.accounts.b.observedAtMs=now+24*3600000;
-  assert.deepEqual(route(g).skipped,{a:'account-reading-stale',b:'account-reading-stale'});
+  assert.deepEqual(route(g).skipped,{[A]:'account-reading-stale',[B]:'account-reading-stale'});
 });
 test('aged snapshot and individual observation are rejected', () => {
   const f=mk(); f.snapshot.atMs=now-180001;
-  assert.deepEqual(route(f).skipped,{a:'quota-snapshot-stale',b:'quota-snapshot-stale'});
+  assert.deepEqual(route(f).skipped,{[A]:'quota-snapshot-stale',[B]:'quota-snapshot-stale'});
   const g=mk(); g.snapshot.accounts.a.observedAtMs=now-900001;
-  assert.equal(route(g).memberId,'b');
+  assert.equal(route(g).memberId,B);
 });
 test('retry bounds hold for missing resets, out-of-range usage and distant resets', () => {
   for (const used of [1.5, -1]) {
@@ -182,54 +185,54 @@ test('retry bounds hold for missing resets, out-of-range usage and distant reset
 });
 test('derived pace hold skips an ahead and fast member without a one-run escape', () => {
   const f=mk({accounts:{a:mkAccount({weeklyUsed:.8,weeklyPeriodStartMs:now-24*3600000,measuredRatePerHour:.1}), b:mkAccount({weeklyUsed:.1,weeklyPeriodStartMs:now-24*3600000})}});
-  assert.equal(route(f).memberId,'b');
+  assert.equal(route(f).memberId,B);
   f.params.candidates=f.params.candidates.slice(0,1);
-  assert.equal(route(f).skipped.a,'pace-held');
+  assert.equal(route(f).skipped[A],'pace-held');
 });
 test('missing member index resolves prefix using a sibling pool identity', () => {
-  const f=mk(); delete f.snapshot.memberIndex.a;
-  assert.equal(route(f).memberId,'a');
+  const f=mk(); delete f.snapshot.memberIndex[A];
+  assert.equal(route(f).memberId,A);
 });
 test('placement wins near ties while a material deficit lead wins beyond the band', () => {
   const f=mk({accounts:{a:mkAccount({measuredRatePerHour:.002,placementQ:0}),b:mkAccount({measuredRatePerHour:.002000001,placementQ:100})}});
-  assert.equal(route(f).memberId,'b');
+  assert.equal(route(f).memberId,B);
   f.snapshot.accounts.b.view.weeklyMeasuredRatePerHour=.007;
-  assert.equal(route(f).memberId,'a');
+  assert.equal(route(f).memberId,A);
 });
 
 test('five-hour binding deficit changes the selected member', () => {
   const f=mk({accounts:{a:mkAccount({fiveHourUsed:.9, fiveHourResetsAtMs:now+3600000, measuredFiveHourRatePerHour:.099})}});
-  assert.equal(route(f).memberId,'b');
+  assert.equal(route(f).memberId,B);
   f.snapshot.accounts.a.view.measuredFiveHourRatePerHour=.01;
-  assert.equal(route(f).memberId,'a');
+  assert.equal(route(f).memberId,A);
 });
 
 test('eligible accounts with out-of-range quota readings are rejected', () => {
   for (const field of ['weeklyUsed', 'fiveHourUsed']) {
     for (const used of [-.1, 1.1]) {
       const f = mk({accounts:{a:mkAccount({[field]:used})}});
-      assert.equal(route(f).memberId, 'b', `${field}=${used} must not win`);
+      assert.equal(route(f).memberId, B, `${field}=${used} must not win`);
       f.params.candidates = f.params.candidates.slice(0, 1);
-      assert.equal(route(f).skipped.a, 'account-reading-stale');
+      assert.equal(route(f).skipped[A], 'account-reading-stale');
     }
   }
 });
 
 test('five-hour pace hold retries at catch-up using configured deadband', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:.4,weeklyPeriodStartMs:now-48*3600000,weeklyResetsAtMs:now+72*3600000,fiveHourUsed:.9,fiveHourResetsAtMs:now+3600000,measuredFiveHourRatePerHour:.5})}});
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{a:'pace-held'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{[A]:'pace-held'}});
   f.config.pacing={deadband:.04};
   assert.equal(route(f).retryAt,new Date(now+18*60000).toISOString());
 });
 test('pace-held retry waits for both windows to catch up', () => {
   const f=mk({ids:['a'],accounts:{a:mkAccount({weeklyUsed:.6,weeklyPeriodStartMs:now-50*3600000,weeklyResetsAtMs:now+50*3600000,fiveHourUsed:.9,fiveHourResetsAtMs:now+3600000,measuredFiveHourRatePerHour:.5})}});
   f.config.pacing={deadband:.096};
-  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{a:'pace-held'}});
+  assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{[A]:'pace-held'}});
 });
 
 test('feed-join stale member overrides an otherwise fresh account snapshot', () => {
-  const f=mk(); f.snapshot.staleMemberIds=['a'];
-  assert.equal(route(f).memberId,'b');
+  const f=mk(); f.snapshot.staleMemberIds=[A];
+  assert.equal(route(f).memberId,B);
   f.params.candidates=f.params.candidates.slice(0,1);
-  assert.equal(route(f).skipped.a,'account-reading-stale');
+  assert.equal(route(f).skipped[A],'account-reading-stale');
 });
