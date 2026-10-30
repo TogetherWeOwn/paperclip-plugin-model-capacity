@@ -97,6 +97,7 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
       deadlineMs: 1500,
     }),
     capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+    ladder: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' })).body,
   };
 }
 
@@ -416,4 +417,19 @@ test('the published family outcomes and the gate attribute a run to the same fam
   assert.equal(cap.familyOutcomes.muse?.runs, 1, 'counted under the decision family, not "unknown"');
   assert.equal(cap.familyOutcomes.unknown, undefined);
   assert.equal(cap.eligibility.roles.doer.outcome.families.muse.judged, 1);
+});
+
+test('fallback reporting does not change routing or ladder serialization', async () => {
+  const common = { enforce: true, roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
+  const off = drive({ config: common });
+  const on = drive({ config: { ...common, roles: { ...common.roles, accountFallback: { enabled: true, minQuality: -3 } } } });
+  await off.setup(); await on.setup();
+  await off.tick(); await on.tick();
+  const a = await off.capacity(); const b = await on.capacity();
+  assert.equal('accountFallback' in a.eligibility, false);
+  assert.equal(b.eligibility.accountFallback.supported, true);
+  assert.ok(b.eligibility.accountFallback.admitted.length > 0);
+  assert.deepEqual(b.roleExclusionsEffective, a.roleExclusionsEffective);
+  assert.equal(JSON.stringify(await on.ladder()), JSON.stringify(await off.ladder()));
+  assert.deepEqual(await on.hook('f2-run', 'eng-doer'), await off.hook('f2-run', 'eng-doer'));
 });

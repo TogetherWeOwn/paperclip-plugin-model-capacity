@@ -369,6 +369,8 @@ function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
 export function buildEligibility({
   arms, records, nowMs, minQuality, outcomeGate, manual, roleOf, familyOf,
   accountGroups = [], structuralGroups = null, roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
+  accountFallback = null, accountCandidates = {}, supersededByAccount = {},
+  mode = 'off', newestVersionActive = false,
 }) {
   const quality = qualityVerdicts(arms, minQuality, { minFleetArms });
   const manualByRole = {};
@@ -550,9 +552,56 @@ export function buildEligibility({
     };
   }).sort((x, y) => (x.armId < y.armId ? -1 : x.armId > y.armId ? 1 : 0));
 
+  // Provisional only: routing continues to consume the unmodified global
+  // exclusions until the seating and finalization slices are wired.
+  const fallbackEnabled = accountFallback?.enabled === true;
+  let accountAdmissions;
+  let fallbackReport;
+  if (fallbackEnabled) {
+    const supported = mode !== 'enforce';
+    accountAdmissions = {};
+    const admitted = [];
+    if (supported) {
+      for (const role of accountFallback.roles ?? []) {
+        if (role !== 'doer' && role !== 'other') continue;
+        const entries = [];
+        if (!roles[role].suspended) {
+          for (const [accountId, candidates] of Object.entries(accountCandidates)) {
+            const superseded = new Set(supersededByAccount?.[accountId] ?? []);
+            const survivors = (candidates ?? []).filter(c => !superseded.has(c.armId));
+            if (survivors.some(c => quality[role][c.armId]?.ok === true)) continue;
+            const eligible = survivors.filter(c => {
+              const verdict = quality[role][c.armId];
+              const family = String(c.family ?? '').toLowerCase();
+              return verdict?.reason?.startsWith('min-quality:') &&
+                isFiniteNumber(verdict.q) && verdict.q >= accountFallback.minQuality &&
+                !manualByRole[role].includes(family) &&
+                !manualByRole[role].includes(armToken(c.armId)) &&
+                !finalOutcomes[role].gated.includes(family);
+            }).sort((a, b) => quality[role][b.armId].q - quality[role][a.armId].q ||
+              (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
+            if (eligible.length) {
+              const armId = eligible[0].armId;
+              const admission = { armId, q: quality[role][armId].q };
+              entries.push([accountId, admission]);
+              admitted.push({ role, accountId, ...admission });
+            }
+          }
+        }
+        accountAdmissions[role] = Object.fromEntries(entries);
+      }
+    } else {
+      warnings.push({ code: 'account-fallback-enforce-unsupported', message: 'account fallback is unavailable in task-ranking enforce mode' });
+    }
+    if (!newestVersionActive) warnings.push({ code: 'account-fallback-without-newest-version', message: 'account fallback is enabled without newest-version filtering' });
+    fallbackReport = { config: accountFallback, supported, newestVersionActive, admitted, suppressed: [] };
+  }
+
   return {
     exclusions,
+    ...(fallbackEnabled ? { accountAdmissions } : {}),
     report: {
+      ...(fallbackEnabled ? { accountFallback: fallbackReport } : {}),
       atMs: nowMs,
       minQuality,
       outcomeGate,

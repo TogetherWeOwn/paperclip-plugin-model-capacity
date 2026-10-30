@@ -306,6 +306,20 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 export const ARM_TOKEN_PREFIX = 'arm:';
 export const armToken = (armId) => `${ARM_TOKEN_PREFIX}${String(armId ?? '').toLowerCase()}`;
 
+/** Resolve the per-account relaxation without modifying global exclusions. */
+export function resolveAccountInputs(baseExclusions, admissions, roleBands, role, accountId,
+  { suppressAccountFallback = false, supersessionView = null, newestEnabled = false } = {}) {
+  const admission = admissions?.[role]?.[accountId];
+  if (suppressAccountFallback || (newestEnabled && supersessionView == null) || !admission) {
+    return { excludedFamilies: baseExclusions, fallbackAdmission: null };
+  }
+  return {
+    excludedFamilies: baseExclusions.filter(token => token !== armToken(admission.armId)),
+    fallbackAdmission: { armId: admission.armId, band: roleBands?.[role] ?? roleBands?.doer,
+      supersessionView, newestEnabled },
+  };
+}
+
 /** True when the arm's family or the arm itself is in the (normalized) exclusion set. */
 function armExcluded(arm, excludedSet) {
   if (excludedSet.size === 0) return false;

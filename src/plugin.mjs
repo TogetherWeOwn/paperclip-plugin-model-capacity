@@ -3496,6 +3496,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           .map(c => ({ ...c, rung: byArm.get(c.armId) })));
       })])),
       roleBands, trialRoles: config.trials.roles,
+      ...(config.roles.accountFallback.enabled && (mode === 'off' || config.taskRanking.mode === 'enforce') ? {
+        accountFallback: config.roles.accountFallback,
+        accountCandidates: mode === 'off' ? Object.fromEntries(ordered.map(a => [a.accountId,
+          (ladders[a.accountId]?.credentialRanking?.candidates ?? []).map(c => ({ armId: c.armId, family: c.family }))])) : {},
+        supersededByAccount: {},
+        mode: config.taskRanking.mode,
+        newestVersionActive: config.roles.newestVersionOnly.enabled,
+      } : {}),
     });
     const legacyEligibility = eligibilityForMode('off', fleetArmScores, config.roles.excludeFamilies);
     const taskEligibility = config.taskRanking.mode !== 'off'
