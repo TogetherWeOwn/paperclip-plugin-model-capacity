@@ -42,7 +42,7 @@ export function buildPoolPlan(raw, connectionRows, qualityVerdicts) {
       const member = {
         id:memberIdFor(poolKey,account.accountKey),
         binding:{mode:'shared',provider:account.provider,method:'api_key',connectionId:connection.id,grantId:connection.grantId},
-        profile:{provider:account.harnessProfile,...(account.harnessProfile === 'acpx' ? {acpxAgent:'claude'} : {}),model:`${account.prefix}/${membership.model}`},
+        profile:{provider:account.harnessProfile,...(account.harnessProfile === 'acpx' ? {acpxAgent:'claude'} : {}),model:`${account.prefix}/${membership.model}`,...(membership.effort !== undefined ? {effort:membership.effort} : {})},
       };
       validatePoolMember(member,account);
       members.push(member);

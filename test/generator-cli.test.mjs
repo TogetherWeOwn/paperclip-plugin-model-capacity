@@ -67,6 +67,31 @@ test('operator CLI defaults to dry-run: complete member JSON, selectable verdict
   assert.doesNotMatch(stdout,/BOARD_DUMMY|DUMMY_ONE|DUMMY_TWO|SECRET_PROVIDER_ECHO|sessionParamsJson/);assert.deepEqual(f.errors,[]);
 });
 
+test('CLI saves registry effort without issue overrides and detects lost or edited effort as read-only drift',async t=>{
+  const f=await fixture(t),raw=structuredClone(registry);
+  for(const account of raw.accounts)for(const membership of Object.values(account.pools))membership.effort='high';
+  await writeFile(join(f.dir,'registry.json'),JSON.stringify(raw));
+  await writeFile(join(f.dir,'quality.json'),JSON.stringify({arms:['terra','sol','claude'].map(model=>({model,armId:`${model}-high`,effort:'high',family:model,qFleet:1,qFleetThinker:1})),records:[],roles:{}}));
+  const dry=JSON.parse((await f.run()).stdout);
+  for(const pool of dry.pools)for(const member of pool.config.members)assert.equal(member.profile.effort,'high');
+  assert.deepEqual(f.api.writes,[]);
+  const apply=journal=>f.run(['--apply','--keep-disabled','--secret-refs',join(f.dir,'refs.json'),'--journal',join(f.dir,journal)]);
+  await apply('effort.jsonl');
+  assert.equal(JSON.parse((await f.run(['--check','--keep-disabled'])).stdout).ok,true);
+  for(const mutate of [m=>{delete m.profile.effort;},m=>{m.profile.effort='low';}]) {
+    mutate(f.api.pools.find(p=>p.name==='builder').members[0]);f.api.writes=[];
+    await assert.rejects(f.run(['--check','--keep-disabled']),e=>{
+      assert.equal(e.code,2);assert.ok(JSON.parse(e.stdout).drift.some(d=>d.type==='pool-drift'&&d.poolKey==='builder'));return true;
+    });
+    assert.deepEqual(f.api.writes,[]);
+    await apply(`repair-${f.requests.length}.jsonl`);
+    assert.equal(f.api.pools.find(p=>p.name==='builder').members[0].profile.effort,'high');
+  }
+  f.api.writes=[];await apply('effort-repeat.jsonl');assert.deepEqual(f.api.writes,[]);
+  assert.equal(JSON.parse((await f.run(['--check','--keep-disabled'])).stdout).ok,true);
+  assert.deepEqual(f.errors,[]);
+});
+
 test('operator --apply, idempotent rerun, R9 --check drift and --rollback use only real upstream HTTP shapes',async t=>{
   const f=await fixture(t),journal=join(f.dir,'journal.jsonl');
   await f.run(['--apply','--keep-disabled','--secret-refs',join(f.dir,'refs.json'),'--journal',journal]);

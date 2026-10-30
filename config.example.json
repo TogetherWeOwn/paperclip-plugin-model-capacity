@@ -18,9 +18,9 @@
         "harnessProfile": "codex",
         "connectionName": "cliproxy-codex-example",
         "pools": {
-          "builder": { "model": "gpt-6.1-terra", "probeEligible": true },
-          "thinker": { "model": "gpt-6.1-sol" },
-          "reviewer": { "model": "gpt-6.1-sol" }
+          "builder": { "model": "gpt-6.1-terra", "effort": "high", "probeEligible": true },
+          "thinker": { "model": "gpt-6.1-sol", "effort": "high" },
+          "reviewer": { "model": "gpt-6.1-sol", "effort": "high" }
         }
       }
     ],

@@ -383,6 +383,7 @@
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
+import { PREFIXED_PROFILE_EFFORTS } from './registry.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
 export const PLUGIN_VERSION = '0.3.0';
@@ -450,9 +451,15 @@ const CONFIG_SCHEMA = {
               feedExempt: { type: 'boolean', default: false },
               pools: { type: 'object', additionalProperties: {
                 type: 'object', additionalProperties: false, required: ['model'],
-                properties: { model: { type: 'string', minLength: 1 }, probeEligible: { type: 'boolean', default: false } },
+                properties: { model: { type: 'string', minLength: 1 }, effort: { type: 'string', enum: PREFIXED_PROFILE_EFFORTS.codex }, probeEligible: { type: 'boolean', default: false } },
               } },
             },
+            allOf: [{
+              if: { properties: { harnessProfile: { const: 'acpx' } }, required: ['harnessProfile'] },
+              then: { properties: { pools: { type: 'object', additionalProperties: {
+                type: 'object', properties: { effort: { type: 'string', enum: PREFIXED_PROFILE_EFFORTS.acpx } },
+              } } } },
+            }],
           },
         },
         pools: { type: 'array', items: {

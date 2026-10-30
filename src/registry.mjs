@@ -5,6 +5,17 @@ import { createHash } from 'node:crypto';
 
 export const PLUGIN_KEY = 'togetherweown.model-capacity';
 
+// Upstream e2cfdc7e poolMemberRuntimeConfig looks up the FULL prefixed model.
+// Those ids use codex-local/index.ts:64-110's default effort list and
+// claude-local/index.ts:26-35's fallback list, not the bare-model catalog.
+export const PREFIXED_PROFILE_EFFORTS = Object.freeze({
+  codex: Object.freeze(['minimal','low','medium','high','xhigh']),
+  acpx: Object.freeze(['low','medium','high']),
+});
+function validateProfileEffort(profile, harnessProfile) {
+  if (Object.hasOwn(profile,'effort') && !PREFIXED_PROFILE_EFFORTS[harnessProfile]?.includes(profile.effort)) throw new Error('unsupported prefixed profile effort');
+}
+
 /** Ownership predicate for upstream pool read objects. Runtime ownership is
  * checked per call; full inspection belongs to the operator --check path. */
 export function poolHasExpectedPluginKey(pool) {
@@ -15,7 +26,7 @@ export const ROUTER_CONFIG_KEYS = Object.freeze({
   pool: Object.freeze(['poolKey','role','poolId','pluginKey','expectedRevision','expectedMemberOrder','members']),
   verifiedMember: Object.freeze(['memberId','accountKey','connectionId','grantId']),
   account: Object.freeze(['accountKey','prefix','provider','protocol','harnessProfile','acpxAgent','connectionName','feedExempt','pools']),
-  membership: Object.freeze(['model','probeEligible']),
+  membership: Object.freeze(['model','effort','probeEligible']),
 });
 const DNS_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -91,6 +102,7 @@ export function normalizeRegistry(raw) {
       if (!roles.has(poolKey) || !membership || typeof membership !== 'object' || Array.isArray(membership)) throw new Error('invalid pool membership');
       const model = text(membership.model, 'model');
       if (model.includes('/') || `${a.prefix}/${model}`.length > 256) throw new Error('model must be unprefixed');
+      validateProfileEffort(membership,a.harnessProfile);
       if (Object.hasOwn(membership, 'probeEligible') && typeof membership.probeEligible !== 'boolean') throw new Error('invalid probeEligible');
       index.push([memberIdFor(poolKey,a.accountKey), {accountKey:a.accountKey,poolKey}]);
       return [poolKey, {...membership, probeEligible: membership.probeEligible ?? false}];
@@ -141,6 +153,7 @@ export function validatePoolMember(member, account) {
   if (!binding || !['shared','delegated'].includes(binding.mode) || binding.provider !== account.provider || !['api_key','subscription'].includes(binding.method) || !uuidPattern.test(binding.connectionId ?? '') || !uuidPattern.test(binding.grantId ?? '')) throw new Error('invalid pool binding');
   if (!profile || profile.provider !== account.harnessProfile || typeof profile.model !== 'string' || !profile.model.startsWith(`${account.prefix}/`) || profile.model.length <= account.prefix.length + 1 || profile.model.length > 256) throw new Error('invalid pool profile');
   if (profile.provider === 'acpx' ? profile.acpxAgent !== 'claude' : Object.hasOwn(profile, 'acpxAgent')) throw new Error('invalid harness profile');
+  validateProfileEffort(profile,account.harnessProfile);
   return member;
 }
 

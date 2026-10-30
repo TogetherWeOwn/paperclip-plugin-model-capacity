@@ -100,10 +100,34 @@ when a finite floor is configured, even if every *scored* variant passes. With
 a null floor, every known variant must still pass the other gates. Unknown or
 unscored evidence with a configured floor also fails closed. Runtime floors
 are not suspended to rescue an empty role, and neither pins nor burn bypass them.
-The current generator does not choose a saved profile effort. A finite-floor
-pool therefore needs explicit, host-supported effort in its native saved member
-profiles, followed by the ordinary operator `--check` and re-attestation sequence;
-an omitted runner default is not an activation-ready substitute.
+Set **per-membership** `router.accounts[].pools[poolKey].effort` alongside
+`model`, for example `{ "model": "gpt-6.1-terra", "effort": "high" }`. The
+generator copies this to native `member.profile.effort`; dry-run, apply and
+read-only `--check` all use that same desired profile. Do not hand-edit a saved
+profile to work around the registry. Explicit-effort generation uses only that
+effort's quality arms, not a stronger sibling. Omission remains valid for legacy
+registries/shadow, but cannot satisfy a finite runtime floor without an explicit
+host-supported issue override; no runner default is guessed.
+
+The upstream effort fold (`server/src/services/ai-connection-router.ts:58-67`,
+contract e2cfdc7e) looks up the **full prefixed model ID**. Those IDs fall back to
+`minimal|low|medium|high|xhigh` for Codex (`packages/adapters/codex-local/src/index.ts:64-110`)
+and `low|medium|high` for ACPX Claude (`packages/adapters/claude-local/src/index.ts:26-35`).
+Both config schemas and registry/member validation reject unsupported values,
+including Codex `max|ultra` and Claude `minimal|xhigh|max`; bare-model catalog
+support is not proof that a prefixed effort will fold. These are host folding
+limits, not proof that a gateway/provider supports any model/effort. Re-verify
+on each upstream upgrade. The portable upstream effort-fold fixture tests this
+boundary only; it does not replace native harness or staging proofs.
+
+Changing a saved effort changes the pool revision. Stage the pool disabled as
+required by the generator, apply the registry change, run a CLEAN `--check`, then
+repeat config test/save/confirm with the NEW revision before routing. An old
+attestation rejects that changed pool even with a fresh quota snapshot. A real
+issue effort override is still checked at its effective effort and cannot
+borrow the profile's stronger score. Fresh AA/scored-fleet **and outcome**
+evidence is an activation precondition even when all role floors are `null`:
+stale or absent policy evidence fails closed before floor evaluation.
 
 **R2 activation blocker, verified against the target upstream source:**
 `server/src/services/heartbeat/run-lifecycle.ts:1342-1406` publishes
@@ -142,6 +166,17 @@ Operator sequence (no deployment is authorized by this documentation):
    echo comes ONLY from the effective fence, never persisted config or quota state.
    It contains IDs only, not credentials. For removal, confirm no entry for that
    poolKey. Routing then uses this fence immediately, subject to a fresh quota snapshot.
+
+**M7 clean-config handoff:** only after the required seven consecutive days
+with zero hook resolutions, prepare the config with the top-level `enforce`
+field REMOVED before validating or re-POSTing it under the clean manifest.
+Retain `router.enabled`, the registry, and all verified pool fields. The clean
+schema has `additionalProperties:false` and will reject even `enforce:false`;
+worker-side tolerance is not server acceptance. Use the same config
+test/save/verified-echo sequence for the scrubbed config and confirm it again
+after the separately authorized clean install. Never re-POST an old transitional
+config unchanged at M7. This is a migration prerequisite, not a deployment step
+performed by this build.
 
 The save endpoint schema-validates but PERSISTS BEFORE notifying the worker;
 notification errors are non-fatal (`server/src/routes/plugins.ts:2402-2476`).
@@ -187,9 +222,10 @@ With no bindings (M1), all configured pools retain their synthetic evaluation.
 
 The policy-backed planner uses the existing `roles.other` floor/outcome gate for
 reviewer pools; it fails closed on unknown models and requires scored arm and
-outcome evidence. Its model-level verdict is existential over effort variants;
-**slice 4** must supply the runtime-effort floor guarantee, burn/overlay/event
-wiring and callback registration before claiming selection-policy compliance.
+outcome evidence. Its omitted-effort model verdict is existential over effort
+variants; an explicit membership effort restricts its evidence. The native callback enforces the
+effective-effort floor separately, without generation's gate suspensions.
+The R2 metadata and native staging gates above remain activation blockers.
 Projection accepts measured per-run cost inputs but defaults to zero where no
 credible per-run history exists; it never invents headroom.
 

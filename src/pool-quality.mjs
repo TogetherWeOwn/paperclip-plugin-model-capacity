@@ -4,11 +4,11 @@ import { buildEligibility, normalizeMinQuality, normalizeOutcomeGate, qualityVer
 import { roleLadderAccess, normalizeExcludedFamilies, armToken } from './decide.mjs';
 
 /**
- * Reviewer uses the legacy other role. Each saved model is represented by all
- * its known effort arms: it qualifies if any variant survives the policy.
- * This is existential, not a promise that an upstream fixed profile can select
- * that effort. Slice 4 owns the runtime-effort floor guarantee and must resolve
- * upstream effort selection before claiming that guarantee.
+ * Reviewer uses the legacy other role. An explicit membership effort restricts
+ * evidence to that effort; without it, the model qualifies if any known effort
+ * survives. The omitted case is existential, not proof of the runner's default.
+ * Runtime selection checks the host's effective effort separately and never
+ * suspends a floor or borrows evidence from another effort.
  * Gate suspension follows legacy policy, scoped to the pool; onReport receives
  * its full report, including suspensions. Unknown families are never evidence.
  */
@@ -20,7 +20,9 @@ export function computePoolQualityVerdicts(rawRegistry, { arms, roles = {}, reco
     const role = pool.role === 'reviewer' ? 'other' : pool.role;
     const candidates = registry.accounts.filter(a => a.pools[pool.poolKey]).map(account => ({
       account,
-      matching: arms.filter(a => a?.model === account.pools[pool.poolKey].model && typeof a.family === 'string' && a.family && a.family.toLowerCase() !== 'unknown'),
+      matching: arms.filter(a => a?.model === account.pools[pool.poolKey].model
+        && (account.pools[pool.poolKey].effort === undefined || a.effort === account.pools[pool.poolKey].effort)
+        && typeof a.family === 'string' && a.family && a.family.toLowerCase() !== 'unknown'),
     }));
     const poolArms = [...new Set(candidates.flatMap(c => c.matching))];
     // All efforts represent the same fixed model; trial gating and rung bands

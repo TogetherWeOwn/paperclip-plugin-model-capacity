@@ -30,7 +30,7 @@ export function syntheticRouterRequest(registry,poolKey,nowMs) {
   const members=registry.accounts.filter(a=>a.pools[poolKey]).map(a=>({
     id:memberIdFor(poolKey,a.accountKey),
     binding:{mode:'shared',provider:a.provider,method:'api_key',connectionId:memberIdFor('shadow-connection',a.accountKey),grantId:memberIdFor('shadow-grant',a.accountKey)},
-    profile:{provider:a.harnessProfile,...(a.harnessProfile==='acpx'?{acpxAgent:'claude'}:{}),model:`${a.prefix}/${a.pools[poolKey].model}`},
+    profile:{provider:a.harnessProfile,...(a.harnessProfile==='acpx'?{acpxAgent:'claude'}:{}),model:`${a.prefix}/${a.pools[poolKey].model}`,...(a.pools[poolKey].effort !== undefined ? {effort:a.pools[poolKey].effort} : {})},
   }));
   return {companyId:registry.companyId,agentId:memberIdFor('shadow-agent',poolKey),
     pool:{id:memberIdFor('shadow-pool',poolKey),companyId:registry.companyId,pluginKey:PLUGIN_KEY,revision:1,name:poolKey,enabled:true,mode:'round_robin',thresholdPercent:90,members},
