@@ -912,7 +912,9 @@ function windowStartMs(resetsAtMs) {
 // read against the public placeholder pin with a fake http client. The
 // worker entry never passes it, so every deployed plugin refuses to read
 // the lane key unless the build pinned a real host.
-export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map() } = {}) {
+// onReviewerAdmission is an optional test observer for the two admission consumers;
+// the worker does not supply it, so it cannot affect deployed routing.
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map(), onReviewerAdmission = null } = {}) {
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -1975,11 +1977,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // and must not exclude a sibling effort of the approved model.
           const legacyArmIds = config.armMap.filter(b => canonicalModelName(b.model) === canon
             && b.effort === approved.effort).map(b => b.aaSlug);
-          return [{ armId: taskArmId(canon, approved.effort ?? 'default'), model, effort: approved.effort, legacyArmIds,
+          const policyArm = { armId: taskArmId(canon, approved.effort ?? 'default'), model, effort: approved.effort, legacyArmIds,
             family: inferFamily(canon), aaSlug: measured?.aaSlug ?? null, credentialEvidence: credentialEvidenceFor(account, canon),
             contextWindow: measured?.contextWindow ?? null, cap: measured?.cap ?? tierCaps[tierModelKey(canon)] ?? null,
             evidenceTrust: 'policy-trusted-incumbent', benchmarkTrusted: measured?.benchmarkTrusted === true,
-          }];
+          };
+          if (viewsByAccount && isSupersededArm(viewsByAccount.get(key), policyArm)) {
+            const log = ctx.logger?.warn ?? ctx.logger?.info;
+            log?.call(ctx.logger, 'model-capacity: newest-version-policy-arm-superseded', { accountId: key, armId: policyArm.armId });
+            return [];
+          }
+          return [policyArm];
         });
         ladders[key].policyReviewerArms = policyArms;
         for (const incumbent of policyArms) {
@@ -4366,7 +4374,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const reviewerLive = liveViews.get(companyId);
     const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
     const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
-      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs));
+      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs, 'capacity'));
     // Use the real routing admission, not the configured default model's pool.
     // An empty list is meaningful: no helper may grant new review slots.
     const reviewerAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
@@ -5182,7 +5190,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * breaker (open and half-open probes route nothing here). Returns true or
    * a refusal string; `match` is the ladder arm used for attribution.
    */
-  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock() } = {}) {
+  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock(), supersessionView = null } = {}) {
     const canon = String(canonicalModelName(arm.model) ?? '').toLowerCase();
     if (!canon) return { ok: 'model unmappable' };
     const sameModel = (m) => String(canonicalModelName(m) ?? '').toLowerCase() === canon;
@@ -5191,6 +5199,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     if (matches.length === 0 && !listed) return { ok: `${arm.model} not served` };
     const effort = arm.effort != null ? String(arm.effort).toLowerCase() : null;
     const match = matches.find((x) => effort != null && String(x.effort ?? '').toLowerCase() === effort) ?? matches[0] ?? null;
+    if (supersessionView) {
+      const requested = matches.find(x => effort != null
+        ? String(x.effort ?? '').toLowerCase() === effort : x.effort == null)
+        ?? { model: canon, effort, armId: effort != null ? taskArmId(canon, effort) : undefined, legacyArmIds: arm.legacyArmIds ?? [] };
+      if (isSupersededArm(supersessionView, requested)) {
+        const identity = supersessionView.identities?.[canon];
+        const newer = supersessionView.byProduct?.[identity?.product]?.membersAtMax ?? [];
+        return { ok: `superseded-version: ${canon} superseded by ${newer.join(', ')} on this account` };
+      }
+    }
     // Admission belongs to the selected arm, not a sibling effort of the model.
     if (readyArms != null && (!match || !readyArms.some((x) => x != null
       && x.armId === match.armId && sameModel(x.model)))) {
@@ -5221,11 +5239,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (Array.isArray(g?.arms)) out.push(...g.arms);
       else if (g && typeof g === 'object' && g.model != null) out.push(g);
     }
-    return out;
+    return a?.newestVersion ? out.filter(arm => !isSupersededArm(a.newestVersion, arm)) : out;
   }
 
   /** One admission policy for routed reviewer capacity, preview and hook. */
-  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock()) {
+  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock(), consumer = 'route') {
     const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
     const roleExcluded = normalizeExcludedFamilies((live.taskRanking?.mode === 'enforce'
       ? live.reviewerPolicyExclusions?.[role] : live.excludeFamilies?.[role]) ?? []);
@@ -5238,13 +5256,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Even with readiness off, require the policy record: its construction
       // enforces the model identity and emitted-servability fences.
       const policy = a.policyReviewerArms ?? [];
-      return reviewerArmCheck(a, arm, {
+      const options = {
         ladderArms: taskEnforce ? policy : liveLadderArms(a),
         readyArms: taskEnforce
           ? policy.filter(c => !readiness || credentialReadiness(c.credentialEvidence, nowMs).eligible)
           : readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
-        roleExcluded, bstore, bcfg, nowMs,
-      });
+        roleExcluded, bstore, bcfg, nowMs, supersessionView: a.newestVersion ?? null,
+      };
+      const result = reviewerArmCheck(a, arm, options);
+      onReviewerAdmission?.({ consumer, accountId: a.accountId, arm, result, ladderArms: options.ladderArms, readyArms: options.readyArms });
+      return result;
     };
   }
 
@@ -5335,8 +5356,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * one. Every other model (or an unknown default) returns null: the caller
    * keeps, exactly as before.
    */
+  function defaultSupersededEverywhere(params, live) {
+    const canon = String(canonicalModelName(params?.agentDefaultModel) ?? '').toLowerCase();
+    if (!canon) return false;
+    const serving = (live?.accounts ?? []).filter(a => (a.models ?? []).some(m => String(canonicalModelName(m) ?? '').toLowerCase() === canon));
+    return serving.length > 0 && serving.every(a => isSupersededArm(a.newestVersion, { model: canon }));
+  }
+
   function keptCapsAnswer(params, live, why) {
     const model = params?.agentDefaultModel;
+    if (defaultSupersededEverywhere(params, live)) return null;
     if (typeof model !== 'string' || model.trim().length === 0) return null;
     const match = liveArmForModel(live, model);
     const family = match?.family ?? inferFamily(canonicalModelName(model));
@@ -5578,6 +5607,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const defModel = params?.agentDefaultModel;
     if (typeof defModel === 'string' && defModel.trim().length > 0) {
       const canon = String(canonicalModelName(defModel) ?? '').toLowerCase();
+      if (defaultSupersededEverywhere(params, live)) {
+        skips.push('default model superseded-version');
+        return fail();
+      }
       let serving = null;
       let heldOnly = false;
       if (canon) {
@@ -5589,7 +5622,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (a.health === 'healthy' && a.action === 'excluded') continue;
           const hasDefault = liveLadderArms(a).some((x) => x != null
             && String(canonicalModelName(x.model) ?? '').toLowerCase() === canon);
-          if (!hasDefault) continue;
+          if (!hasDefault) {
+            if (isSupersededArm(a.newestVersion, { model: canon })) skips.push('default model superseded-version');
+            continue;
+          }
           // Reserve quota is for review runs: a non-review keep must not
           // spend a held account, even at exhaustion.
           if (heldIds.has(accountId)) { heldOnly = true; continue; }
@@ -6492,6 +6528,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // told before: it is no longer waiting, so the pace guard counts it.
       // A routed run proves the lane servable: the exhaustion streak resets.
       const keep = () => {
+        if (live?.enforce === true && enforceCompanies.has(params?.companyId)
+          && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)
+          && defaultSupersededEverywhere(params, live)) {
+          return { kind: 'defer', retryAfterMs: 20000, reason: 'default model superseded-version' };
+        }
         clearDeferred(params?.companyId, params?.runId);
         if (exhaustionEnabledFor(params?.companyId)) clearExhaustionStreak(params.companyId, params);
         return { kind: 'keep' };
@@ -6589,6 +6630,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             countTowardExhaustion: false,
           });
         }
+        if (defaultSupersededEverywhere(params, live)) {
+          return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'default model superseded-version' }, { countTowardExhaustion: false });
+        }
         await recordKeptDecision(params.companyId, live, params.runId, params.agentId);
         if (!enforceCompanies.has(params.companyId)) return keep();
         if (!liveIsCurrent(params.companyId, live)) return invalidatedDefer(params, live);
@@ -6617,6 +6661,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'free-lane evidence snapshot stale or invalid' }, {
             countTowardExhaustion: false,
           });
+        }
+        if (defaultSupersededEverywhere(params, live)) {
+          return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'default model superseded-version' }, { countTowardExhaustion: false });
         }
         const staleAns = keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' };
         // Either answer executes the run, ending the chain: the streak
