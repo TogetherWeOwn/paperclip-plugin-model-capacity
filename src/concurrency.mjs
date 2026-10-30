@@ -599,24 +599,34 @@ function allocateMultiPoolReviewers(input) {
       if (!hardHeld.has(a.accountId)) rawPacedLeft.set(pool, (rawPacedLeft.get(pool) ?? 0) + n);
     }
   }
+  // Held non-exempt lanes contribute no spendable physical slots, but their
+  // fixed running floors still occupy the pool's total in-flight budget.
+  const heldFixedRunning = new Map();
+  for (const row of fixed.kept) {
+    const id = keptByAgent[row.agentId]?.accountId;
+    if (!hardHeld.has(id) || exemptions.has(id)) continue;
+    const pool = accountPool.get(id);
+    heldFixedRunning.set(pool, (heldFixedRunning.get(pool) ?? 0) + row.running);
+  }
   for (const [pool, n] of pacedLeft) {
     const rawCap = paced.get(pool)?.cap;
+    const heldRunning = heldFixedRunning.get(pool) ?? 0;
     // Restored allowance can only fund a suspended account for its own role.
     // Unheld accounts still share the raw cap, even when another role's
     // exception increases the total pool budget.
     const rawSlots = rawPacedLeft.get(pool) ?? 0;
-    rawPacedLeft.set(pool, Number.isFinite(rawCap) ? Math.max(0, Math.min(rawSlots, rawCap)) : rawSlots);
+    rawPacedLeft.set(pool, Number.isFinite(rawCap) ? Math.max(0, Math.min(rawSlots, rawCap - heldRunning)) : rawSlots);
     const localCaps = Object.entries(reviewerPaceByAgent ?? {}).flatMap(([id, verdict]) => {
       if (![...(exemptByAgent.get(id) ?? [])].some(account => accountPool.get(account) === pool)) return [];
       const caps = (verdict.pools ?? []).filter(p => p.pool === pool).map(p => p.cap);
       if (!agentPacedLeft.has(id)) agentPacedLeft.set(id, new Map());
-      agentPacedLeft.get(id).set(pool, caps.some(c => !Number.isFinite(c)) ? Infinity : Math.max(0, ...caps));
+      agentPacedLeft.get(id).set(pool, caps.some(c => !Number.isFinite(c)) ? Infinity : Math.max(0, Math.max(...caps) - heldRunning));
       return caps;
     });
     const cap = localCaps.length > 0
       ? (localCaps.some(c => !Number.isFinite(c)) || !Number.isFinite(rawCap) ? null : Math.max(rawCap, ...localCaps))
       : rawCap;
-    const bounded = Number.isFinite(cap) ? Math.max(0, Math.min(n, cap)) : n;
+    const bounded = Number.isFinite(cap) ? Math.max(0, Math.min(n, cap - heldRunning)) : n;
     poolLeft.set(pool, Math.max(0, Math.floor((poolLeft.get(pool) ?? 0) - n + bounded)));
     pacedLeft.set(pool, bounded);
   }
@@ -627,6 +637,8 @@ function allocateMultiPoolReviewers(input) {
   // charge (they are ordinary shared capacity); held non-exempt ones cannot.
   for (const row of fixed.kept) {
     const servingId = keptByAgent[row.agentId]?.accountId;
+    // Its running floor was charged to finite caps above, not to a mate's
+    // physical slots: a held lane has none in accountLeft to reserve again.
     if (hardHeld.has(servingId) && !exemptions.has(servingId)) continue;
     const pool = accountPool.get(servingId);
     poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - row.allocated));

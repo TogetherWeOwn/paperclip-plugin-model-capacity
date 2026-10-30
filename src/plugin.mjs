@@ -4177,6 +4177,27 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
     };
+    const tickReviewerView = () => {
+      const pressure = freshPressure();
+      return { atMs: nowMs, taskRanking: config.taskRanking,
+        reviewerRouting: config.reviewerRouting, burnModeTokens: config.burnModeTokens,
+        maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
+        maxTrialInFlightPerAccountByProvider: config.trials.maxInFlightPerAccountByProvider,
+        trialBudget: freshTrialBudget(), trialRoles: config.trials.roles, trialAdapters: config.trials.adapters,
+        adapterByAgent: Object.fromEntries([...agentAdapterCache].filter(([k, v]) => k.startsWith(`${companyId}:`)
+          && nowMs - v.atMs <= ADAPTER_TTL_MS).map(([k, v]) => [k.slice(companyId.length + 1), v])),
+        thinkerAgentIds: config.roles.thinkerAgentIds, doerAgentIds: config.roles.doerAgentIds,
+        reviewerPolicyExclusions: config.roles.excludeFamilies, excludeFamilies: roleExclusions,
+        roleBands, contextCaps: config.contextCaps,
+        decidedRunIds: new Set([...ledger.values()].filter(r => r.decidedAccount).map(r => r.runId)),
+        accounts: accountViews.map(v => ({ ...v, laneProvider: v.provider, provider: v.pool ?? v.provider,
+          burn: v.burnMode === true, inFlight: pressure.byAccount[v.accountId] ?? 0,
+          credentialRanking: ladders[v.accountId]?.credentialRanking,
+          policyReviewerArms: ladders[v.accountId]?.policyReviewerArms,
+          taskRankingMode: config.taskRanking.mode,
+        })),
+      };
+    };
     // opts.forReview: review runs see the unheld order (the reserve holds
     // quota FOR them). opts.applyReserve false keeps the pace-guard pools
     // report complete (held pools are not candidates, but they are still
@@ -4193,20 +4214,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             inputs.fallbackAdmission), breakers, v.accountId, nowMs, breakersCfg));
       };
       const universalPools = opts.universalPools === true;
-      // Policy records count only under enforce, with the same readiness and
-      // closed-breaker gates as routed admission. A reviewer's local pool uses
-      // its own exclusion fence; the shared raw pool accepts any spendable role,
-      // but never a lane excluded by every role.
-      const policyArmIn = (v, roleExcluded) => config.taskRanking.mode === 'enforce'
-        && policyArmQualifies(ladders[v.accountId]?.policyReviewerArms, v.accountId,
-          breakers, breakersCfg, nowMs, config.credentialReadiness.enforce, roleExcluded);
-      const hasReadyPolicyArm = v => policyArmIn(v, config.roles.excludeFamilies?.[role] ?? []);
-      const hasUniversalPolicyArm = v => ['doer', 'thinker', 'other']
-        .some(spendRole => policyArmIn(v, config.roles.excludeFamilies?.[spendRole] ?? []));
+      const policyReview = opts.forReview === true && configuredTaskReviewer(config, opts.run?.agentId);
+      // Pool membership and empty-role safety use actual per-reviewer
+      // admission, including trial/price gates, not a weaker policy-record test.
+      const reviewLive = config.taskRanking.mode === 'enforce' ? tickReviewerView() : null;
+      const reviewAccounts = new Map((reviewLive?.accounts ?? []).map(a => [a.accountId, a]));
+      const admissionByAgent = new Map((reviewLive?.reviewerRouting?.agentIds ?? []).map(agentId => [agentId,
+        reviewerArmAdmission(reviewLive, companyId, agentId, nowMs,
+          { selfId: selfRunId, adapterType: agentId === opts.run?.agentId ? opts.run?.adapterType : null, consumer: 'pacing' })]));
+      const policyArmIn = (v, agentId) => {
+        const a = reviewAccounts.get(v.accountId), admit = admissionByAgent.get(agentId);
+        return a != null && admit != null && config.reviewerRouting.arms.some(arm =>
+          arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true);
+      };
+      const hasReadyPolicyArm = v => policyArmIn(v, opts.run?.agentId);
+      const hasUniversalPolicyArm = v => [...admissionByAgent.keys()].some(agentId => policyArmIn(v, agentId));
       return orderAccountsWithPacing(
-        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
-          || (opts.forReview === true && hasReadyPolicyArm(v))
-          || (universalPools && hasUniversalPolicyArm(v)))).map(v => ({
+        accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (policyReview
+          ? hasReadyPolicyArm(v)
+          : routesRun(v, true) || (universalPools && hasUniversalPolicyArm(v)))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
@@ -4236,10 +4262,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           duplicates,
-          held: !duplicates && !routesRun(v, false),
+          held: !policyReview && !duplicates && !routesRun(v, false),
           placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates, opts.taskMode, suppress),
           freeCost: v.freeCost === true,
           ...tickTaskPreview(v, role, duplicates, opts),
+          // Configured reviewers use policy admission, not the ordinary task
+          // ladder, for structural empty-role safety. The filter proved it.
+          ...(policyReview ? { roleEligible: true, taskFeasible: v.reactive === true
+            ? (byAccount[v.accountId] ?? 0) < trialInflightCapFor(config.trials, v.provider)
+            : v.remainingPct != null } : {}),
           planAhead: v.planAhead,
           ...(v.burnMode === true ? { burn: true } : {}),
           ...(v.burnMode === true && v.burnFloor != null ? { burnFirst: true } : {}),
@@ -4302,21 +4333,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     for (const run of candidates) {
       if (config.taskRanking.mode === 'enforce' && config.reviewerRouting?.agentIds.includes(run.agentId)) {
-        const pressure = freshPressure();
-        const reviewLive = { atMs: nowMs, taskRanking: config.taskRanking,
-          reviewerRouting: config.reviewerRouting, burnModeTokens: config.burnModeTokens,
-          maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
-          maxTrialInFlightPerAccountByProvider: config.trials.maxInFlightPerAccountByProvider,
-          thinkerAgentIds: config.roles.thinkerAgentIds, doerAgentIds: config.roles.doerAgentIds,
-          reviewerPolicyExclusions: config.roles.excludeFamilies, excludeFamilies: roleExclusions,
-          roleBands, contextCaps: config.contextCaps, decidedRunIds: new Set([...ledger.values()].filter(r => r.decidedAccount).map(r => r.runId)),
-          accounts: accountViews.map(v => ({ ...v, laneProvider: v.provider, provider: v.pool ?? v.provider,
-            burn: v.burnMode === true, inFlight: pressure.byAccount[v.accountId] ?? 0,
-            credentialRanking: ladders[v.accountId]?.credentialRanking,
-            policyReviewerArms: ladders[v.accountId]?.policyReviewerArms,
-            taskRankingMode: config.taskRanking.mode,
-          })),
-        };
+        const reviewLive = tickReviewerView();
         const paced = allocationOrder(roleOf(config, run.agentId), run.runId, true, { forReview: true, run }).paced;
         const held = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
         const d = recordReviewerShadow(ledger, reviewLive, companyId, run,
@@ -4733,7 +4750,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const reviewerPaceByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
       const role = roleOf({ roles: { thinkerAgentIds: reviewerLive.thinkerAgentIds, doerAgentIds: reviewerLive.doerAgentIds } }, agentId);
       const verdict = allocationOrderFromLive(reviewerLive, companyId, null, role,
-        normalizeExcludedFamilies(reviewerLive.excludeFamilies?.[role] ?? []), true, true);
+        normalizeExcludedFamilies(reviewerLive.excludeFamilies?.[role] ?? []), true, true, { agentId });
       const admitted = new Set(reviewerAccountIdsByAgent[agentId]);
       return [agentId, { holdSuspendedAccountIds: verdict.holdSuspendedAccountIds.filter(id => admitted.has(id)),
         pools: verdict.pools }];
@@ -4779,7 +4796,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (rcfg && liveNow && rcfg.agentIds.length > 0) {
         const reviewRole = roleOf(config, rcfg.agentIds[0]);
         const paced = allocationOrderFromLive(liveNow, companyId, null, reviewRole,
-          normalizeExcludedFamilies(liveNow.excludeFamilies?.[reviewRole] ?? []), true, true).paced;
+          normalizeExcludedFamilies(liveNow.excludeFamilies?.[reviewRole] ?? []), true, true, { agentId: rcfg.agentIds[0] }).paced;
         const pacedIds = config.taskRanking.mode === 'enforce' ? new Set(paced.flatMap(p => p.pacedAccountIds ?? [])) : null;
         const { pick, admissionOf } = pickReviewerRoute(liveNow, companyId, rcfg.agentIds[0], null, nowMs, pacedIds);
         preview = pick.none
@@ -5473,35 +5490,33 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const routesRun = (a, dups) => filterBreakerRungs(routableGroupsFor(a, dups, nowMs,
       credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg),
       accountInputs(a).fallbackAdmission), bstore, a.accountId, nowMs, bcfg);
-    // A policy record is not an admission here either: the live pool must
-    // apply the same readiness, breaker and role-exclusion gate as the tick,
-    // or an unready, breaker-open or excluded sibling reopens the reviewer
-    // pool and admits a second run. The exclusion fence is the one
-    // reviewerArmAdmission reads for this mode: the operator's manual policy
-    // list while task ranking enforces, the legacy list otherwise. The
-    // derived eligibility tokens are not a membership fence -- they encode
-    // measurement gates that routed admission never applies to policy arms.
-    const policyFence = (live.taskRanking?.mode === 'enforce'
-      ? live.reviewerPolicyExclusions?.[role] : live.excludeFamilies?.[role]) ?? [];
-    const hasPolicyArm = a => policyArmQualifies(a.policyReviewerArms, a.accountId, bstore, bcfg, nowMs,
-      credentialReadinessEnforced(companyId), policyFence);
+    // Reserve privilege alone does not select a different agent's policy.
+    // Configured reviewers share the exact admission used by their route,
+    // including current-price and per-run trial gates for unscored arms.
+    const policyReview = forReview && configuredTaskReviewer(live, run.agentId);
+    const admitPolicy = policyReview ? reviewerArmAdmission(live, companyId, run.agentId, nowMs,
+      { selfId: excludeRunId, adapterType: run.adapterType ?? null, consumer: 'pacing' }) : null;
+    const hasPolicyArm = a => live.reviewerRouting.arms.some(arm =>
+      arm.provider === String(a.pool ?? a.provider).toLowerCase() && admitPolicy(a, arm).ok === true);
     return orderAccountsWithPacing(
-      (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (rungsHaveEligibleArms(routesRun(a, true))
-        || (forReview && live.taskRanking?.mode === 'enforce' && hasPolicyArm(a)))).map(a => {
+      (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (policyReview
+        ? hasPolicyArm(a) : rungsHaveEligibleArms(routesRun(a, true)))).map(a => {
         const p = poolOf(a.accountId);
         const ladderRungs = routesRun(a, duplicates);
         const preview = live.taskRanking?.mode === 'enforce' ? decide({ ...inputsFor(a), ladderRungs }) : null;
-        const taskView = preview ? taskPlacement(preview, ladderRungs) : {};
+        // Membership above is the configured reviewer's structural admission;
+        // an empty ordinary task ladder must not hide its safety exception.
+        const taskView = policyReview ? { taskFeasible: true } : preview ? taskPlacement(preview, ladderRungs) : {};
         if (preview && ((!a.reactive && !a.remainingKnown)
           || (a.reactive && (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0) >= liveTrialInflightCapFor(live, a)))) taskView.taskFeasible = false;
         return {
           ...a,
           ladderRungs,
-          roleEligible: roleLadderAccess(ladderRungs, {
+          roleEligible: policyReview || roleLadderAccess(ladderRungs, {
             role, roleBands: live.roleBands, excludedFamilies: accountInputs(a).excludedFamilies,
             trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
           }).eligible,
-          held: !duplicates && !rungsHaveEligibleArms(ladderRungs),
+          held: !policyReview && !duplicates && !rungsHaveEligibleArms(ladderRungs),
           targetShare: a.targetShare ?? null,
           inFlight: (live.inFlightByPool?.[p] ?? 0) + (poolPending[p] ?? 0),
           paceInFlight: pacePools[p] ?? 0,
@@ -5648,35 +5663,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       else if (g && typeof g === 'object' && g.model != null) out.push(g);
     }
     return a?.newestVersion ? out.filter(arm => !isSupersededArm(a.newestVersion, arm)) : out;
-  }
-
-  /**
-   * One membership predicate for configured policy reviewer arms, shared by
-   * the tick's raw pools and the hook's live pools. A policy record is an
-   * admission only when its own arm reads exactly what reviewerArmCheck
-   * demands of a routed pick: a mappable, served model that survives the
-   * role's exclusions, credentials eligible (when readiness is enforced) and
-   * the arm's breaker closed. Presence alone must never qualify a lane, or a
-   * sibling that cannot run erases a qualified soft cap and reopens the pool
-   * fail-open. Servability is structural: policy records only exist for
-   * models the account serves (see the ladder construction), so the checks
-   * here are the ones that can vary per tick.
-   */
-  function policyArmQualifies(arms, accountId, store, cfg, nowMs, enforce, roleExcluded = []) {
-    const breakerGated = cfg?.enabled !== false;
-    const excluded = new Set(normalizeExcludedFamilies(roleExcluded));
-    return (arms ?? []).some((c) => {
-      const canon = String(canonicalModelName(c.model) ?? '').toLowerCase();
-      if (!canon) return false;
-      const fam = inferFamily(canon);
-      if (fam && excluded.has(fam)) return false;
-      if (excluded.has(armToken(canon)) || excluded.has(String(c.family ?? '').toLowerCase())
-        || excluded.has(armToken(c.armId))
-        || (c.aaSlug && excluded.has(armToken(c.aaSlug)))
-        || (c.legacyArmIds ?? []).some(id => excluded.has(armToken(id)))) return false;
-      if (enforce && !credentialReadiness(c.credentialEvidence, nowMs).eligible) return false;
-      return !breakerGated || breakerState(store, accountId, c?.armId, nowMs, cfg) === 'closed';
-    });
   }
 
   /** One admission policy for routed reviewer capacity, preview and hook. */
@@ -6249,7 +6235,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, params.agentId);
     const paced = live.paceGuard?.enabled === true
       ? (allocationOrderFromLive(live, companyId, selfId, role,
-        normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true).paced ?? [])
+        normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true, params).paced ?? [])
       : [];
     const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
     const { pick, admissionOf, capHeld } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds, params.adapterType);

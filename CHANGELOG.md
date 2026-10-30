@@ -7,7 +7,8 @@
 
 ### Fixed
 - Require a mappable, credential-ready (while enforced), closed-breaker reviewer policy arm before counting it as pool membership. A reviewer-local pool applies its own role exclusions; universal raw membership requires survival of at least one of the doer, thinker or other fences, so neither one role's exclusion nor an arm excluded by every role can corrupt a shared cap. Shadow-mode policy diagnostics never size enforced capacity.
-- Keep fixed reservations off a hold-suspended pool mate's reviewer-local allowance, preserving the reviewer's feasible slot across account orders and both allocator modes. Running work on a held non-exempt lane retains its floor without charging that restored allowance.
+- Keep fixed reservations off a hold-suspended pool mate's reviewer-local allowance, preserving the reviewer's feasible slot across account orders and both allocator modes. Running work on a held non-exempt lane retains its floor and consumes shared total-in-flight budgets without spending a mate's restored physical slots.
+- Evaluate routed-reviewer empty-role safety against actual per-reviewer admission, including current-price and trial gates, not ordinary task ladders or unconfigured alternatives. A sole ready policy-only reviewer retains one ordinarily paced slot without releasing its global hold or granting another pinned role capacity. Reserve-only agents retain ordinary routing unless explicitly listed in that reviewer policy.
 
 ## 0.2.75
 ### Added
