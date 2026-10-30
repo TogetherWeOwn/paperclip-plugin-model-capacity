@@ -110,15 +110,20 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     try {agents=await listAgents(companyId);if(!Array.isArray(agents))throw new Error();} catch {return failure(companyId,'pool-bindings-unavailable');}
     const boundIds=new Set(agents.filter(a=>a?.runtimeConfig?.aiConnection?.mode==='router').map(a=>a.runtimeConfig.aiConnection.connectionId));
     const boundKeys=new Set(pools.filter(p=>boundIds.has(p.id)).map(p=>p.name));
+    // Without an inspected pool ID -> key mapping we cannot prove which
+    // configured pools are unbound. Omit synthetic evidence conservatively
+    // instead of double-counting a live pool as a shadow-only selection.
+    const shadowSuppressedReason=[...boundIds].some(id=>!pools.some(p=>p.id===id))?'pool-bindings-unmapped':null;
+    if(shadowSuppressedReason)report(companyId,shadowSuppressedReason);
     const atMs=built.snapshot.atMs,shadow=[];
     for(const {poolKey} of registry.pools) {
-      if(boundKeys.has(poolKey))continue;
+      if(shadowSuppressedReason || boundKeys.has(poolKey))continue;
       const params=syntheticRouterRequest(registry,poolKey,atMs);
       const decision=routeDecision(params,shadowSnapshot,{...config,router:{...config.router,enabled:true}});
       shadow.push({poolKey,wouldSelect:decision.kind==='selected'?shadowSnapshot.memberIndex[decision.memberId].accountKey:decision.kind,atMs,decision});
     }
     const shadowHistory=[...(previous?.shadow??[]),...shadow].slice(-SHADOW_CAP);
-    const envelope={...built,shadow:shadowHistory,currentShadow:shadow,inspection};
+    const envelope={...built,shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
     try {
       if(!await publisher.publish(companyId,envelope,{isCurrent}))return {status:'superseded'};
     } catch {return failure(companyId,'quota-state-failed');}
@@ -129,7 +134,7 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     get:publisher.get,
     status(companyId) {
       const e=publisher.envelope(companyId);
-      return {snapshotAtMs:e?.snapshot?.atMs??null,inspection:e?.inspection??'pending',lastFailure:lastFailure.get(companyId)??null,shadow:e?.currentShadow??[],unavailablePoolKeys:e?.snapshot?.unavailablePoolKeys??[]};
+      return {snapshotAtMs:e?.snapshot?.atMs??null,inspection:e?.inspection??'pending',lastFailure:lastFailure.get(companyId)??null,shadow:e?.currentShadow??[],shadowSuppressedReason:e?.shadowSuppressedReason??null,unavailablePoolKeys:e?.snapshot?.unavailablePoolKeys??[]};
     },
     failure,
     refresh(companyId,config,input) {

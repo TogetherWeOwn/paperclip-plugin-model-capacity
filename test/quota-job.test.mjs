@@ -97,6 +97,23 @@ test('M1 quota-only shadow still rejects missing feed members and unusable crede
   assert.equal(reasons.includes('unmapped-member'),false,'remove only deployment poisoning, not quota gates');
 });
 
+test('worker suppresses synthetic shadow when a live router binding cannot be mapped without inspection',async t=>{
+  const s=await start(t,{configure:false,withInspector:false,withPools:false});
+  s.context.agents.list=async()=>[{runtimeConfig:{aiConnection:{mode:'router',connectionId:'40000000-0000-4000-8000-000000009999'}}}];
+  await s.plugin.onConfigChanged(s.cfg,{companyId});await s.tick();
+  const native=(await s.capacity()).body.nativeRouter;
+  assert.deepEqual(native.shadow,[],'an unknown live pool must not be assumed unbound');
+  assert.equal(native.shadowSuppressedReason,'pool-bindings-unmapped');
+  assert.equal(native.snapshotAtMs,NOW,'binding ambiguity must not prevent fresh quota publication');
+  assert.deepEqual(native.unavailablePoolKeys,['builder','thinker']);
+  s.setNow(NOW+MINUTE);s.setBody(quotaFeed(NOW+MINUTE));await s.tick();
+  assert.equal(s.logs.filter(l=>l.details?.reason==='pool-bindings-unmapped').length,1,'suppression warning is rate limited');
+  s.context.agents.list=async()=>[];
+  s.setNow(NOW+2*MINUTE);s.setBody(quotaFeed(NOW+2*MINUTE));await s.tick();
+  const recovered=(await s.capacity()).body.nativeRouter;
+  assert.equal(recovered.shadow.length,2);assert.equal(recovered.shadowSuppressedReason,null);
+});
+
 test('first router config launches an async immediate refresh without waiting for HTTP or readiness',async t=>{
   const s=await start(t,{configure:false});let release;s.blockOn(new Promise(r=>{release=r;}));
   await s.plugin.onConfigChanged(s.cfg,{companyId});

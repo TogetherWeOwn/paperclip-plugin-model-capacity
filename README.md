@@ -54,8 +54,13 @@ inspector. Quota freshness, missing feed members, and credential evidence still
 apply. The published real-routing snapshot retains every inspection/drift gate;
 shadow never authorizes a run or changes the real master switch. Both the
 snapshot and bounded shadow records commit in the same persist-before-publish
-envelope exposed through `/capacity.nativeRouter`. Bound pools are excluded
-from synthetic shadow when their native identity can be inspected.
+envelope exposed through `/capacity.nativeRouter`. Known bound pools are excluded
+from synthetic shadow. If any live router binding cannot be mapped to an
+inspected pool ID, the job conservatively suppresses **all** synthetic records
+for that tick, publishes `shadowSuppressedReason: "pool-bindings-unmapped"`, and
+emits a rate-limited warning. It does not guess pool names from UUIDs or claim
+those missing records as M1 shadow evidence; quota publication still proceeds.
+With no bindings (M1), all configured pools retain their synthetic evaluation.
 
 The policy-backed planner uses the existing `roles.other` floor/outcome gate for
 reviewer pools; it fails closed on unknown models and requires scored arm and
