@@ -1751,6 +1751,27 @@ rollback restoration), reset-session and wake. Bodyless connection DELETE is
 also checked. The CLI test server rejects unverified mutation routes. Run `npm ci --ignore-scripts --legacy-peer-deps` then
 `npm test`; the runtime CLI has no Zod dependency. Per amendment A1, runtime quota
 job enforcement / U14 remains slice 3 and runtime effort-floor enforcement remains
-slice 4. The spec's U15 lane-job and U16 scorecard tests are not generator tests
-and are not delivered here; they still need ownership in the remaining port work. This CLI does not wire the deployed hook,
-install a host timer, or authorize any deployment.
+slice 4. U15 is now delivered in `test/lane-denylist.test.mjs`: the existing
+lane request builder enforces the pinned origin and exact accounts path even
+before config normalization. It cannot emit a direct queue/RESP request.
+
+U16 (and the U23 counter boundaries) is delivered as the **job-side accounting
+library** `src/scorecard.mjs`, tested in `test/scorecard.test.mjs`. Its pure
+`tickScorecard(saved, {nowMs, periodMs, accounts, ...})` returns serializable
+state; `scorecardRows(state)` returns isolated public rows. The future quota
+job must supply joined account evidence (including `inScope:false` policy
+exclusions), computed eligibility/floor/pacing verdicts and Keeper counters;
+the reducer does not assume an idle account is eligible. Public usage/unused
+figures are percentages; input quota readings are ratios. It latches each
+reset window, caps interval accounting at two job periods, retains eight
+windows per account, and distinguishes proved eligible-unpicked time from
+unexplained/held/feed-gap leftovers. Keeper deltas are window/epoch scoped;
+ledger totals stay separate and discrepancies emit warning facts. Wait
+attribution remains honestly null pending the staging G3 event-shape proof.
+
+These are library-level acceptance tests, **not a claim of runtime rollout**:
+this generator change does not register the quota job, persist its scorecard
+state, expose `GET /scorecard`, or fold rows into `/capacity`. Those runtime
+integration requirements remain part of the port; no spec ownership has been
+silently amended. This CLI does not wire the deployed hook, install a host
+timer, or authorize any deployment.
