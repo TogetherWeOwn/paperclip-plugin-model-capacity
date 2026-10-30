@@ -105,13 +105,16 @@ export function normalizeNewestVersionOnly(raw) {
   const nonempty = value => typeof value === 'string' && value.trim().length > 0;
   const validKey = value => nonempty(value) && !/^(?:arm|model|product):$/.test(value);
   const overrides = object(object(raw).overrides);
-  const keep = Array.isArray(overrides.keep) ? overrides.keep.filter(validKey) : [];
+  const keep = Array.isArray(overrides.keep)
+    ? overrides.keep.filter(nonempty).map(value => value.trim()).filter(validKey) : [];
   const productAliases = Object.fromEntries(Object.entries(object(overrides.productAliases))
-    .filter(([key, value]) => nonempty(key) && nonempty(value)));
+    .filter(([key, value]) => nonempty(key) && nonempty(value))
+    .map(([key, value]) => [key.trim(), value.trim()]));
   const parsePins = Object.fromEntries(Object.entries(object(overrides.parsePins))
+    .map(([key, pin]) => [key.trim(), pin])
     .filter(([key, pin]) => validKey(key) && nonempty(pin?.product) && Array.isArray(pin?.version)
       && pin.version.length > 0 && pin.version.every(n => Number.isSafeInteger(n) && n >= 0))
-    .map(([key, pin]) => [key, { product: pin.product, version: [...pin.version] }]));
+    .map(([key, pin]) => [key, { product: pin.product.trim(), version: [...pin.version] }]));
   return { enabled: object(raw).enabled === true, overrides: { keep, productAliases, parsePins } };
 }
 

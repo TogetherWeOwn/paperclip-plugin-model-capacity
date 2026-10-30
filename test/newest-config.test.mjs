@@ -47,10 +47,31 @@ test('newest normalizer defaults off and drops malformed overrides', () => {
     parsePins: { 'model:foo': { product: 'bar', version: [1, 2] }, 'arm:foo@high': { product: 'bar', version: [2] }, bad: { product: '', version: [1] }, bad2: { product: 'x', version: [-1] }, bad3: { product: 'x', version: [] }, bad4: null },
   } };
   const expected = { enabled: true, overrides: { keep: ['arm:foo@high', 'model:foo', 'product:foo', 'foo'], productAliases: { foo: 'bar' }, parsePins: { 'model:foo': { product: 'bar', version: [1, 2] }, 'arm:foo@high': { product: 'bar', version: [2] } } } };
-  assert.deepEqual(normalize(input), expected);
+  const result = normalize(input);
+  assert.deepEqual(result, expected);
   assert.deepEqual(resolveConfig({ roles: { newestVersionOnly: input } }).roles.newestVersionOnly, expected);
+  input.overrides.keep.push('model:later');
   input.overrides.parsePins['model:foo'].version.push(9);
-  assert.deepEqual(expected.overrides.parsePins['model:foo'].version, [1, 2]);
+  assert.deepEqual(result, expected);
+});
+
+test('newest normalizer trims overrides and rejects empty trimmed entries', () => {
+  const result = eligibility.normalizeNewestVersionOnly({ enabled: true, overrides: {
+    keep: [' foo ', ' model:foo ', 'model:foo ', 'model: ', ' arm:  ', ' product: ', '  '],
+    productAliases: { ' foo ': ' bar ', '  ': 'value', empty: '  ' },
+    parsePins: {
+      ' model:foo ': { product: ' bar ', version: [1, 2] },
+      'model: ': { product: 'bar', version: [1] },
+      ' arm: ': { product: 'bar', version: [1] },
+      ' product: ': { product: 'bar', version: [1] },
+      'model:empty': { product: '  ', version: [1] },
+    },
+  } });
+  assert.deepEqual(result, { enabled: true, overrides: {
+    keep: ['foo', 'model:foo', 'model:foo'],
+    productAliases: { foo: 'bar' },
+    parsePins: { 'model:foo': { product: 'bar', version: [1, 2] } },
+  } });
 });
 
 test('newest configuration is exposed default-off in manifest and example', async () => {
