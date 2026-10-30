@@ -1,0 +1,272 @@
+[
+  {
+    "armId": "claude-fable-5-1",
+    "model": "claude-fable-5-1",
+    "effort": "max"
+  },
+  {
+    "armId": "claude-haiku-5-5",
+    "model": "claude-haiku-5-5",
+    "effort": "max"
+  },
+  {
+    "armId": "claude-haiku-5-5-xhigh",
+    "model": "claude-haiku-5-5",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "claude-opus-5-5",
+    "model": "claude-opus-5-5",
+    "effort": "max"
+  },
+  {
+    "armId": "claude-opus-5-5-xhigh",
+    "model": "claude-opus-5-5",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "claude-sonnet-5",
+    "model": "claude-sonnet-5",
+    "effort": "max"
+  },
+  {
+    "armId": "claude-sonnet-5-5",
+    "model": "claude-sonnet-5-5",
+    "effort": "max"
+  },
+  {
+    "armId": "claude-sonnet-5-5-high",
+    "model": "claude-sonnet-5-5",
+    "effort": "high"
+  },
+  {
+    "armId": "claude-sonnet-5-5-xhigh",
+    "model": "claude-sonnet-5-5",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "deepseek-v4-flash-free",
+    "model": "deepseek-v4-flash-free",
+    "effort": "max"
+  },
+  {
+    "armId": "deepseek-v4.1-flash",
+    "model": "deepseek-v4.1-flash",
+    "effort": "max"
+  },
+  {
+    "armId": "deepseek-v4.1-flash-1017",
+    "model": "deepseek-v4.1-flash-1017",
+    "effort": "max"
+  },
+  {
+    "armId": "deepseek-v4.1-flash-free",
+    "model": "deepseek-v4.1-flash-free",
+    "effort": "max"
+  },
+  {
+    "armId": "gemini-3-flash",
+    "model": "gemini-3-flash",
+    "effort": "max"
+  },
+  {
+    "armId": "gemini-3.5-flash-lite",
+    "model": "gemini-3.5-flash-lite",
+    "effort": "max"
+  },
+  {
+    "armId": "gemini-3.8-flash-high",
+    "model": "gemini-3.8-flash-high",
+    "effort": "high"
+  },
+  {
+    "armId": "glm-4.7-flash",
+    "model": "glm-4.7-flash",
+    "effort": "max"
+  },
+  {
+    "armId": "glm-5.3",
+    "model": "glm-5.3",
+    "effort": "max"
+  },
+  {
+    "armId": "glm-5.3-flash",
+    "model": "glm-5.3-flash",
+    "effort": "max"
+  },
+  {
+    "armId": "glm-5.3-flash-free",
+    "model": "glm-5.3-flash-free",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-5.6-terra",
+    "model": "gpt-5.6-terra",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-6-1-sol",
+    "model": "gpt-6.1-sol",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-6-1-sol-high",
+    "model": "gpt-6.1-sol",
+    "effort": "high"
+  },
+  {
+    "armId": "gpt-6-astra",
+    "model": "gpt-6-astra",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-6-astra-high",
+    "model": "gpt-6-astra",
+    "effort": "high"
+  },
+  {
+    "armId": "gpt-6-astra-low",
+    "model": "gpt-6-astra",
+    "effort": "low"
+  },
+  {
+    "armId": "gpt-6-astra-medium",
+    "model": "gpt-6-astra",
+    "effort": "medium"
+  },
+  {
+    "armId": "gpt-6-astra-xhigh",
+    "model": "gpt-6-astra",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "gpt-6-luna",
+    "model": "gpt-6-luna",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-6-luna-high",
+    "model": "gpt-6-luna",
+    "effort": "high"
+  },
+  {
+    "armId": "gpt-6-luna-low",
+    "model": "gpt-6-luna",
+    "effort": "low"
+  },
+  {
+    "armId": "gpt-6-luna-medium",
+    "model": "gpt-6-luna",
+    "effort": "medium"
+  },
+  {
+    "armId": "gpt-6-luna-xhigh",
+    "model": "gpt-6-luna",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "gpt-6-sol",
+    "model": "gpt-6-sol",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-6.1-terra",
+    "model": "gpt-6.1-terra",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-oss-120b",
+    "model": "gpt-oss-120b",
+    "effort": "max"
+  },
+  {
+    "armId": "gpt-oss-120b-medium",
+    "model": "gpt-oss-120b-medium",
+    "effort": "max"
+  },
+  {
+    "armId": "kimi-k3",
+    "model": "kimi-k3",
+    "effort": "max"
+  },
+  {
+    "armId": "ling-3.0-flash-fin-free",
+    "model": "ling-3.0-flash-fin-free",
+    "effort": "max"
+  },
+  {
+    "armId": "ling-3.1-flash-free",
+    "model": "ling-3.1-flash-free",
+    "effort": "max"
+  },
+  {
+    "armId": "mimo-v2.6-flash-free",
+    "model": "mimo-v2.6-flash-free",
+    "effort": "max"
+  },
+  {
+    "armId": "mistral-large-4",
+    "model": "mistral-large-4",
+    "effort": "max"
+  },
+  {
+    "armId": "muse-spark-1-3",
+    "model": "muse-spark-1.3-contributor",
+    "effort": "max"
+  },
+  {
+    "armId": "muse-spark-1-3-xhigh",
+    "model": "muse-spark-1.3-contributor",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "muse-spark-1.1",
+    "model": "muse-spark-1.1",
+    "effort": "max"
+  },
+  {
+    "armId": "muse-spark-1.2",
+    "model": "muse-spark-1.2",
+    "effort": "max"
+  },
+  {
+    "armId": "muse-spark-1.3",
+    "model": "muse-spark-1.3",
+    "effort": "max"
+  },
+  {
+    "armId": "muse-wonder-1.0-contributor",
+    "model": "muse-wonder-1.0-contributor",
+    "effort": "xhigh"
+  },
+  {
+    "armId": "muse-wonder-full-1.0-contributor",
+    "model": "muse-wonder-full-1.0-contributor",
+    "effort": "max"
+  },
+  {
+    "armId": "nemotron-3-super-120b",
+    "model": "nemotron-3-super-120b",
+    "effort": "max"
+  },
+  {
+    "armId": "nemotron-3.5-lightning-free",
+    "model": "nemotron-3.5-lightning-free",
+    "effort": "max"
+  },
+  {
+    "armId": "nemotron-3.5-super-vl-free",
+    "model": "nemotron-3.5-super-vl-free",
+    "effort": "max"
+  },
+  {
+    "armId": "qwen3.8-27b",
+    "model": "qwen3.8-27b",
+    "effort": "max"
+  },
+  {
+    "armId": "step-5-preview-nim",
+    "model": "step-5-preview-nim",
+    "effort": "max"
+  }
+]

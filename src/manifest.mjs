@@ -116,6 +116,14 @@
  *   change, no enforce-flag touch. Adds exactly `issues.create` +
  *   `issues.update` (create/update field allowlists + ownership checks in
  *   failure-clusters.mjs); no other capability, egress, secret or env key.
+ * v0.2.76 = SCOPED FREE UNSCORED TRIALS + DEVIN LANE: exact served-id
+ *   allowlists admit missing-AA trials without inventing benchmark scores;
+ *   expiring per-id included pricing is rechecked on every routing path.
+ *   Optional punctuation folding keeps aggregator duplicates native-first;
+ *   mandatory model bans and shared trial/reviewer account caps apply.
+ *   Preserves account-scoped newest-version fences and account fallback
+ *   seating from v0.2.75. No capability, egress, secret or env-key change.
+ *
  * v0.2.72 = POLICY-CACHE INVALIDATION ON CONFIG CHANGE: per-company config
  *   generations fence the cached routing policy; a source replacement at
  *   unchanged TTL refetches, a config change retires the live view (the
@@ -385,7 +393,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.73';
+export const PLUGIN_VERSION = '0.2.77';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -473,6 +481,33 @@ const CONFIG_SCHEMA = {
             doer: { type: 'array', default: [], items: { type: 'string' } },
             thinker: { type: 'array', default: [], items: { type: 'string' } },
             other: { type: 'array', default: [], items: { type: 'string' } },
+          },
+        },
+        newestVersionOnly: {
+          type: 'object', additionalProperties: false,
+          description: 'Prefer newest model versions per account and product line. Disabled by default. Overrides can retain specific arms, models or products, alias products, or pin parsed identities.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            overrides: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                keep: { type: 'array', default: [], items: { type: 'string', minLength: 1 }, description: 'Arm IDs, model:<canonicalModel>, product:<productKey>, or arm:<armId> to retain.' },
+                productAliases: { type: 'object', default: {}, additionalProperties: { type: 'string', minLength: 1 } },
+                parsePins: { type: 'object', default: {}, additionalProperties: {
+                  type: 'object', additionalProperties: false, required: ['product', 'version'],
+                  properties: { product: { type: 'string', minLength: 1 }, version: { type: 'array', minItems: 1, items: { type: 'integer', minimum: 0 } } },
+                } },
+              },
+            },
+          },
+        },
+        accountFallback: {
+          type: 'object', additionalProperties: false,
+          description: 'Opt-in account-local fallback for doer and other roles; never relaxes thinker eligibility. minQuality is a fleet Q z-score floor.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            roles: { type: 'array', default: ['doer', 'other'], items: { type: 'string', enum: ['doer', 'other'] } },
+            minQuality: { type: 'number', default: -0.5 },
           },
         },
         minQuality: {
@@ -803,6 +838,10 @@ const CONFIG_SCHEMA = {
           description: 'Provider-scoped reactive in-flight cap per account (lower-cased provider name to integer >= 1, e.g. {"nvidia-nim": 1}). Overrides maxInFlightPerAccount only for that provider; every other provider keeps the global value. Empty (default) keeps every provider on the global cap.',
           additionalProperties: { type: 'integer', minimum: 1 },
         },
+        unscoredServedIds: {
+          type: 'array', default: [], description: 'Exact served ids admitted as unscored trial arms with required provenance. Q remains null; normal trial roles, adapters and caps apply. Only legacy routing; proven families and banned models are refused. An unpriced unscored arm cannot route.',
+          items: { type: 'object', additionalProperties: false, required: ['servedId', 'reason'], properties: { servedId: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
+        },
         maxInFlightPerFamily: { type: 'integer', minimum: 1, default: 2 },
         minRuns: { type: 'integer', minimum: 1, default: 10 },
         minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
@@ -817,6 +856,7 @@ const CONFIG_SCHEMA = {
         },
       },
     },
+    bannedModels: { type: 'array', default: [], items: { type: 'string', minLength: 1 }, description: 'Additional bare model ids; this list only widens the mandatory bans on gpt-6-sol and gpt-5.6-terra, which cannot be removed.' },
     modelAaOverrides: {
       type: 'object', default: {},
       description: 'Operator extensions to the AA-slug override table: CLIProxy model id to AA slug (or { slug, effort }). Merged over the built-in table.',
@@ -858,6 +898,15 @@ const CONFIG_SCHEMA = {
       properties: {
         qualityWeight: { type: 'number', minimum: 0, default: 1 },
         allowanceWeight: { type: 'number', minimum: 0, default: 0.35 },
+        duplicateVersionPunctuationFolding: {
+          type: 'boolean', default: false,
+          description: 'Opt in to matching digit-separated dash and dot version spellings for per-arm aggregator duplicate fallback only; emission, benchmark matching and kept defaults are unchanged.',
+        },
+        freeCostServedIds: {
+          type: 'object', default: {},
+          description: 'Exact served id to included-price deadline and provenance. Legacy monetary C is zero until the real timezone-explicit ISO deadline; task ranking reports zero cash but still ranks by resource cost. The account and quota costs do not become free. After expiry normal pricing resumes; unscored arms without a price stop routing. Verify the offer applies to the actual serving integration before enabling.',
+          additionalProperties: { type: 'object', additionalProperties: false, required: ['until', 'reason'], properties: { until: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
+        },
         freeCostProviders: {
           type: 'array', default: [],
           description: "Providers whose 'free'-plan accounts place at zero monetary cost (e.g. [\"nvidia-nim\"]): costEffective and ladder cost read 0 while quality bars, quota/burn accounting and climbForSpend stay unchanged. Empty (default) prices every account from Artificial Analysis, exactly as before.",

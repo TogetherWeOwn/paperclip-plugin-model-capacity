@@ -1,0 +1,612 @@
+{
+  "baseline": "a368f5c",
+  "cases": {
+    "twins": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol-high",
+            "rung": 0
+          },
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 1
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 0
+          }
+        ]
+      },
+      "shadow": [],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
+      },
+      "taskCandidates": []
+    },
+    "account-free-legacy": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "reason": "rung 0 on codex:native (doer)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 0
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "kimi-k3",
+            "rung": 0
+          }
+        ]
+      },
+      "shadow": [],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
+      },
+      "taskCandidates": []
+    },
+    "account-free-task": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer); AA workload proxy 3 USD (not calibrated accepted-task cost)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 0
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "kimi-k3",
+            "rung": 0
+          }
+        ]
+      },
+      "shadow": [],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
+      },
+      "taskCandidates": [
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "doer",
+          "C": 5,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "doer",
+          "C": 3,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "reviewer",
+          "C": 5,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "reviewer",
+          "C": 3,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "thinker",
+          "C": 5,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "pareto-dominated"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "thinker",
+          "C": 3,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "other",
+          "C": 5,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "other",
+          "C": 3,
+          "cashUsdPerAcceptedTask": 0,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "doer",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "reviewer",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "thinker",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "other",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        }
+      ]
+    },
+    "task-order": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer); AA workload proxy 3 USD (not calibrated accepted-task cost)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol-high",
+            "rung": 0
+          },
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 1
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "kimi-k3",
+            "rung": 0
+          }
+        ]
+      },
+      "shadow": [],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [
+              "kimi-k3@max"
+            ],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
+      },
+      "taskCandidates": [
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "doer",
+          "C": 5,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "doer",
+          "C": 3,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "reviewer",
+          "C": 5,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "reviewer",
+          "C": 3,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "thinker",
+          "C": 5,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "pareto-dominated"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "thinker",
+          "C": 3,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@max",
+          "role": "other",
+          "C": 5,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "gpt-6-1-sol@high",
+          "role": "other",
+          "C": 3,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "eligible"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "doer",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "reviewer",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "thinker",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        },
+        {
+          "armId": "kimi-k3@max",
+          "role": "other",
+          "C": 1,
+          "cashUsdPerAcceptedTask": null,
+          "selectionReason": "effort-unverified"
+        }
+      ]
+    },
+    "manual-outage": {
+      "hook": {
+        "kind": "decide",
+        "model": "glm-5",
+        "effort": "max",
+        "reason": "rung 0 on codex:native (doer)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "glm-5",
+            "rung": 0
+          },
+          {
+            "armId": "gpt-6-1-sol-high",
+            "rung": 1
+          },
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 2
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "kimi-k3",
+            "rung": 0
+          }
+        ]
+      },
+      "shadow": [],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [
+              "sol"
+            ],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": [
+          {
+            "code": "manual-exclusions",
+            "roles": {
+              "doer": [
+                "sol"
+              ]
+            },
+            "message": "roles.excludeFamilies is an emergency override; eligibility is decided by roles.minQuality and roles.outcomeGate"
+          }
+        ]
+      },
+      "taskCandidates": []
+    },
+    "dominated-drop-shared-rung": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "reason": "rung 0 on codex:native (doer)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 0
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "glm-5",
+            "rung": 0
+          },
+          {
+            "armId": "deepseek-v4-pro",
+            "rung": 1
+          }
+        ]
+      },
+      "shadow": [],
+      "dominated": [
+        "gpt-5.6-sol"
+      ],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
+      },
+      "taskCandidates": []
+    }
+  }
+}

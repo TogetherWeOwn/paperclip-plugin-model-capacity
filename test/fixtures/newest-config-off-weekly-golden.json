@@ -1,0 +1,5111 @@
+{
+  "capacity": {
+    "reviewAdmissionGeneration": 1,
+    "reviewAdmissionEpoch": "<epoch>",
+    "atMs": 1793275200000,
+    "taskRanking": {
+      "mode": "shadow",
+      "profileVersion": "aa-role-v1",
+      "normalizationVersion": "dfe86188f88627c8",
+      "metricRegistryVersion": "aa-fields-v1",
+      "metricRegistry": {
+        "terminalbenchV40": {
+          "source": "terminalbenchV40",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Terminal-Bench 4.0",
+          "group": "coding",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "terminalbenchV21": {
+          "source": "terminalbenchV21",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Terminal-Bench 2.1",
+          "group": "coding-legacy",
+          "aggregate": false,
+          "category": "legacy"
+        },
+        "terminalbenchHard": {
+          "source": "terminalbenchHard",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Terminal-Bench Hard (legacy)",
+          "group": "coding-legacy",
+          "aggregate": false,
+          "category": "legacy"
+        },
+        "scicode": {
+          "source": "scicode",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "SciCode (source snapshot harness)",
+          "group": "coding",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "codingIndex": {
+          "source": "codingIndex",
+          "direction": "higher",
+          "units": "index",
+          "min": 0,
+          "max": 100,
+          "version": "legacy API coding index; not Coding Agent Index v2",
+          "group": "coding",
+          "aggregate": true,
+          "category": "scored"
+        },
+        "intelligenceIndex": {
+          "source": "intelligenceIndex",
+          "direction": "higher",
+          "units": "index",
+          "min": 0,
+          "max": 100,
+          "version": "Intelligence Index (source snapshot version)",
+          "group": "intelligence",
+          "aggregate": true,
+          "category": "scored"
+        },
+        "hle": {
+          "source": "hle",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "HLE (source snapshot grader)",
+          "group": "reasoning",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "gpqa": {
+          "source": "gpqa",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "GPQA Diamond (legacy)",
+          "group": "reasoning",
+          "aggregate": false,
+          "category": "legacy"
+        },
+        "critpt": {
+          "source": "critpt",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "CritPt (source snapshot)",
+          "group": "reasoning",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "lcr": {
+          "source": "lcr",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "AA-LCR (source snapshot)",
+          "group": "long-context",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "ifbench": {
+          "source": "ifbench",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "IFBench (source snapshot)",
+          "group": "instruction",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "gdpvalNormalized": {
+          "source": "gdpvalNormalized",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "GDPval normalized (source snapshot)",
+          "group": "agent",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "tau2": {
+          "source": "tau2",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "tau2 (legacy, not Banking)",
+          "group": "tool-use",
+          "aggregate": false,
+          "category": "legacy"
+        },
+        "tauBanking": {
+          "source": "tauBanking",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Banking (source snapshot)",
+          "group": "banking",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "apexAgents": {
+          "source": "apexAgents",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "APEX Agents (source snapshot)",
+          "group": "agent",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "itbenchSre": {
+          "source": "itbenchSre",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "ITBench SRE (source snapshot)",
+          "group": "ops",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "analystAgent": {
+          "source": "analystAgent",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "AnalystAgent (source snapshot)",
+          "group": "agent",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "mmmuPro": {
+          "source": "mmmuPro",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "MMMU Pro (source snapshot)",
+          "group": "multimodal",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "omniscience": {
+          "source": "omniscience",
+          "direction": "higher",
+          "units": "index",
+          "min": -100,
+          "max": 100,
+          "version": "AA-Omniscience headline",
+          "group": "reliability",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "omniscienceAccuracy": {
+          "source": "omniscienceAccuracy",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "AA-Omniscience accuracy",
+          "group": "reliability",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "omniscienceNonHallucination": {
+          "source": "omniscienceNonHallucination",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "AA-Omniscience 1 - hallucination rate",
+          "group": "reliability",
+          "aggregate": false,
+          "category": "scored"
+        },
+        "terminalBench40": {
+          "source": "terminalBench40",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Terminal-Bench 4.0",
+          "group": "coding",
+          "aggregate": false,
+          "category": "diagnostic-only"
+        },
+        "terminalBench21": {
+          "source": "terminalBench21",
+          "direction": "higher",
+          "units": "fraction",
+          "min": 0,
+          "max": 1,
+          "version": "Terminal-Bench 2.1",
+          "group": "coding-legacy",
+          "aggregate": false,
+          "category": "diagnostic-only"
+        },
+        "intelligenceIndexCostPerTask": {
+          "source": "intelligenceIndexCostPerTask",
+          "direction": "lower",
+          "units": "USD",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "cost",
+          "aggregate": false,
+          "category": "cost-related"
+        },
+        "price1mInputTokens": {
+          "source": "price1mInputTokens",
+          "direction": "lower",
+          "units": "USD",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "cost",
+          "aggregate": false,
+          "category": "cost-related"
+        },
+        "price1mOutputTokens": {
+          "source": "price1mOutputTokens",
+          "direction": "lower",
+          "units": "USD",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "cost",
+          "aggregate": false,
+          "category": "cost-related"
+        },
+        "cacheHitPrice": {
+          "source": "cacheHitPrice",
+          "direction": "lower",
+          "units": "USD",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "cost",
+          "aggregate": false,
+          "category": "cost-related"
+        },
+        "cacheWritePrice": {
+          "source": "cacheWritePrice",
+          "direction": "lower",
+          "units": "USD",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "cost",
+          "aggregate": false,
+          "category": "cost-related"
+        },
+        "contextWindowTokens": {
+          "source": "contextWindowTokens",
+          "direction": "higher",
+          "units": "tokens",
+          "min": 1,
+          "max": null,
+          "version": "source snapshot",
+          "group": "context",
+          "aggregate": false,
+          "category": "feasibility-related"
+        },
+        "medianOutputTokensPerSecond": {
+          "source": "medianOutputTokensPerSecond",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "outputTokensPerSecondP5": {
+          "source": "outputTokensPerSecondP5",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "outputTokensPerSecondP25": {
+          "source": "outputTokensPerSecondP25",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "outputTokensPerSecondP75": {
+          "source": "outputTokensPerSecondP75",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "outputTokensPerSecondP95": {
+          "source": "outputTokensPerSecondP95",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "percentile05OutputTokensPerSecond": {
+          "source": "percentile05OutputTokensPerSecond",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "quartile25OutputTokensPerSecond": {
+          "source": "quartile25OutputTokensPerSecond",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "quartile75OutputTokensPerSecond": {
+          "source": "quartile75OutputTokensPerSecond",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "percentile95OutputTokensPerSecond": {
+          "source": "percentile95OutputTokensPerSecond",
+          "direction": "higher",
+          "units": "tokens/second",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "percentile05TimeToFirstTokenSeconds": {
+          "source": "percentile05TimeToFirstTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "quartile25TimeToFirstTokenSeconds": {
+          "source": "quartile25TimeToFirstTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "quartile75TimeToFirstTokenSeconds": {
+          "source": "quartile75TimeToFirstTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "percentile95TimeToFirstTokenSeconds": {
+          "source": "percentile95TimeToFirstTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "medianTimeToFirstTokenSeconds": {
+          "source": "medianTimeToFirstTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "medianTimeToFirstAnswerTokenSeconds": {
+          "source": "medianTimeToFirstAnswerTokenSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "medianEndToEndResponseTimeSeconds": {
+          "source": "medianEndToEndResponseTimeSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        },
+        "medianReasoningTimeSeconds": {
+          "source": "medianReasoningTimeSeconds",
+          "direction": "lower",
+          "units": "seconds",
+          "min": 0,
+          "max": null,
+          "version": "source snapshot",
+          "group": "latency",
+          "aggregate": false,
+          "category": "latency-related"
+        }
+      },
+      "schemaWarnings": [],
+      "correlationNotice": "Role profiles are priors; residual correlation is not independent evidence.",
+      "profiles": {
+        "doer": {
+          "min": -1,
+          "scoredPopulation": 0,
+          "alpha": 0,
+          "suspended": true,
+          "suspensionReason": "insufficient-scored-population",
+          "applies": false,
+          "advisory": false
+        },
+        "reviewer": {
+          "min": null,
+          "scoredPopulation": 0,
+          "alpha": 0,
+          "suspended": false,
+          "suspensionReason": null,
+          "applies": false,
+          "advisory": true
+        },
+        "thinker": {
+          "min": 0.4,
+          "scoredPopulation": 0,
+          "alpha": 0,
+          "suspended": true,
+          "suspensionReason": "insufficient-scored-population",
+          "applies": false,
+          "advisory": false
+        },
+        "other": {
+          "min": -1,
+          "scoredPopulation": 0,
+          "alpha": 0,
+          "suspended": true,
+          "suspensionReason": "insufficient-scored-population",
+          "applies": false,
+          "advisory": false
+        }
+      },
+      "calibration": {
+        "ready": false,
+        "reason": "awaiting-native-attributed-outcomes",
+        "closedTasks": 0,
+        "acceptedTasks": 0,
+        "pendingTasks": 0,
+        "relativeCiHalfWidth": null
+      },
+      "coverage": {
+        "uniqueArms": 2,
+        "candidates": 2
+      },
+      "unmatched": [
+        {
+          "model": "muse-spark-1.3-contributor",
+          "effort": "max",
+          "reason": "no-aa-effort-match",
+          "tried": [
+            "muse-spark-1.3-contributor",
+            "muse-spark-1-3-contributor",
+            "muse-spark-1-3"
+          ]
+        }
+      ],
+      "candidates": [
+        {
+          "armId": "muse-spark-1-3@xhigh",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": false,
+          "aaSlug": "muse-spark-1-3-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": true,
+          "matchReason": null,
+          "evidenceReason": null,
+          "canonicalModel": "muse-spark-1.3-contributor",
+          "operationalReasons": [],
+          "costBase": 1,
+          "costMultiplier": 1,
+          "costEffective": 1,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 1,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 1,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "doer",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": -1,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "insufficient-profile-coverage",
+          "selectionReason": "insufficient-profile-coverage",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 50,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 1,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 1,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "insufficient-profile-coverage"
+          ],
+          "benchmarkDisposition": "insufficient-profile-coverage",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-4@xhigh",
+          "model": "muse-spark-1.4-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": true,
+          "aaSlug": "muse-spark-1-4-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": false,
+          "matchReason": null,
+          "evidenceReason": "effort-unverified",
+          "canonicalModel": "muse-spark-1.4-contributor",
+          "operationalReasons": [],
+          "costBase": 2,
+          "costMultiplier": 1,
+          "costEffective": 2,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 2,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 2,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "doer",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": -1,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "effort-unverified",
+          "selectionReason": "effort-unverified",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 55,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 2,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 2,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "effort-unverified"
+          ],
+          "benchmarkDisposition": "effort-unverified",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-3@xhigh",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": false,
+          "aaSlug": "muse-spark-1-3-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": true,
+          "matchReason": null,
+          "evidenceReason": null,
+          "canonicalModel": "muse-spark-1.3-contributor",
+          "operationalReasons": [],
+          "costBase": 1,
+          "costMultiplier": 1,
+          "costEffective": 1,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 1,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 1,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "reviewer",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": null,
+            "q": null,
+            "suspended": null
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "insufficient-profile-coverage",
+          "selectionReason": "insufficient-profile-coverage",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 50,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 1,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 1,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "insufficient-profile-coverage"
+          ],
+          "benchmarkDisposition": "insufficient-profile-coverage",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-4@xhigh",
+          "model": "muse-spark-1.4-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": true,
+          "aaSlug": "muse-spark-1-4-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": false,
+          "matchReason": null,
+          "evidenceReason": "effort-unverified",
+          "canonicalModel": "muse-spark-1.4-contributor",
+          "operationalReasons": [],
+          "costBase": 2,
+          "costMultiplier": 1,
+          "costEffective": 2,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 2,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 2,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "reviewer",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.2,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": null,
+            "q": null,
+            "suspended": null
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "effort-unverified",
+          "selectionReason": "effort-unverified",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 55,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 2,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 2,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "effort-unverified"
+          ],
+          "benchmarkDisposition": "effort-unverified",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-3@xhigh",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": false,
+          "aaSlug": "muse-spark-1-3-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": true,
+          "matchReason": null,
+          "evidenceReason": null,
+          "canonicalModel": "muse-spark-1.3-contributor",
+          "operationalReasons": [],
+          "costBase": 1,
+          "costMultiplier": 1,
+          "costEffective": 1,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 1,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 1,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "thinker",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gpqa": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GPQA Diamond (legacy)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "critpt": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "CritPt (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gdpvalNormalized": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GDPval normalized (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.05,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gpqa": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GPQA Diamond (legacy)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "critpt": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "CritPt (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gdpvalNormalized": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GDPval normalized (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.05,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": 0.4,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "insufficient-profile-coverage",
+          "selectionReason": "insufficient-profile-coverage",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 50,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 1,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 1,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "insufficient-profile-coverage"
+          ],
+          "benchmarkDisposition": "insufficient-profile-coverage",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-4@xhigh",
+          "model": "muse-spark-1.4-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": true,
+          "aaSlug": "muse-spark-1-4-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": false,
+          "matchReason": null,
+          "evidenceReason": "effort-unverified",
+          "canonicalModel": "muse-spark-1.4-contributor",
+          "operationalReasons": [],
+          "costBase": 2,
+          "costMultiplier": 1,
+          "costEffective": 2,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 2,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 2,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "thinker",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gpqa": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GPQA Diamond (legacy)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "critpt": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "CritPt (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gdpvalNormalized": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GDPval normalized (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.05,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "hle": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.25,
+              "version": "HLE (source snapshot grader)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gpqa": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GPQA Diamond (legacy)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "critpt": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "CritPt (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "gdpvalNormalized": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "GDPval normalized (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.05,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": 0.4,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "effort-unverified",
+          "selectionReason": "effort-unverified",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 55,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 2,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 2,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "effort-unverified"
+          ],
+          "benchmarkDisposition": "effort-unverified",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-3@xhigh",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": false,
+          "aaSlug": "muse-spark-1-3-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": true,
+          "matchReason": null,
+          "evidenceReason": null,
+          "canonicalModel": "muse-spark-1.3-contributor",
+          "operationalReasons": [],
+          "costBase": 1,
+          "costMultiplier": 1,
+          "costEffective": 1,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 1,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 1,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "other",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": -1,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "insufficient-profile-coverage",
+          "selectionReason": "insufficient-profile-coverage",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 50,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 1,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 1,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "insufficient-profile-coverage"
+          ],
+          "benchmarkDisposition": "insufficient-profile-coverage",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "armId": "muse-spark-1-4@xhigh",
+          "model": "muse-spark-1.4-contributor",
+          "effort": "xhigh",
+          "family": "muse",
+          "providers": null,
+          "dynamic": true,
+          "aaSlug": "muse-spark-1-4-xhigh",
+          "aaEffort": "xhigh",
+          "matchType": "verified-alias",
+          "effortVerified": false,
+          "matchReason": null,
+          "evidenceReason": "effort-unverified",
+          "canonicalModel": "muse-spark-1.4-contributor",
+          "operationalReasons": [],
+          "costBase": 2,
+          "costMultiplier": 1,
+          "costEffective": 2,
+          "tierSource": "none",
+          "statsRequests": 0,
+          "costFree": false,
+          "trial": false,
+          "contextWindow": null,
+          "cap": null,
+          "quotaBurnPerRunPct": null,
+          "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+          "fieldObservedAt": null,
+          "costEstimated": false,
+          "aaCostPerTask": 2,
+          "aaCostSource": "measured",
+          "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+          "taskCostProxy": 2,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "taskRanking": true,
+          "role": "other",
+          "Q": null,
+          "qThinker": null,
+          "qFleet": null,
+          "qFleetThinker": null,
+          "qAa": null,
+          "qFleetAa": null,
+          "qEee": null,
+          "qFleetEee": null,
+          "qBlended": null,
+          "blendAlpha": 0,
+          "components": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "fleetComponents": {
+            "terminalbenchV40": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.45,
+              "version": "Terminal-Bench 4.0",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "scicode": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "SciCode (source snapshot harness)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "lcr": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "AA-LCR (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "ifbench": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.15,
+              "version": "IFBench (source snapshot)",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            },
+            "omniscienceNonHallucination": {
+              "value": null,
+              "reason": "missing",
+              "z": null,
+              "weight": 0.1,
+              "version": "AA-Omniscience 1 - hallucination rate",
+              "observedAt": null,
+              "source": "aa-snapshot"
+            }
+          },
+          "coverage": 0,
+          "absoluteCoverage": 0,
+          "primaryEvidence": false,
+          "minQuality": {
+            "ok": true,
+            "min": -1,
+            "q": null,
+            "suspended": "insufficient-scored-population"
+          },
+          "benchmarkTrusted": false,
+          "trustReason": "effort-unverified",
+          "selectionReason": "effort-unverified",
+          "metricObservations": {
+            "intelligenceIndex": {
+              "value": 55,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            },
+            "intelligenceIndexCostPerTask": {
+              "value": 2,
+              "reason": null,
+              "observedAt": "2026-10-29T12:00:00.000Z",
+              "source": "aa-snapshot"
+            }
+          },
+          "C": 2,
+          "eligible": false,
+          "benchmarkEligible": false,
+          "accountId": "meta:sample",
+          "exclusionReasons": [
+            "effort-unverified"
+          ],
+          "benchmarkDisposition": "effort-unverified",
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "accountId": "meta:sample",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "max",
+          "role": "doer",
+          "aaSlug": null,
+          "matchType": "missing",
+          "benchmarkTrusted": false,
+          "Q": null,
+          "qFleet": null,
+          "aaCostPerTask": null,
+          "taskCostProxy": null,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "exclusionReasons": [
+            "no-aa-effort-match"
+          ],
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "benchmarkDisposition": null,
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "accountId": "meta:sample",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "max",
+          "role": "thinker",
+          "aaSlug": null,
+          "matchType": "missing",
+          "benchmarkTrusted": false,
+          "Q": null,
+          "qFleet": null,
+          "aaCostPerTask": null,
+          "taskCostProxy": null,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "exclusionReasons": [
+            "no-aa-effort-match"
+          ],
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "benchmarkDisposition": null,
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "accountId": "meta:sample",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "max",
+          "role": "other",
+          "aaSlug": null,
+          "matchType": "missing",
+          "benchmarkTrusted": false,
+          "Q": null,
+          "qFleet": null,
+          "aaCostPerTask": null,
+          "taskCostProxy": null,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "exclusionReasons": [
+            "no-aa-effort-match"
+          ],
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "benchmarkDisposition": null,
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        },
+        {
+          "accountId": "meta:sample",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "max",
+          "role": "reviewer",
+          "aaSlug": null,
+          "matchType": "missing",
+          "benchmarkTrusted": false,
+          "Q": null,
+          "qFleet": null,
+          "aaCostPerTask": null,
+          "taskCostProxy": null,
+          "estimatedApiEquivalentPerAcceptedTask": null,
+          "cashUsdPerAcceptedTask": null,
+          "exclusionReasons": [
+            "no-aa-effort-match"
+          ],
+          "calibration": {
+            "ready": false,
+            "reason": "awaiting-native-attributed-outcomes",
+            "closedTasks": 0,
+            "acceptedTasks": 0,
+            "pendingTasks": 0,
+            "relativeCiHalfWidth": null
+          },
+          "benchmarkDisposition": null,
+          "policyBucket": {
+            "funding": "plan",
+            "burn": false,
+            "burnFirst": false,
+            "fallbackOnly": false,
+            "need": "metered-behind-or-unknown",
+            "freeCash": false
+          },
+          "snapshotAgeMs": 0
+        }
+      ],
+      "routeComparisons": [
+        {
+          "previewInputs": {
+            "role": "doer",
+            "adapterType": null,
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "doer",
+            "adapterType": "claude_local",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "doer",
+            "adapterType": "claude-code",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "thinker",
+            "adapterType": null,
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "thinker",
+            "adapterType": "claude_local",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "thinker",
+            "adapterType": "claude-code",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "other",
+            "adapterType": null,
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "other",
+            "adapterType": "claude_local",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        },
+        {
+          "previewInputs": {
+            "role": "other",
+            "adapterType": "claude-code",
+            "contextTokens": null,
+            "retryCount": 0
+          },
+          "legacy": null,
+          "proposed": null,
+          "current": null,
+          "changed": false,
+          "cheapestRejectedAlternative": {
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "accountId": "meta:sample",
+            "taskCostProxy": 1,
+            "reason": "insufficient-profile-coverage"
+          }
+        }
+      ],
+      "gateSuspensions": [
+        {
+          "code": "fleet-too-small",
+          "role": "doer",
+          "message": "only 0 scored arms (< 8): the doer quality minimum is not applied"
+        },
+        {
+          "code": "fleet-too-small",
+          "role": "thinker",
+          "message": "only 0 scored arms (< 8): the thinker quality minimum is not applied"
+        },
+        {
+          "code": "fleet-too-small",
+          "role": "other",
+          "message": "only 0 scored arms (< 8): the other quality minimum is not applied"
+        }
+      ],
+      "translatedExclusions": {
+        "doer": [],
+        "thinker": [],
+        "other": []
+      }
+    },
+    "target": null,
+    "demandFactor": 1,
+    "targetRaw": null,
+    "demandBound": null,
+    "targetUnweighted": null,
+    "maxTotal": 75,
+    "calibration": "weak",
+    "familyOutcomes": {},
+    "roles": null,
+    "demandSource": "issues",
+    "medianMeasuredBurnPct": null,
+    "calibrationGroups": {},
+    "smoothing": {
+      "halfLifeMin": 30,
+      "targetDownHalfLifeMin": 10,
+      "verifiedUpHalfLifeMin": 5,
+      "verifiedUpWindowMin": 30,
+      "staleHours": 6,
+      "fastUntilMs": 0
+    },
+    "perAccount": [
+      {
+        "accountId": "meta:sample",
+        "slots": 0,
+        "runsPerHour": 0,
+        "capped": true,
+        "reason": "uncalibrated",
+        "calibrated": false,
+        "measuredBurnPerRunPct": null,
+        "burnPerRunPct": null,
+        "runsInWindow": 0,
+        "calibrationGroup": "meta:sample",
+        "capacityWeight": 1
+      }
+    ],
+    "breakerUnavailableAccountIds": [],
+    "accounts": [
+      {
+        "accountId": "meta:sample",
+        "arms": [
+          {
+            "armId": "muse-spark-1-3-xhigh",
+            "model": "muse-spark-1.3-contributor",
+            "effort": "xhigh",
+            "family": "muse",
+            "rung": 0,
+            "trial": false,
+            "breaker": "closed",
+            "cap": null,
+            "costBase": 1,
+            "costMultiplier": 1,
+            "costEffective": 1,
+            "tierSource": "none",
+            "statsRequests": 0,
+            "qFleet": -1
+          },
+          {
+            "armId": "muse-spark-1.4-contributor",
+            "model": "muse-spark-1.4-contributor",
+            "effort": "xhigh",
+            "family": "muse",
+            "rung": 1,
+            "trial": false,
+            "breaker": "closed",
+            "cap": null,
+            "costBase": 2,
+            "costMultiplier": 1,
+            "costEffective": 2,
+            "tierSource": "none",
+            "statsRequests": 0,
+            "qFleet": 1
+          }
+        ],
+        "provider": "meta",
+        "health": "healthy",
+        "meter": null,
+        "quality": "live",
+        "reactive": false,
+        "freeCost": false,
+        "weeklyUsedPct": 0.2,
+        "fiveHourUsedPct": 0.1,
+        "headroomPct": 0.9,
+        "headroomSource": "five-hour",
+        "creditFallback": false,
+        "creditType": null,
+        "creditFree": null,
+        "creditBalance": null,
+        "creditFraction": null,
+        "creditResetAtMs": null,
+        "resetAtMs": 1793880000000,
+        "remainingPct": 0.8,
+        "hoursToReset": 168,
+        "burnHorizonMs": null,
+        "burnHorizonSource": null,
+        "pointer": 0,
+        "guardActive": false,
+        "action": "hold-cheapest",
+        "reason": "cheapest capable rung (climbForSpend off)",
+        "rateBasis": "position",
+        "measuredRatePerHour": null,
+        "rateSpanMs": null,
+        "ratePoints": 0,
+        "rateHistoryPoints": 1,
+        "warmingUp": true,
+        "bypassedCooldown": false,
+        "requiredRatePerHour": 0.004761904761904762,
+        "planAhead": 0.2,
+        "planTargetUsedPct": 1,
+        "spendableRemaining": 0.8,
+        "weeklyElapsed": 0,
+        "fiveHourElapsed": 0,
+        "hoursTo5hReset": 5,
+        "pool": "meta",
+        "calibrationGroup": "meta:sample",
+        "capacityWeight": 1,
+        "calibrationConfidence": 0,
+        "calibrationSource": "group-prior",
+        "attributedRuns": null,
+        "calibrationRejectionReason": "no-evidence",
+        "attemptedAttributedRuns": null,
+        "unattributedRequestShare": null,
+        "groupMedianBurnPerRunPct": null,
+        "fiveHourBurnPerRunPct": null,
+        "burnCalibrated": false,
+        "effectiveBurnPerRunPct": 0.0005,
+        "targetShare": 9.523809523809524,
+        "models": [
+          "muse-spark-1.3-contributor",
+          "muse-spark-1.4-contributor"
+        ],
+        "fallbackOnly": false
+      }
+    ],
+    "skippedArms": [
+      {
+        "aaSlug": "claude-opus-5-5",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-opus-5-5-xhigh",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-sonnet-5-5",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-sonnet-5-5-xhigh",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-sonnet-5-5-high",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-haiku-5-5",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "claude-haiku-5-5-xhigh",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-1-sol",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-1-sol-high",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-1-luna",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-1-luna-high",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-luna",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-luna-xhigh",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-luna-high",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-luna-medium",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-luna-low",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-astra",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-astra-xhigh",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-astra-high",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-astra-medium",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "gpt-6-astra-low",
+        "reason": "slug-absent-from-snapshot"
+      },
+      {
+        "aaSlug": "muse-spark-1-3",
+        "reason": "slug-absent-from-snapshot"
+      }
+    ],
+    "unscored": [],
+    "unservable": [],
+    "modelInventory": {
+      "version": 1,
+      "atMs": 1793275200000,
+      "servedList": {
+        "status": "unknown",
+        "count": null
+      },
+      "configuredModels": {
+        "coverage": "incomplete",
+        "reason": "agent-config-restricted",
+        "detail": "other-agent adapter configuration is restricted; no fleet-wide configured-model census is claimed"
+      },
+      "compatibility": {
+        "protocol": "unknown",
+        "tools": "unknown",
+        "reasoning": "unknown",
+        "reason": "no-evidence"
+      },
+      "feedModelsAbsentAccounts": [],
+      "counts": {
+        "canonicalModels": 2,
+        "rawIds": 2,
+        "servedPresent": 0,
+        "servedAbsent": 0,
+        "servedUnknown": 2,
+        "unscored": 0,
+        "unservable": 0
+      },
+      "models": [
+        {
+          "canonical": "muse-spark-1.3-contributor",
+          "family": "muse",
+          "rawIds": [
+            "muse-spark-1.3-contributor"
+          ],
+          "rawIdsByAccount": {
+            "meta:sample": [
+              "muse-spark-1.3-contributor"
+            ]
+          },
+          "providers": [
+            "meta"
+          ],
+          "servedBy": [
+            "meta:sample"
+          ],
+          "emittedByAccount": {
+            "meta:sample": "muse-spark-1.3-contributor"
+          },
+          "servedIdStatusByAccount": {
+            "meta:sample": "unknown"
+          },
+          "arms": [
+            {
+              "aaSlug": "muse-spark-1-3-xhigh",
+              "effort": "xhigh"
+            }
+          ],
+          "unscored": null,
+          "unservable": [],
+          "readiness": [
+            {
+              "accountId": "meta:sample",
+              "eligible": true,
+              "reason": "ready"
+            }
+          ],
+          "compatibility": {
+            "protocol": "unknown",
+            "tools": "unknown",
+            "reasoning": "unknown",
+            "reason": "no-evidence"
+          }
+        },
+        {
+          "canonical": "muse-spark-1.4-contributor",
+          "family": "muse",
+          "rawIds": [
+            "muse-spark-1.4-contributor"
+          ],
+          "rawIdsByAccount": {
+            "meta:sample": [
+              "muse-spark-1.4-contributor"
+            ]
+          },
+          "providers": [
+            "meta"
+          ],
+          "servedBy": [
+            "meta:sample"
+          ],
+          "emittedByAccount": {
+            "meta:sample": "muse-spark-1.4-contributor"
+          },
+          "servedIdStatusByAccount": {
+            "meta:sample": "unknown"
+          },
+          "arms": [
+            {
+              "aaSlug": "muse-spark-1-4-xhigh",
+              "effort": "xhigh"
+            }
+          ],
+          "unscored": null,
+          "unservable": [],
+          "readiness": [
+            {
+              "accountId": "meta:sample",
+              "eligible": true,
+              "reason": "ready"
+            }
+          ],
+          "compatibility": {
+            "protocol": "unknown",
+            "tools": "unknown",
+            "reasoning": "unknown",
+            "reason": "no-evidence"
+          }
+        }
+      ]
+    },
+    "credentialAvailability": {
+      "version": 1,
+      "mode": "off",
+      "alarm": false,
+      "models": [
+        {
+          "accountId": "meta:sample",
+          "provider": "meta",
+          "model": "muse-spark-1.3-contributor",
+          "evaluatedAtMs": 1793275200000,
+          "eligible": true,
+          "reason": "ready",
+          "evidence": {
+            "model": "muse-spark-1.3-contributor",
+            "provider": "meta",
+            "accountId": "meta:sample",
+            "status": "valid",
+            "servingCredentials": 1,
+            "readyCredentials": 1,
+            "observedAtMs": 1793275200000,
+            "expiresAtMs": 1793275320000
+          }
+        },
+        {
+          "accountId": "meta:sample",
+          "provider": "meta",
+          "model": "muse-spark-1.4-contributor",
+          "evaluatedAtMs": 1793275200000,
+          "eligible": true,
+          "reason": "ready",
+          "evidence": {
+            "model": "muse-spark-1.4-contributor",
+            "provider": "meta",
+            "accountId": "meta:sample",
+            "status": "valid",
+            "servingCredentials": 1,
+            "readyCredentials": 1,
+            "observedAtMs": 1793275200000,
+            "expiresAtMs": 1793275320000
+          }
+        }
+      ],
+      "countsByReason": {
+        "ready": 2
+      },
+      "validEnvelopeAccounts": 1,
+      "totalAccounts": 1
+    },
+    "contextTiers": {
+      "baselineMultiplier": null,
+      "caps": {}
+    },
+    "trialFamilies": {},
+    "trialTransitions": 0,
+    "armBreakers": [],
+    "roleExclusions": {
+      "doer": [],
+      "thinker": [],
+      "other": []
+    },
+    "roleExclusionsEffective": {
+      "doer": [],
+      "thinker": [],
+      "other": []
+    },
+    "eligibility": {
+      "atMs": 1793275200000,
+      "minQuality": {
+        "doer": -1,
+        "thinker": 0.4,
+        "other": -1
+      },
+      "outcomeGate": {
+        "enabled": true,
+        "minRuns": 12,
+        "minProgressRate": 0.5,
+        "relativeToBest": 0.75,
+        "windowHours": 24,
+        "lastRuns": 40
+      },
+      "manual": {
+        "doer": [],
+        "thinker": [],
+        "other": []
+      },
+      "warnings": [
+        {
+          "code": "fleet-too-small",
+          "role": "doer",
+          "message": "only 2 scored arms (< 8): the doer quality minimum is not applied"
+        },
+        {
+          "code": "fleet-too-small",
+          "role": "thinker",
+          "message": "only 2 scored arms (< 8): the thinker quality minimum is not applied"
+        },
+        {
+          "code": "fleet-too-small",
+          "role": "other",
+          "message": "only 2 scored arms (< 8): the other quality minimum is not applied"
+        }
+      ],
+      "roles": {
+        "doer": {
+          "excludedFamilies": [],
+          "excludedArms": [],
+          "suspended": false,
+          "suspendedGates": [],
+          "suspendedManual": [],
+          "outcome": {
+            "families": {},
+            "gated": [],
+            "best": null
+          }
+        },
+        "thinker": {
+          "excludedFamilies": [],
+          "excludedArms": [],
+          "suspended": false,
+          "suspendedGates": [],
+          "suspendedManual": [],
+          "outcome": {
+            "families": {},
+            "gated": [],
+            "best": null
+          }
+        },
+        "other": {
+          "excludedFamilies": [],
+          "excludedArms": [],
+          "suspended": false,
+          "suspendedGates": [],
+          "suspendedManual": [],
+          "outcome": {
+            "families": {},
+            "gated": [],
+            "best": null
+          }
+        }
+      },
+      "arms": [
+        {
+          "armId": "muse-spark-1-3-xhigh",
+          "family": "muse",
+          "model": "muse-spark-1.3-contributor",
+          "effort": "xhigh",
+          "qFleet": -1,
+          "qFleetThinker": -1,
+          "eligible": {
+            "doer": {
+              "ok": true,
+              "reasons": []
+            },
+            "thinker": {
+              "ok": true,
+              "reasons": []
+            },
+            "other": {
+              "ok": true,
+              "reasons": []
+            }
+          }
+        },
+        {
+          "armId": "muse-spark-1.4-contributor",
+          "family": "muse",
+          "model": "muse-spark-1.4-contributor",
+          "effort": "xhigh",
+          "qFleet": 1,
+          "qFleetThinker": 1,
+          "eligible": {
+            "doer": {
+              "ok": true,
+              "reasons": []
+            },
+            "thinker": {
+              "ok": true,
+              "reasons": []
+            },
+            "other": {
+              "ok": true,
+              "reasons": []
+            }
+          }
+        }
+      ]
+    },
+    "agentRunning": {},
+    "keepAgentIds": [],
+    "keptByAgent": {},
+    "reviewerAccountIdsByAgent": {},
+    "reviewerPaceByAgent": {},
+    "inFlightByAccount": {},
+    "inFlightByPool": {},
+    "staleInFlightDropped": 0,
+    "unverifiedExcluded": 0,
+    "reconciledUnverified": 0,
+    "clampedInFlightDropped": 0,
+    "reactiveAccounts": 0,
+    "runsObserved": 0,
+    "runsCandidates": 0,
+    "runsSource": "events",
+    "paceGuard": {
+      "enabled": true,
+      "holdAheadPts": 0.1,
+      "roleSafety": [
+        {
+          "code": "role-empty-hold-suspended",
+          "role": "doer",
+          "accountIds": [
+            "meta:sample"
+          ],
+          "message": "weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies"
+        },
+        {
+          "code": "role-empty-hold-suspended",
+          "role": "thinker",
+          "accountIds": [
+            "meta:sample"
+          ],
+          "message": "weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies"
+        },
+        {
+          "code": "role-empty-hold-suspended",
+          "role": "other",
+          "accountIds": [
+            "meta:sample"
+          ],
+          "message": "weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies"
+        }
+      ],
+      "marginPct": 0.02,
+      "retryAfterMs": 300000,
+      "pools": [
+        {
+          "pool": "meta",
+          "lanes": 1,
+          "planAhead": 0.2,
+          "pacedSlots": 1.7714285714285714,
+          "cap": 2,
+          "inFlight": 0,
+          "ahead": true,
+          "paced": false,
+          "state": "ahead",
+          "pacedAccountIds": []
+        }
+      ],
+      "rawPools": [
+        {
+          "pool": "meta",
+          "lanes": 1,
+          "planAhead": 0.2,
+          "pacedSlots": 0,
+          "cap": 0,
+          "inFlight": 0,
+          "ahead": true,
+          "paced": true,
+          "state": "hard-held",
+          "pacedAccountIds": [
+            "meta:sample"
+          ],
+          "hardHeldAccountIds": [
+            "meta:sample"
+          ]
+        }
+      ],
+      "burnAccounts": [],
+      "unattributedInFlight": 0
+    },
+    "reviewReserve": {
+      "enabled": true,
+      "agentIds": [
+        "reviewer"
+      ],
+      "providers": [
+        "claude"
+      ],
+      "perProvider": {
+        "claude": {
+          "provider": "claude",
+          "reserve": 0.1,
+          "lent": true,
+          "needPctPerH": 0,
+          "reviewRatePctPerH": 0,
+          "backlogRatePctPerH": 0,
+          "capacityPctPerH": 0,
+          "queuedReviews": 0,
+          "reviewRunsPerH": 0,
+          "pctPerReviewRun": 0,
+          "heldAccountIds": [],
+          "accounts": []
+        }
+      },
+      "heldAccountIds": []
+    },
+    "reviewer": {
+      "providers": [
+        "claude"
+      ],
+      "qualifiedAccountIds": [],
+      "slots": 0,
+      "hold": true,
+      "resume": false,
+      "reason": "no qualified reviewer capacity: hold reviews until a qualified provider recovers",
+      "routing": {
+        "enabled": false,
+        "reason": "reviewerRouting not configured: review agents keep their configured model"
+      }
+    },
+    "capacityChange": {
+      "version": 1,
+      "atMs": 1793275200000,
+      "added": [
+        "meta:sample"
+      ],
+      "removed": [],
+      "upwardAccountIds": [],
+      "downwardAccountIds": [],
+      "wake": false,
+      "seq": 0,
+      "lastWakeAtMs": null
+    },
+    "supplySignal": {
+      "providers": [],
+      "wake": false,
+      "doerStarvation": {
+        "target": null,
+        "liveDoerRuns": 0,
+        "doerDemand": 2,
+        "gap": null,
+        "marginRuns": 4,
+        "sustainMs": 600000,
+        "starving": false,
+        "waiting": false,
+        "sinceMs": null,
+        "wake": false,
+        "unknown": true
+      }
+    },
+    "unmappedRuns": 0,
+    "runEventsSeen": 0,
+    "lastRunEventAtMs": null,
+    "shadow": {
+      "decided": 0,
+      "mergedEventTime": 0,
+      "backfilledActuals": 0,
+      "skippedNoDecision": 0,
+      "skippedPaced": 0
+    }
+  },
+  "ladders": {
+    "atMs": 1793275200000,
+    "ladders": {
+      "meta:sample": {
+        "rungs": [
+          {
+            "armId": "muse-spark-1-3-xhigh",
+            "family": "muse",
+            "model": "muse-spark-1.3-contributor",
+            "Q": -1,
+            "C": 1,
+            "coverage": 1,
+            "costBase": 1,
+            "costMultiplier": 1,
+            "costEffective": 1,
+            "tierSource": "none",
+            "statsRequests": 0,
+            "credentialEvidence": {
+              "model": "muse-spark-1.3-contributor",
+              "provider": "meta",
+              "accountId": "meta:sample",
+              "status": "valid",
+              "servingCredentials": 1,
+              "readyCredentials": 1,
+              "observedAtMs": 1793275200000,
+              "expiresAtMs": 1793275320000
+            },
+            "effort": "xhigh",
+            "trial": false,
+            "contextWindow": null,
+            "costEstimated": false,
+            "qAa": -1,
+            "qEee": null,
+            "qBlended": -1,
+            "qThinker": -1,
+            "qFleet": -1,
+            "qFleetThinker": -1,
+            "eeePrior": null,
+            "rung": 0,
+            "maxRung": 1,
+            "cap": null,
+            "breaker": "closed"
+          },
+          {
+            "armId": "muse-spark-1.4-contributor",
+            "family": "muse",
+            "model": "muse-spark-1.4-contributor",
+            "Q": 1,
+            "C": 2,
+            "coverage": 1,
+            "costBase": 2,
+            "costMultiplier": 1,
+            "costEffective": 2,
+            "tierSource": "none",
+            "statsRequests": 0,
+            "credentialEvidence": {
+              "model": "muse-spark-1.4-contributor",
+              "provider": "meta",
+              "accountId": "meta:sample",
+              "status": "valid",
+              "servingCredentials": 1,
+              "readyCredentials": 1,
+              "observedAtMs": 1793275200000,
+              "expiresAtMs": 1793275320000
+            },
+            "effort": "xhigh",
+            "trial": false,
+            "contextWindow": null,
+            "costEstimated": false,
+            "qAa": 1,
+            "qEee": null,
+            "qBlended": 1,
+            "qThinker": 1,
+            "qFleet": 1,
+            "qFleetThinker": 1,
+            "eeePrior": null,
+            "rung": 1,
+            "maxRung": 1,
+            "cap": null,
+            "breaker": "closed"
+          }
+        ],
+        "dominated": [],
+        "dropped": [],
+        "withinNoise": [],
+        "rankingRungs": [
+          {
+            "rung": 0,
+            "armId": "muse-spark-1-3-xhigh",
+            "Q": -1,
+            "C": 1,
+            "coverage": 1,
+            "maxRung": 1
+          },
+          {
+            "rung": 1,
+            "armId": "muse-spark-1.4-contributor",
+            "Q": 1,
+            "C": 2,
+            "coverage": 1,
+            "maxRung": 1
+          }
+        ],
+        "rankingWithinNoise": [],
+        "credentialRanking": {
+          "candidates": [
+            {
+              "armId": "muse-spark-1-3-xhigh",
+              "family": "muse",
+              "model": "muse-spark-1.3-contributor",
+              "Q": -1,
+              "C": 1,
+              "coverage": 1,
+              "costBase": 1,
+              "costMultiplier": 1,
+              "costEffective": 1,
+              "tierSource": "none",
+              "statsRequests": 0,
+              "credentialEvidence": {
+                "model": "muse-spark-1.3-contributor",
+                "provider": "meta",
+                "accountId": "meta:sample",
+                "status": "valid",
+                "servingCredentials": 1,
+                "readyCredentials": 1,
+                "observedAtMs": 1793275200000,
+                "expiresAtMs": 1793275320000
+              },
+              "effort": "xhigh",
+              "trial": false,
+              "contextWindow": null,
+              "costEstimated": false,
+              "qAa": -1,
+              "qEee": null,
+              "qBlended": -1,
+              "qThinker": -1,
+              "qFleet": -1,
+              "qFleetThinker": -1,
+              "eeePrior": null,
+              "cap": null
+            },
+            {
+              "armId": "muse-spark-1.4-contributor",
+              "family": "muse",
+              "model": "muse-spark-1.4-contributor",
+              "Q": 1,
+              "C": 2,
+              "coverage": 1,
+              "costBase": 2,
+              "costMultiplier": 1,
+              "costEffective": 2,
+              "tierSource": "none",
+              "statsRequests": 0,
+              "credentialEvidence": {
+                "model": "muse-spark-1.4-contributor",
+                "provider": "meta",
+                "accountId": "meta:sample",
+                "status": "valid",
+                "servingCredentials": 1,
+                "readyCredentials": 1,
+                "observedAtMs": 1793275200000,
+                "expiresAtMs": 1793275320000
+              },
+              "effort": "xhigh",
+              "trial": false,
+              "contextWindow": null,
+              "costEstimated": false,
+              "qAa": 1,
+              "qEee": null,
+              "qBlended": 1,
+              "qThinker": 1,
+              "qFleet": 1,
+              "qFleetThinker": 1,
+              "eeePrior": null,
+              "cap": null
+            }
+          ],
+          "rankingRungs": [
+            {
+              "rung": 0,
+              "armId": "muse-spark-1-3-xhigh",
+              "Q": -1,
+              "C": 1,
+              "coverage": 1,
+              "maxRung": 1
+            },
+            {
+              "rung": 1,
+              "armId": "muse-spark-1.4-contributor",
+              "Q": 1,
+              "C": 2,
+              "coverage": 1,
+              "maxRung": 1
+            }
+          ],
+          "previousRungs": [],
+          "gateByArm": null,
+          "heldPairs": []
+        },
+        "burnPerRunPct": {
+          "muse-spark-1-3-xhigh": null,
+          "muse-spark-1.4-contributor": null
+        },
+        "policyReviewerArms": [],
+        "taskRoles": {
+          "doer": {
+            "rungs": [],
+            "dominated": [],
+            "dropped": [],
+            "withinNoise": [],
+            "candidates": [
+              {
+                "armId": "muse-spark-1-3@xhigh",
+                "model": "muse-spark-1.3-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": false,
+                "aaSlug": "muse-spark-1-3-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-3-xhigh",
+                  "intelligenceIndex": 50,
+                  "intelligenceIndexCostPerTask": 1
+                },
+                "matchType": "verified-alias",
+                "effortVerified": true,
+                "matchReason": null,
+                "evidenceReason": null,
+                "canonicalModel": "muse-spark-1.3-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.3-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 1,
+                "costMultiplier": 1,
+                "costEffective": 1,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 1,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 1,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "doer",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": -1,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "insufficient-profile-coverage",
+                "selectionReason": "insufficient-profile-coverage",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 50,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 1,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 1,
+                "eligible": false,
+                "benchmarkEligible": false
+              },
+              {
+                "armId": "muse-spark-1-4@xhigh",
+                "model": "muse-spark-1.4-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": true,
+                "aaSlug": "muse-spark-1-4-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-4-xhigh",
+                  "intelligenceIndex": 55,
+                  "intelligenceIndexCostPerTask": 2
+                },
+                "matchType": "verified-alias",
+                "effortVerified": false,
+                "matchReason": null,
+                "evidenceReason": "effort-unverified",
+                "canonicalModel": "muse-spark-1.4-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.4-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 2,
+                "costMultiplier": 1,
+                "costEffective": 2,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 2,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 2,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "doer",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": -1,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "effort-unverified",
+                "selectionReason": "effort-unverified",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 55,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 2,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 2,
+                "eligible": false,
+                "benchmarkEligible": false
+              }
+            ],
+            "rankingRungs": [],
+            "previousRungs": [],
+            "gateByArm": null,
+            "heldPairs": []
+          },
+          "reviewer": {
+            "rungs": [],
+            "dominated": [],
+            "dropped": [],
+            "withinNoise": [],
+            "candidates": [
+              {
+                "armId": "muse-spark-1-3@xhigh",
+                "model": "muse-spark-1.3-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": false,
+                "aaSlug": "muse-spark-1-3-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-3-xhigh",
+                  "intelligenceIndex": 50,
+                  "intelligenceIndexCostPerTask": 1
+                },
+                "matchType": "verified-alias",
+                "effortVerified": true,
+                "matchReason": null,
+                "evidenceReason": null,
+                "canonicalModel": "muse-spark-1.3-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.3-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 1,
+                "costMultiplier": 1,
+                "costEffective": 1,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 1,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 1,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "reviewer",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": null,
+                  "q": null,
+                  "suspended": null
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "insufficient-profile-coverage",
+                "selectionReason": "insufficient-profile-coverage",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 50,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 1,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 1,
+                "eligible": false,
+                "benchmarkEligible": false
+              },
+              {
+                "armId": "muse-spark-1-4@xhigh",
+                "model": "muse-spark-1.4-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": true,
+                "aaSlug": "muse-spark-1-4-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-4-xhigh",
+                  "intelligenceIndex": 55,
+                  "intelligenceIndexCostPerTask": 2
+                },
+                "matchType": "verified-alias",
+                "effortVerified": false,
+                "matchReason": null,
+                "evidenceReason": "effort-unverified",
+                "canonicalModel": "muse-spark-1.4-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.4-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 2,
+                "costMultiplier": 1,
+                "costEffective": 2,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 2,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 2,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "reviewer",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.2,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": null,
+                  "q": null,
+                  "suspended": null
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "effort-unverified",
+                "selectionReason": "effort-unverified",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 55,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 2,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 2,
+                "eligible": false,
+                "benchmarkEligible": false
+              }
+            ],
+            "rankingRungs": [],
+            "previousRungs": [],
+            "gateByArm": null,
+            "heldPairs": []
+          },
+          "thinker": {
+            "rungs": [],
+            "dominated": [],
+            "dropped": [],
+            "withinNoise": [],
+            "candidates": [
+              {
+                "armId": "muse-spark-1-3@xhigh",
+                "model": "muse-spark-1.3-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": false,
+                "aaSlug": "muse-spark-1-3-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-3-xhigh",
+                  "intelligenceIndex": 50,
+                  "intelligenceIndexCostPerTask": 1
+                },
+                "matchType": "verified-alias",
+                "effortVerified": true,
+                "matchReason": null,
+                "evidenceReason": null,
+                "canonicalModel": "muse-spark-1.3-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.3-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 1,
+                "costMultiplier": 1,
+                "costEffective": 1,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 1,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 1,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "thinker",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gpqa": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GPQA Diamond (legacy)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "critpt": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "CritPt (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gdpvalNormalized": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GDPval normalized (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.05,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gpqa": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GPQA Diamond (legacy)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "critpt": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "CritPt (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gdpvalNormalized": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GDPval normalized (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.05,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": 0.4,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "insufficient-profile-coverage",
+                "selectionReason": "insufficient-profile-coverage",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 50,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 1,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 1,
+                "eligible": false,
+                "benchmarkEligible": false
+              },
+              {
+                "armId": "muse-spark-1-4@xhigh",
+                "model": "muse-spark-1.4-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": true,
+                "aaSlug": "muse-spark-1-4-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-4-xhigh",
+                  "intelligenceIndex": 55,
+                  "intelligenceIndexCostPerTask": 2
+                },
+                "matchType": "verified-alias",
+                "effortVerified": false,
+                "matchReason": null,
+                "evidenceReason": "effort-unverified",
+                "canonicalModel": "muse-spark-1.4-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.4-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 2,
+                "costMultiplier": 1,
+                "costEffective": 2,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 2,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 2,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "thinker",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gpqa": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GPQA Diamond (legacy)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "critpt": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "CritPt (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gdpvalNormalized": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GDPval normalized (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.05,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "hle": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.25,
+                    "version": "HLE (source snapshot grader)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gpqa": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GPQA Diamond (legacy)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "critpt": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "CritPt (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "gdpvalNormalized": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "GDPval normalized (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.05,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": 0.4,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "effort-unverified",
+                "selectionReason": "effort-unverified",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 55,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 2,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 2,
+                "eligible": false,
+                "benchmarkEligible": false
+              }
+            ],
+            "rankingRungs": [],
+            "previousRungs": [],
+            "gateByArm": null,
+            "heldPairs": []
+          },
+          "other": {
+            "rungs": [],
+            "dominated": [],
+            "dropped": [],
+            "withinNoise": [],
+            "candidates": [
+              {
+                "armId": "muse-spark-1-3@xhigh",
+                "model": "muse-spark-1.3-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": false,
+                "aaSlug": "muse-spark-1-3-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-3-xhigh",
+                  "intelligenceIndex": 50,
+                  "intelligenceIndexCostPerTask": 1
+                },
+                "matchType": "verified-alias",
+                "effortVerified": true,
+                "matchReason": null,
+                "evidenceReason": null,
+                "canonicalModel": "muse-spark-1.3-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.3-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 1,
+                "costMultiplier": 1,
+                "costEffective": 1,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 1,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 1,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "other",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": -1,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "insufficient-profile-coverage",
+                "selectionReason": "insufficient-profile-coverage",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 50,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 1,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 1,
+                "eligible": false,
+                "benchmarkEligible": false
+              },
+              {
+                "armId": "muse-spark-1-4@xhigh",
+                "model": "muse-spark-1.4-contributor",
+                "effort": "xhigh",
+                "family": "muse",
+                "providers": null,
+                "dynamic": true,
+                "aaSlug": "muse-spark-1-4-xhigh",
+                "aaEffort": "xhigh",
+                "row": {
+                  "slug": "muse-spark-1-4-xhigh",
+                  "intelligenceIndex": 55,
+                  "intelligenceIndexCostPerTask": 2
+                },
+                "matchType": "verified-alias",
+                "effortVerified": false,
+                "matchReason": null,
+                "evidenceReason": "effort-unverified",
+                "canonicalModel": "muse-spark-1.4-contributor",
+                "credentialEvidence": {
+                  "model": "muse-spark-1.4-contributor",
+                  "provider": "meta",
+                  "accountId": "meta:sample",
+                  "status": "valid",
+                  "servingCredentials": 1,
+                  "readyCredentials": 1,
+                  "observedAtMs": 1793275200000,
+                  "expiresAtMs": 1793275320000
+                },
+                "operationalReasons": [],
+                "costBase": 2,
+                "costMultiplier": 1,
+                "costEffective": 2,
+                "tierSource": "none",
+                "statsRequests": 0,
+                "costFree": false,
+                "trial": false,
+                "contextWindow": null,
+                "cap": null,
+                "quotaBurnPerRunPct": null,
+                "evidenceObservedAt": "2026-10-29T12:00:00.000Z",
+                "fieldObservedAt": null,
+                "costEstimated": false,
+                "aaCostPerTask": 2,
+                "aaCostSource": "measured",
+                "aaCostObservedAt": "2026-10-29T12:00:00.000Z",
+                "taskCostProxy": 2,
+                "estimatedApiEquivalentPerAcceptedTask": null,
+                "cashUsdPerAcceptedTask": null,
+                "calibration": {
+                  "ready": false,
+                  "reason": "awaiting-native-attributed-outcomes",
+                  "closedTasks": 0,
+                  "acceptedTasks": 0,
+                  "pendingTasks": 0,
+                  "relativeCiHalfWidth": null
+                },
+                "taskRanking": true,
+                "role": "other",
+                "Q": null,
+                "qThinker": null,
+                "qFleet": null,
+                "qFleetThinker": null,
+                "qAa": null,
+                "qFleetAa": null,
+                "qEee": null,
+                "qFleetEee": null,
+                "qBlended": null,
+                "blendAlpha": 0,
+                "components": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "fleetComponents": {
+                  "terminalbenchV40": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.45,
+                    "version": "Terminal-Bench 4.0",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "scicode": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "SciCode (source snapshot harness)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "lcr": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "AA-LCR (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "ifbench": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.15,
+                    "version": "IFBench (source snapshot)",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  },
+                  "omniscienceNonHallucination": {
+                    "value": null,
+                    "reason": "missing",
+                    "z": null,
+                    "weight": 0.1,
+                    "version": "AA-Omniscience 1 - hallucination rate",
+                    "observedAt": null,
+                    "source": "aa-snapshot"
+                  }
+                },
+                "coverage": 0,
+                "absoluteCoverage": 0,
+                "primaryEvidence": false,
+                "minQuality": {
+                  "ok": true,
+                  "min": -1,
+                  "q": null,
+                  "suspended": "insufficient-scored-population"
+                },
+                "benchmarkTrusted": false,
+                "trustReason": "effort-unverified",
+                "selectionReason": "effort-unverified",
+                "metricObservations": {
+                  "intelligenceIndex": {
+                    "value": 55,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  },
+                  "intelligenceIndexCostPerTask": {
+                    "value": 2,
+                    "reason": null,
+                    "observedAt": "2026-10-29T12:00:00.000Z",
+                    "source": "aa-snapshot"
+                  }
+                },
+                "C": 2,
+                "eligible": false,
+                "benchmarkEligible": false
+              }
+            ],
+            "rankingRungs": [],
+            "previousRungs": [],
+            "gateByArm": null,
+            "heldPairs": []
+          }
+        },
+        "taskRankingMode": "shadow",
+        "taskTrialRoles": [
+          "doer",
+          "other"
+        ],
+        "taskBurnPerRunPct": {
+          "muse-spark-1-3@xhigh": null,
+          "muse-spark-1-4@xhigh": null
+        }
+      }
+    }
+  }
+}

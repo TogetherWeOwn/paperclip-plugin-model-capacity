@@ -1,10 +1,29 @@
 # Changelog
 
-## Unreleased
-
-### Weekly pacing (0.2.73 — 2026-10-28)
+## 0.2.77
+### Weekly pacing
 - Add a default ten-percentage-point weekly ahead hold (`pacing.holdAheadPts`; `null` opts out): idle ahead accounts receive zero new slots instead of immediately reopening the one-job minimum. Burn mode remains exempt. Per-role empty-capacity safety suspends only hard holds, retains ordinary pacing, and is reported in `/capacity.paceGuard.roleSafety`. Shared-pool caps exclude held account allowance and preserve existing running work. Raw hold facts remain separate from role-local routing exceptions, so global pinned/reviewer budgets cannot inherit another role's exemption.
 - Price the weekly linear endpoint, required rate and concurrency need at 100% minus the existing explicit account floor (`burnMode.floors`) only when it governs the weekly meter, with no extra pacing remainder; regenerating-meter floors retain their own exhaustion gate without reducing the weekly target. Report target and spendable quota without changing raw remaining readings. No new capabilities, jobs, egress, host automation or production changes.
+
+### Fixed
+- Require a mappable, credential-ready (while enforced), closed-breaker reviewer policy arm before counting it as pool membership. A reviewer-local pool applies its own role exclusions; universal raw membership requires survival of at least one of the doer, thinker or other fences, so neither one role's exclusion nor an arm excluded by every role can corrupt a shared cap. Shadow-mode policy diagnostics never size enforced capacity.
+- Keep fixed reservations off a hold-suspended pool mate's reviewer-local allowance, preserving the reviewer's feasible slot across account orders and both allocator modes. Running work on a held non-exempt lane retains its floor without charging that restored allowance.
+
+## 0.2.75
+### Added
+- Opt-in per-account fallback for `doer` and `other` roles, preserving reviewer and other safety fences. Inspect admitted and suppressed rows in `/capacity.eligibility.accountFallback`; dashboard exclusions remain global. The fallback quality floor is a fleet-relative z-score, not an absolute benchmark.
+- Offline replay provenance and parity checks for staged newest/fallback rollout. Retain pre-newest capture-time provenance and pass historical fidelity before enabling newest; judge a newest-enabled capture only with its matching producer and flags, then check parity before enabling fallback.
+
+## 0.2.74
+### Added
+- Opt-in account-scoped newest-version filtering with scoped keeps, parser overrides, and auditable supersession views. Disabled by default. Strict Pareto and cross-account dominance remain in force.
+
+## 0.2.73
+### Fixed
+- Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.
+- Preserve missing benchmark and cost observations with their original timestamps, while publishing a new intelligence-index major as a fresh generation without carrying prior-major data. Report pages, static arm coverage and previous snapshot age.
+
+## Unreleased
 
 ### Added
 - Alert-only failure-cluster detector (default off): failed-run events feed per-account counters in plugin state; >= 3 allowlisted failures (`claude_auth_required`, `claude_transient_upstream`, `adapter_failed`) for one account inside a 15-minute event-time window creates or updates exactly one stable-origin managed alert issue and reports `error` through plugin health until the cluster clears. Writes happen on cluster enter/exit/count-band transitions only, never per run; `timed_out` runs are excluded and the account keeps the legacy ` on provider:account` extraction. Opt in with `failureClusterAlert: { enabled: true, assigneeAgentId }`; disabled or unassigned performs zero issue writes. Adds exactly `issues.create` + `issues.update` with create/update field allowlists and per-write ownership checks; no comment, checkout, wakeup, interaction, document or relation writes, no routing or enforce-flag change, no new job, egress, secret or env key.
@@ -13,8 +32,6 @@
 - Free running counts and cap headroom stay separate from paid allocations. Existing manual exclusions, native pins, reviewer boundaries, credential-readiness mode, context caps, task-evidence trust and breakers retain authority. Synthetic and unmetered Workers AI are excluded; NIM Muse and non-`:free` OpenRouter IDs are denied. No new job, capability, external call, host script or core patch. The default-off path is unchanged.
 
 ### Fixed
-- Require the full routed admission test before a configured reviewer policy record counts as pool membership: a mappable model, credential readiness (while enforced), a closed arm breaker, and survival of the role's configured exclusions. Raw weekly pools and live reviewer pools now match the routed reviewer pick, so an unready, breaker-open or role-excluded sibling lane can no longer erase a qualified soft cap, reopen the pool fail-open, or admit a second concurrent reviewer run. Policy records also no longer size raw capacity while task ranking is off. No new capability, egress, secret or env key.
-- Stop fixed reservations from charging a hold-suspended account's restored slots. Those slots are released for one reviewer role only, so charging them either stranded the reviewer the restoration was fenced for or, depending on account order, left it unfunded while a pool mate's allowance sat idle. Fixed pins now charge only unheld pool mates (and an exempt role's own serving account), which makes the allocation independent of account order. No capability, egress, secret or env key change.
 - Invalidate the cached routing policy on configuration change: per-company config generations refetch a replaced source at unchanged TTL, retire the live view so the resolve hook defers instead of routing on a stale snapshot, and reject late old-generation publication. Cache hits never refresh source observation time or extend evidence/authorization expiry. No capability, egress, secret or env-key change.
 - Failure-cluster alerts retain a bounded pending transition snapshot through issue-write outages and window expiry, then deliver a catch-up history on recovery. Queued maintenance respects current disable config, invalid failure timestamps fall through to valid publish times, and missing run identifiers no longer collapse distinct failures into one.
 - Bound blocking-priority cap smoothing by the paid target before adding free allocations; a held paid cap cannot spend the separate free budget when both opt-ins are enabled.

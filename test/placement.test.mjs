@@ -167,6 +167,21 @@ test('placementArm picks the same arm as decide() (headroom ample, no trial arms
   }
 });
 
+test('a rung-zero unscored canary does not override a higher pacing pointer in decide or placement', () => {
+  const rungs = [
+    { rung: 0, arms: [arm('swe-2', 'swe', null, null, { C: 0, trial: true, unscoredTrial: true })] },
+    { rung: 1, arms: [arm('sonnet', 'sonnet', 0.5, 0.6)] },
+  ];
+  const options = { role: 'doer', roleBands: bands, pointer: 1, trialRoles: ['doer'] };
+  const placed = placementArm(rungs, options);
+  const decision = decide({ ...options, runId: 'canary-pointer', agentId: 'builder', accountId: 'mixed',
+    ladderRungs: rungs, trialBudget: { swe: 1 }, trialAdapters: { 'claude-code': ['swe'] }, adapterType: 'claude-code' });
+  assert.equal(placed.armId, 'sonnet');
+  assert.equal(decision.kind, 'decide');
+  assert.equal(decision.armId, placed.armId);
+  assert.equal(decision.rung, placed.rung);
+});
+
 test('trial arms are placed only for trial roles', () => {
   const rungs = [{ rung: 0, arms: [arm('oss', 'oss', 0, 0.5, { trial: true })] }];
   assert.equal(placementArm(rungs, { role: 'doer', roleBands: bands, pointer: 0, trialRoles: ['doer'] }).armId, 'oss');

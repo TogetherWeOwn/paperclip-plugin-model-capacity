@@ -7,7 +7,7 @@ import {
 } from '../src/aa.mjs';
 
 test('free-API URL is the documented endpoint', () => {
-  assert.equal(AA_FREE_LIST_URL, 'https://artificialanalysis.ai/api/v2/data/llms/models');
+  assert.equal(AA_FREE_LIST_URL, 'https://artificialanalysis.ai/api/v2/language/models/free');
 });
 
 test('fetch args require the allowlisted URL and a key', () => {
