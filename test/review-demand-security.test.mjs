@@ -401,6 +401,7 @@ for (const change of ['disable', 'repository', 'secret-version']) {
 async function pluginFixture(fetch) {
   const f = fixture({ fetch });
   const raw = {
+    pacing: { holdAheadPts: null }, // isolate transport/cache security from weekly-evidence admission
     roles: { keepAgentIds: ['reviewer'] },
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'codex', model: 'fixture-model' }] },
     reviewDemand: { repositories: ['example/product'], tokenSecretRef: { ...REF } },

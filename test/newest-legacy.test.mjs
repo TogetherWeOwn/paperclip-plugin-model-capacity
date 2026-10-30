@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { replayTick } from '../scripts/aa-replay.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 import { loadWeeklyReference } from './weekly-reference.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 
 // Routing fixtures use allowed synthetic versions, retaining the captured
 // product ordering and cohort size without bypassing mandatory model bans.
@@ -222,7 +223,12 @@ test('X-T03: full-fleet newest and fallback flag matrix preserves supersession b
     execFileSync('tar', ['-x', '-C', histDir], { input: archive });
     const baseline = await import(pathToFileURL(join(histDir, 'scripts/aa-replay.mjs')).href);
     const ref = await weekly.replayTick({ ...base, lane: fleet, snapshot: scored, config: disabledConfig });
-    assert.deepEqual(projectForParity(results.get('false:false')), projectForParity(ref));
+    const parityReference = projectForParity(ref);
+    assert.equal(Object.hasOwn(parityReference.capacity, 'reviewAdmissionEpoch'), false);
+    // This old no-reviewer capture predates the now-mandatory process marker.
+    // Only the expected comparison gets a placeholder; current real evidence is validated separately.
+    parityReference.capacity.reviewAdmissionEpoch = '<epoch>';
+    assert.deepEqual(projectCompatibilityEvidence(results.get('false:false')), parityReference);
     // Historical-to-weekly migration: 19 reactive accounts lack weekly readings,
     // so spendable stays null while the plan endpoint is still published.
     const unmodified = await baseline.replayTick({ ...base, lane: fleet, snapshot: scored, config: disabledConfig });

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 import { loadWeeklyReference } from './weekly-reference.mjs';
+import { projectForParity } from '../scripts/aa-replay.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 
 test('offline replay executes the real shadow tick with supplied AA snapshots', async () => {
   const path = new URL('../scripts/aa-replay.mjs', import.meta.url);
@@ -101,6 +103,21 @@ function replayInputs() {
 
 // Weekly-compatible reference loads from the portable fixture.
 // See weekly-reference.mjs: synthetic assembly, never a live capture.
+function conservativeCodexReference(reference) {
+  const expected = projectForParity(reference), capacity = expected.capacity;
+  assert.deepEqual(capacity.accounts.map(account => account.accountId), ['codex:a']);
+  assert.deepEqual(capacity.paceGuard.rawPools[0].hardHeldAccountIds, ['codex:a']);
+  assert.equal(capacity.paceGuard.rawPools[0].cap, 0);
+  assert.equal(capacity.reviewer.routing.preview.routed, true);
+  assert.equal(capacity.reviewer.routing.accountId, 'codex:a');
+  // This one archived fixture advertised a globally held policy-only review
+  // route. The cut replaces only that unsafe positive and its missing local hold.
+  const reason = 'no servable account serves a configured reviewer arm (1 refused)';
+  capacity.reviewer.routing = { ...capacity.reviewer.routing, accountId: null, provider: null, arm: null,
+    reason, preview: { routed: false, fallback: 'keep', reason } };
+  capacity.reviewerPaceByAgent.review.pools = structuredClone(capacity.paceGuard.rawPools);
+  return expected;
+}
 
 test('X-R1: lifecycle generation differs in historical fidelity but not identical replays', async () => {
   const { replayTick, assertFidelity, projectForParity } = await import('../scripts/aa-replay.mjs');
@@ -168,7 +185,7 @@ test('X-R4(c,d): enabled producer judges itself; its inputs still support disabl
     input.config.roles.newestVersionOnly = { enabled: false };
     const ref = await weekly.replayTick(structuredClone(input));
     const patched = await replayTick(structuredClone(input));
-    assert.deepEqual(projectForParity(ref), projectForParity(patched));
+    assert.deepEqual(conservativeCodexReference(ref), projectCompatibilityEvidence(patched));
   } finally { await cleanup(); }
 });
 
@@ -186,7 +203,7 @@ test('X-R2: post-state replay advances capacity change while fidelity holds', as
   const { mod: weekly, cleanup } = await loadWeeklyReference();
   try {
     const ref = await weekly.replayTick(structuredClone(postInput));
-    assert.deepEqual(projectForParity(post), projectForParity(ref));
+    assert.deepEqual(projectCompatibilityEvidence(post), conservativeCodexReference(ref));
   } finally { await cleanup(); }
 });
 
@@ -224,7 +241,7 @@ test('synthetic Gate S compares baseline and patched for absent, false and malfo
       const patched = await replayTick(structuredClone(input));
       assert.equal(Object.hasOwn(ref.capacity, 'reviewAdmissionEpoch'), Object.hasOwn(patched.capacity, 'reviewAdmissionEpoch'));
       for (const output of [ref, patched]) assert.match(output.capacity.reviewAdmissionEpoch, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
-      assert.deepEqual(projectForParity(ref), projectForParity(patched));
+      assert.deepEqual(conservativeCodexReference(ref), projectCompatibilityEvidence(patched));
     }
   } finally { await cleanup(); }
 });

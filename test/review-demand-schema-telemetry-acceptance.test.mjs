@@ -67,6 +67,7 @@ async function capsFixture({ running = 0, pause = false } = {}) {
   const calls = [];
   let censusResolved = false;
   const raw = {
+    pacing: { holdAheadPts: null }, // generation/telemetry fixture; no invented weekly evidence
     roles: { keepAgentIds: ['reviewer'] }, reviewReserve: { enabled: false },
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },
     reviewDemand: source('example/product'),

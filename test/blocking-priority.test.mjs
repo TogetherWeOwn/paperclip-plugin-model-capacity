@@ -21,6 +21,7 @@ const total = rows => rows.reduce((sum, row) => sum + row.allocated, 0);
 async function drive({ issues = chain(), config = {}, target = 1, running = {}, maxTotal = 75,
   failStatus = null, hold = {}, kept = [], queuedCounts = [],
 } = {}) {
+  config = { pacing: { holdAheadPts: null }, ...config }; // priority-only manual snapshots
   let now = NOW;
   const cap = {
     atMs: NOW, calibration: 'measured', target, maxTotal,
@@ -52,7 +53,7 @@ async function drive({ issues = chain(), config = {}, target = 1, running = {}, 
   await plugin.onConfigChanged(config, { companyId: COMPANY });
   return {
     reads, cap, store,
-    configure: config => plugin.onConfigChanged(config, { companyId: COMPANY }),
+    configure: config => plugin.onConfigChanged({ pacing: { holdAheadPts: null }, ...config }, { companyId: COMPANY }),
     advance: ms => { now += ms; },
     caps: async () => {
       const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });

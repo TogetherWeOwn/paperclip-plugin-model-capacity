@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createModelCapacityPlugin, resolveConfig, validateConfigShape } from '../src/plugin.mjs';
 import { manifest } from '../src/manifest.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { projectProducerEpoch } from './producer-evidence.mjs';
 
 const NOW = Date.parse('2026-10-25T15:00:00Z');
 const MODEL = 'nvidia-nim/step-5-preview-nim';
@@ -136,8 +137,14 @@ test('flag off is bit-identical for hook, capacity, caps, shadow and persisted s
   const off = await drive({ free: { ...freeConfig, enabled: false } });
   for (let i = 0; i < 4; i++) assert.deepEqual(await off.hook({ runId: `r${i}` }), await legacy.hook({ runId: `r${i}` }));
   await legacy.tick(); await off.tick();
-  for (const api of ['capacity', 'caps', 'shadow']) assert.deepEqual(await off.api(api), await legacy.api(api), api);
-  assert.deepEqual(off.store, legacy.store);
+  for (const api of ['capacity', 'caps', 'shadow']) {
+    const a = await off.api(api), b = await legacy.api(api);
+    assert.deepEqual(api === 'capacity' ? projectProducerEpoch(a) : a,
+      api === 'capacity' ? projectProducerEpoch(b) : b, api);
+  }
+  const state = store => new Map([...store].map(([key, value]) =>
+    [key, key === skey('capacity-v1') ? projectProducerEpoch(value) : value]));
+  assert.deepEqual(state(off.store), state(legacy.store));
 });
 
 test('disabling free lanes takes effect immediately; enabling waits for fresh native tick', async () => {

@@ -380,7 +380,8 @@ test('keep denied when the default pool is exhausted: keep deferring with skip r
 });
 
 test('exhaustion keep rejects a healthy default whose weekly meter is exhausted', async () => {
-  const d = drive({ accounts: [claudeWeeklyExhausted()], config: baseConfig() });
+  const d = drive({ accounts: [claudeWeeklyExhausted()],
+    config: baseConfig({ pacing: { holdAheadPts: null, guard: { enabled: true } } }) });
   await d.setup();
   await d.tick();
   const view = (await d.api('capacity')).accounts.find(account => account.accountId === 'claude:a1');

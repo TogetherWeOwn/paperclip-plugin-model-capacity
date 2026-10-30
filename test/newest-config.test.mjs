@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { replayTick } from '../scripts/aa-replay.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 import * as eligibility from '../src/eligibility.mjs';
 import { resolveConfig } from '../src/plugin.mjs';
 import { manifest } from '../src/manifest.mjs';
@@ -14,10 +15,8 @@ const snapshot = { fetchedAt: new Date(nowMs).toISOString(), rows: [{ slug: 'mus
 const inputs = { lane, snapshot, states: {}, demand: { doer: 2, thinker: 1, other: 0 }, nowMs };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function project(result) {
-  const copy = structuredClone({ capacity: result.capacity, ladders: result.ladders });
-  assert.match(copy.capacity.reviewAdmissionEpoch, uuid);
-  copy.capacity.reviewAdmissionEpoch = '<epoch>';
-  return copy;
+  assert.match(result.capacity.reviewAdmissionEpoch, uuid);
+  return projectCompatibilityEvidence({ capacity: result.capacity, ladders: result.ladders });
 }
 
 // The checked-in golden was captured from a368f5c's behavior before N2.

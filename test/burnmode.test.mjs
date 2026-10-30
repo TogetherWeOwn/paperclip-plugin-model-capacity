@@ -462,7 +462,8 @@ test('plugin: before the reset the reset still binds (deadlines only shorten aft
 });
 
 test('plugin: routing prefers the burn account; matching by label from the feed', async () => {
-  const accounts = [lane2('a1', 0.2, 100), lane2('a2', 0.6, 100, { label: 'Spare Seat' })];
+  const accounts = [lane2('a1', 0.2, 100, { models: ['claude-opus-5-5'] }),
+    lane2('a2', 0.6, 100, { label: 'Spare Seat', models: ['claude-sonnet-5-5'] })];
   const d = drive({ config: { enforce: true, reviewReserve: { enabled: false }, burnMode: { accounts: ['SPARE SEAT'] } }, accounts });
   await d.setup();
   await d.tick();

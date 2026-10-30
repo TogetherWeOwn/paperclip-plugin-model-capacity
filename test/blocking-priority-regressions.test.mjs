@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { projectProducerEpoch } from './producer-evidence.mjs';
 
 const COMPANY = 'acme';
 const NOW = Date.parse('2026-10-25T12:00:00Z');
@@ -151,7 +152,7 @@ for (const [label, options] of [
     const d = await targetScenario({ priority: true, ...options });
     assert.equal(legacy.capacity.target, 15);
     assert.equal(legacy.capacity.demandBound, 15);
-    assert.deepEqual(d.capacity, legacy.capacity);
+    assert.deepEqual(projectProducerEpoch(d.capacity), projectProducerEpoch(legacy.capacity));
     const { allocation, ...fallback } = d.caps;
     assert.deepEqual(allocation, { blockingPriority: false, error: 'priority-unavailable' });
     assert.deepEqual(fallback, legacy.caps);

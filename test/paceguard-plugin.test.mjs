@@ -364,8 +364,9 @@ test('a lane without ready credentials is outside the pool: its position does no
   // no ready credential, so it can serve nothing. The pool is a1 alone.
   // Readiness exclusion is opt-in: this pins the flag on (off mode admits
   // both lanes, covered by the credential-readiness parity corpus).
-  const ready = claudeLane(0.6, 48);
-  const unready = { ...claudeLane(0.99, 48), accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
+  const ready = claudeLane(0.6, 48, { models: ['claude-opus-5-5'] });
+  const unready = { ...claudeLane(0.99, 48, { models: ['claude-sonnet-5-5'] }),
+    accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
   const d = drive({ config: { enforce: true, credentialReadiness: { enforce: true } }, accounts: [ready, unready] });
   await d.setup();
   await d.tick();
@@ -676,7 +677,7 @@ test('weekly hard hold: burn opt-in bypasses the hold without disabling it for o
 });
 
 for (const mode of ['shadow', 'enforce']) {
-  test(`weekly hard hold: duplicate-only peer prevents a native-pass safety exception (ranking=${mode})`, async () => {
+  test(`weekly hard hold: an indistinguishable duplicate route stays closed (ranking=${mode})`, async () => {
     const fixture = {
       config: { enforce: true, taskRanking: { mode } },
       snapshotRows: aaRows().map(row => ({ ...row, terminalbenchV40: 0.9, scicode: 0.9, lcr: 0.9,
@@ -697,10 +698,12 @@ for (const mode of ['shadow', 'enforce']) {
     assert.ok(Math.abs(capacity.accounts.find(a => a.accountId === 'claude:a1').planAhead - 0.45) < 1e-10);
     assert.ok(capacity.accounts.find(a => a.accountId === 'devin:d1').planAhead < 0);
     const route = await d.hook(`duplicate-peer-${mode}`);
-    assert.equal(route.kind, 'decide', JSON.stringify(route));
+    assert.equal(route.kind, 'defer', JSON.stringify(route));
+    assert.equal(route.model, undefined, 'the common model cannot prove the held native credential is excluded');
     await d.tick();
     const entry = (await d.api('shadow')).body.entries.find(e => e.runId === `duplicate-peer-${mode}`);
-    assert.equal(entry?.accountId, 'devin:d1', 'full-role duplicate capacity must win over the hard-held native');
+    assert.equal(entry?.accountId, undefined, 'an internal duplicate account label is not a safe emission');
+    assert.equal(entry?.wouldModel, undefined);
   });
 }
 

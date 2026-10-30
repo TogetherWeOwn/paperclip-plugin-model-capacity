@@ -335,6 +335,7 @@ async function capsBodyFor(spec) {
   const heartbeatIds = new Set([...spec.keepAgentIds, ...reviews]);
   const ready = spec.agents.map(entry => issueRow(`root-${entry.agentId}`, entry.agentId));
   const raw = {
+    pacing: { holdAheadPts: null }, // bounded-matching wire fixture has no weekly producer proof
     allocation: { blockingPriority: true },
     roles: {
       keepAgentIds: [...heartbeatIds],

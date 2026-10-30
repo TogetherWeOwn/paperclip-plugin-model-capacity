@@ -69,11 +69,15 @@ async function instance({ store, clock, used, raw = config() }) {
     event: (id, type) => events.get(type)({ type, companyId: COMPANY, entityId: id,
       occurredAt: new Date(clock()).toISOString(),
       payload: { run: { agentId: 'worker', provider: 'codex', model: 'gpt-6.1-sol' } } }),
-    caps: async () => {
+    caps: async ({ evidenceUnavailable = false } = {}) => {
       const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
       assert.equal(response.status, 200);
-      assert.equal(response.body.capsError, undefined);
-      assert.deepEqual(response.body.allocation, { blockingPriority: true });
+      assert.equal(response.body.capsError, evidenceUnavailable ? 'weekly-hold-evidence-unavailable' : undefined);
+      if (evidenceUnavailable) {
+        assert.equal(response.body.target, null);
+        for (const row of response.body.agents) assert.equal(row.allocated, row.running);
+      }
+      assert.deepEqual(response.body.allocation, evidenceUnavailable ? undefined : { blockingPriority: true });
       return response.body;
     },
   };
@@ -105,6 +109,10 @@ async function producedSnapshot() {
   assert.ok(snapshot.target > 0, `expected real usable capacity, got ${JSON.stringify(snapshot)}`);
   assert.deepEqual(snapshot.reviewerAccountIdsByAgent.review, ['codex:a'], 'real producer must admit the old arm');
   assert.ok(Object.hasOwn(snapshot, 'reviewAdmissionGeneration'), 'tick must persist its own admission generation');
+  assert.equal(snapshot.holdEvidenceVersion, 1, 'only the current real producer supplies compatible weekly facts');
+  assert.deepEqual(snapshot.weeklyRouteFacts.hardHeldAccountIds, []);
+  assert.deepEqual(snapshot.weeklyRouteFacts.accounts.map(row => ({ accountId: row.accountId, models: row.models })),
+    [{ accountId: 'codex:a', models: ['gpt-6.1-sol'] }]);
   return { store, clock, used, a, snapshot };
 }
 
@@ -126,7 +134,7 @@ test('restart before the next tick rejects previous-process admission despite a 
   assert.equal(b.feedCalls(), 0, 'startup must not silently replace the stored admission snapshot');
   const before = stateValue(d.store, 'capacity-v1');
   assert.deepEqual(before, d.snapshot);
-  const body = await b.caps();
+  const body = await b.caps({ evidenceUnavailable: true });
   const row = reviewer(body);
   assert.equal(body.atMs, d.snapshot.atMs, 'the stale snapshot is still within the normal age window');
   assert.equal(row.queued, 5, 'rejection must preserve visible demand');
@@ -140,7 +148,7 @@ test('restart before the next tick rejects previous-process admission despite a 
 test('restart with unchanged config still requires its own fresh producer snapshot', async () => {
   const d = await producedSnapshot();
   const b = await instance(d);
-  const row = reviewer(await b.caps());
+  const row = reviewer(await b.caps({ evidenceUnavailable: true }));
   assert.equal(b.ticks(), 0);
   assert.equal(row.allocated, row.running, 'persisted admission belongs to the producing process, not just numeric counter 1');
 });
@@ -149,7 +157,7 @@ test('same-process config invalidation rejects real previously-produced admissio
   const d = await producedSnapshot();
   assert.ok(reviewer(await d.a.caps()).allocated > 0);
   await d.a.configure(config('gpt-6.1-sol-unserved'));
-  const row = reviewer(await d.a.caps());
+  const row = reviewer(await d.a.caps({ evidenceUnavailable: true }));
   assert.equal(row.queued, 5);
   assert.equal(row.allocated, row.running);
 });
@@ -187,7 +195,7 @@ test('fresh numeric-only admission cannot grant helpers but same-instance produc
   assert.equal(numericOnly.atMs, d.clock(), 'numeric-only snapshot is fresh, not rejected for age');
   assert.deepEqual(numericOnly.reviewerAccountIdsByAgent.review, ['codex:a']);
   d.store.set(`${COMPANY}/capacity-v1`, numericOnly);
-  const rejected = reviewer(await d.a.caps());
+  const rejected = reviewer(await d.a.caps({ evidenceUnavailable: true }));
   assert.equal(rejected.queued, 5, 'rejected provenance must not erase reviewer demand');
   assert.equal(rejected.running, 0);
   assert.equal(rejected.allocated, rejected.running, 'a numeric generation without current-instance epoch cannot authorize helpers');

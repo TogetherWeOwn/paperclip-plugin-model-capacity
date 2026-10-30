@@ -87,15 +87,32 @@ for (const mode of ['off', 'shadow', 'enforce']) {
 
   test(`a temporarily full reactive alternative cannot unlock a hard-held lane (${mode})`, async t => {
     const raw = config(mode);
-    raw.reviewerRouting.arms.push(policy('gemini', 'gemini-2-5-flash'));
-    const d = await drive({ raw, accounts: [lane('held', .85, 120),
-      lane('reactive', .3, 84, { provider: 'gemini', models: ['gemini-2-5-flash'],
+    const reactiveModel = 'muse-spark-1.3-contributor';
+    const benchmark = { ...rows()[0], slug: 'muse-spark-1-3-xhigh', intelligenceIndex: 58,
+      intelligenceIndexCostPerTask: 4, price1mInputTokens: 1, price1mOutputTokens: 4 };
+    raw.reviewerRouting.arms.push(policy('meta', reactiveModel, 'xhigh'));
+    const d = await drive({ raw, aaRows: [...rows(), benchmark], accounts: [lane('held', .85, 120),
+      lane('reactive', .3, 84, { provider: 'meta', models: [reactiveModel],
         meter: 'reactive', quality: 'reactive', weekly: undefined })] });
     await d.tick();
+    const initial = await d.capacity();
+    const reactive = initial.accounts.find(account => account.accountId === 'meta:reactive');
+    assert.equal(reactive.reactive, true);
+    assert.equal(reactive.health, 'healthy');
+    assert.ok(reactive.arms.some(arm => arm.model === reactiveModel && arm.effort === 'xhigh'));
+    assert.ok(initial.reviewerAccountIdsByAgent.review.includes('meta:reactive'));
+    if (mode !== 'off') {
+      const candidate = initial.taskRanking.candidates.find(candidate => candidate.accountId === 'meta:reactive'
+        && candidate.role === 'doer' && candidate.effort === 'xhigh');
+      assert.equal(candidate?.effortVerified, true, 'the reactive control has supported benchmark effort evidence');
+      assert.equal(candidate?.eligible, true);
+      const ladder = (await d.api('ladder')).ladders['meta:reactive'];
+      assert.ok(ladder.taskRoles.doer.rungs.some(rung => rung.armId === 'muse-spark-1-3@xhigh'));
+    }
     const first = await d.hook(`reactive-${mode}-1`);
     const second = await d.hook(`reactive-${mode}-2`);
-    assert.deepEqual([first.kind, first.model, second.kind, second.model],
-      ['decide', 'gemini-2-5-flash', 'decide', 'gemini-2-5-flash']);
+    assert.deepEqual([first.kind, first.model, first.effort, second.kind, second.model, second.effort],
+      ['decide', reactiveModel, 'xhigh', 'decide', reactiveModel, 'xhigh']);
     const third = await d.hook(`reactive-${mode}-3`, { agentDefaultModel: OPUS });
     const review = await d.hook(`reactive-${mode}-review`, { agentId: 'review', agentDefaultModel: OPUS });
     await d.tick();
@@ -109,6 +126,23 @@ for (const mode of ['off', 'shadow', 'enforce']) {
     assert.deepEqual((await d.capacity()).paceGuard.roleSafety, []);
   });
 }
+
+test('an unverified reactive benchmark effort is refused before any fullness decision', async () => {
+  const raw = config('enforce');
+  raw.reviewerRouting.arms.push(policy('gemini', 'gemini-2-5-flash'));
+  const d = await drive({ raw, accounts: [lane('held', .85, 120),
+    lane('unverified', .3, 84, { provider: 'gemini', models: ['gemini-2-5-flash'],
+      meter: 'reactive', quality: 'reactive', weekly: undefined })] });
+  await d.tick();
+  const capacity = await d.capacity();
+  const candidate = capacity.taskRanking.candidates.find(candidate => candidate.accountId === 'gemini:unverified'
+    && candidate.role === 'doer' && candidate.effort === 'max');
+  assert.equal(candidate?.effortVerified, false);
+  assert.equal(candidate?.eligible, false);
+  assert.equal(candidate?.selectionReason, 'effort-unverified');
+  assert.deepEqual((await d.api('ladder')).ladders['gemini:unverified'].taskRoles.doer.rungs, []);
+  assertDeferred(await d.hook('unverified-reactive-first'));
+});
 
 async function measuredSibling(mode, refusal) {
   const raw = config(mode);
@@ -261,6 +295,7 @@ for (const burnRunning of [0, 2]) {
 for (const includeDeniedAlternative of [false, true]) {
   test(`a non-held policy reviewer stays useful with a denied trial record (configured=${includeDeniedAlternative})`, async () => {
     const raw = config();
+    raw.concurrency.meanRunDurationHours = .1; // targetShare 10 * 0.1h = one ordinary slot
     raw.credentialReadiness.enforce = false;
     raw.trials = { roles: [], unscoredServedIds: [{ servedId: 'devin/swe-2', reason: 'synthetic acceptance' }] };
     raw.placement = { freeCostServedIds: { 'devin/swe-2': { until: '2026-12-01T00:00:00Z', reason: 'synthetic acceptance' } } };
@@ -273,6 +308,11 @@ for (const includeDeniedAlternative of [false, true]) {
     const capacity = await d.capacity();
     assert.deepEqual(capacity.reviewerAccountIdsByAgent.review, ['meta:policy']);
     assert.deepEqual(capacity.reviewerPaceByAgent.review.holdSuspendedAccountIds, []);
+    const account = capacity.accounts.find(account => account.accountId === 'meta:policy');
+    const pool = capacity.reviewerPaceByAgent.review.pools.find(pool => pool.pool === 'meta');
+    assert.equal(account.targetShare, 10);
+    assert.ok(account.planAhead > .02 && account.planAhead < .1, 'the control is paced but not weekly-held');
+    assert.deepEqual({ slots: pool.pacedSlots, cap: pool.cap }, { slots: 1, cap: 1 });
     assert.equal(agent(await d.caps(), 'review').allocated, 1);
     const first = await d.hook(`nonheld-trial-${includeDeniedAlternative}-1`, { agentId: 'review' });
     assert.deepEqual({ kind: first.kind, model: first.model, effort: first.effort },
@@ -284,6 +324,7 @@ for (const includeDeniedAlternative of [false, true]) {
 for (const refusal of ['ready', 'unready', 'manual-exclusion']) {
   test(`non-held policy reviewer readiness and exclusion gates remain observable (${refusal})`, async () => {
     const raw = config(); raw.reviewerRouting.arms = [policy('meta', WONDER, 'max')];
+    raw.concurrency.meanRunDurationHours = .1;
     if (refusal === 'manual-exclusion') raw.roles.excludeFamilies = { doer: ['muse'] };
     const d = await drive({ raw, accounts: [lane('policy', .58, 84, { provider: 'meta', models: [WONDER],
       ...(refusal === 'unready' ? { credentialAvailability: { version: 1, models: [] } } : {}) })],
@@ -293,8 +334,14 @@ for (const refusal of ['ready', 'unready', 'manual-exclusion']) {
     const decision = await d.hook(`nonheld-policy-${refusal}`, { agentId: 'review' });
     assert.deepEqual(capacity.reviewerAccountIdsByAgent.review, refusal === 'ready' ? ['meta:policy'] : []);
     if (refusal === 'ready') {
+      const account = capacity.accounts.find(account => account.accountId === 'meta:policy');
+      const pool = capacity.reviewerPaceByAgent.review.pools.find(pool => pool.pool === 'meta');
+      assert.equal(account.targetShare, 10);
+      assert.ok(account.planAhead > .02 && account.planAhead < .1);
+      assert.deepEqual({ slots: pool.pacedSlots, cap: pool.cap }, { slots: 1, cap: 1 });
       assert.equal(decision.kind, 'decide'); assert.equal(decision.model, WONDER);
       assert.equal(agent(caps, 'review').allocated, 1);
+      assertDeferred(await d.hook('nonheld-policy-ready-next', { agentId: 'review' }));
     } else {
       assertDeferred(decision); assert.equal(agent(caps, 'review').allocated, 0);
     }

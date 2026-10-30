@@ -49,6 +49,7 @@ function admissionSnapshot(ids = ['reviewer']) {
 }
 async function capsFixture({ cap = admissionSnapshot(), raw = routedConfig(), heads = 0,
   heartbeats = [], holdGate = null } = {}) {
+  raw = { pacing: { holdAheadPts: null }, ...raw }; // wire-fixture demand tests, not a producer attestation
   const store = new Map([['capacity-v1', cap]]);
   const calls = [];
   const holdReached = deferred();

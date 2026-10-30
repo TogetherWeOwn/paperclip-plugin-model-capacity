@@ -635,6 +635,7 @@ test('F-T30 caller: routing-only reviewer cannot spend held quota; reserve membe
 test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account fallback', async () => {
   for (const mode of ['off', 'shadow']) for (const exhaustion of [false, true]) {
     const input = windowFixture();
+    input.config.pacing = { holdAheadPts: null }; // ordinary pace exhaustion, not weekly rescue
     input.config.taskRanking.mode = mode;
     input.config.enforce = true;
     input.config.exhaustion = { enabled: exhaustion, finalAnswerFromAttempt: 1 };
@@ -649,7 +650,7 @@ test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account f
     weak.planAhead = -0.1;
     strong.planAhead = 0.5;
     weak.targetShare = strong.targetShare = 0;
-    live.paceGuard = { enabled: true, marginPct: .02, meanRunDurationHours: 1, retryAfterMs: 300000 };
+    live.paceGuard = { enabled: true, holdAheadPts: null, marginPct: .02, meanRunDurationHours: 1, retryAfterMs: 300000 };
     live.reviewerRouting = { agentIds: ['worker'], arms: [{ provider: 'fixture', model: names[7], effort: 'high' }] };
     const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: `routed-${mode}-${exhaustion}`,
       issueId: 'routed-issue', agentId: 'worker', adapterType: 'claude-code' });

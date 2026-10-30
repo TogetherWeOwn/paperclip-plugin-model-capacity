@@ -7,6 +7,7 @@ import {
 import { parseFreeResets } from '../src/cliproxy.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { projectProducerEpoch } from './producer-evidence.mjs';
 
 const H = 3600000;
 const D = 24 * H;
@@ -214,7 +215,7 @@ async function capacityBody({ config = {}, feedExtra = {}, lane = null, smoothE 
 test('fail-open bit-for-bit: enabled with no feed data matches the kill switch', async () => {
   const enabledNoData = await capacityBody({ config: {} });
   const killed = await capacityBody({ config: { burnHorizon: { enabled: false } } });
-  assert.deepEqual(enabledNoData, killed);
+  assert.deepEqual(projectProducerEpoch(enabledNoData), projectProducerEpoch(killed));
 });
 
 test('engaged horizon quickens the required pace, within the clamp', async () => {
