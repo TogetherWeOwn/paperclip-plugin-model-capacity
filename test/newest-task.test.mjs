@@ -28,7 +28,14 @@ test('N-T11/T24: shadow and enforce mark older task arms and fence every role fr
     for (const role of ['doer', 'thinker', 'other', 'reviewer']) {
       const ranking = ladder.taskRoles[role];
       const old = ranking.candidates.find(c => c.armId === 'gpt-6-luna@high');
+      const newest = ranking.candidates.find(c => c.armId === 'gpt-6-1-luna@high');
       assert.ok(old, role);
+      assert.ok(newest, role);
+      for (const [candidate, version] of [[old, [6]], [newest, [6, 1]]]) {
+        assert.equal(candidate.productLine, 'gpt-luna', role);
+        assert.deepEqual(candidate.parsedVersion, version, role);
+        assert.equal(candidate.newestVersionManaged, true, role);
+      }
       assert.equal(old.selectionReason, 'superseded-version');
       assert.equal(old.eligible, false);
       assert.equal(old.benchmarkEligible, false);
