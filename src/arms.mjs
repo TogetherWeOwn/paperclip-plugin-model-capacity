@@ -298,7 +298,7 @@ export function buildDynamicBindings(servedModels, { coveredModels = [], overrid
  * entry with reason `no-aa-match` (the model stays unrankable and is
  * listed, never silently dropped).
  */
-export function resolveDynamicArms(aaRows, bindings) {
+export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new Map(), bannedModels = [] } = {}) {
   const bySlug = new Map();
   const counts = new Map();
   for (const row of aaRows ?? []) {
@@ -321,6 +321,20 @@ export function resolveDynamicArms(aaRows, bindings) {
       }
     }
     if (!row) {
+      const entries = unscoredAllowlist.get(b.model) ?? [];
+      if (entries.length && !isBannedModel(b.model, bannedModels)) {
+        if (PROVEN_FAMILIES.includes(inferFamily(b.model))) {
+          unscored.push({ model: b.model, reason: 'unscored-proven-family', tried });
+          continue;
+        }
+        if (effortAllowed(b.family, b.effort)) {
+          arms.push({ armId: b.model, aaSlug: null, model: b.model, effort: b.effort,
+            family: b.family, providers: null, dynamic: true, row: null, unscoredTrial: true,
+            unscoredServedIds: entries.map(e => e.servedId),
+            unscoredReasons: Object.fromEntries(entries.map(e => [e.servedId, e.reason])) });
+          continue;
+        }
+      }
       unscored.push({ model: b.model, reason: 'no-aa-match', tried });
       continue;
     }

@@ -829,6 +829,10 @@ const CONFIG_SCHEMA = {
           description: 'Provider-scoped reactive in-flight cap per account (lower-cased provider name to integer >= 1, e.g. {"nvidia-nim": 1}). Overrides maxInFlightPerAccount only for that provider; every other provider keeps the global value. Empty (default) keeps every provider on the global cap.',
           additionalProperties: { type: 'integer', minimum: 1 },
         },
+        unscoredServedIds: {
+          type: 'array', default: [], description: 'Exact served ids admitted as unscored trial arms with required provenance. Q remains null; normal trial roles, adapters and caps apply. Only legacy routing; proven families and banned models are refused. An unpriced unscored arm cannot route.',
+          items: { type: 'object', additionalProperties: false, required: ['servedId', 'reason'], properties: { servedId: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
+        },
         maxInFlightPerFamily: { type: 'integer', minimum: 1, default: 2 },
         minRuns: { type: 'integer', minimum: 1, default: 10 },
         minSuccessRate: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
@@ -885,6 +889,15 @@ const CONFIG_SCHEMA = {
       properties: {
         qualityWeight: { type: 'number', minimum: 0, default: 1 },
         allowanceWeight: { type: 'number', minimum: 0, default: 0.35 },
+        duplicateVersionPunctuationFolding: {
+          type: 'boolean', default: false,
+          description: 'Opt in to matching digit-separated dash and dot version spellings for per-arm aggregator duplicate fallback only; emission, benchmark matching and kept defaults are unchanged.',
+        },
+        freeCostServedIds: {
+          type: 'object', default: {},
+          description: 'Exact served id to included-price deadline and provenance. Legacy monetary C is zero until the real timezone-explicit ISO deadline; task ranking reports zero cash but still ranks by resource cost. The account and quota costs do not become free. After expiry normal pricing resumes; unscored arms without a price stop routing. Verify the offer applies to the actual serving integration before enabling.',
+          additionalProperties: { type: 'object', additionalProperties: false, required: ['until', 'reason'], properties: { until: { type: 'string', minLength: 1 }, reason: { type: 'string', minLength: 1 } } },
+        },
         freeCostProviders: {
           type: 'array', default: [],
           description: "Providers whose 'free'-plan accounts place at zero monetary cost (e.g. [\"nvidia-nim\"]): costEffective and ladder cost read 0 while quality bars, quota/burn accounting and climbForSpend stay unchanged. Empty (default) prices every account from Artificial Analysis, exactly as before.",

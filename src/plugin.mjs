@@ -39,7 +39,7 @@ import {
 import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill, carryForwardCosts, carryForwardBenchmarks, markStaleBenchmarks, BENCHMARK_FIELDS, stampAaObservations } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
-  canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId,
+  canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId, isBannedModel, aliasKey,
 } from './arms.mjs';
 import { buildAccountSupersession, isSupersededArm } from './newest-version.mjs';
 import { computeComposite, DEFAULT_WEIGHTS, METRIC_SOURCES } from './quality.mjs';
@@ -185,6 +185,8 @@ const scopeKey = (companyId, stateKey) => ({ scopeKind: 'company', scopeId: comp
 function isSecretRef(v) {
   return v != null && typeof v === 'object' && v.type === 'secret_ref' && typeof v.secretId === 'string';
 }
+
+function isValidServedId(id) { return typeof id === 'string' && /^[^/\s]+(?:\/[^/\s]+)?$/.test(id); }
 
 export function validateConfigShape(raw) {
   const errors = [];
@@ -411,7 +413,25 @@ export function validateConfigShape(raw) {
       }
     }
   }
-  if (raw.trials) {
+  const validTrialsObject = raw.trials != null && typeof raw.trials === 'object' && !Array.isArray(raw.trials);
+  if (raw.trials != null && !validTrialsObject) errors.push('trials must be an object');
+  if (validTrialsObject && Object.hasOwn(raw.trials, 'unscoredServedIds')) {
+    const list = raw.trials.unscoredServedIds;
+    if (!Array.isArray(list)) errors.push('trials.unscoredServedIds must be an array');
+    else {
+      const seen = new Set();
+      list.forEach((e, i) => {
+        const prefix = `trials.unscoredServedIds[${i}]`;
+        if (!e || typeof e !== 'object' || Array.isArray(e) || !isValidServedId(e.servedId) || typeof e.reason !== 'string' || !e.reason.trim() || Object.keys(e).some(k => !['servedId', 'reason'].includes(k))) { errors.push(`${prefix} requires a servedId and provenance reason`); return; }
+        if (seen.has(e.servedId)) errors.push(`${prefix} duplicates servedId`);
+        seen.add(e.servedId);
+        const family = inferFamily(canonicalModelName(e.servedId));
+        if (PROVEN_FAMILIES.includes(family)) errors.push(`${prefix} family "${family}" is already proven; unscored admission is only for families with no fleet history`);
+        if (isBannedModel(e.servedId, Array.isArray(raw.bannedModels) ? raw.bannedModels : [])) errors.push(`${prefix} names a banned model`);
+      });
+    }
+  }
+  if (validTrialsObject) {
     for (const k of ['maxInFlightPerAccount', 'maxInFlightPerFamily', 'minRuns']) {
       if (k in raw.trials && !(raw.trials[k] >= 1)) errors.push(`trials.${k} must be >= 1`);
     }
@@ -450,6 +470,17 @@ export function validateConfigShape(raw) {
           errors.push(`placement.${k} must be a non-negative number`);
         }
       }
+      if ('freeCostServedIds' in raw.placement) {
+        const map = raw.placement.freeCostServedIds;
+        if (!map || typeof map !== 'object' || Array.isArray(map)) errors.push('placement.freeCostServedIds must be an object');
+        else for (const [id, entry] of Object.entries(map)) {
+          const prefix = `placement.freeCostServedIds[${JSON.stringify(id)}]`;
+          if (!isValidServedId(id) || !entry || typeof entry !== 'object' || Array.isArray(entry) || Object.keys(entry).some(k => !['until', 'reason'].includes(k))) { errors.push(`${prefix} must be an object with until and reason`); continue; }
+          if (parseFreeUntil(entry.until) === null) errors.push(`${prefix}.until must be a timezone-explicit ISO-8601 timestamp naming a real calendar date (e.g. 2026-11-30T23:59:59Z)`);
+          if (typeof entry.reason !== 'string' || !entry.reason.trim()) errors.push(`${prefix}.reason must be a non-empty string`);
+        }
+      }
+      if ('duplicateVersionPunctuationFolding' in raw.placement && typeof raw.placement.duplicateVersionPunctuationFolding !== 'boolean') errors.push('placement.duplicateVersionPunctuationFolding must be a boolean');
       if ('freeCostProviders' in raw.placement) {
         const list = raw.placement.freeCostProviders;
         if (!Array.isArray(list) || list.some(p => typeof p !== 'string' || p.trim().length === 0)) {
@@ -593,8 +624,22 @@ export function extractRunErrorText(event) {
   return parts.length > 0 ? parts.join(' | ').slice(0, BREAKER_ERROR_TEXT_MAX) : null;
 }
 
+function normalizeUnscoredServedIds(raw, bannedModels) {
+  const seen = new Set(), out = [];
+  const counts = new Map();
+  for (const e of Array.isArray(raw) ? raw : []) if (isValidServedId(e?.servedId)) counts.set(e.servedId, (counts.get(e.servedId) ?? 0) + 1);
+  for (const e of Array.isArray(raw) ? raw : []) {
+    if (!e || typeof e !== 'object' || Array.isArray(e) || !isValidServedId(e.servedId) || typeof e.reason !== 'string' || !e.reason.trim() || Object.keys(e).some(k => !['servedId', 'reason'].includes(k))) continue;
+    const model = canonicalModelName(e.servedId);
+    if (!model || counts.get(e.servedId) !== 1 || seen.has(e.servedId) || PROVEN_FAMILIES.includes(inferFamily(model)) || isBannedModel(model, Array.isArray(bannedModels) ? bannedModels : [])) continue;
+    seen.add(e.servedId); out.push({ servedId: e.servedId, reason: e.reason, model });
+  }
+  return out;
+}
+
 export function resolveConfig(raw = {}) {
   const keepAgentIds = (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string');
+  const freeCostServedIds = normalizeFreeCostServedIds(raw.placement?.freeCostServedIds);
   return {
     cliproxy: {
       // Belt and braces behind the validator: a non-allowlisted baseUrl
@@ -715,6 +760,7 @@ export function resolveConfig(raw = {}) {
     // other; thinkers never), capped in flight per account and per family,
     // until measured success graduates them.
     trials: {
+      unscoredServedIds: normalizeUnscoredServedIds(raw.trials?.unscoredServedIds, raw.bannedModels),
       maxInFlightPerAccount: raw.trials?.maxInFlightPerAccount ?? DEFAULT_TRIALS.maxInFlightPerAccount,
       maxInFlightPerFamily: raw.trials?.maxInFlightPerFamily ?? DEFAULT_TRIALS.maxInFlightPerFamily,
       minRuns: raw.trials?.minRuns ?? DEFAULT_TRIALS.minRuns,
@@ -767,6 +813,8 @@ export function resolveConfig(raw = {}) {
       // the feed's usage numbers (if any) are not rewritten. Empty
       // (default) prices every account from AA, exactly as before.
       freeCostProviders: normalizeFreeCostProviders(raw.placement?.freeCostProviders),
+      ...(raw.placement?.duplicateVersionPunctuationFolding === true ? { duplicateVersionPunctuationFolding: true } : {}),
+      ...(Object.keys(freeCostServedIds).length ? { freeCostServedIds } : {}),
     },
     freeLanes: normalizeFreeLanes(raw.freeLanes),
     shadowMaxEntries: raw.shadow?.maxEntries ?? SHADOW_CAPACITY,
@@ -863,6 +911,32 @@ export function normalizeFreeCostProviders(raw) {
  * placement.freeCostProviders. Only the monetary placement cost reads zero;
  * quality bars, quota/burn accounting and climbForSpend are untouched.
  */
+const FREE_UNTIL_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})$/;
+export function parseFreeUntil(value) {
+  if (typeof value !== 'string') return null;
+  const m = FREE_UNTIL_RE.exec(value); if (!m) return null;
+  const [, y, mo, d, h, mi, sec = '0', frac = '', zone] = m;
+  if (zone !== 'Z' && (+zone.slice(1, 3) > 14 || +zone.slice(4, 6) > 59)) return null;
+  const offset = zone === 'Z' ? 0 : (zone[0] === '-' ? -1 : 1) * (+zone.slice(1, 3) * 3600 + +zone.slice(4, 6) * 60) * 1000;
+  const ms = +(frac.padEnd(3, '0') || 0);
+  const wall = Date.UTC(+y, +mo - 1, +d, +h, +mi, +sec, ms);
+  const back = new Date(wall);
+  if (back.getUTCFullYear() !== +y || back.getUTCMonth() !== +mo - 1 || back.getUTCDate() !== +d || back.getUTCHours() !== +h || back.getUTCMinutes() !== +mi || back.getUTCSeconds() !== +sec || back.getUTCMilliseconds() !== ms) return null;
+  return wall - offset;
+}
+export function normalizeFreeCostServedIds(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).flatMap(([id, entry]) => {
+    if (!isValidServedId(id) || !entry || typeof entry !== 'object' || Array.isArray(entry) || Object.keys(entry).some(k => !['until', 'reason'].includes(k)) || typeof entry.reason !== 'string' || !entry.reason.trim()) return [];
+    const untilMs = parseFreeUntil(entry.until);
+    return untilMs === null ? [] : [[id, { untilMs, until: entry.until, reason: entry.reason }]];
+  }));
+}
+export function freeCostServedIdEntry(map, servedId, nowMs) {
+  const e = Object.hasOwn(map ?? {}, servedId) ? map[servedId] : null;
+  return e && nowMs <= e.untilMs ? e : null;
+}
+
 export function isFreeCostAccount(account, freeCostProviders) {
   if (!Array.isArray(freeCostProviders) || freeCostProviders.length === 0) return false;
   const plan = typeof account?.plan === 'string' ? account.plan.trim().toLowerCase() : null;
@@ -926,6 +1000,15 @@ export function fallbackSeatCandidate(ranking, armId, nowMs, enforce,
   return { candidate };
 }
 
+function repriceServedIdFree(c, nowMs) {
+    if (c.costFreeSource !== 'served-id' || nowMs <= c.freeUntilMs) return c;
+    if (c.unscoredTrial) return null;
+    const { costFree, costFreeSource, freeServedId, freeUntilMs, freeReason, ...paid } = c;
+    if (c.taskRanking === true) return { ...paid, costFree: false, cashUsdPerAcceptedTask: null };
+    const effective = c.costBase != null ? c.costBase * (c.costMultiplier ?? 1) : null;
+    return { ...paid, C: effective, costEffective: effective, ...(Object.hasOwn(c, 'cashUsdPerAcceptedTask') ? { cashUsdPerAcceptedTask: null } : {}) };
+  }
+
 /** Materialize account groups using the plugin's injected clock. */
 export function createCredentialGroupHelpers(clock = Date.now) {
   function groupByRung(rungs) {
@@ -943,12 +1026,23 @@ export function createCredentialGroupHelpers(clock = Date.now) {
   function credentialLadderFor(ranking, nowMs, enforce = false, admits = null) {
     const trusted = ranking.candidates.filter(c => c.taskRanking !== true
       || (c.eligible === true && (!admits || admits(c))));
-    const ready = enforce
+    const ready = (enforce
       ? trusted.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
-      : trusted;
+      : trusted).map(c => repriceServedIdFree(c, nowMs)).filter(Boolean);
     const byArm = new Map(ready.map(c => [c.armId, c]));
-    const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
-    const benchmark = ranking.rankingRungs;
+    const ids = new Set(ranking.unscoredArmIds ?? []);
+    const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs,
+      ids.size ? { unscoredArmIds: ids } : {});
+    // Expiry changes the Pareto frontier, not just the arm's scalar price.
+    // Rebuild the benchmark from all original candidates, before readiness or
+    // per-run filters, exactly as the tick builds it.
+    const expired = ranking.candidates.some(c => c.costFreeSource === 'served-id'
+      && nowMs > c.freeUntilMs && !c.unscoredTrial && c.taskRanking !== true);
+    const benchmark = expired
+      ? buildLadder(ranking.candidates.map(c => repriceServedIdFree(c, nowMs)).filter(Boolean),
+        ranking.previousRungs, ranking.gateByArm, ranking.heldPairs,
+        ids.size ? { unscoredArmIds: ids } : {}).rungs
+      : ranking.rankingRungs;
     const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
     const candidatesByArm = new Map(ranking.candidates.map(c => [c.armId, c]));
     const excluded = new Set(ranking.excludedArmIds ?? []);
@@ -967,7 +1061,11 @@ export function createCredentialGroupHelpers(clock = Date.now) {
         maxRung: r.coverage < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : benchmark.length - 1,
       }];
     });
-    return { ...admitted, rungs };
+    for (const u of admitted.unscored ?? []) {
+      if (!excluded.has(u.armId) && byArm.has(u.armId)) rungs.push({ ...byArm.get(u.armId), ...u, rung: 0, maxRung: LOW_COVERAGE_MAX_RUNG });
+    }
+    if (ids.size) rungs.sort((a, b) => a.rung - b.rung);
+    return { ...admitted, rungs, ...(expired ? { repricedBenchmarkRungs: benchmark } : {}) };
   }
 
   function credentialGroupsFor(ladder, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null, fallbackAdmission = null) {
@@ -975,14 +1073,18 @@ export function createCredentialGroupHelpers(clock = Date.now) {
     const ranking = roleRanking ?? ladder?.credentialRanking;
     if (!ranking) {
       const groups = ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []);
-      return enforce ? filterCredentialRungs(groups, nowMs) : groups;
+      const priced = groups.map(g => ({ ...g, arms: (g.arms ?? []).map(a => repriceServedIdFree(a, nowMs)).filter(Boolean) }));
+      return enforce ? filterCredentialRungs(priced, nowMs) : priced;
     }
     const admitted = credentialLadderFor(ranking, nowMs, enforce, roleRanking ? c =>
       (!c.trial || roleTakesTrial(ladder.taskTrialRoles ?? DEFAULT_TRIALS.roles, role, c.family)) && (!admits || admits(c)) : null);
     const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
     // decide and placement use group count as topRung; retain empty shells
     // just like the breaker and family-exclusion filters.
-    const groups = ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
+    const shellRungs = [...new Set((admitted.repricedBenchmarkRungs ?? ranking.rankingRungs).map(r => r.rung))];
+    for (const rung of byRung.keys()) if (!shellRungs.includes(rung)) shellRungs.push(rung);
+    shellRungs.sort((a, b) => a - b);
+    const groups = shellRungs.map(rung => byRung.get(rung) ?? { rung, arms: [] });
     if (!fallbackAdmission) return groups;
     const { candidate } = fallbackSeatCandidate(ranking, fallbackAdmission.armId, nowMs, enforce, fallbackAdmission);
     return candidate ? seatFallbackArm(groups, candidate, fallbackAdmission.band) : groups;
@@ -993,7 +1095,7 @@ export function createCredentialGroupHelpers(clock = Date.now) {
   function routableGroupsFor(ladder, duplicates = true, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null, fallbackAdmission = null) {
     const duplicateIds = ladder?.credentialRanking?.duplicateArmIds ?? [];
     const duplicateSlugs = new Set((ladder?.credentialRanking?.candidates ?? []).filter(c => duplicateIds.includes(c.armId)).map(c => c.armId));
-    const taskIds = (ladder?.taskRoles?.[role]?.candidates ?? []).filter(c => duplicateSlugs.has(c.aaSlug)).map(c => c.armId);
+    const taskIds = [...(ladder?.taskRoles?.[role]?.candidates ?? []).filter(c => duplicateSlugs.has(c.aaSlug)).map(c => c.armId), ...(ladder?.credentialRanking?.duplicateTaskArmIds ?? [])];
     const held = duplicates ? null : new Set([...duplicateIds, ...taskIds]);
     const groups = credentialGroupsFor(ladder, nowMs, enforce, role, taskMode,
       c => (!held || !held.has(c.armId)) && (!admits || admits(c)), fallbackAdmission);
@@ -1646,7 +1748,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     const classicModels = new Set(classic.arms.map(a => a.model));
     const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides, bannedModels: config.bannedModels });
-    const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings);
+    const unscoredAllowlist = new Map();
+    for (const entry of config.trials.unscoredServedIds) {
+      if (!unscoredAllowlist.has(entry.model)) unscoredAllowlist.set(entry.model, []);
+      unscoredAllowlist.get(entry.model).push(entry);
+    }
+    const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings, { unscoredAllowlist, bannedModels: config.bannedModels });
     return { classic, dynamic, accountModels, arms: [...classic.arms, ...dynamic.arms] };
   }
 
@@ -1684,6 +1791,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const refused = new Set();
       for (const arm of armsForAccount(arms, account)) {
         const emittedId = servedIdForArm(account?.models, arm.model, account?.provider, servedIds);
+        // An unscored trial belongs to its serving account, never a second pool or breaker namespace.
+        if (arm.unscoredTrial && !arm.unscoredServedIds.includes(emittedId)) {
+          unservable.push({ model: arm.model, accountId: keyOf(account, i), emitted: emittedId, reason: 'unscored-not-allowlisted-for-account' });
+          continue;
+        }
         if (!servedIds || servedIds.has(emittedId)) {
           const evidence = credentialEvidenceFor(account, arm.model);
           const readiness = credentialReadiness(evidence, credentialNow);
@@ -1770,7 +1882,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // family still prices its arms from the fleet's measured costs instead of
     // dropping them from the ladder. fillCosts dedupes by armId, so served
     // arms are not double-counted.
-    const fleetCostPool = fleetArms.map(a => ({
+    const fleetCostPool = fleetArms.filter(a => !a.unscoredTrial).map(a => ({
       armId: a.armId,
       family: a.family ?? null,
       cost: a.row.intelligenceIndexCostPerTask,
@@ -1795,7 +1907,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         : null;
       const alphaDoer = eeeLive ? blendAlphaForRole('doer', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
       const alphaThinker = eeeLive ? blendAlphaForRole('thinker', { doer: config.eee.blendDoer, thinker: config.eee.blendThinker }) : 0;
-      const costs = fillCosts(served.map(a => ({
+      const costs = fillCosts(served.filter(a => !a.unscoredTrial).map(a => ({
         armId: a.armId,
         family: a.family ?? null,
         cost: a.row.intelligenceIndexCostPerTask,
@@ -1812,6 +1924,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const unfiltered = served.map(a => {
         const base = costs.get(a.armId)?.C ?? null;
         const tier = tierCostOf(a, base);
+        const emittedId = servedIdForArm(account?.models, a.model, account?.provider, servedIds);
+        const freeEntry = freeCostServedIdEntry(config.placement.freeCostServedIds, emittedId, tickNow);
+        const armFree = freeCost || !!freeEntry;
         const qAa = scored.get(a.armId)?.Q ?? null;
         const qEee = eeeScored?.get(a.armId)?.Qeee ?? null;
         eeeByArm.set(a.armId, {
@@ -1833,20 +1948,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // (see ladder.mjs): entries without them keep strict-only behavior.
           family: a.family ?? null,
           model: a.model ?? null,
-          Q: blendQ(qAa, qEee, alphaDoer),
+          Q: a.unscoredTrial ? null : blendQ(qAa, qEee, alphaDoer),
           // Ladder order runs on EFFECTIVE cost (tier-adjusted). Quota burn
           // below uses the same effective cost while
           // contextCaps.tierAffectsQuota holds (default true): on
           // subscription lanes quota charges the tier price, not base.
-          C: freeCost ? 0 : (tier.costEffective ?? base),
+          C: armFree ? 0 : (tier.costEffective ?? base),
           coverage: scored.get(a.armId)?.coverage ?? 0,
           // Carried-cost provenance rides to candidates, rungs and the
           // capacity view; absent when the row measured its own costs.
-          ...(a.row.costCarriedFrom != null ? { costCarriedFrom: a.row.costCarriedFrom } : {}),
+          ...(a.row?.costCarriedFrom != null ? { costCarriedFrom: a.row.costCarriedFrom } : {}),
           costBase: base,
           costMultiplier: tier.costMultiplier,
-          costEffective: freeCost ? 0 : tier.costEffective,
-          ...(freeCost ? { costFree: true } : {}),
+          costEffective: armFree ? 0 : tier.costEffective,
+          ...(armFree ? { costFree: true } : {}),
+          ...(!freeCost && freeEntry ? { costFreeSource: 'served-id', freeServedId: emittedId, freeUntilMs: freeEntry.untilMs, freeReason: freeEntry.reason } : {}),
+          ...(a.unscoredTrial ? { unscoredTrial: true, unscoredServedId: emittedId, unscoredReason: a.unscoredReasons[emittedId] } : {}),
           tierSource: tier.tierSource,
           statsRequests: tier.statsRequests,
         };
@@ -1891,7 +2008,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // but ready alternative without waiting for another telemetry tick.
       const previousRungs = prev.rankingRungs ?? prev.rungs ?? [];
       const heldPairs = prev.rankingWithinNoise ?? prev.withinNoise ?? [];
-      const ranking = buildLadder(eligible, previousRungs, gateByArm, heldPairs);
+      const unscoredArmIds = new Set(served.filter(a => a.unscoredTrial).map(a => a.armId));
+      const ranking = buildLadder(eligible, previousRungs, gateByArm, heldPairs,
+        unscoredArmIds.size ? { unscoredArmIds } : {});
       const candidates = eligible.map(r => {
           const arm = byArm.get(r.armId);
           const tier = eligibleByArm.get(r.armId);
@@ -1907,8 +2026,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             credentialEvidence: credentialEvidenceFor(account, arm.model),
             effort: arm.effort,
             family: arm.family,
-            trial: !isProvenFamily(trialState, arm.family),
-            contextWindow: arm.row.contextWindowTokens ?? null,
+            trial: arm.unscoredTrial ? !(trialState?.graduated ?? []).includes(arm.family) : !isProvenFamily(trialState, arm.family),
+            contextWindow: arm.row?.contextWindowTokens ?? null,
             costEstimated: costs.get(r.armId)?.estimated ?? false,
             costBase: tier?.costBase ?? null,
             costMultiplier: tier?.costMultiplier ?? 1,
@@ -1930,6 +2049,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         candidates, rankingRungs: ranking.rungs, previousRungs,
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
         ...(view ? { excludedArmIds: [...view.supersededLegacyArmIds] } : {}),
+        ...(unscoredArmIds.size ? { unscoredArmIds: (ranking.unscored ?? []).map(u => u.armId) } : {}),
       };
       const admitted = credentialLadderFor(credentialRanking, credentialNow, config.credentialReadiness.enforce);
       // Quota burn prices the tier multiplier while tierAffectsQuota holds:
@@ -2011,6 +2131,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const identity = view?.identities[canonicalModelName(a.model)];
           const withoutKeeps = view && { ...view, overrides: { ...view.overrides, keep: [] } };
           const kept = view && isSupersededArm(withoutKeeps, a) && !superseded;
+          const accountFree = isFreeCostAccount(account, config.placement.freeCostProviders);
+          const freeEntry = freeCostServedIdEntry(config.placement.freeCostServedIds, model, tickNow);
           return { ...a, model, canonicalModel: a.model, effortVerified,
             ...(view ? { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null,
               newestVersionManaged: true, ...(kept ? { newestVersionKept: true } : {}),
@@ -2019,7 +2141,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             credentialEvidence: evidence, operationalReasons,
             costBase: base, costMultiplier: tier.costMultiplier, costEffective: tier.costEffective,
             tierSource: tier.tierSource, statsRequests: tier.statsRequests,
-            costFree: isFreeCostAccount(account, config.placement.freeCostProviders),
+            costFree: accountFree || !!freeEntry,
+            ...(!accountFree && freeEntry ? { costFreeSource: 'served-id', freeServedId: model, freeUntilMs: freeEntry.untilMs, freeReason: freeEntry.reason } : {}),
             trial: !isProvenFamily(trialState, a.family), contextWindow: a.row.contextWindowTokens ?? null,
             cap: tierCaps[tierModelKey(a.model)] ?? null,
             quotaBurnPerRunPct: burnFor(quotaCost),
@@ -2123,6 +2246,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // the eligibility gates and their audit view judge the whole fleet.
     const fleet = fleetArms.map(a => ({
       armId: a.armId, family: a.family, model: a.model, effort: a.effort,
+      ...(a.unscoredTrial ? { unscoredTrial: true } : {}),
       qFleet: fleetQ(a.armId, fleetAlphaDoer), qFleetThinker: fleetQ(a.armId, fleetAlphaThinker),
     }));
     // Read-only inventory projection for /capacity: raw/canonical/emitted ids
@@ -3573,6 +3697,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // list per role. Everything below (target, placement, picks) and the
     // published live view read this list, so the gates act on every path.
     const taskManual = translateTaskExclusions(config.roles.excludeFamilies, taskRanking.candidates);
+    const dupKey = config.placement.duplicateVersionPunctuationFolding ? aliasKey : canonicalKey;
     const crossAccountInputs = (() => {
       const feedModelsByKey = new Map();
       for (let i = 0; i < snapshot.accounts.length; i++) {
@@ -3580,7 +3705,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const set = new Set();
         if (Array.isArray(raw)) {
           for (const m of raw) {
-            const k = canonicalKey(m);
+            const k = dupKey(m);
             if (k) set.add(k);
           }
         }
@@ -3596,7 +3721,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         remainingPct: v.remainingPct ?? null,
         models: [...(feedModelsByKey.get(v.accountId) ?? [])],
       }));
-      const nativeModels = nativeQualifiedModels(orderingViews, 0.05);
+      const nativeModels = nativeQualifiedModels(orderingViews, 0.05, dupKey);
       // Dominators must be routable this tick: qualified with headroom AND
       // a known weekly remaining (the candidate loop skips metered accounts
       // with remainingPct == null, so a 5h-only reading must not dominate).
@@ -3645,8 +3770,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const rank = mode === 'enforce' ? l?.taskRoles?.[role] : l?.credentialRanking;
         const rungs = rank?.rankingRungs ?? l?.rankingRungs ?? [];
         const byArm = new Map(rungs.map(r => [r.armId, r.rung]));
-        return groupByRung((rank?.candidates ?? l?.rungs ?? []).filter(c => byArm.has(c.armId))
-          .map(c => ({ ...c, rung: byArm.get(c.armId) })));
+        const unscoredIds = new Set(rank?.unscoredArmIds ?? []);
+        return groupByRung((rank?.candidates ?? l?.rungs ?? []).filter(c => byArm.has(c.armId) || unscoredIds.has(c.armId))
+          .map(c => ({ ...c, rung: byArm.get(c.armId) ?? 0 })));
       })])),
       roleBands, trialRoles: config.trials.roles,
       ...(config.roles.accountFallback.enabled && (mode === 'off' || config.taskRanking.mode === 'enforce') ? {
@@ -3875,13 +4001,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Candidates, not survivors: a duplicate shadowed on the Pareto front
         // today is revived by admission once its unique sibling loses readiness.
         for (const r of ladder?.credentialRanking?.candidates ?? ladder?.rungs ?? []) {
-          const k = canonicalKey(r.model);
+          const k = dupKey(r.model);
           if (k && nativeModels.has(k)) {
             dupKeys.add(`${key}\u0000${r.armId}`);
             duplicateArmIds.push(r.armId);
           }
         }
-        if (ladder?.credentialRanking) ladder.credentialRanking.duplicateArmIds = duplicateArmIds;
+        if (ladder?.credentialRanking) {
+          ladder.credentialRanking.duplicateArmIds = duplicateArmIds;
+          if (config.placement.duplicateVersionPunctuationFolding) {
+            const taskIds = new Set();
+            for (const role of Object.values(ladder.taskRoles ?? {})) for (const c of role.candidates ?? []) {
+              const k = dupKey(c.canonicalModel ?? c.model);
+              if (k && nativeModels.has(k)) { taskIds.add(c.armId); dupKeys.add(`${key}\u0000${c.armId}`); }
+            }
+            ladder.credentialRanking.duplicateTaskArmIds = [...taskIds];
+          }
+        }
       }
       // Duplicate aggregator rungs are NOT dropped: deleting them strands
       // runs when no native can route this tick (reactive cap, open
@@ -3907,7 +4043,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (before === 0) continue;
           const kept = (ladder.rungs ?? []).filter(r => !dropKeys.has(`${key}\u0000${r.armId}`));
           if (kept.length !== before) {
-            ladder.rungs = kept.map((r, rung) => ({ ...r, rung }));
+            // Only the explicit unscored path shares canary rung zero.
+            // Scored-only ladders retain the historical positional renumber
+            // (including readiness backups sharing a benchmark rung).
+            const hasUnscored = kept.some(r => r.unscoredTrial === true);
+            const groups = hasUnscored ? [...new Set(kept.map(r => r.rung))].sort((a, b) => a - b) : [];
+            ladder.rungs = kept.map((r, i) => ({ ...r, rung: hasUnscored ? groups.indexOf(r.rung) : i }));
             ladder.crossAccountDominated = [
               ...(ladder.crossAccountDominated ?? []),
               ...[...dropKeys].filter(k => k.startsWith(`${key}\u0000`)).map(k => k.split('\u0000')[1]),
@@ -3923,7 +4064,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       for (const v of accountViews) {
         const probe = orderingViews.find(o => o.accountId === v.accountId);
         v.models = probe ? probe.models : [];
-        v.fallbackOnly = probe ? isFallbackOnlyView(probe, nativeModels) : false;
+        v.fallbackOnly = probe ? isFallbackOnlyView(probe, nativeModels, dupKey) : false;
       }
       if (dominated.length > 0 || dupKeys.size > 0) {
         ctx.logger.info('model-capacity: cross-account filter', {
@@ -5062,6 +5203,47 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // flip: only onConfigChanged writes the set.
     return credentialEnforceCompanies.has(companyId)
       && live?.credentialReadinessEnforced === true;
+  }
+
+  // Reporting is a read-only projection: stored snapshots and routing state
+  // remain unchanged. Bare benchmark rungs inherit price from their account's
+  // exact candidate, not another provider's identically named arm.
+  function hasExpiredPrice(value, nowMs) {
+    if (!value || typeof value !== 'object') return false;
+    if (value.costFreeSource === 'served-id' && nowMs > value.freeUntilMs) return true;
+    return Object.values(value).some(v => hasExpiredPrice(v, nowMs));
+  }
+
+  function projectReportedPrices(value, nowMs, byArm = new Map()) {
+    if (Array.isArray(value)) return value.map(v => projectReportedPrices(v, nowMs, byArm));
+    if (!value || typeof value !== 'object') return value;
+    let projected = value;
+    if (value.costFreeSource === 'served-id' && nowMs > value.freeUntilMs) {
+      projected = repriceServedIdFree(value, nowMs);
+      if (!projected) {
+        const { costFree, costFreeSource, freeServedId, freeUntilMs, freeReason, ...unpriced } = value;
+        projected = { ...unpriced, C: null, costEffective: null };
+      }
+    } else if (value.armId && value.rung != null && value.C != null && byArm.has(value.armId)) {
+      const candidate = byArm.get(value.armId);
+      projected = { ...value, C: candidate?.C ?? null };
+    }
+    return Object.fromEntries(Object.entries(projected).map(([k, v]) => [k, projectReportedPrices(v, nowMs, byArm)]));
+  }
+
+  function projectCapacityPrices(snapshot, nowMs) {
+    return hasExpiredPrice(snapshot, nowMs) ? projectReportedPrices(snapshot, nowMs) : snapshot;
+  }
+
+  function projectLadderPrices(snapshot, nowMs) {
+    if (!snapshot?.ladders || !hasExpiredPrice(snapshot, nowMs)) return snapshot;
+    const ladders = Object.fromEntries(Object.entries(snapshot.ladders).map(([key, ladder]) => {
+      const byArm = new Map((ladder.credentialRanking?.candidates ?? [])
+        .filter(c => c.costFreeSource === 'served-id' && nowMs > c.freeUntilMs)
+        .map(c => [c.armId, repriceServedIdFree(c, nowMs)]));
+      return [key, projectReportedPrices(ladder, nowMs, byArm)];
+    }));
+    return { ...snapshot, ladders };
   }
 
   // Run-local feasibility precedes Pareto pruning in the task path. Calling
@@ -6394,7 +6576,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const companyId = input.companyId;
       if (!configured.has(companyId)) return { status: 404, body: { error: 'company-not-configured' } };
       if (input.routeKey === 'capacity') {
-        return { status: 200, body: (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null } };
+        return { status: 200, body: projectCapacityPrices((await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null }, clock()) };
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:
@@ -6407,7 +6589,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return { status: 200, body: { entries: shadowEntries(view, { limit }), size: decidedCount(view) } };
       }
       if (input.routeKey === 'ladder') {
-        return { status: 200, body: (await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} } };
+        return { status: 200, body: projectLadderPrices((await ctx.state.get(scopeKey(companyId, LADDER_KEY))) ?? { ladders: {} }, clock()) };
       }
       if (input.routeKey === 'caps') {
         const generation = configGenerationOf(companyId);

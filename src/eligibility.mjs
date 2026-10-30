@@ -171,6 +171,7 @@ export function qualityVerdicts(arms, minQuality, { minFleetArms = MIN_FLEET_ARM
       let verdict;
       if (arm?.roleTrusted?.[role] === false) verdict = { ok: false, q, min: isFiniteNumber(min) ? min : null, reason: 'task-evidence-admission' };
       else if (!applies) verdict = { ok: true, q, min: isFiniteNumber(min) ? min : null, reason: null };
+      else if (arm?.unscoredTrial === true) verdict = { ok: true, q: null, min, reason: 'unscored-trial-admission' };
       else if (q == null) verdict = { ok: false, q, min, reason: 'unscored' };
       else if (q < min) verdict = { ok: false, q, min, reason: `min-quality: ${q.toFixed(2)} < ${min}` };
       else verdict = { ok: true, q, min, reason: null };
