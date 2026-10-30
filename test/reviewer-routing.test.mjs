@@ -416,6 +416,26 @@ test('N-T16: kept default superseded on every serving account defers', async () 
   assert.match(out.reason, /superseded-version/);
 });
 
+test('N-T16: inferred serving universe blocks superseded default while explicit empty serves nowhere', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const armMap = [old, newer].map(model => ({ aaSlug: model, model, effort: 'high', family: 'claude', providers: ['claude'] }));
+  const rows = armMap.map(({ aaSlug }) => ({ slug: aaSlug, intelligenceIndex: 70, intelligenceIndexCostPerTask: 2 }));
+  for (const [models, expectedSource, expectedKind] of [
+    [undefined, 'inferred-provider-arms', 'defer'],
+    [[], 'account-models', 'keep'],
+  ]) {
+    const d = drive({ rows, config: { ...BASE, armMap, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
+      accounts: [claudeLane(0.5, 24, { models })] });
+    await d.setup(); await d.tick();
+    const view = d.liveViews.get('acme').accounts[0].newestVersion;
+    assert.equal(view.universeSource, expectedSource);
+    assert.equal(Object.hasOwn(view.identities, old), models === undefined);
+    const out = await d.hook(`universe-${expectedSource}`, { agentDefaultModel: old });
+    assert.equal(out.kind, expectedKind);
+    if (expectedKind === 'defer') assert.match(out.reason, /superseded-version/);
+  }
+});
+
 test('N-T14: unscored superseded listed reviewer model cannot route', async () => {
   const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
   const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } },

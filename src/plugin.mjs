@@ -5359,7 +5359,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   function defaultSupersededEverywhere(params, live) {
     const canon = String(canonicalModelName(params?.agentDefaultModel) ?? '').toLowerCase();
     if (!canon) return false;
-    const serving = (live?.accounts ?? []).filter(a => (a.models ?? []).some(m => String(canonicalModelName(m) ?? '').toLowerCase() === canon));
+    const identityKey = canon.slice(canon.lastIndexOf('/') + 1);
+    const serving = (live?.accounts ?? []).filter(a =>
+      (a.models ?? []).some(m => String(canonicalModelName(m) ?? '').toLowerCase() === canon)
+      || Object.hasOwn(a.newestVersion?.identities ?? {}, identityKey));
     return serving.length > 0 && serving.every(a => isSupersededArm(a.newestVersion, { model: canon }));
   }
 
