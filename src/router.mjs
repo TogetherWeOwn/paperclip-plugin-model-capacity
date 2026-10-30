@@ -4,6 +4,7 @@
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { applyInFlightOverlay } from './views.mjs';
 import { accountKeyForModel } from './ledger.mjs';
+import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { poolHasExpectedPluginKey, verifiedPoolError } from './registry.mjs';
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -186,7 +187,7 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
       const best = Math.max(...group.map(v => Number.isFinite(v.deficit) ? v.deficit : 0));
       const band = Math.abs(best) * (config.pacing?.rateDeadbandRel ?? .15);
       const winner = group.find(v => (Number.isFinite(v.deficit) ? v.deficit : 0) >= best - band);
-      return {kind:'selected', memberId:winner.memberId};
+      return {kind:'selected', memberId:winner.memberId, ...(Object.keys(skipped).length ? {skipped} : {})};
     }
   }
   for (const i of infos) if (!skipped[i.id]) {skipped[i.id] = 'weekly-exhausted'; retries.push(nextTime(i.account, 'weekly-exhausted', now, recheck));}
@@ -197,4 +198,39 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
     if (expiry.length) retry = Math.min(retry, ...expiry);
   }
   return wait(now, skipped, Number.isFinite(retry) ? retry : now + MINUTE);
+}
+
+
+/** SDK boundary adapter. Getters are synchronous process-local views. The
+ * callback never reads SDK config/state, touches the ledger, or reserves a
+ * member: a host cursor retry must be safe to discard without side effects.
+ */
+export function createRouterAdapter({getConfig,getSnapshot,getPolicy,getOverlay=()=>({}),getOverlayStatus=()=>({}),logger}) {
+  return params => {
+    const companyId=params?.companyId, snapshot=getSnapshot(companyId), config=getConfig(companyId);
+    const policySkips=snapshot && config?.router?.enabled !== false
+      ? computeRuntimePolicySkips(params,snapshot,config,getPolicy(companyId)) : {};
+    const decisionSnapshot=snapshot ? {...snapshot,memberSkipReasons:{...policySkips,...snapshot.memberSkipReasons}} : null;
+    const decisionConfig={...config,overlayDelta:getOverlay(companyId,snapshot?.version)};
+    const decision=routeDecision(params,decisionSnapshot,decisionConfig);
+    const {level,...diagnostics}=routerDiagnostics(params,decisionSnapshot,decisionConfig);
+    const counts=new Map();
+    for (const reason of Object.values(decision.skipped ?? {})) counts.set(reason,(counts.get(reason) ?? 0)+1);
+    const nowMs=nowOf(params);
+    const facts={...diagnostics,kind:decision.kind,
+      snapshotAgeMs:snapshot && Number.isFinite(nowMs) ? nowMs-snapshot.atMs : null,
+      topSkipReasons:[...counts].map(([reason,count])=>({reason,count})).sort((a,b)=>b.count-a.count || a.reason.localeCompare(b.reason)).slice(0,5),
+      ...getOverlayStatus(companyId),
+    };
+    if (decision.kind==='selected') {
+      facts.chosenMemberId=decision.memberId;
+      const candidate=candidatesOf(params).find(c=>memberId(c)===decision.memberId);
+      facts.accountKey=snapshot?.memberIndex?.[decision.memberId]?.accountKey
+        ?? accountKeyForModel(candidate?.runtimeConfig?.model,registry(config));
+    }
+    if (decision.kind==='exhausted') facts.retryAt=decision.retryAt;
+    logger?.info?.('model-capacity: native route',facts);
+    if (level==='warn' || level==='error') logger?.[level]?.('model-capacity: native route configuration',facts);
+    return decision;
+  };
 }

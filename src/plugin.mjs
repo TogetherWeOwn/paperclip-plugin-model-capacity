@@ -25,6 +25,7 @@
 import { randomUUID } from 'node:crypto';
 import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
 import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
+import { createRouterAdapter } from './router.mjs';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -913,8 +914,9 @@ function windowStartMs(resetsAtMs) {
 // read against the public placeholder pin with a fake http client. The
 // worker entry never passes it, so every deployed plugin refuses to read
 // the lane key unless the build pinned a real host.
-export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, inspectPools = null } = {}) {
-  let ctx, quotaRefresh;
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, inspectPools = null, variant = 'transitional' } = {}) {
+  if (!['transitional','clean'].includes(variant)) throw new Error('invalid plugin variant');
+  let ctx, quotaRefresh, routeConnection;
   const quotaJobs = new Map();
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -1192,6 +1194,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  const routerConfigFor = companyId => {
+    const config = lastConfig.get(companyId) ?? {};
+    return {...config,router:{...config.router,pools:attestedPools.get(companyId) ?? noAttestedPools}};
+  };
   const readReviewDemand = createReviewDemandReader({ clock });
   // Persisted admission must not compare equal after a worker restart, even
   // when its wall clock and first per-company configuration counter match.
@@ -4155,6 +4161,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     if (superseded()) return { status: 'superseded' };
     liveViews.set(companyId, {
+      ...(config.router ? {routerPolicy:{atMs:nowMs,arms:fleetArmScores,
+        records:terminalRecords(ledger).map(r=>({runId:r.runId,agentId:r.agentId,status:r.status,terminalAt:r.terminalAt,progress:r.progress,family:outcomeFamilyOf(r)})),
+        roleOf:id=>roleOf(lastConfig.get(companyId) ?? config,id),familyOf:r=>r.family,
+      }} : {}),
       policyGeneration: configRevisions.get(companyId)?.policyGeneration,
       atMs: nowMs,
       enforce: config.enforce === true,
@@ -6031,18 +6041,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
   }
 
-  return {
+  const plugin = {
     multiCompanyConfig: true,
 
     // Slice 4 must call this synchronously at decision time, never retain a
     // tick's config as the authority for operator-verified pool metadata.
     getRouterConfig(companyId) {
-      const config = lastConfig.get(companyId) ?? {};
-      return {...config,router:{...config.router,pools:attestedPools.get(companyId) ?? noAttestedPools}};
+      return routerConfigFor(companyId);
     },
+
+    onRouteAiConnection(params) { return routeConnection(params); },
 
     async setup(context) {
       ctx = context;
+      routeConnection = createRouterAdapter({getConfig:routerConfigFor,getSnapshot:id=>quotaRefresh?.get(id),
+        getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
+        logger:ctx.logger,
+      });
       quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
         keyFor:companyId => scopeKey(companyId, 'router-quota-v1'),
         listAgents:async companyId => {
@@ -6831,4 +6846,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return deferred(terminal);
     },
   };
+  if (variant === 'clean') delete plugin.onResolveRunModel;
+  return plugin;
 }
