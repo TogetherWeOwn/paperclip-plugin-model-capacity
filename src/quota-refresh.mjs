@@ -8,6 +8,8 @@
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
 import { checkPoolDrift } from '../scripts/pool-saga.mjs';
 import { buildQuotaSnapshot, createSnapshotPublisher, freezeSnapshot } from './snapshot.mjs';
+import { tickScorecard, scorecardRows, scorecardAccounts } from './scorecard.mjs';
+import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { routeDecision } from './router.mjs';
 
 const WARNING_INTERVAL_MS = 10 * 60_000;
@@ -54,7 +56,7 @@ function driftMemberReasons(registry,drift) {
   return reasons;
 }
 
-export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPools=null,listAgents=async()=>[],captureOverlay=()=>0,onPublished=()=>{}}) {
+export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPools=null,getPolicy=()=>null,listAgents=async()=>[],captureOverlay=()=>0,onPublished=()=>{}}) {
   const publisher=createSnapshotPublisher({state,keyFor}),failures=new Map(),lastFailure=new Map(),queues=new Map();
   function report(companyId,reason,details={},level='warn',message='model-capacity: native quota refresh') {
     const nowMs=clock(),key=JSON.stringify([companyId,reason,details.accountKey??details.poolId??details.poolKey??null]);
@@ -128,7 +130,19 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
       shadow.push({poolKey,wouldSelect:decision.kind==='selected'?shadowSnapshot.memberIndex[decision.memberId].accountKey:decision.kind,atMs,decision});
     }
     const shadowHistory=[...(previous?.shadow??[]),...shadow].slice(-SHADOW_CAP);
-    const envelope={...built,shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
+    let scorecard;
+    try {
+      const memberPolicySkips={};
+      const evidence=getPolicy(companyId);
+      for (const {poolKey} of registry.pools) Object.assign(memberPolicySkips,
+        computeRuntimePolicySkips(syntheticRouterRequest(registry,poolKey,atMs),built.snapshot,config,evidence));
+      scorecard=tickScorecard(previous?.scorecard ?? null,{nowMs:atMs,
+        hardCapWeekly:config.router.hardCapWeekly ?? .995,accountStaleMs:config.router.accountStaleMs ?? 900_000,
+        accounts:scorecardAccounts({registry,snapshot:built.snapshot,feed,previous:previous?.scorecard,ledger,memberPolicySkips,nowMs:atMs,
+          hardCapWeekly:config.router.hardCapWeekly ?? .995,hardCapFiveHour:config.router.hardCapFiveHour ?? .99})});
+    } catch {return failure(companyId,'scorecard-invalid');}
+    for (const warning of scorecard.warnings) report(companyId,warning.reason,{accountKey:warning.accountKey,windowResetsAt:warning.windowResetsAt});
+    const envelope={...built,scorecard,shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
     try {
       if(!await publisher.publish(companyId,envelope,{isCurrent,onPublish:()=>onPublished(companyId,built.snapshot,overlayCheckpoint)}))return {status:'superseded'};
     } catch {return failure(companyId,'quota-state-failed');}
@@ -137,9 +151,13 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
   }
   return {
     get:publisher.get,
+    scorecard(companyId) {
+      const e=publisher.envelope(companyId);
+      return {atMs:e?.scorecard?.atMs ?? null,rows:scorecardRows(e?.scorecard),burn:e?.snapshot?.burn ?? null};
+    },
     status(companyId) {
       const e=publisher.envelope(companyId);
-      return {snapshotAtMs:e?.snapshot?.atMs??null,inspection:e?.inspection??'pending',lastFailure:lastFailure.get(companyId)??null,shadow:e?.currentShadow??[],shadowSuppressedReason:e?.shadowSuppressedReason??null,unavailablePoolKeys:e?.snapshot?.unavailablePoolKeys??[]};
+      return {snapshotAtMs:e?.snapshot?.atMs??null,inspection:e?.inspection??'pending',burn:e?.snapshot?.burn??null,lastFailure:lastFailure.get(companyId)??null,shadow:e?.currentShadow??[],shadowSuppressedReason:e?.shadowSuppressedReason??null,unavailablePoolKeys:e?.snapshot?.unavailablePoolKeys??[]};
     },
     failure,
     refresh(companyId,config,input) {

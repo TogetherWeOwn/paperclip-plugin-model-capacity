@@ -6070,6 +6070,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         logger:ctx.logger,
       });
       quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
+        getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
         captureOverlay:id=>nativeOverlay.capture(id),onPublished:(id,snapshot,checkpoint)=>nativeOverlay.publish(id,snapshot.version,checkpoint,snapshot.inFlightRunAccounts),
         keyFor:companyId => scopeKey(companyId, 'router-quota-v1'),
         listAgents:async companyId => {

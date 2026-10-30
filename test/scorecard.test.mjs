@@ -125,3 +125,23 @@ test('prefer burn mode is upstream-spec-shaped and a reset after downtime never 
   state=tick(state,RESET,[]);
   assert.deepEqual(rows(state)[0].burnWindows,[{from:NOW,to:NOW+MINUTE,mode:'prefer'}]);
 });
+
+test('window and rolling 24h rates survive short pacing-history pruning and project remaining unused at reset',()=>{
+  let state=null;
+  const reset=NOW+7*24*HOUR;
+  for(let hour=0;hour<=30;hour++) {
+    const now=NOW+hour*HOUR,used=hour<=6?.1+hour*.01:.16+(hour-6)*.005;
+    state=tick(state,now,[account({weeklyResetsAtMs:reset,weeklyUsed:used,projectedUsed:used,observedAtMs:now,measuredRatePerHour:null,measuredRate24h:null,usage:{epoch:'keeper-1',requests:100,observedAtMs:now}})]);
+  }
+  const row=rows(state)[0];
+  assert.ok(Math.abs(row.measuredRatePerHour-.006)<1e-10,'window: (.28 - .1) / 30h');
+  assert.ok(Math.abs(row.measuredRate24h-.005)<1e-10,'24h: (.28 - .16) / 24h');
+  assert.ok(Math.abs(row.projectedUnusedAtReset)<1e-10,'window rate reaches full use before reset');
+});
+
+test('burn expiry gaps close at the expiry or removal tick and mode switches remain separate',()=>{
+  let state=tick(null,NOW,[account({burn:{active:true,mode:'prefer',expiresAtMs:NOW+10*MINUTE}})]);
+  state=tick(state,NOW+MINUTE,[account({observedAtMs:NOW+MINUTE,burn:{active:true,mode:'exclusive',expiresAtMs:NOW+10*MINUTE}})]);
+  state=tick(state,NOW+2*MINUTE,[account({observedAtMs:NOW+2*MINUTE})]);
+  assert.deepEqual(rows(state)[0].burnWindows,[{from:NOW,to:NOW+MINUTE,mode:'prefer'},{from:NOW+MINUTE,to:NOW+2*MINUTE,mode:'exclusive'}]);
+});
