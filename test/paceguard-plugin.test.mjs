@@ -832,9 +832,9 @@ async function policyReviewerSnapshot(d) {
   review: { lanes: review?.lanes, cap: review?.cap } };
 }
 
-async function measuredPolicyReviewer({ breakerArmIds = [] } = {}) {
+async function measuredPolicyReviewer({ breakerArmIds = [], config = policyReviewerConfig(), snapshotRows = aaRows() } = {}) {
   const onlyOpus = { models: ['claude-opus-5-5'] };
-  const d = drive({ config: policyReviewerConfig(), accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+  const d = drive({ config, snapshotRows, accounts: [claudeLane(0.55, 84.5, onlyOpus)],
     heartbeats: [{ agentId: 'fixed', queued: 8 }] });
   await d.setup();
   if (breakerArmIds.length > 0) {
@@ -924,6 +924,124 @@ for (const unreadySibling of [false, true]) {
     assert.deepEqual({ review: after.review, decisions: decisions.map(d => d.kind) },
       { review: { lanes: 1, cap: 1 }, decisions: ['decide', 'defer'] },
       'an unready policy sibling cannot reopen the live reviewer pool or admit a second run');
+  });
+}
+
+const sonnetPolicyReviewerConfig = (excludeFamilies = {}, mode = 'enforce') => {
+  const config = policyReviewerConfig();
+  config.taskRanking.mode = mode;
+  config.roles = { ...config.roles, doerAgentIds: ['fixed', 'reviewer-1'],
+    thinkerAgentIds: ['reviewer-thinker'],
+    keepAgentIds: ['fixed', 'reviewer-1', 'reviewer-thinker', 'reviewer-other'], excludeFamilies };
+  config.reviewerRouting.agentIds = ['reviewer-1', 'reviewer-thinker', 'reviewer-other'];
+  config.reviewerRouting.arms.push({ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'max' });
+  return config;
+};
+const sonnetPolicySibling = () => policyReviewerSibling({ models: ['claude-sonnet-5-5'] });
+
+async function policyReviewerRunPair(d, prefix, agentId = 'reviewer-1') {
+  const runIds = [`${prefix}-first`, `${prefix}-second`];
+  const decisions = [];
+  for (const runId of runIds) decisions.push(await d.hook(runId, { agentId }));
+  await d.tick();
+  const entries = (await d.api('shadow')).body.entries;
+  const admitted = decisions.flatMap((decision, i) => decision.kind === 'decide' ? [{ decision, runId: runIds[i] }] : []);
+  return { decisions: decisions.map(d => d.kind),
+    models: admitted.map(({ decision }) => decision.model),
+    accounts: admitted.map(({ runId }) => entries.find(e => e.runId === runId)?.accountId) };
+}
+
+test('policy exclusions: a sibling excluded by every role cannot erase the universal raw cap', async t => {
+  const config = sonnetPolicyReviewerConfig({ doer: ['sonnet'], thinker: ['sonnet'], other: ['sonnet'] });
+  const fixture = await measuredPolicyReviewer({ config });
+  const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+  const ladder = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+  assert.ok(ladder.policyReviewerArms.some(a => a.model === 'claude-sonnet-5-5'
+    && a.credentialEvidence?.readyCredentials === 1), 'the excluded model has ready policy evidence');
+  assert.equal(after.capacity.accounts.find(a => a.accountId === 'claude:policy-peer').health, 'healthy');
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+  assert.deepEqual(after.review, { lanes: 1, cap: 1 });
+  const live = await policyReviewerRunPair(fixture.d, 'all-roles-excluded');
+  assert.deepEqual(live, { decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] });
+  t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 },
+    'no spendable role survives: a policy record alone must not reopen fixed capacity');
+});
+
+for (const survivingRole of ['doer', 'thinker', 'other']) {
+  test(`policy exclusions: universal membership survives when only ${survivingRole} can spend the sibling`, async () => {
+    const exclusions = { doer: ['sonnet'], thinker: ['sonnet'], other: ['sonnet'], [survivingRole]: [] };
+    const config = sonnetPolicyReviewerConfig(exclusions);
+    // Prefer Sonnet in this positive control so the admitted run proves the sibling is spendable.
+    config.reviewerRouting.arms.reverse();
+    const fixture = await measuredPolicyReviewer({ config });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+      'one relevant role is enough; another role must not narrow universal capacity');
+    const agentId = { doer: 'reviewer-1', thinker: 'reviewer-thinker', other: 'reviewer-other' }[survivingRole];
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent[agentId], ['claude:a1', 'claude:policy-peer']);
+    const pool = after.capacity.reviewerPaceByAgent[agentId].pools.find(p => p.pool === 'claude');
+    assert.deepEqual({ lanes: pool.lanes, cap: pool.cap }, { lanes: 2, cap: null });
+    if (survivingRole !== 'doer') {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+      assert.deepEqual(after.review, { lanes: 1, cap: 1 }, 'reviewer-local membership still obeys its own role fence');
+    }
+    const live = await policyReviewerRunPair(fixture.d, `only-${survivingRole}-allowed`, agentId);
+    assert.deepEqual(live, { decisions: ['decide', 'decide'], models: ['claude-sonnet-5-5', 'claude-sonnet-5-5'],
+      accounts: ['claude:policy-peer', 'claude:policy-peer'] });
+  });
+}
+
+test('policy exclusions: no sibling retains the reviewer cap independently of family overrides', async () => {
+  const fixture = await measuredPolicyReviewer({ config: sonnetPolicyReviewerConfig({ doer: ['sonnet'] }) });
+  const after = await addPolicyReviewerSibling(fixture, null);
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 });
+  assert.deepEqual(after.review, { lanes: 1, cap: 1 });
+  assert.deepEqual(await policyReviewerRunPair(fixture.d, 'excluded-no-sibling'),
+    { decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] });
+});
+
+for (const token of ['sonnet', 'arm:claude-sonnet-5-5', 'arm:claude-sonnet-5-5@max']) {
+  test(`policy exclusions: reviewer-local and live membership honor ${token}`, async t => {
+    const fixture = await measuredPolicyReviewer({ config: sonnetPolicyReviewerConfig({ doer: [token] }) });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+    assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+      'other roles may spend Sonnet; a local reviewer exclusion is not a global hold');
+    const live = await policyReviewerRunPair(fixture.d, `local-${token}`);
+    t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+    assert.deepEqual({ review: after.review, ...live }, { review: { lanes: 1, cap: 1 },
+      decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] },
+    'the reviewer cannot borrow another role\'s sibling membership or admit a second run on a1');
+  });
+}
+
+for (const mode of ['shadow', 'enforce']) {
+  test(`policy membership mode: ${mode} ${mode === 'enforce' ? 'admits' : 'ignores'} a policy-only sibling`, async t => {
+    const config = sonnetPolicyReviewerConfig({}, mode);
+    config.reviewerRouting.arms.reverse();
+    const fixture = await measuredPolicyReviewer({ config,
+      snapshotRows: aaRows().filter(row => !row.slug.startsWith('claude-sonnet')) });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    const ladder = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+    assert.equal(ladder.rungs.length, 0, 'no AA row supplies ordinary capacity for the Sonnet sibling');
+    assert.ok(ladder.policyReviewerArms.some(a => a.model === 'claude-sonnet-5-5'
+      && a.credentialEvidence?.readyCredentials === 1), 'the policy-only diagnostic record exists in both modes');
+    const live = await policyReviewerRunPair(fixture.d, `policy-only-${mode}`);
+    t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+    if (mode === 'shadow') {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+      assert.deepEqual({ raw: after.raw, review: after.review, ...live },
+        { raw: { lanes: 1, cap: 1, allocated: 1 }, review: { lanes: 1, cap: 1 },
+          decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] },
+        'shadow policy diagnostics are not enforced capacity');
+    } else {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1', 'claude:policy-peer']);
+      assert.deepEqual({ raw: after.raw, review: after.review, ...live },
+        { raw: { lanes: 2, cap: null, allocated: 8 }, review: { lanes: 2, cap: null },
+          decisions: ['decide', 'decide'], models: ['claude-sonnet-5-5', 'claude-sonnet-5-5'],
+          accounts: ['claude:policy-peer', 'claude:policy-peer'] });
+    }
   });
 }
 

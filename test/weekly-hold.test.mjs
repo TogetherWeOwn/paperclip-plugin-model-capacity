@@ -247,3 +247,52 @@ for (const blockingPriority of [false, true]) {
     assert.equal(total(allocateKeptAndRoutedCaps({ ...input, unavailableAccountIds: ['ahead'] })), 0);
   });
 }
+
+// Fixed spill uses unheld mates, never an exempt reviewer's restored slot.
+for (const blockingPriority of [false, true]) {
+  for (const orderName of ['held-middle', 'held-last']) {
+    test(`fixed spill onto unheld mate preserves exempt reviewer slot (${orderName}, priority=${blockingPriority})`, async () => {
+      const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+      const order = orderName === 'held-middle' ? ['u1', 'held', 'u2'] : ['u1', 'u2', 'held'];
+      const slotsById = { u1: 1, held: 1, u2: 1 };
+      const accounts = order.map(accountId => ({ accountId, pool: 'shared' }));
+      const perAccount = order.map(accountId => ({ accountId, slots: slotsById[accountId] }));
+      const pacePools = [{ pool: 'shared', cap: 2, hardHeldAccountIds: ['held'] }];
+      const reviewerPaceByAgent = { reviewer: { holdSuspendedAccountIds: ['held'], pools: [{ pool: 'shared', cap: 3 }] } };
+      const agents = [{ agentId: 'fixed', running: 0, queued: 2 }, { agentId: 'reviewer', running: 0, queued: 3 }];
+      const out = allocateKeptAndRoutedCaps({ target: 8, blockingPriority, agents,
+        keepAgentIds: ['fixed'], keptByAgent: { fixed: { accountId: 'u1' } },
+        reviewerAccountIdsByAgent: { reviewer: ['held'] }, reviewerPaceByAgent,
+        accounts, perAccount, pacePools });
+      const rows = [...out.kept, ...out.routed];
+      const row = id => rows.find(a => a.agentId === id);
+      assert.equal(row('fixed').allocated, 2);
+      assert.equal(row('reviewer').allocated, 1);
+      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 3);
+    });
+  }
+}
+
+for (const blockingPriority of [false, true]) {
+  for (const orderName of ['held-middle', 'held-last']) {
+    test(`running fixed on held non-exempt lane cannot bypass pool/total fences (${orderName}, priority=${blockingPriority})`, async () => {
+      const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+      const order = orderName === 'held-middle' ? ['u1', 'held', 'u2', 'held-busy'] : ['u1', 'u2', 'held', 'held-busy'];
+      const slotsById = { u1: 1, u2: 1, held: 1, 'held-busy': 2 };
+      const accounts = order.map(accountId => ({ accountId, pool: 'shared' }));
+      const perAccount = order.map(accountId => ({ accountId, slots: slotsById[accountId] }));
+      const pacePools = [{ pool: 'shared', cap: 2, hardHeldAccountIds: ['held', 'held-busy'] }];
+      const reviewerPaceByAgent = { reviewer: { holdSuspendedAccountIds: ['held'], pools: [{ pool: 'shared', cap: 3 }] } };
+      const agents = [{ agentId: 'fixed', running: 2, queued: 0 }, { agentId: 'reviewer', running: 0, queued: 3 }];
+      const out = allocateKeptAndRoutedCaps({ target: 8, blockingPriority, agents,
+        keepAgentIds: ['fixed'], keptByAgent: { fixed: { accountId: 'held-busy' } },
+        reviewerAccountIdsByAgent: { reviewer: ['held'] }, reviewerPaceByAgent,
+        accounts, perAccount, pacePools });
+      const rows = [...out.kept, ...out.routed];
+      const row = id => rows.find(a => a.agentId === id);
+      assert.equal(row('fixed').allocated, 2);
+      assert.equal(row('reviewer').allocated, 1);
+      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 3);
+    });
+  }
+}
