@@ -108,6 +108,13 @@ test('feed join rejects malformed and duplicate identities with named errors', a
   }
 });
 
+test('feed join rejects a non-boolean exemption rather than silently exempting an absent account', async () => {
+  const {joinRegistryFeed}=await import('../src/registry.mjs');
+  const registry=normalizeRegistry(fixture());
+  registry.accounts[0].feedExempt='yes';
+  assert.throws(()=>joinRegistryFeed(registry,{accounts:[]}),/invalid registry/);
+});
+
 test('policy errors take precedence for misplaced probe flags and excluded pool members', () => {
   const raw=fixture(); raw.accounts[0].probeEligible=true;
   assert.throws(()=>normalizeRegistry(raw),/probeEligible belongs to pool membership/);
