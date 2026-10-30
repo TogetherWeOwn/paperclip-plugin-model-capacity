@@ -295,8 +295,11 @@ export function buildDynamicBindings(servedModels, { coveredModels = [], overrid
  * Join dynamic bindings to AA snapshot rows. A binding matches when its
  * override slug or any slug candidate names a non-historical snapshot row;
  * effort must be expressible (muse cap applies to contributor rows). No match
- * -> unscored with `slug-prior-only` if only history matched, otherwise
- * `no-aa-match` (the model stays unrankable, never silently dropped).
+ * -> unscored with `slug-prior-only` if history matched and no fresh alias
+ * did, otherwise `no-aa-match` (the model stays unrankable, never silently
+ * dropped). A `slug-prior-only` model is not admitted by the unscored
+ * allowlist either: that path is for models AA never scored, not for one the
+ * feed retired.
  */
 export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new Map(), bannedModels = [] } = {}) {
   const bySlug = new Map();
