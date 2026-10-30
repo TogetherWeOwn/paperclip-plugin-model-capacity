@@ -85,9 +85,13 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
   const byKey = new Map(parsed.accounts.map(a => [a.accountKey, a]));
   const router = config.router ?? registry, pacing = {...DEFAULT_PACING, ...config.pacing};
   const staleMs = Math.min(router.accountStaleMs ?? 900_000, CREDENTIAL_MAX_AGE_MS);
-  const counts = new Map(), inFlightRunAccounts = {};
+  const counts = new Map(), inFlightRunAccounts = {}, unattributedRunIds = [];
   for (const run of ledger.values()) {
     if (!isInflight(run, nowMs, horizonMs)) continue;
+    // Config-seeded guesses are not native lifecycle attribution.
+    const observedModel = run.eventModel ?? (run.actualModelSource === 'run-decision' ? run.actualModel : null);
+    if (run.status === 'running' && typeof run.runId === 'string' && !accountKeyForModel(observedModel, registry.accounts))
+      unattributedRunIds.push(run.runId);
     // Observed actual prefixed model only. A shadow decision is not a run.
     const key = accountKeyForModel(run.actualModel ?? run.eventModel, registry.accounts);
     if (key) {
@@ -164,7 +168,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     warning:nowMs >= Date.parse(burn.expiresAt) ? `burn: expired ${burn.expiresAt}; inactive (expiresAt in past)` : burn.mode === 'exclusive' ? 'burn: exclusive drain enabled' : null} : null;
   if (burnState?.warning) joined.warnings.push({reason:burnState.status === 'expired' ? 'burn-expired' : 'burn-exclusive',message:burnState.warning});
   const snapshot = freezeSnapshot({burn:burnState,version:(previous?.version ?? 0) + 1,atMs:nowMs,accounts,
-    inFlightRunAccounts,memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,
+    inFlightRunAccounts,unattributedRunIds,memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,
     memberSkipReasons:skipReasons,unavailablePoolIds:[...unavailablePoolIds],unavailablePoolKeys:[...unavailablePoolKeys],drift});
   return {snapshot,histories:outHistories,controllers:outControllers,warnings:joined.warnings};
 }

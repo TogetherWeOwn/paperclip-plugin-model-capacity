@@ -32,7 +32,7 @@ export function overlayCount(state, accountKey, base) {
 export function createRunOverlay() {
   const companies = new Map();
   const company = id => {
-    if (!companies.has(id)) companies.set(id, {version:0,sequence:0,runs:new Map(),journal:[],baseRuns:{},overlay:createOverlay()});
+    if (!companies.has(id)) companies.set(id, {version:0,sequence:0,runs:new Map(),journal:[],baseRuns:{},seeded:new Set(),overlay:createOverlay()});
     return companies.get(id);
   };
   const apply = (state,event,baseRuns) => {
@@ -56,8 +56,16 @@ export function createRunOverlay() {
       s.overlay=apply(s.overlay,event,s.baseRuns);
     },
     capture(companyId) { return company(companyId).sequence; },
-    publish(companyId,version,checkpoint,baseRuns={}) {
-      const s=company(companyId);
+    publish(companyId,version,checkpoint,baseRuns={},unattributedRunIds=[]) {
+      const s=company(companyId), census=new Set(unattributedRunIds);
+      for (const id of s.seeded) {
+        if (!census.has(id) && s.runs.get(id)?.status === 'running') s.runs.delete(id);
+      }
+      s.seeded.clear();
+      for (const id of census) {
+        if (!s.runs.has(id)) {s.runs.set(id,{status:'running',accountKey:null});s.seeded.add(id);}
+        else if (s.runs.get(id)?.status === 'running' && !s.runs.get(id)?.accountKey) s.seeded.add(id);
+      }
       s.journal=s.journal.filter(e=>e.sequence>checkpoint);
       s.baseRuns=baseRuns;
       s.overlay=s.journal.reduce((overlay,event)=>apply(overlay,event,baseRuns),resetOverlay());

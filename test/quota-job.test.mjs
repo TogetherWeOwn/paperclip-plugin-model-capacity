@@ -277,3 +277,13 @@ test('A2 persisted-but-undelivered edit stays at echoed revision 7 across ticks;
   assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'selected');
   await s.tick();
 });
+
+
+test('removing the entire router block immediately clears verified pools',async t=>{
+  const s=await startAttested(t);assert.equal((await echoed(s)).length,1);
+  delete s.cfg.router;await s.plugin.onConfigChanged(s.cfg,{companyId});
+  assert.deepEqual(s.plugin.getRouterConfig(companyId).router.pools,[]);
+  assert.equal((await s.capacity()).body.nativeRouter,undefined);
+  s.cfg.router=verifiedConfig().router;await s.tick();
+  assert.deepEqual(await echoed(s),[],'an undelivered config cannot resurrect the fence');
+});

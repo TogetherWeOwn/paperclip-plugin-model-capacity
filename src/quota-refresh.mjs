@@ -11,6 +11,7 @@ import { buildQuotaSnapshot, createSnapshotPublisher, freezeSnapshot } from './s
 import { tickScorecard, scorecardView, scorecardAccounts } from './scorecard.mjs';
 import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { routeDecision } from './router.mjs';
+import { MIN_ATTRIBUTED_RUNS } from './calibration.mjs';
 
 const WARNING_INTERVAL_MS = 10 * 60_000;
 const SHADOW_CAP = 120;
@@ -70,7 +71,7 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     lastFailure.set(companyId,reason);report(companyId,reason,{},'error',message);
     return {status:'error',reason};
   }
-  async function tick(companyId,config,{feed,ledger=new Map(),isCurrent=()=>true}={}) {
+  async function tick(companyId,config,{feed,ledger=new Map(),calibration={},isCurrent=()=>true}={}) {
     if (!config.router) return {status:'disabled'};
     let registry;
     try {registry=normalizeRegistry(config.router);} catch {return failure(companyId,'router-registry-invalid');}
@@ -94,7 +95,22 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     if(!isCurrent())return {status:'superseded'};
     let built;
     const overlayCheckpoint=captureOverlay(companyId);
-    try {built=buildQuotaSnapshot({registry,feed,nowMs:clock(),previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config});}
+    const nowMs=clock(), meanRunWeeklyPctByAccount={}, meanRunFiveHourPctByAccount={};
+    for (const account of registry.accounts) {
+      // The legacy calibration state is keyed by provider plus feed accountKey.
+      // Only validated, fresh individual measurements are evidence, not a
+      // guessed group prior or a rejected sample.
+      const sample=calibration?.accountE?.[`${account.provider}:${account.accountKey}`];
+      const age=nowMs-sample?.atMs;
+      if (!sample || !Number.isFinite(age) || age<0 || age>(config.smoothing?.staleHours ?? 6)*3_600_000
+          || sample.rejectionReason != null || !['account-weekly','account-five-hour'].includes(sample.source)
+          || (sample.source==='account-weekly' && !(sample.attributedRuns>=MIN_ATTRIBUTED_RUNS))) continue;
+      if (sample.source==='account-weekly' && Number.isFinite(sample.burnPerRunPct) && sample.burnPerRunPct>0)
+        meanRunWeeklyPctByAccount[account.accountKey]=sample.burnPerRunPct;
+      if (Number.isFinite(sample.fiveHourBurnPerRunPct) && sample.fiveHourBurnPerRunPct>0)
+        meanRunFiveHourPctByAccount[account.accountKey]=sample.fiveHourBurnPerRunPct;
+    }
+    try {built=buildQuotaSnapshot({registry,feed,nowMs,previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config,meanRunWeeklyPctByAccount,meanRunFiveHourPctByAccount});}
     catch {return failure(companyId,'quota-feed-invalid');}
     // M1 simulates registry members before native pools even exist. Preserve
     // all quota/feed/credential gates, but do not treat deployment drift as a

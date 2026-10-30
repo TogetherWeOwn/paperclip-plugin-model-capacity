@@ -2553,7 +2553,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (!feed || !current()) return {status:'superseded'};
       let native;
       if (config.router) native = await quotaRefresh.refresh(companyId, config, {
-        feed:feed.quotaFeed, ledger:await loadLedger(companyId), isCurrent:current,
+        feed:feed.quotaFeed, ledger:await loadLedger(companyId), calibration:await ctx.state.get(scopeKey(companyId, SMOOTH_KEY)), isCurrent:current,
       });
       if (!current()) return {status:'superseded'};
       await runShadowTick(companyId, job, feed);
@@ -6571,7 +6571,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       });
       quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
         getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
-        captureOverlay:id=>nativeOverlay.capture(id),onPublished:(id,snapshot,checkpoint)=>nativeOverlay.publish(id,snapshot.version,checkpoint,snapshot.inFlightRunAccounts),
+        captureOverlay:id=>nativeOverlay.capture(id),onPublished:(id,snapshot,checkpoint)=>nativeOverlay.publish(id,snapshot.version,checkpoint,snapshot.inFlightRunAccounts,snapshot.unattributedRunIds),
         keyFor:companyId => scopeKey(companyId, 'router-quota-v1'),
         listAgents:async companyId => {
           const agents=[];
