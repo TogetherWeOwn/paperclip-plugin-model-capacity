@@ -116,6 +116,14 @@
  *   change, no enforce-flag touch. Adds exactly `issues.create` +
  *   `issues.update` (create/update field allowlists + ownership checks in
  *   failure-clusters.mjs); no other capability, egress, secret or env key.
+ * v0.2.76 = SCOPED FREE UNSCORED TRIALS + DEVIN LANE: exact served-id
+ *   allowlists admit missing-AA trials without inventing benchmark scores;
+ *   expiring per-id included pricing is rechecked on every routing path.
+ *   Optional punctuation folding keeps aggregator duplicates native-first;
+ *   mandatory model bans and shared trial/reviewer account caps apply.
+ *   Preserves account-scoped newest-version fences and account fallback
+ *   seating from v0.2.75. No capability, egress, secret or env-key change.
+ *
  * v0.2.72 = POLICY-CACHE INVALIDATION ON CONFIG CHANGE: per-company config
  *   generations fence the cached routing policy; a source replacement at
  *   unchanged TTL refetches, a config change retires the live view (the
@@ -385,7 +393,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.75';
+export const PLUGIN_VERSION = '0.2.76';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.

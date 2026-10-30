@@ -96,3 +96,26 @@ test('F-T25: empty benchmark never invents a shell or seats a candidate', () => 
   assert.deepEqual(credentialGroupsFor(account, 1, false, 'other', null, null, descriptor), []);
   assert.deepEqual(routableGroupsFor(account, false, 1, false, 'other', null, null, descriptor), []);
 });
+
+
+test('Devin expiry also fences account-fallback seating without a tick', () => {
+  const { credentialGroupsFor } = plugin.createCredentialGroupHelpers(() => 11);
+  const trial = arm('swe-2', null, 0, { unscoredTrial: true, costFree: true,
+    costFreeSource: 'served-id', freeUntilMs: 10, costBase: null });
+  const scored = arm('sample-free', 0, 0, { costFree: true,
+    costFreeSource: 'served-id', freeUntilMs: 10, costBase: 3, costMultiplier: 2 });
+  for (const c of [trial, scored]) {
+    const r = ranking([low, c], [{ armId: low.armId, rung: 0, Q: low.Q, C: low.C }]);
+    if (c.unscoredTrial) r.unscoredArmIds = [c.armId];
+    const account = { credentialRanking: r };
+    const before = structuredClone(account);
+    const groups = credentialGroupsFor(account, 11, false, 'doer', null, null, { armId: c.armId, band });
+    const seated = groups.flatMap(g => g.arms).find(a => a.armId === c.armId);
+    if (c.unscoredTrial) assert.equal(seated, undefined, 'fallback cannot revive an expired missing-AA trial');
+    else {
+      assert.equal(seated.C, 6, 'fallback uses the current paid cost');
+      assert.notEqual(seated.costFree, true);
+    }
+    assert.deepEqual(account, before);
+  }
+});

@@ -761,3 +761,39 @@ test('ordinary trial reservations consume the same reviewer family budget', asyn
   assert.equal((await d.hook('ordinary-trial')).model, 'devin/swe-2');
   assert.notEqual((await d.hook('review-after-ordinary', 'reviewer')).model, 'devin/swe-2');
 });
+
+for (const mode of ['off', 'enforce']) {
+  test(`Devin folded duplicates preserve newest and account-fallback routing in ${mode} mode`, async () => {
+    const d = await driveDevin({ mode, twins: true, folding: true, configExtra: {
+      roles: { doerAgentIds: ['builder'], thinkerAgentIds: ['thinker'],
+        minQuality: { doer: null, thinker: null, other: null },
+        newestVersionOnly: { enabled: true }, accountFallback: { enabled: true } },
+    } });
+    const cap = await d.capacity();
+    assert.equal(cap.newestVersion.enabled, true);
+    assert.ok(Array.isArray(cap.eligibility.accountFallback.admitted));
+    const ladder = (await d.ladder()).ladders['devin:d'];
+    assert.ok(ladder.credentialRanking.duplicateArmIds.includes('gpt-6-1-sol'));
+    if (mode === 'off') assert.ok(ladder.rungs.some(a => a.unscoredTrial && a.model === 'devin/swe-2'));
+    else {
+      assert.ok(ladder.taskRoles.doer.candidates.every(a => a.model !== 'devin/swe-2'));
+      assert.ok(ladder.credentialRanking.duplicateTaskArmIds.length > 0);
+    }
+    assert.equal((await d.hook()).model, 'gpt-6.1-sol');
+  });
+}
+
+test('newest-version filtering excludes an admitted missing-AA Devin predecessor', async () => {
+  const d = await driveDevin({ onlyDevin: true, devinModels: ['devin/swe-2', 'devin/swe-3'],
+    aaExtraRows: [{ slug: 'swe-3', intelligenceIndex: 60, intelligenceIndexCostPerTask: 2 }],
+    configExtra: { roles: { doerAgentIds: ['builder'], minQuality: { doer: null, thinker: null, other: null },
+      newestVersionOnly: { enabled: true }, accountFallback: { enabled: true } } },
+  });
+  const cap = await d.capacity();
+  assert.ok(cap.newestVersion.accounts['devin:d'].supersededCanonicalModels.includes('swe-2'));
+  const ladder = (await d.ladder()).ladders['devin:d'];
+  assert.ok(ladder.credentialRanking.excludedArmIds.includes('swe-2'));
+  assert.ok(ladder.credentialRanking.candidates.every(a => a.model !== 'devin/swe-2'));
+  assert.ok(ladder.rungs.every(a => a.model !== 'devin/swe-2'));
+  assert.notEqual((await d.hook()).model, 'devin/swe-2');
+});

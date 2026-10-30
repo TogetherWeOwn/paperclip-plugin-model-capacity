@@ -989,25 +989,27 @@ function windowStartMs(resetsAtMs) {
 export function fallbackSeatCandidate(ranking, armId, nowMs, enforce,
   { excludedIds = ranking?.excludedArmIds, supersessionView = null, newestEnabled = false } = {}) {
   if (!ranking || !ranking.rankingRungs?.length) return { reason: 'no-benchmark-rungs' };
-  const candidate = ranking.candidates?.find(c => c.armId === armId);
+  let candidate = ranking.candidates?.find(c => c.armId === armId);
   if (!candidate) return { reason: 'candidate-absent' };
   if ((newestEnabled && supersessionView == null) || isSupersededArm(supersessionView, candidate)) {
     return { reason: 'superseded-version' };
   }
   if (new Set(excludedIds ?? []).has(armId)) return { reason: 'cross-account-excluded' };
+  candidate = repriceServedIdFree(candidate, nowMs);
+  if (!candidate) return { reason: 'expired-price' };
   if (!Number.isFinite(candidate.Q) || !Number.isFinite(candidate.C)) return { reason: 'missing-cost-or-quality' };
   if (enforce && !credentialReadiness(candidate.credentialEvidence, nowMs).eligible) return { reason: 'not-ready' };
   return { candidate };
 }
 
 function repriceServedIdFree(c, nowMs) {
-    if (c.costFreeSource !== 'served-id' || nowMs <= c.freeUntilMs) return c;
-    if (c.unscoredTrial) return null;
-    const { costFree, costFreeSource, freeServedId, freeUntilMs, freeReason, ...paid } = c;
-    if (c.taskRanking === true) return { ...paid, costFree: false, cashUsdPerAcceptedTask: null };
-    const effective = c.costBase != null ? c.costBase * (c.costMultiplier ?? 1) : null;
-    return { ...paid, C: effective, costEffective: effective, ...(Object.hasOwn(c, 'cashUsdPerAcceptedTask') ? { cashUsdPerAcceptedTask: null } : {}) };
-  }
+  if (c.costFreeSource !== 'served-id' || nowMs <= c.freeUntilMs) return c;
+  if (c.unscoredTrial) return null;
+  const { costFree, costFreeSource, freeServedId, freeUntilMs, freeReason, ...paid } = c;
+  if (c.taskRanking === true) return { ...paid, costFree: false, cashUsdPerAcceptedTask: null };
+  const effective = c.costBase != null ? c.costBase * (c.costMultiplier ?? 1) : null;
+  return { ...paid, C: effective, costEffective: effective, ...(Object.hasOwn(c, 'cashUsdPerAcceptedTask') ? { cashUsdPerAcceptedTask: null } : {}) };
+}
 
 /** Materialize account groups using the plugin's injected clock. */
 export function createCredentialGroupHelpers(clock = Date.now) {
@@ -4691,7 +4693,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const reviewerLive = liveViews.get(companyId);
     const reviewerAccounts = new Map((reviewerLive?.accounts ?? []).map(a => [a.accountId, a]));
     const reviewerAdmissions = (config.reviewerRouting?.agentIds ?? [])
-      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs, 'capacity'));
+      .map(agentId => reviewerArmAdmission(reviewerLive, companyId, agentId, nowMs, { consumer: 'capacity' }));
     // Use the real routing admission, not the configured default model's pool.
     // An empty list is meaningful: no helper may grant new review slots.
     const reviewerAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
