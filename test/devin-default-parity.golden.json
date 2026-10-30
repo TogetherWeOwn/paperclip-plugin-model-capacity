@@ -3,10 +3,10 @@
   "cases": {
     "twins": {
       "hook": {
-        "kind": "defer",
-        "model": null,
-        "effort": null,
-        "reason": "no account has headroom right now"
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer)"
       },
       "ladders": {
         "codex:native": [
@@ -73,9 +73,9 @@
     "account-free-legacy": {
       "hook": {
         "kind": "decide",
-        "model": "devin/kimi-k3",
+        "model": "gpt-6.1-sol",
         "effort": "max",
-        "reason": "rung 0 on devin:aggregate (doer)"
+        "reason": "rung 0 on codex:native (doer)"
       },
       "ladders": {
         "codex:native": [
@@ -137,10 +137,10 @@
     },
     "account-free-task": {
       "hook": {
-        "kind": "defer",
-        "model": null,
-        "effort": null,
-        "reason": "no account has headroom right now"
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer); AA workload proxy 3 USD (not calibrated accepted-task cost)"
       },
       "ladders": {
         "codex:native": [
@@ -293,10 +293,10 @@
     },
     "task-order": {
       "hook": {
-        "kind": "defer",
-        "model": null,
-        "effort": null,
-        "reason": "no account has headroom right now"
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "high",
+        "reason": "rung 0 on codex:native (doer); AA workload proxy 3 USD (not calibrated accepted-task cost)"
       },
       "ladders": {
         "codex:native": [
@@ -453,20 +453,24 @@
     },
     "manual-outage": {
       "hook": {
-        "kind": "defer",
-        "model": null,
-        "effort": null,
-        "reason": "no account has headroom right now"
+        "kind": "decide",
+        "model": "glm-5",
+        "effort": "max",
+        "reason": "rung 0 on codex:native (doer)"
       },
       "ladders": {
         "codex:native": [
           {
-            "armId": "gpt-6-1-sol-high",
+            "armId": "glm-5",
             "rung": 0
           },
           {
-            "armId": "gpt-6-1-sol",
+            "armId": "gpt-6-1-sol-high",
             "rung": 1
+          },
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 2
           }
         ],
         "devin:aggregate": [
@@ -529,6 +533,78 @@
             "message": "roles.excludeFamilies is an emergency override; eligibility is decided by roles.minQuality and roles.outcomeGate"
           }
         ]
+      },
+      "taskCandidates": []
+    },
+    "dominated-drop-shared-rung": {
+      "hook": {
+        "kind": "decide",
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "reason": "rung 0 on codex:native (doer)"
+      },
+      "ladders": {
+        "codex:native": [
+          {
+            "armId": "gpt-6-1-sol",
+            "rung": 0
+          }
+        ],
+        "devin:aggregate": [
+          {
+            "armId": "glm-5",
+            "rung": 0
+          },
+          {
+            "armId": "deepseek-v4-pro",
+            "rung": 1
+          }
+        ]
+      },
+      "shadow": [],
+      "dominated": [
+        "gpt-5.6-sol"
+      ],
+      "eligibility": {
+        "roles": {
+          "doer": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "thinker": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          },
+          "other": {
+            "excludedFamilies": [],
+            "excludedArms": [],
+            "suspended": false,
+            "suspendedGates": [],
+            "suspendedManual": [],
+            "outcome": {
+              "families": {},
+              "gated": [],
+              "best": null
+            }
+          }
+        },
+        "warnings": []
       },
       "taskCandidates": []
     }
