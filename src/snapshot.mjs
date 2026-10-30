@@ -6,7 +6,7 @@ import { parseLaneBody, resetAtMsOf } from './cliproxy.mjs';
 import { CREDENTIAL_MAX_AGE_MS, credentialEvidenceFor, credentialReadiness } from './availability.mjs';
 import { joinRegistryFeed } from './registry.mjs';
 import { accountKeyForModel, isInflight } from './ledger.mjs';
-import { appendUtilReading, appendTickLog, robustRatePerHour, stepRateController, DEFAULT_PACING } from './pacing.mjs';
+import { appendUtilReading, appendTickLog, robustRatePerHour, stepRateController, DEFAULT_PACING, RATE_HISTORY_KEEP_MS, RATE_HISTORY_CAP } from './pacing.mjs';
 import { snapshotAccountView } from './views.mjs';
 
 const MINUTE = 60_000, HOUR = 60 * MINUTE, WEEK = 7 * 24 * HOUR;
@@ -26,7 +26,7 @@ export function snapshotIsStale(snapshot, nowMs, staleSnapshotMs = 180_000) {
   return !snapshot || !fresh(snapshot.atMs, nowMs, staleSnapshotMs);
 }
 export function accountReadingIsStale(account, nowMs, accountStaleMs = 900_000) {
-  return !account || !credibleQuality(account.quality) || !Number.isFinite(account.weeklyUsed)
+  return !account || Number.isFinite(account.staleSinceMs) || !credibleQuality(account.quality) || !Number.isFinite(account.weeklyUsed)
     || !fresh(account.observedAtMs, nowMs, Math.min(accountStaleMs, CREDENTIAL_MAX_AGE_MS));
 }
 
@@ -42,15 +42,19 @@ function appendWindow(previous, kind, used, resetAtMs, observedAtMs, nowMs) {
       ticks = appendTickLog(ticks, {atMs:observedAtMs, usedPct:used}, nowMs, last);
     } else {
       // Even a repeated cached reading must prune the retained history.
-      history = history.filter(p => nowMs - p.atMs <= 90 * MINUTE).slice(-120);
+      history = history.filter(p => nowMs - p.atMs <= RATE_HISTORY_KEEP_MS).slice(-RATE_HISTORY_CAP);
     }
   }
   return {[kind]:history, [ticksKey]:ticks, [resetKey]:resetAtMs};
 }
-function retryTime(account, reason, nowMs, recheckMs) {
+function retryTime(account, reason, nowMs, recheckMs, hardCapFiveHour) {
   if (reason === 'weekly-exhausted' || reason === 'five-hour-exhausted') {
     const reset = reason === 'weekly-exhausted' ? account.weeklyResetsAtMs : account.fiveHourResetsAtMs;
-    if (Number.isFinite(reset) && reset > nowMs) return clamp(reset, nowMs + MINUTE, nowMs + WEEK);
+    if (Number.isFinite(reset) && reset > nowMs) {
+      const five = account.fiveHourResetsAtMs;
+      const both = reason === 'weekly-exhausted' && account.view.projectedFiveHourUsed >= hardCapFiveHour && Number.isFinite(five) && five > nowMs;
+      return clamp(both ? Math.max(reset,five) : reset, nowMs + MINUTE, nowMs + WEEK);
+    }
   }
   if (reason === 'pace-held') {
     const end = account.view.bindingWindow === 'five-hour' ? account.fiveHourResetsAtMs : account.weeklyResetsAtMs;
@@ -93,7 +97,8 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     const entryAtMs = raw && Object.hasOwn(raw,'observedAt') && raw.observedAt !== undefined ? resetAtMsOf(raw.observedAt) : bodyAtMs;
     const observedAtMs = Number.isFinite(bodyAtMs) && Number.isFinite(entryAtMs) ? Math.min(bodyAtMs,entryAtMs) : null;
     const quality = credibleQuality(a?.quality) && Number.isFinite(a?.weekly?.utilization) ? a.quality : 'unknown';
-    const stale = !fresh(bodyAtMs,nowMs,staleMs) || !fresh(entryAtMs,nowMs,staleMs) || quality === 'unknown';
+    const stale = !fresh(bodyAtMs,nowMs,staleMs) || !fresh(entryAtMs,nowMs,staleMs) || quality === 'unknown'
+      || !Number.isFinite(a?.weekly?.resetsAtMs) || a.weekly.resetsAtMs <= nowMs;
     const weeklyUsed = a?.weekly?.utilization ?? null, fiveHourUsed = a?.fiveHour?.utilization ?? null;
     const weeklyResetsAtMs = a?.weekly?.resetsAtMs ?? null, fiveHourResetsAtMs = a?.fiveHour?.resetsAtMs ?? null;
     const history = {
@@ -141,7 +146,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     account.skipReason = reason;
     account.held = reason === 'pace-held';
     account.view.held = account.held;
-    account.nextEligibleAtMs = reason ? retryTime(account,reason,nowMs,router.recheckMs ?? 300_000) : nowMs + MINUTE;
+    account.nextEligibleAtMs = reason ? retryTime(account,reason,nowMs,router.recheckMs ?? 300_000,router.hardCapFiveHour ?? .99) : nowMs + MINUTE;
     accounts[key] = account;
   }
   const totalRequired = Object.values(accounts).reduce((s,a)=>s + nonNegative(a.requiredRatePerHour),0);

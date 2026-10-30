@@ -87,3 +87,23 @@ test('quota publisher fences a config change while an old lane fetch is pending'
   const envelope=s.store.get(JSON.stringify(s.keyFor(companyId)));
   assert.ok(!envelope || envelope.snapshot.accounts.one.credentialReady===false,'old prefix cannot publish ready native state; unaffected account two may stay eligible');
 });
+
+test('native scheduled ticks refresh the lane every minute even with a long legacy demand-cache TTL',async t=>{
+  const s=await start(t,{configure:false});s.cfg.cliproxy.cacheTtlSec=3600;
+  await s.plugin.onConfigChanged(s.cfg,{companyId});await s.tick();
+  s.setNow(NOW+MINUTE);s.setBody(quotaFeed(NOW+MINUTE));await s.tick();
+  assert.equal(s.requests.length,2,'native quota job must not reuse a long-lived legacy demand cache');
+});
+
+test('omitting router.enabled never silently enables the native callback policy',async t=>{
+  const {resolveConfig}=await import('../src/plugin.mjs');
+  const {routeDecision}=await import('../src/router.mjs');
+  const {syntheticRouterRequest}=await import('../src/quota-refresh.mjs');
+  const {normalizeRegistry}=await import('../src/registry.mjs');
+  const s=await start(t,{configure:false});delete s.cfg.router.enabled;
+  await s.plugin.onConfigChanged(s.cfg,{companyId});await s.tick();
+  const snapshot=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot;
+  const request=syntheticRouterRequest(normalizeRegistry(s.cfg.router),'builder',NOW);
+  const result=routeDecision(request,snapshot,resolveConfig(s.cfg));
+  assert.equal(result.kind,'exhausted');assert.ok(Object.values(result.skipped).every(reason=>reason==='router-disabled'));
+});

@@ -5,30 +5,58 @@ should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-## Native router registry (not yet wired)
+## Native router quota producer (callback integration pending)
 
-The `router` block in `config.example.json` contains fictitious IDs and a worked
-example account; replace them before use. It documents the future native pool
-registry. Its company and owner UUIDs are placeholders, not real identities;
-replace them before using the generator. `enabled` defaults to `false`; this
-branch does not yet register the native router. The operator CLI and pure
-registry, quality, and drift libraries are present (see the generator section).
-Pool `thresholdPercent` is ignored by this plugin; pacing is reset-relative.
-The policy-backed planner uses the existing `roles.other` floor and outcome
-gate for reviewer pools because the existing eligibility configuration has no
-reviewer key. It fails closed on unknown models and requires scored arm and
-outcome evidence.
+The `router` block in `config.example.json` contains fictitious company/owner
+UUIDs and a worked example account; replace them before using the generator.
+`enabled` defaults to `false`, including when omitted. This branch does not yet
+register the native router callback. The operator CLI and pure registry, quality,
+and drift libraries are present (see the generator section). Pool
+`thresholdPercent` is ignored by this plugin; pacing is reset-relative.
 
-Amendment A1 assigns runtime enforcement to **slice 3**, not these libraries:
-the quota-refresh producer must call `joinRegistryFeed` from `src/registry.mjs`
-each tick, publish its `staleMemberIds`, emit its `warnings`, and consume the
-read-only `checkPoolDrift` from `scripts/pool-saga.mjs` each tick. Startup must
-use `poolHasExpectedPluginKey` from `src/registry.mjs` to report V0 ownership
-mismatches as ERROR and unavailable. These runtime actions are not wired yet;
-V0–V5 runtime enforcement is not complete. The model-level quality verdict is
-existential over effort variants and does not guarantee the runtime-selected
-effort clears the floor. **Slice 4** owns that runtime-effort guarantee before
-selection wiring may claim §9(b) compliance.
+The native `quota-refresh` job (`* * * * *`) replaces `shadow-tick`. It is the
+single scheduled quota-feed consumer; the retained hook's capacity computation
+reuses that same read. A company-scoped config lifecycle event starts one
+asynchronous initial refresh without blocking worker readiness. The job enforces
+a ten-second fetch deadline, preserves the prior publication on fetch/parse/state
+failure, and rate-limits sanitized failure diagnostics to ten minutes per class.
+The upstream SDK drops AbortSignal at its RPC boundary, so the deadline also
+locally discards late HTTP answers; it cannot cancel that outstanding host RPC.
+
+`src/snapshot.mjs` builds frozen account views, bounded meter histories and
+controller state. One `router-quota-v1` company-state envelope is persisted before
+memory publication. Observations older than 120 seconds, missing weekly meters
+or non-future weekly resets fail closed. `joinRegistryFeed` runs each tick;
+missing non-exempt accounts produce warnings and `staleMemberIds`. An exemption
+suppresses only the join warning, never inventing a meter. Snapshot age remains
+independent of account observation age.
+
+**A1 inspection integration is blocked on an upstream SDK capability gap.**
+`packages/plugins/sdk/src/types.ts` in the upstream contract tree exposes no
+pool/connection/grant/install inspection client; `scripts/pool-saga.mjs`'s
+`checkPoolDrift` requires those reads and a board-owner identity. The quota
+coordinator has an explicit `inspectPools` integration seam (not a fictional
+`ctx` method). With a supported adapter, it calls the real read-only drift
+checker per tick, marks drifted members `unmapped-member`, and logs wrong
+plugin ownership at ERROR before making the pool unavailable. The production
+worker does **not** supply that adapter: it reports `pool-inspection-unavailable`
+and fails all native pools closed. No board token, loopback HTTP, direct DB,
+or host automation workaround is included. An upstream-native inspection
+surface or an explicitly revised contract is required before activation.
+
+For unbound pools, the job runs synthetic requests through the same pure
+`routeDecision` with `router.enabled` overridden to `true`. It records selections,
+quota exhaustion, or explicit configuration unavailability to bounded plugin
+state and `/capacity.nativeRouter`. The real callback policy continues to see
+the actual master switch. Bound pools are excluded from synthetic shadow.
+
+The policy-backed planner uses the existing `roles.other` floor/outcome gate for
+reviewer pools; it fails closed on unknown models and requires scored arm and
+outcome evidence. Its model-level verdict is existential over effort variants;
+**slice 4** must supply the runtime-effort floor guarantee, burn/overlay/event
+wiring and callback registration before claiming selection-policy compliance.
+Projection accepts measured per-run cost inputs but defaults to zero where no
+credible per-run history exists; it never invents headroom.
 
 **v0.2.5 = SHADOW BY DEFAULT, enforce-capable opt-in.** The default
 manifest (`manifest`, the one `package.json` points at) holds NO

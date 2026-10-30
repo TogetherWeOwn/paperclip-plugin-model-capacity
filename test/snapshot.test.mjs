@@ -162,3 +162,21 @@ test('account staleness helper retains the oldest body/account observation, not 
   assert.equal(a.observedAtMs,NOW-121_000);
   assert.equal(api.accountReadingIsStale(a,NOW),true);
 });
+
+test('account staleness helper also rejects future/skewed envelope evidence even when the older peer is fresh', () => {
+  const a=build({feed:feed([row()],NOW+60_001)}).snapshot.accounts.one;
+  assert.equal(api.accountReadingIsStale(a,NOW),true);
+});
+
+test('a present weekly reading without a future reset cannot be paced and stays stale', () => {
+  for(const resetsAt of [null,'bad',NOW-1]) {
+    const a=build({feed:feed([row({weekly:{used:.2,resetsAt}})])}).snapshot.accounts.one;
+    assert.equal(a.eligible,false);assert.equal(a.skipReason,'account-reading-stale');
+    assert.ok(a.nextEligibleAtMs>=NOW+MIN);
+  }
+});
+
+test('snapshot next eligibility honors both exhausted windows rather than waking before the binding reset', () => {
+  const a=build({feed:feed([row({weekly:{used:1,resetsAt:NOW+HOUR},fiveHour:{used:1,resetsAt:NOW+4*HOUR}})])}).snapshot.accounts.one;
+  assert.equal(a.skipReason,'weekly-exhausted');assert.equal(a.nextEligibleAtMs,NOW+4*HOUR);
+});

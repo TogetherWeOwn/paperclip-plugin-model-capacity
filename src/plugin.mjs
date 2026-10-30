@@ -596,7 +596,7 @@ export function extractRunErrorText(event) {
 export function resolveConfig(raw = {}) {
   const keepAgentIds = (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string');
   return {
-    ...(raw.router ? {router:structuredClone(raw.router)} : {}),
+    ...(raw.router ? {router:{enabled:false,...structuredClone(raw.router)}} : {}),
     cliproxy: {
       // Belt and braces behind the validator: a non-allowlisted baseUrl
       // falls back to the default instead of ever carrying the lane key.
@@ -1254,7 +1254,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const entry = cacheFor(companyId, config);
     const cache = entry.cache;
     const cached = cache.get('accounts', nowMs);
-    if (cached) return cached;
+    // Native quota maintenance owns a fresh read each tick; a legacy demand
+    // cache TTL must not turn healthy feed observations stale.
+    if (cached && !config.router) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
       return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null, freeResets: null };
     }
