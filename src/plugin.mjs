@@ -60,7 +60,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, roleTakesTrial, adapterAllowsTrial, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken, seatFallbackArm } from './decide.mjs';
+import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, roleTakesTrial, adapterAllowsTrial, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken, seatFallbackArm, resolveAccountInputs } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts, applyBurnFloors } from './burnmode.mjs';
 import {
@@ -3571,6 +3571,63 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // list per role. Everything below (target, placement, picks) and the
     // published live view read this list, so the gates act on every path.
     const taskManual = translateTaskExclusions(config.roles.excludeFamilies, taskRanking.candidates);
+    const crossAccountInputs = (() => {
+      const feedModelsByKey = new Map();
+      for (let i = 0; i < snapshot.accounts.length; i++) {
+        const raw = snapshot.accounts[i]?.models;
+        const set = new Set();
+        if (Array.isArray(raw)) {
+          for (const m of raw) {
+            const k = canonicalKey(m);
+            if (k) set.add(k);
+          }
+        }
+        feedModelsByKey.set(stateKeys[i], set);
+      }
+      const orderingViews = accountViews.map(v => ({
+        accountId: v.accountId,
+        provider: v.provider,
+        health: v.health,
+        meter: v.meter,
+        quality: v.quality,
+        headroomPct: v.headroomPct,
+        remainingPct: v.remainingPct ?? null,
+        models: [...(feedModelsByKey.get(v.accountId) ?? [])],
+      }));
+      const nativeModels = nativeQualifiedModels(orderingViews, 0.05);
+      // Dominators must be routable this tick: qualified with headroom AND
+      // a known weekly remaining (the candidate loop skips metered accounts
+      // with remainingPct == null, so a 5h-only reading must not dominate).
+      const qualifiedHeadroom = new Set(
+        orderingViews.filter(v => hasHeadroom(v, 0.05) && v.remainingPct != null).map(v => v.accountId),
+      );
+      const fleetArms = [];
+      const allowedDominatorKeys = new Set();
+      for (const [key, ladder] of Object.entries(ladders ?? {})) {
+        for (const r of ladder?.rungs ?? []) {
+          const breaker = r.breaker ?? 'closed';
+          fleetArms.push({
+            accountId: key,
+            armId: r.armId,
+            family: r.family,
+            model: r.model,
+            ...(viewsByAccount ? (() => {
+              const canonical = canonicalModelName(r.model)?.split('/').at(-1).toLowerCase();
+              const identity = viewsByAccount.get(key)?.identities?.[canonical];
+              return { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null };
+            })() : {}),
+            Q: r.qFleet ?? null,
+            C: r.costEffective ?? r.C ?? null,
+            breaker,
+          });
+          if (breaker === 'closed') allowedDominatorKeys.add(`${key}\u0000${r.armId}`);
+        }
+      }
+      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys,
+        ...(viewsByAccount ? { requireSameProductForNewer: true } : {}) });
+      const dominatedKeys = new Set(dominated.map(d => `${d.accountId}\u0000${d.armId}`));
+      return { orderingViews, nativeModels, dominated, dominatedKeys };
+    })();
     const eligibilityForMode = (mode, arms, manual) => buildEligibility({
       arms, records: terminalRecords(ledger), nowMs, minQuality: config.roles.minQuality,
       outcomeGate: config.roles.outcomeGate, manual,
@@ -3594,7 +3651,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         accountFallback: config.roles.accountFallback,
         accountCandidates: mode === 'off' ? Object.fromEntries(ordered.map(a => [a.accountId,
           (ladders[a.accountId]?.credentialRanking?.candidates ?? []).map(c => ({ armId: c.armId, family: c.family }))])) : {},
-        supersededByAccount: {},
+        supersededByAccount: Object.fromEntries(ordered.map(a => [a.accountId,
+          viewsByAccount?.get(a.accountId)?.supersededLegacyArmIds ?? []])),
         mode: config.taskRanking.mode,
         newestVersionActive: config.roles.newestVersionOnly.enabled,
       } : {}),
@@ -3603,6 +3661,33 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const taskEligibility = config.taskRanking.mode !== 'off'
       ? eligibilityForMode('enforce', taskFleet ?? [], taskManual) : null;
     const eligibility = config.taskRanking.mode === 'enforce' ? taskEligibility : legacyEligibility;
+    if (legacyEligibility.report.accountFallback) {
+      const report = legacyEligibility.report.accountFallback;
+      const admitted = [];
+      for (const row of report.admitted) {
+        const excludedIds = [...crossAccountInputs.dominatedKeys]
+          .filter(k => k.startsWith(`${row.accountId}\u0000`))
+          .map(k => k.slice(row.accountId.length + 1));
+        const { reason } = fallbackSeatCandidate(ladders[row.accountId]?.credentialRanking,
+          row.armId, nowMs, config.credentialReadiness.enforce, {
+            excludedIds, supersessionView: viewsByAccount?.get(row.accountId) ?? null,
+            newestEnabled: config.roles.newestVersionOnly.enabled,
+          });
+        if (reason) {
+          delete legacyEligibility.accountAdmissions[row.role][row.accountId];
+          report.suppressed.push({ ...row, reason });
+        } else admitted.push(row);
+      }
+      report.admitted = admitted;
+      for (const role of [...new Set(admitted.map(row => row.role))]) {
+        legacyEligibility.report.warnings.push({ code: 'account-fallback-admitted', role,
+          message: `account fallback admitted for role ${role}` });
+      }
+      for (const row of admitted) {
+        const arm = legacyEligibility.report.arms.find(a => a.armId === row.armId);
+        arm?.eligible?.[row.role]?.reasons.push(`account-fallback-admitted: ${row.accountId}`);
+      }
+    }
     const roleExclusions = eligibility.exclusions;
     const exclusionsForMode = (role, mode = config.taskRanking.mode) =>
       (mode === 'enforce' ? taskEligibility : legacyEligibility)?.exclusions?.[role] ?? [];
@@ -3612,16 +3697,28 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     warnEligibility(companyId, eligibility.report.warnings, nowMs);
     const viewById = new Map(accountViews.map(v => [v.accountId, v]));
+    const tickInputs = (role, accountId, mode = config.taskRanking.mode, suppressAccountFallback = false) =>
+      resolveAccountInputs(exclusionsForMode(role, mode), mode === 'enforce' ? null : legacyEligibility.accountAdmissions,
+        roleBands, role, accountId, { suppressAccountFallback,
+          supersessionView: viewsByAccount?.get(accountId) ?? null,
+          newestEnabled: config.roles.newestVersionOnly.enabled });
     const roleAccess = Object.create(null);
+    const roleAccessGlobal = Object.create(null);
     for (const a of ordered) {
-      const entry = {};
+      const entry = {}, globalEntry = {};
       for (const role of ROLES) {
-        const groups = filterBreakerRungs(credentialGroupsFor(ladders[a.accountId], nowMs, config.credentialReadiness.enforce, role), breakers, a.accountId, nowMs, breakersCfg);
-        entry[role] = roleLadderAccess(groups, {
-          role, roleBands, excludedFamilies: roleExclusions[role], trialRoles: config.trials.roles,
+        const inputs = tickInputs(role, a.accountId);
+        const groupsFor = descriptor => filterBreakerRungs(credentialGroupsFor(ladders[a.accountId], nowMs,
+          config.credentialReadiness.enforce, role, null, null, descriptor), breakers, a.accountId, nowMs, breakersCfg);
+        const access = (groups, excludedFamilies) => roleLadderAccess(groups, {
+          role, roleBands, excludedFamilies, trialRoles: config.trials.roles,
         });
+        const base = groupsFor(null);
+        globalEntry[role] = access(base, roleExclusions[role]);
+        entry[role] = inputs.fallbackAdmission ? access(groupsFor(inputs.fallbackAdmission), inputs.excludedFamilies) : globalEntry[role];
       }
       roleAccess[a.accountId] = entry;
+      roleAccessGlobal[a.accountId] = globalEntry;
     }
     let concurrencyRoleAccess = roleAccess;
     const demand = await roleDemandFor(companyId, config, nowMs);
@@ -3767,60 +3864,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // open (never fallback-only). Dominance uses fleet Q + effective cost;
     // only qualified-with-headroom accounts dominate.
     {
-      const feedModelsByKey = new Map();
-      for (let i = 0; i < snapshot.accounts.length; i++) {
-        const raw = snapshot.accounts[i]?.models;
-        const set = new Set();
-        if (Array.isArray(raw)) {
-          for (const m of raw) {
-            const k = canonicalKey(m);
-            if (k) set.add(k);
-          }
-        }
-        feedModelsByKey.set(stateKeys[i], set);
-      }
-      const orderingViews = accountViews.map(v => ({
-        accountId: v.accountId,
-        provider: v.provider,
-        health: v.health,
-        meter: v.meter,
-        quality: v.quality,
-        headroomPct: v.headroomPct,
-        remainingPct: v.remainingPct ?? null,
-        models: [...(feedModelsByKey.get(v.accountId) ?? [])],
-      }));
-      const nativeModels = nativeQualifiedModels(orderingViews, 0.05);
-      // Dominators must be routable this tick: qualified with headroom AND
-      // a known weekly remaining (the candidate loop skips metered accounts
-      // with remainingPct == null, so a 5h-only reading must not dominate).
-      const qualifiedHeadroom = new Set(
-        orderingViews.filter(v => hasHeadroom(v, 0.05) && v.remainingPct != null).map(v => v.accountId),
-      );
-      const fleetArms = [];
-      const allowedDominatorKeys = new Set();
-      for (const [key, ladder] of Object.entries(ladders ?? {})) {
-        for (const r of ladder?.rungs ?? []) {
-          const breaker = r.breaker ?? 'closed';
-          fleetArms.push({
-            accountId: key,
-            armId: r.armId,
-            family: r.family,
-            model: r.model,
-            ...(viewsByAccount ? (() => {
-              const canonical = canonicalModelName(r.model)?.split('/').at(-1).toLowerCase();
-              const identity = viewsByAccount.get(key)?.identities?.[canonical];
-              return { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null };
-            })() : {}),
-            Q: r.qFleet ?? null,
-            C: r.costEffective ?? r.C ?? null,
-            breaker,
-          });
-          if (breaker === 'closed') allowedDominatorKeys.add(`${key}\u0000${r.armId}`);
-        }
-      }
-      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys,
-        ...(viewsByAccount ? { requireSameProductForNewer: true } : {}) });
-      const dominatedKeys = new Set(dominated.map(d => `${d.accountId}\u0000${d.armId}`));
+      const { orderingViews, nativeModels, dominated, dominatedKeys } = crossAccountInputs;
       const dupKeys = new Set();
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         const probe = orderingViews.find(v => v.accountId === key);
@@ -3957,12 +4001,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       return { ...taskPlacement(d, groups), taskLadderRungs: groups, roleEligible: d.kind === 'decide' };
     };
-    const placementQualityFor = (accountId, pointer, role, duplicates = true, taskMode = null) => {
+    const placementQualityFor = (accountId, pointer, role, duplicates = true, taskMode = null, suppress = false) => {
+      const inputs = tickInputs(role, accountId, taskMode ?? config.taskRanking.mode, suppress);
       const groups = filterBreakerRungs(routableGroupsFor(
-        ladders[accountId], duplicates, nowMs, config.credentialReadiness.enforce, role, taskMode,
+        ladders[accountId], duplicates, nowMs, config.credentialReadiness.enforce, role, taskMode, null, inputs.fallbackAdmission,
       ), breakers, accountId, nowMs, breakersCfg);
       return placementArm(groups, {
-        role, roleBands, excludedFamilies: exclusionsForMode(role, taskMode ?? config.taskRanking.mode),
+        role, roleBands, excludedFamilies: inputs.excludedFamilies,
         trialRoles: config.trials.roles, pointer,
       })?.quality ?? null;
     };
@@ -3974,8 +4019,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const { pools, byAccount } = freshPressure();
       const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey }).pools;
       const applyReserve = opts.applyReserve !== false && reviewReserveView.enabled === true;
-      const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
-        routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
+      const suppress = opts.suppressAccountFallback === true || reviewAgentIdsFor(config).has(opts.run?.agentId);
+      const routesRun = (v, dups) => {
+        const inputs = tickInputs(role, v.accountId, opts.taskMode ?? config.taskRanking.mode, suppress);
+        return rungsHaveEligibleArms(filterBreakerRungs(
+          routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode, null,
+            inputs.fallbackAdmission), breakers, v.accountId, nowMs, breakersCfg));
+      };
       return orderAccountsWithPacing(
         accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
           || (opts.forReview === true && config.taskRanking.mode === 'enforce' && (ladders[v.accountId]?.policyReviewerArms?.length ?? 0) > 0))).map(v => ({
@@ -3995,16 +4045,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           models: v.models,
           fallbackOnly: v.fallbackOnly,
           creditFallback: v.creditFallback,
-          roleEligible: opts.taskMode == null ? roleAccess[v.accountId]?.[role]?.eligible === true
-            : roleLadderAccess(credentialGroupsFor(ladders[v.accountId], nowMs, config.credentialReadiness.enforce, role, opts.taskMode),
-              { role, roleBands, excludedFamilies: exclusionsForMode(role, opts.taskMode), trialRoles: config.trials.roles }).eligible,
+          roleEligible: opts.taskMode == null ? (suppress ? roleAccessGlobal : roleAccess)[v.accountId]?.[role]?.eligible === true
+            : (() => {
+              const inputs = tickInputs(role, v.accountId, opts.taskMode, suppress);
+              return roleLadderAccess(credentialGroupsFor(ladders[v.accountId], nowMs, config.credentialReadiness.enforce,
+                role, opts.taskMode, null, inputs.fallbackAdmission),
+              { role, roleBands, excludedFamilies: inputs.excludedFamilies, trialRoles: config.trials.roles }).eligible;
+            })(),
           inFlight: pools[v.pool] ?? 0,
           paceInFlight: pacePools[v.pool] ?? 0,
           pool: v.pool,
           laneInFlight: byAccount[v.accountId] ?? 0,
           duplicates,
           held: !duplicates && !routesRun(v, false),
-          placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates, opts.taskMode),
+          placementQ: placementQualityFor(v.accountId, v.pointer, role, duplicates, opts.taskMode, suppress),
           freeCost: v.freeCost === true,
           ...tickTaskPreview(v, role, duplicates, opts),
           planAhead: v.planAhead,
@@ -4151,8 +4205,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Role-based family exclusions: accounts with no eligible arm for
         // this role are skipped, never deferred on (decide would only find
         // empty rungs there).
+        const inputs = tickInputs(role, sel.accountId, config.taskRanking.mode, reviewAgentIdsFor(config).has(run.agentId));
         const roleRungs = filterRungsByExcludedFamilies(
-          sel.taskLadderRungs ?? routableGroupsFor(ladder, sel.duplicates, nowMs, config.credentialReadiness.enforce, role), roleExclusions[role]);
+          sel.taskLadderRungs ?? routableGroupsFor(ladder, sel.duplicates, nowMs, config.credentialReadiness.enforce, role, null, null, inputs.fallbackAdmission), inputs.excludedFamilies);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: run.runId,
@@ -4164,7 +4219,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // probe slot -- only enforced hook runs route real traffic, so
           // only the hook calls startProbe.
           ladderRungs: filterBreakerRungs(roleRungs, breakers, sel.accountId, nowMs, breakersCfg),
-          excludedFamilies: roleExclusions[role],
+          excludedFamilies: inputs.excludedFamilies,
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -4493,7 +4548,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
-        const access = roleAccess?.[v.accountId];
+        const access = roleAccessGlobal?.[v.accountId];
         const thinker = access?.thinker;
         const doer = access?.doer;
         const pool = String(v.pool ?? v.provider ?? '').toLowerCase();
@@ -4670,10 +4725,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const v = viewById.get(sel.accountId), l = ladders[sel.accountId];
           if (!v?.reactive && v?.remainingPct == null) continue;
           if (v?.reactive && (freshPressure().byAccount[sel.accountId] ?? 0) >= trialInflightCapFor(config.trials, v.provider)) continue;
+          const inputs = tickInputs(role, sel.accountId, mode);
           const groups = sel.taskLadderRungs ?? filterBreakerRungs(routableGroupsFor(l, sel.duplicates, nowMs,
-            config.credentialReadiness.enforce, role, mode), breakers, sel.accountId, nowMs, breakersCfg);
+            config.credentialReadiness.enforce, role, mode, null, inputs.fallbackAdmission), breakers, sel.accountId, nowMs, breakersCfg);
           const d = decide({ runId: run.runId, agentId: run.agentId, role, ladderRungs: groups,
-            excludedFamilies: exclusionsForMode(role, mode), pointer: v.pointer, retryCount: 0, failureClass: 'none', contextTokens: null,
+            excludedFamilies: inputs.excludedFamilies, pointer: v.pointer, retryCount: 0, failureClass: 'none', contextTokens: null,
             fiveHourHeadroomPct: v.headroomPct, burnPerRunPct: mode === 'enforce' ? l.taskBurnPerRunPct : l.burnPerRunPct,
             reservePct: .05, accountId: sel.accountId, roleBands, contextCaps: config.contextCaps, adapterType,
             trialBudget: freshTrialBudget(), trialAdapters: config.trials.adapters, trialRoles: config.trials.roles,
