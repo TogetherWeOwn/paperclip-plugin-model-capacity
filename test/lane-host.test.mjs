@@ -139,6 +139,9 @@ const PUBLIC_HOSTS = new Set([
   'api.github.com', // fixed read-only reviewer-demand census, not a lane host
   'cliproxy', // docker service name used as a negative-test input
   'z.ai', // model provider named in an error-path fixture, not a lane host
+  'registry.npmjs.org', // pinned test-only Zod dependency tarball
+  'github.com', // public dependency funding/license metadata
+  'openrouter.ai', // unmodified upstream routing-schema fixture
   'codex-reset.com', // public Codex free-reset timeline feeding burnHorizon history, not a lane host
 ]);
 
@@ -150,6 +153,7 @@ const isReserved = host =>
   host.endsWith('.example') ||
   host.endsWith('.test') ||
   host === 'localhost' ||
+  host === '127.0.0.1' || // loopback-only operator HTTP test server, never a lane host
   host.endsWith('.localhost');
 
 // Suffixes a bare dotted token must end in to count as a host candidate.

@@ -1,158 +1,209 @@
-// Experimental, injected fake-API saga. This is not an operator interface:
-// host selectability, session and installation gates are not implemented yet.
-import { open, readFile } from 'node:fs/promises';
-import { isDeepStrictEqual } from 'node:util';
-import { normalizeRegistry, PLUGIN_KEY } from '../src/registry.mjs';
-import { buildPoolPlan } from './generate-pool.mjs';
+/** Native HTTP-contract saga; no separate grant writes. See the upstream
+ * routes/ai-connections.ts POST (inline grant+installs), routes/tool-access.ts
+ * name-only PATCH and PUT installs, and services/ai-connections.ts immutable
+ * routing check. Pools are saved LAST, disabled, checked, then activated.
+ */
+import { normalizeRegistry, memberIdFor, PLUGIN_KEY } from '../src/registry.mjs';
+import { buildPoolPlan } from './pool-plan.mjs';
+import { planGatewayConnections } from './gateway-batch.mjs';
+import { batchAgents, selectableVerdict, sessionEvidence, issueIdForTaskKey, poolConfig, equal, installsFor, orderedInstalls, connectionShape } from './generator-safety.mjs';
+import { newJournal, temporaryName, rollbackJournal } from './pool-journal.mjs';
 
-function connectionPlan(a) {
-  return {name:a.connectionName,provider:a.provider,method:'api_key',routing:{models:[...new Set(Object.values(a.pools).map(p=>`${a.prefix}/${p.model}`))].sort()}};
-}
-function sameModels(a,b) {
-  return Array.isArray(a) && Array.isArray(b) && isDeepStrictEqual([...a].sort(),[...b].sort());
-}
-async function discover(api, raw, {allowWrongPluginKey=false}={}) {
+async function discover(options) {
+  const {api,registry:raw,batch,baseUrl,allAgents=false,allAgentsApproved=false}=options;
   const registry=normalizeRegistry(raw);
-  const connections=await api.listConnections(registry.companyId);
+  if(!registry.accounts.length || !registry.pools.length) throw new Error('registry must contain accounts and pools');
+  if(registry.pools.some(p=>p.poolKey.length>160))throw new Error('pool name exceeds host limit');
+  const desired=planGatewayConnections({registry:raw,batch,baseUrl,allAgents,allAgentsApproved});
+  const assignments=batchAgents(batch);
+  const listing=await api.listConnections(registry.companyId);
+  if(listing.currentUserId!==registry.ownerUserId || listing.canManageConnections!==true || !Array.isArray(listing.connections)) throw new Error('board identity must match ownerUserId with connection management permission');
   const pools=await api.listPools(registry.companyId);
+  if(!Array.isArray(pools))throw new Error('invalid host pool list');
   const accounts=[];
-  for (const account of registry.accounts) {
-    const found=connections.filter(c=>c.name===account.connectionName);
-    if(found.length>1) throw new Error(`ambiguous connection: ${account.connectionName}`);
-    const connection=found[0];
-    let grant;
-    if(connection) {
-      const grants=(await api.listGrants(connection.id)).filter(g=>g.mode==='shared' && g.provider===account.provider && g.method==='api_key');
-      if(grants.length>1) throw new Error(`ambiguous grant: ${account.connectionName}`);
-      grant=grants[0];
-    }
-    accounts.push({account,connection,grant,desired:connectionPlan(account)});
+  for(const account of registry.accounts) {
+    const rows=listing.connections.filter(c=>c.name===account.connectionName);
+    const ids=[...new Set(rows.map(c=>c.id))];
+    if(ids.length>1) throw new Error(`ambiguous connection: ${account.accountKey}`);
+    if(rows.length>1) throw new Error(`ambiguous grant: ${account.accountKey}`);
+    const row=rows[0],entry={account,row,input:desired.find(d=>d.accountKey===account.accountKey).inputWithoutSecret};
+    if(row) {
+      entry.detail=await api.getConnection(row.id);
+      const grants=await api.getGrants(row.id);
+      const matches=grants.grants.filter(g=>g.kind==='organization' && g.id===row.grantId);
+      if(matches.length!==1) throw new Error(`missing or ambiguous shared grant: ${account.accountKey}`);
+      entry.grant=matches[0];entry.installs=await api.getInstalls(row.id);
+      if(!Array.isArray(entry.installs) || !entry.detail || entry.detail.companyId!==registry.companyId || entry.detail.createdByUserId!==registry.ownerUserId || entry.grant.createdByUserId!==registry.ownerUserId || row.ownership!=='shared' || row.provider!==account.provider || row.method!=='api_key') throw new Error(`connection ownership or provider mismatch: ${account.accountKey}`);
+    } else entry.installs=[];
+    accounts.push(entry);
   }
-  for(const {poolKey} of registry.pools) {
-    const found=pools.filter(p=>p.name===poolKey);
-    if(found.length>1) throw new Error(`ambiguous pool: ${poolKey}`);
-    if(!allowWrongPluginKey && found.length && found[0].pluginKey!==PLUGIN_KEY) throw new Error(`wrong pluginKey: ${poolKey}`);
+  for(const {poolKey} of registry.pools) if(pools.filter(p=>p.name===poolKey).length>1)throw new Error(`ambiguous pool: ${poolKey}`);
+  const agents=new Map();
+  for(const id of assignments.keys()) {
+    const a=await api.getAgent(id);
+    if(!a || a.id!==id || a.companyId!==registry.companyId)throw new Error('agent not in company');
+    agents.set(id,a);
   }
-  return {registry,accounts,pools};
+  return {raw,registry,accounts,pools,assignments,agents};
 }
-function rowsFor(accounts) {
-  return accounts.filter(x=>x.connection && x.grant).map(({account,connection,grant})=>({id:connection.id,grantId:grant.id,name:account.connectionName,provider:account.provider,method:'api_key',ownership:'shared',status:connection.status}));
+function rowsFor(state,{provisional=false}={}) {
+  return state.accounts.map(e=>({id:e.row?.id??memberIdFor('planned-connection',e.account.accountKey),grantId:e.row?.grantId??memberIdFor('planned-grant',e.account.accountKey),name:e.account.connectionName,provider:e.account.provider,method:'api_key',ownership:'shared',status:provisional?'connected':e.row?.status}));
 }
-function poolConfig(pool) { return {name:pool.name,enabled:pool.enabled,mode:pool.mode,thresholdPercent:pool.thresholdPercent,members:pool.members}; }
-function comparePool(existing, desired) {
-  const actual=poolConfig(existing);
-  // An enabled, otherwise identical pool is not drift solely due to activation.
-  return isDeepStrictEqual({...actual,enabled:false},desired.config);
-}
-async function append(handle, entry) {
-  await handle.writeFile(`${JSON.stringify(entry)}\n`);
-  await handle.sync();
-}
-
-// Complete SaveInputs require discovered connection and grant IDs; do not
-// fabricate IDs in a dry plan when the target objects have not been created.
-export async function planPoolSaga({api,registry,qualityVerdicts}) {
-  const state=await discover(api,registry);
-  if(state.accounts.some(x=>!x.connection || !x.grant)) throw new Error('complete plan requires discovered connections and grants');
-  const plan=buildPoolPlan(registry,rowsFor(state.accounts),qualityVerdicts);
-  return {connections:state.accounts.map(x=>x.desired),...plan};
-}
-
-export async function applyPoolSaga({api,registry,qualityVerdicts,journalPath}) {
-  const state=await discover(api,registry);
-  // Validate all evidence, discovered connection health and model drift before
-  // the first write. A placeholder UUID lets the pure planner validate inputs.
-  const placeholder='10000000-0000-4000-8000-000000000000';
-  for(const x of state.accounts) {
-    if(x.connection && (x.connection.status!=='connected' || x.connection.provider!==x.account.provider || x.connection.method!=='api_key' || !sameModels(x.connection.routing?.models,x.desired.routing.models))) throw new Error(`connection drift or unavailable: ${x.account.connectionName}`);
+function planFor(state,qualityVerdicts) {return buildPoolPlan(state.raw,rowsFor(state,{provisional:true}),qualityVerdicts);}
+function verdictsFor(state,plan) {
+  const result=[];
+  for(const [agentId,poolKey] of state.assignments) for(const member of plan.pools.find(p=>p.config.name===poolKey)?.config.members??[]) {
+    const accountKey=state.registry.memberIndex[member.id].accountKey;
+    result.push({poolKey,accountKey,...selectableVerdict({agent:state.agents.get(agentId),entry:state.accounts.find(e=>e.account.accountKey===accountKey),member,companyId:state.registry.companyId})});
   }
-  const preflight=buildPoolPlan(registry,state.accounts.map(x=>({id:x.connection?.id??placeholder,grantId:x.grant?.id??placeholder,name:x.account.connectionName,provider:x.account.provider,method:'api_key',ownership:'shared',status:'connected'})),qualityVerdicts);
-  for (const {poolKey} of state.registry.pools) {
-    if (!preflight.pools.some(p=>p.config.name===poolKey)) throw new Error(`no eligible members for pool: ${poolKey}`);
-  }
-  // Creating dependencies alongside an existing pool could make rollback unsafe.
-  if(state.pools.some(p=>state.registry.pools.some(q=>q.poolKey===p.name)) && state.accounts.some(x=>!x.connection || !x.grant)) throw new Error('existing pool with missing dependency requires manual reconciliation');
-  const handle=await open(journalPath,'wx',0o600);
-  const orphans=[];
-  try {
-    await append(handle,{type:'header',version:1,companyId:state.registry.companyId});
-    for(const x of state.accounts) if(!x.connection) {
-      x.connection=await api.createConnection(x.desired);
-      const entry={type:'created',kind:'connection',id:x.connection.id,name:x.account.connectionName};
-      orphans.push(entry); await append(handle,entry);
-    }
-    for(const x of state.accounts) if(!x.grant) {
-      x.grant=await api.createGrant({connectionId:x.connection.id,mode:'shared',provider:x.account.provider,method:'api_key'});
-      const entry={type:'created',kind:'grant',id:x.grant.id,connectionId:x.connection.id};
-      orphans.push(entry); await append(handle,entry);
-    }
-    const plan=buildPoolPlan(registry,rowsFor(state.accounts),qualityVerdicts);
-    for(const pool of plan.pools) {
-      const existing=state.pools.find(p=>p.name===pool.config.name);
-      if(existing) {
-        if(comparePool(existing,pool)) continue;
-        if(existing.enabled) throw new Error('refusing to update enabled pool');
-        const saved=await api.savePool({...pool,id:existing.id,expectedRevision:existing.revision});
-        await append(handle,{type:'updated',id:saved.id,revision:saved.revision,name:pool.config.name});
-        continue;
-      }
-      const saved=await api.savePool(pool);
-      const entry={type:'created',kind:'pool',id:saved.id,revision:saved.revision,name:pool.config.name};
-      orphans.push(entry); await append(handle,entry);
-    }
-    await append(handle,{type:'complete'});
-    return plan;
-  } catch {
-    const failure=new Error('pool saga failed; inspect journal and orphan set');
-    failure.journalPath=journalPath; failure.orphans=orphans;
-    throw failure;
-  } finally { await handle.close(); }
+  return result;
 }
-
-export async function checkPoolDrift({api,registry,qualityVerdicts,expectedEnabled=false}) {
-  if(typeof expectedEnabled!=='boolean') throw new Error('expectedEnabled must be boolean');
-  const state=await discover(api,registry,{allowWrongPluginKey:true}); const drift=[];
+function sameConnection(entry) {return entry.row?.status==='connected' && equal(entry.row.routing,entry.input.routing);}
+function ensurePools(state,plan) {
   for(const {poolKey} of state.registry.pools) {
-    const existing=state.pools.find(p=>p.name===poolKey);
-    if(!existing) drift.push({type:'missing-pool',poolKey});
-    else if(existing.pluginKey!==PLUGIN_KEY) drift.push({type:'plugin-key-drift',poolKey});
+    const p=plan.pools.find(p=>p.config.name===poolKey);
+    if(!p)throw new Error(`no eligible members for pool: ${poolKey}`);
+    if(p.config.members.length>100)throw new Error('pool exceeds host member limit');
   }
-  for(const x of state.accounts) {
-    if(!x.connection) drift.push({type:'missing-connection',accountKey:x.account.accountKey});
-    else if(x.connection.status!=='connected' || x.connection.provider!==x.account.provider || x.connection.method!=='api_key' || !sameModels(x.connection.routing?.models,x.desired.routing.models)) drift.push({type:'connection-drift',accountKey:x.account.accountKey});
-    if(x.connection && !x.grant) drift.push({type:'missing-grant',accountKey:x.account.accountKey});
-  }
-  if(state.accounts.every(x=>x.connection && x.grant)) {
-    const desired=buildPoolPlan(registry,rowsFor(state.accounts).map(x=>({...x,status:'connected'})),qualityVerdicts);
-    // Empty desired pools cannot be represented by SaveInput, but their live
-    // counterparts must not silently pass drift checks.
-    for(const {poolKey} of state.registry.pools) {
-      if(!desired.pools.some(p=>p.config.name===poolKey) && state.pools.some(p=>p.name===poolKey)) drift.push({type:'pool-drift',poolKey});
-    }
-    for(const pool of desired.pools) {
-      const existing=state.pools.find(p=>p.name===pool.config.name);
-      if(!existing) continue;
-      const ids=new Set((existing.members??[]).map(m=>m.id));
-      for(const member of pool.config.members) if(!ids.has(member.id)) drift.push({type:'missing-member',poolKey:pool.config.name,memberId:member.id});
-      if(existing.enabled!==expectedEnabled || !comparePool(existing,pool)) drift.push({type:'pool-drift',poolKey:pool.config.name});
-    }
-  }
-  return {ok:drift.length===0,drift};
 }
 
-export async function rollbackPoolSaga({api,journalPath}) {
-  const lines=(await readFile(journalPath,'utf8')).split('\n').filter(Boolean).map(JSON.parse);
-  if(lines[0]?.type!=='header' || lines[0].version!==1) throw new Error('invalid journal');
-  // Until update compensation is implemented, never remove dependencies of an
-  // adopted pool or undo a successful run based on a stale journal.
-  if(lines.some(e=>e.type==='complete')) throw new Error('cannot rollback completed journal');
-  if(lines.some(e=>e.type==='updated')) throw new Error('cannot rollback journal containing updated objects; manual reconciliation required');
-  const entries=lines.filter(e=>e.type==='created');
-  if(entries.some(e=>!['pool','grant','connection'].includes(e.kind) || typeof e.id!=='string' || (e.kind==='pool' && (!Number.isInteger(e.revision) || e.revision<1)))) throw new Error('invalid journal object');
-  for(const entry of entries.reverse()) {
-    if(entry.kind==='pool') await api.deletePool(entry.id,entry.revision);
-    else if(entry.kind==='grant') await api.deleteGrant(entry.id);
-    else if(entry.kind==='connection') await api.deleteConnection(entry.id);
-    else throw new Error('invalid journal object');
+export async function planPoolSaga(options) {
+  const state=await discover(options),plan=planFor(state,options.qualityVerdicts);
+  const sessions=await sessionEvidence(options.api,[...state.assignments.keys()],options.sessionPlans);
+  const errors=[];
+  for(const {poolKey} of state.registry.pools) {
+    if(!plan.pools.some(p=>p.config.name===poolKey))errors.push({poolKey,reason:'no-eligible-members'});
+    const existing=state.pools.find(p=>p.name===poolKey);
+    if(existing?.pluginKey!==undefined && existing.pluginKey!==PLUGIN_KEY)errors.push({poolKey,reason:'plugin-key-drift'});
+  }
+  return {...plan,connections:state.accounts.map(e=>({accountKey:e.account.accountKey,inputWithoutSecret:e.input,action:!e.row?'create':sameConnection(e)?'adopt':'replace-immutable-routing',identity:e.row?{connectionId:e.row.id,grantId:e.row.grantId}:{provisional:true,connectionId:memberIdFor('planned-connection',e.account.accountKey),grantId:memberIdFor('planned-grant',e.account.accountKey)}})),selectableVerdicts:verdictsFor(state,plan),sessionBlockers:sessions.blockers,resets:sessions.resets,errors,provisional:state.accounts.some(e=>!e.row),expectedEnabled:options.activate!==false};
+}
+function wakeFor(runId,agentId,taskKey) {return {source:'on_demand',triggerDetail:'manual',reason:'connection-pool-session-adoption',payload:{issueId:issueIdForTaskKey(taskKey)},idempotencyKey:`mc:${runId}:${agentId}:${taskKey}`};}
+async function assertSessionsEmpty(api,ids) {
+  const evidence=await sessionEvidence(api,ids,{});
+  if(!evidence.ready)throw new Error('live session appeared before binding; drain or roll back');
+}
+async function checkOwnership(state) {
+  for(const {poolKey} of state.registry.pools) {
+    const p=state.pools.find(p=>p.name===poolKey);
+    if(p && p.pluginKey!==PLUGIN_KEY)throw new Error(`wrong pluginKey: ${poolKey}`);
   }
 }
+export async function applyPoolSaga(options) {
+  const {api,journalPath,qualityVerdicts,activate=true}=options;
+  if(typeof activate!=='boolean')throw new Error('activate must be boolean');
+  let state=await discover(options),plan=planFor(state,qualityVerdicts);
+  ensurePools(state,plan);await checkOwnership(state);
+  const ids=[...state.assignments.keys()];
+  const sessions=await sessionEvidence(api,ids,options.sessionPlans);
+  if(sessions.blockers.some(b=>!b.authorized))throw new Error('live session requires an explicit per-agent reset plan; drained requires no sessions');
+  if(!activate && sessions.resets.length)throw new Error('cannot reset sessions for a disabled-only batch');
+  for(const s of sessions.resets)issueIdForTaskKey(s.taskKey);
+  // All immutable-route replacements and membership changes must start with
+  // disabled pools. Unchanged enabled pools remain idempotent, not rewritten.
+  for(const p of state.pools.filter(p=>state.registry.pools.some(q=>q.poolKey===p.name))) {
+    const desired=plan.pools.find(q=>q.config.name===p.name);
+    const replacement=state.accounts.some(e=>e.row && !sameConnection(e) && p.members.some(m=>m.binding.connectionId===e.row.id));
+    if(p.enabled && (replacement || !equal({...poolConfig(p),enabled:false},desired.config)))throw new Error('disable changed pools through native pool settings before applying registry updates');
+  }
+  const fatal=verdictsFor(state,plan).filter(v=>!v.selectable && !['pending-connection','not-installed'].includes(v.reason));
+  if(fatal.length)throw new Error('negative selectable verdict; repair connection, audience or harness before applying');
+  for(const a of state.agents.values()) if(a.status==='running')throw new Error('agent is running; drain batch before applying');
+  const journal=await newJournal(journalPath,{companyId:state.registry.companyId,ownerUserId:state.registry.ownerUserId,target:api.target??null});
+  const created=[],resets=[];
+  try {
+    for(const e of state.accounts) {
+      if(!e.row || !sameConnection(e)) {
+        const made=await journal.step(api,{kind:'connection-create',accountKey:e.account.accountKey,before:null,after:{...e.input,name:temporaryName(journal.header.runId,`account-${e.account.accountKey}`).slice(0,160)}});
+        created.push({kind:'connection',id:made.id,grantId:made.grantId});
+        if(e.row) {
+          const before=connectionShape(e.detail);
+          await journal.step(api,{kind:'connection-patch',id:e.row.id,before,after:{name:temporaryName(journal.header.runId,`prior-${e.account.accountKey}`).slice(0,160),enabled:false}});
+        }
+        const c=await api.getConnection(made.id);
+        await journal.step(api,{kind:'connection-patch',id:made.id,before:connectionShape(c),after:{name:e.account.connectionName,enabled:true}});
+      } else {
+        const desired=orderedInstalls(installsFor(e.input,state.registry.companyId));
+        if(!equal(orderedInstalls(e.installs),desired))await journal.step(api,{kind:'installs',id:e.row.id,before:orderedInstalls(e.installs),after:desired});
+      }
+    }
+    state=await discover(options);plan=planFor(state,qualityVerdicts);ensurePools(state,plan);
+    const selectableVerdicts=verdictsFor(state,plan);
+    if(selectableVerdicts.some(v=>!v.selectable))throw new Error('negative selectable verdict after install');
+    for(const s of sessions.resets) {
+      const wake=wakeFor(journal.header.runId,s.agentId,s.taskKey);
+      await journal.step(api,{kind:'reset',id:s.agentId,taskKey:s.taskKey,wake});resets.push({...s,wake});
+    }
+    await assertSessionsEmpty(api,ids);
+    for(const pool of plan.pools) {
+      const old=state.pools.find(p=>p.name===pool.config.name);
+      if(old && equal({...poolConfig(old),enabled:false},pool.config) && (activate || !old.enabled))continue;
+      if(old)await journal.step(api,{kind:'pool-save',companyId:state.registry.companyId,id:old.id,expectedRevision:old.revision,before:poolConfig(old),after:pool.config});
+      else {
+        const made=await journal.step(api,{kind:'pool-create',companyId:state.registry.companyId,before:null,after:{...pool.config,name:temporaryName(journal.header.runId,`pool-${pool.config.name}`).slice(0,160)}});
+        created.push({kind:'pool',id:made.id});
+        const p=(await api.listPools(state.registry.companyId)).find(p=>p.id===made.id);
+        await journal.step(api,{kind:'pool-save',companyId:state.registry.companyId,id:p.id,expectedRevision:p.revision,before:poolConfig(p),after:pool.config});
+      }
+    }
+    // The check phase permits unchanged, previously-active pools, but every
+    // created/changed pool is still disabled and verified before activation.
+    const live=await api.listPools(state.registry.companyId);
+    const phases=Object.fromEntries(live.filter(p=>state.registry.pools.some(q=>q.poolKey===p.name)).map(p=>[p.name,p.enabled]));
+    const check=await checkPoolDrift({...options,expectedEnabled:phases});
+    if(!check.ok)throw new Error('pre-activation drift check failed');
+    if(activate) {
+      for(const p of live.filter(p=>state.registry.pools.some(q=>q.poolKey===p.name))) if(!p.enabled)await journal.step(api,{kind:'pool-save',companyId:state.registry.companyId,id:p.id,expectedRevision:p.revision,before:poolConfig(p),after:{...poolConfig(p),enabled:true}});
+      await assertSessionsEmpty(api,ids);
+      for(const [id,poolKey] of state.assignments) {
+        const current=await api.getAgent(id),pool=(await api.listPools(state.registry.companyId)).find(p=>p.name===poolKey);
+        const before=current.runtimeConfig?.aiConnection??null,after={mode:'router',connectionId:pool.id};
+        // Re-list immediately at the binding boundary, not merely at startup.
+        await assertSessionsEmpty(api,[id]);
+        if(!equal(before,after))await journal.step(api,{kind:'binding',id,before,after});
+      }
+      for(const {agentId,taskKey,wake} of resets)await journal.step(api,{kind:'wake',id:agentId,taskKey,after:wake});
+    }
+    const finalState=await discover(options);
+    const mapping=finalState.accounts.map(e=>({accountKey:e.account.accountKey,connectionId:e.row.id,grantId:e.row.grantId,memberIds:Object.keys(finalState.registry.memberIndex).filter(id=>finalState.registry.memberIndex[id].accountKey===e.account.accountKey)}));
+    await journal.record({type:'mapping',accounts:mapping,pools:(await api.listPools(state.registry.companyId)).filter(p=>state.registry.pools.some(q=>q.poolKey===p.name)).map(p=>({poolKey:p.name,id:p.id,revision:p.revision}))});
+    await journal.record({type:'complete'});
+    return {...plan,mapping,selectableVerdicts,journalPath,enabled:activate};
+  } catch {
+    await journal.record({type:'failed'}).catch(()=>{});
+    const error=new Error('pool saga failed; inspect journal and recover pending intents with --rollback');
+    error.journalPath=journalPath;error.orphans=created;error.pendingIntents=journal.entries.filter(e=>e.type==='intent'&&!journal.entries.some(d=>d.type==='done'&&d.seq===e.seq)).map(({seq,kind})=>({seq,kind}));
+    throw error;
+  } finally {await journal.close();}
+}
+
+export async function checkPoolDrift(options) {
+  const {expectedEnabled=true}=options;
+  if(typeof expectedEnabled!=='boolean' && (!expectedEnabled || typeof expectedEnabled!=='object' || Array.isArray(expectedEnabled)))throw new Error('invalid expectedEnabled');
+  const state=await discover(options),plan=planFor(state,options.qualityVerdicts),drift=[];
+  for(const e of state.accounts) {
+    if(!e.row)drift.push({type:'missing-connection',accountKey:e.account.accountKey});
+    else {
+      if(!sameConnection(e))drift.push({type:'connection-drift',accountKey:e.account.accountKey});
+      if(e.grant.status!=='active')drift.push({type:'missing-grant',accountKey:e.account.accountKey});
+      if(!equal(orderedInstalls(e.installs),orderedInstalls(installsFor(e.input,state.registry.companyId))))drift.push({type:'install-drift',accountKey:e.account.accountKey});
+    }
+  }
+  for(const {poolKey} of state.registry.pools) {
+    const current=state.pools.find(p=>p.name===poolKey),desired=plan.pools.find(p=>p.config.name===poolKey);
+    if(!current) {drift.push({type:'missing-pool',poolKey});continue;}
+    if(current.pluginKey!==PLUGIN_KEY)drift.push({type:'plugin-key-drift',poolKey});
+    if(!desired) {drift.push({type:'pool-drift',poolKey});continue;}
+    for(const member of desired.config.members) {
+      if(!current.members?.some(m=>m.id===member.id))drift.push({type:'missing-member',poolKey,memberId:member.id});
+      const accountKey=state.registry.memberIndex[member.id].accountKey;
+      if(!state.accounts.find(e=>e.account.accountKey===accountKey)?.row)drift.push({type:'unresolvable-member',poolKey,memberId:member.id});
+    }
+    const enabled=typeof expectedEnabled==='boolean'?expectedEnabled:expectedEnabled[poolKey];
+    if(typeof enabled!=='boolean' || !equal(poolConfig(current),{...desired.config,enabled}))drift.push({type:'pool-drift',poolKey});
+  }
+  const selectableVerdicts=verdictsFor(state,plan);
+  for(const v of selectableVerdicts)if(!v.selectable)drift.push({type:'unselectable-member',poolKey:v.poolKey,memberId:v.memberId,agentId:v.agentId,reason:v.reason});
+  return {ok:drift.length===0,drift,selectableVerdicts,primarySignal:'R9 operator drift check'};
+}
+export async function rollbackPoolSaga(options) {return rollbackJournal({...options,target:options.api.target??null});}

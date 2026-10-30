@@ -33,10 +33,10 @@ test('policy-excluded membership is reported and never included in pools', () =>
   assert.equal(result.pools[0].config.members.length,1);
 });
 
-test('unfinished operator CLI fails closed rather than silently claiming success', async () => {
+test('operator CLI refuses apply without required inputs instead of silently claiming success', async () => {
   const {spawnSync}=await import('node:child_process');
   const r=spawnSync(process.execPath,[new URL('../scripts/generate-pool.mjs',import.meta.url).pathname,'--apply'],{encoding:'utf8'});
-  assert.notEqual(r.status,0); assert.match(r.stderr,/not implemented/i);
+  assert.notEqual(r.status,0); assert.match(r.stderr,/refused or failed/i);
 });
 
 test('planning rejects connections with missing or non-connected status', () => {

@@ -1,4 +1,135 @@
 {
-  "connection": {"name":"One","provider":"openai","method":"api_key","routing":{"models":["one/model"]}},
-  "pool": {"companyId":"10000000-0000-4000-8000-000000000001","config":{"name":"builder","enabled":false,"mode":"round_robin","thresholdPercent":90,"members":[{"id":"85edad02-43eb-5759-aa97-3b7511046bbe","binding":{"mode":"shared","provider":"openai","method":"api_key","connectionId":"10000000-0000-4000-8000-000000000011","grantId":"10000000-0000-4000-8000-000000000012"},"profile":{"provider":"codex","model":"one/model"}}]}}
+  "connections": [
+    {
+      "accountKey": "one",
+      "inputWithoutSecret": {
+        "name": "One",
+        "provider": "openai",
+        "method": "api_key",
+        "ownership": "shared",
+        "routing": {
+          "kind": "gateway",
+          "protocol": "responses",
+          "baseUrl": "https://gateway.example/v1",
+          "auth": "bearer",
+          "models": [
+            {
+              "id": "one/sol"
+            },
+            {
+              "id": "one/terra"
+            }
+          ]
+        },
+        "agentIds": [
+          "30000000-0000-4000-8000-000000000003",
+          "30000000-0000-4000-8000-000000000004"
+        ],
+        "allAgents": false
+      },
+      "action": "create",
+      "identity": {
+        "provisional": true,
+        "connectionId": "7fab8b8f-9c76-59f2-b4d6-7d485defe3f5",
+        "grantId": "4f84187a-0471-5e13-822f-c64ee165eaa6"
+      }
+    },
+    {
+      "accountKey": "two",
+      "inputWithoutSecret": {
+        "name": "Two",
+        "provider": "anthropic",
+        "method": "api_key",
+        "ownership": "shared",
+        "routing": {
+          "kind": "gateway",
+          "protocol": "messages",
+          "baseUrl": "https://gateway.example/v1",
+          "auth": "bearer",
+          "models": [
+            {
+              "id": "two/claude"
+            }
+          ]
+        },
+        "agentIds": [
+          "30000000-0000-4000-8000-000000000003"
+        ],
+        "allAgents": false
+      },
+      "action": "create",
+      "identity": {
+        "provisional": true,
+        "connectionId": "d1d99feb-c4bb-5d98-8116-4e608e1b865b",
+        "grantId": "cabc93a2-9588-5323-bbc0-5fa615c98dc6"
+      }
+    }
+  ],
+  "pools": [
+    {
+      "companyId": "10000000-0000-4000-8000-000000000001",
+      "config": {
+        "name": "builder",
+        "enabled": false,
+        "mode": "round_robin",
+        "thresholdPercent": 90,
+        "members": [
+          {
+            "id": "85edad02-43eb-5759-aa97-3b7511046bbe",
+            "binding": {
+              "mode": "shared",
+              "provider": "openai",
+              "method": "api_key",
+              "connectionId": "7fab8b8f-9c76-59f2-b4d6-7d485defe3f5",
+              "grantId": "4f84187a-0471-5e13-822f-c64ee165eaa6"
+            },
+            "profile": {
+              "provider": "codex",
+              "model": "one/terra"
+            }
+          },
+          {
+            "id": "1b6d6c62-2299-5bce-a39c-d3bbad27a6bd",
+            "binding": {
+              "mode": "shared",
+              "provider": "anthropic",
+              "method": "api_key",
+              "connectionId": "d1d99feb-c4bb-5d98-8116-4e608e1b865b",
+              "grantId": "cabc93a2-9588-5323-bbc0-5fa615c98dc6"
+            },
+            "profile": {
+              "provider": "acpx",
+              "acpxAgent": "claude",
+              "model": "two/claude"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "companyId": "10000000-0000-4000-8000-000000000001",
+      "config": {
+        "name": "thinker",
+        "enabled": false,
+        "mode": "round_robin",
+        "thresholdPercent": 90,
+        "members": [
+          {
+            "id": "507a424f-36eb-58d3-8d4d-b2e2c67929f9",
+            "binding": {
+              "mode": "shared",
+              "provider": "openai",
+              "method": "api_key",
+              "connectionId": "7fab8b8f-9c76-59f2-b4d6-7d485defe3f5",
+              "grantId": "4f84187a-0471-5e13-822f-c64ee165eaa6"
+            },
+            "profile": {
+              "provider": "codex",
+              "model": "one/sol"
+            }
+          }
+        ]
+      }
+    }
+  ]
 }

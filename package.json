@@ -24,5 +24,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check:public-pin": "node scripts/check-public-pin.mjs"
+  },
+  "devDependencies": {
+    "zod": "4.6.7"
   }
 }
