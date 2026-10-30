@@ -144,6 +144,7 @@ test('router registry is configurable with per-membership probe eligibility and 
   assert.equal(account.properties.pools.additionalProperties.properties.probeEligible.default, false);
   const example = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../config.example.json', import.meta.url)));
   assert.equal(example.router.enabled, false);
-  assert.equal(example.router.accounts.length, 0);
-  assert.equal(example.router.pools.length, 0);
+  assert.ok(example.router.accounts.some(a => a.pools.builder?.probeEligible === true));
+  assert.deepEqual(example.router.pools.map(p => p.role), ['doer', 'thinker', 'reviewer']);
+  assert.deepEqual(validateConfigShape({router: example.router}), []);
 });

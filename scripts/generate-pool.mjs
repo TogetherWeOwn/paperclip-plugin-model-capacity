@@ -3,6 +3,12 @@
  */
 import { pathToFileURL } from 'node:url';
 import { normalizeRegistry, memberIdFor, validatePoolMember } from '../src/registry.mjs';
+import { computePoolQualityVerdicts } from '../src/pool-quality.mjs';
+
+/** Policy-backed planner: derive rather than trust per-membership verdicts. */
+export function buildPoolPlanFromPolicy(raw, connectionRows, evidence) {
+  return buildPoolPlan(raw, connectionRows, computePoolQualityVerdicts(raw, evidence));
+}
 
 /** Build validated disabled pool SaveInputs using previously discovered grants.
  * Quality verdicts are required for each membership; unknown never passes.

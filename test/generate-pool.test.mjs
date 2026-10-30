@@ -45,3 +45,15 @@ test('planning rejects connections with missing or non-connected status', () => 
     assert.throws(() => buildPoolPlan(registry(), discovered, verdicts()), /connection.*unavailable/i);
   }
 });
+
+test('policy-backed pool planning computes and applies membership floors', async () => {
+  const { buildPoolPlanFromPolicy } = await import('../scripts/generate-pool.mjs');
+  const result = buildPoolPlanFromPolicy(registry(), rows(), {
+    arms:[{armId:'terra',model:'gpt-6.1-terra',family:'terra',qFleet:0.3,qFleetThinker:0.3},
+      {armId:'sol',model:'gpt-6.1-sol',family:'sol',qFleet:1,qFleetThinker:1},
+      {armId:'weak',model:'model',family:'weak',qFleet:-2,qFleetThinker:-2}],
+    roles:{minQuality:{doer:0,thinker:0.4}},records:[],nowMs:10000,roleOf:()=> 'doer',familyOf:r=>r.family,
+  });
+  assert.deepEqual(result.excluded,[{accountKey:'claude-1',poolKey:'builder',reason:'excluded-by-policy'}]);
+  assert.equal(result.pools[0].config.members.length,1);
+});

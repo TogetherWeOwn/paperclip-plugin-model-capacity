@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { validateRouterConfig } from './registry.mjs';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -189,7 +190,7 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
-  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes));
+  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes), ...validateRouterConfig(raw.router));
   if (raw.allocation != null) {
     const allocation = raw.allocation;
     if (typeof allocation !== 'object' || Array.isArray(allocation)) errors.push('allocation must be an object');

@@ -73,3 +73,39 @@ export function validatePoolMember(member, account) {
   if (profile.provider === 'acpx' ? profile.acpxAgent !== 'claude' : Object.hasOwn(profile, 'acpxAgent')) throw new Error('invalid harness profile');
   return member;
 }
+
+/** Validate plugin router configuration without changing the deployed hook. */
+export function validateRouterConfig(raw) {
+  if (raw === undefined) return [];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['router must be an object'];
+  const errors = [];
+  const checkKeys = (obj, allowed, path) => {
+    for (const k of Object.keys(obj)) if (!allowed.includes(k)) errors.push(`${path}.${k} is not a known key`);
+  };
+  checkKeys(raw, ['enabled','allowMessages','companyId','ownerUserId','staleSnapshotMs','accountStaleMs','recheckMs','hardCapWeekly','hardCapFiveHour','accounts','pools'], 'router');
+  for (const k of ['enabled','allowMessages']) if (k in raw && typeof raw[k] !== 'boolean') errors.push(`router.${k} must be a boolean`);
+  for (const k of ['companyId','ownerUserId']) if (typeof raw[k] !== 'string' || !uuidPattern.test(raw[k])) errors.push(`router.${k} must be a UUID`);
+  for (const k of ['staleSnapshotMs','accountStaleMs','recheckMs']) if (k in raw && !(Number.isSafeInteger(raw[k]) && raw[k] > 0)) errors.push(`router.${k} must be a positive integer`);
+  for (const k of ['hardCapWeekly','hardCapFiveHour']) if (k in raw && !(Number.isFinite(raw[k]) && raw[k] >= 0 && raw[k] <= 1)) errors.push(`router.${k} must be a number in [0, 1]`);
+  if (Array.isArray(raw.pools)) for (const pool of raw.pools) {
+    if (pool && typeof pool === 'object' && !Array.isArray(pool)) {
+      checkKeys(pool, ['poolKey','role'], 'router.pools[]');
+      if (typeof pool.poolKey === 'string' && pool.poolKey.length > 160) errors.push('router poolKey exceeds 160 characters');
+    }
+  }
+  if (Array.isArray(raw.accounts)) for (const account of raw.accounts) {
+    if (!account || typeof account !== 'object' || Array.isArray(account)) continue;
+    checkKeys(account, ['accountKey','prefix','provider','protocol','harnessProfile','acpxAgent','connectionName','feedExempt','pools'], 'router.accounts[]');
+    if ('acpxAgent' in account && account.acpxAgent !== 'claude') errors.push('router account acpxAgent must be claude');
+    if ('feedExempt' in account && typeof account.feedExempt !== 'boolean') errors.push('router account feedExempt must be a boolean');
+    if (typeof account.connectionName === 'string' && account.connectionName.length > 160) errors.push('router connectionName exceeds 160 characters');
+    if (account.pools && typeof account.pools === 'object' && !Array.isArray(account.pools)) for (const member of Object.values(account.pools)) {
+      if (member && typeof member === 'object' && !Array.isArray(member)) {
+        checkKeys(member, ['model','probeEligible'], 'router membership');
+        if ('probeEligible' in member && typeof member.probeEligible !== 'boolean') errors.push('router membership probeEligible must be a boolean');
+      }
+    }
+  }
+  try { normalizeRegistry(raw); } catch (error) { errors.push(`router registry: ${error.message}`); }
+  return errors;
+}

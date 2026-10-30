@@ -9,8 +9,26 @@
     "recheckMs": 300000,
     "hardCapWeekly": 0.995,
     "hardCapFiveHour": 0.99,
-    "accounts": [],
-    "pools": []
+    "accounts": [
+      {
+        "accountKey": "codex-example",
+        "prefix": "codexexample",
+        "provider": "openai",
+        "protocol": "responses",
+        "harnessProfile": "codex",
+        "connectionName": "cliproxy-codex-example",
+        "pools": {
+          "builder": { "model": "gpt-6.1-terra", "probeEligible": true },
+          "thinker": { "model": "gpt-6.1-sol" },
+          "reviewer": { "model": "gpt-6.1-sol" }
+        }
+      }
+    ],
+    "pools": [
+      { "poolKey": "builder", "role": "doer" },
+      { "poolKey": "thinker", "role": "thinker" },
+      { "poolKey": "reviewer", "role": "reviewer" }
+    ]
   },
   "cliproxy": {
     "accountsPath": "/telemetry/cliproxy/live/accounts.json",
