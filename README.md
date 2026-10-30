@@ -182,19 +182,25 @@ failed/superseded ticks do not reset it.
 The integration pass merges already-reviewed mainline `dc86ae4` (PRs #74/#75),
 restoring the superseded-default defer guards and reviewer
 `suppressAccountFallback` inputs missing from the original port handoff. It
-introduces no new hook algorithm. The transitional resolver body now matches
-BOTH mainline and the supplied read-only 0.2.72 reference byte-for-byte, SHA256
+introduced no new hook algorithm at that integration checkpoint. Its
+transitional resolver body matched BOTH mainline and the supplied read-only
+0.2.72 reference byte-for-byte, SHA256
 `a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2`.
 Extraction is from the exact `async onResolveRunModel(params)` declaration
 through its closing property delimiter, with whitespace retained. The tarball
-regression pins that independent reference hash (not a hash of our own source)
-and checks the entire packaged transitional source after only the build-time
-factory lock. The stale handoff hash was `18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
-the new assertion failed on that hash before mainline reconciliation. Mainline's
+regression still pins that independent reference hash (not a hash of our own
+source) and checks the entire packaged transitional source after only the
+build-time factory lock. The conservative weekly overlay subsequently added
+default, pinned-agent and stale-default emission guards inside this body; its
+current hash is `edd6abfca260ae46e31d5bbf291366f98cd9394aebabb86e36afe3ca02f037f1`.
+The independent-hash assertion therefore remains red pending an explicit
+contract disposition; current reference parity or release readiness is not
+claimed. The stale handoff hash was `18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
+the assertion failed on that hash before mainline reconciliation. Mainline's
 frozen default-parity corpus and reviewer/Devin regression suites also execute
-against the unpacked transitional artifact. This establishes source/package
-retention, NOT live fork-image install or production behavior proof; G-T and
-independent integration review remain open.
+against the unpacked transitional artifact. Package/source equality does not
+establish live fork-image install or production behavior; G-T and independent
+integration review remain open.
 
 Operator sequence (no deployment is authorized by this documentation):
 
@@ -692,11 +698,12 @@ must distinguish those from actual native staging installs and real traffic.
 - [x] Draft companion registry rows include every Q3 dependency, named Keeper
   writer, reserve uncertainty, caps disposition, residual and MCP audit gap.
   They are NOT applied host changes; remaining census work is explicit.
-- [x] **Reference/mainline hook source parity**: merge mainline PRs #74/#75
-  in a distinct integration commit; transitional artifact resolver hash matches
-  both main `dc86ae4` and the read-only 0.2.72 reference above, with an empty
-  byte diff. Test-first regression rejects the stale port handoff. Independent
-  integration review and live G-T behavior proof are still required below.
+- [ ] **Reference/mainline hook source parity disposition**: the distinct
+  integration of mainline PRs #74/#75 matched main `dc86ae4` and the read-only
+  0.2.72 reference with an empty byte diff. The later conservative weekly
+  emission guards change that body; the independent fingerprint regression
+  remains red, not repinned or waived. Its contract disposition, independent
+  integration review and live G-T behavior proof remain required.
 - [ ] Full-src reserve/caps-consumer/producer census and any required Q7 clean
   route retirement; local port-call-site tests are narrower evidence.
 - [ ] Staging evidence G-1, G-T (both handlers simultaneously on fork image,

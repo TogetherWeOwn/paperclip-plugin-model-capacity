@@ -751,8 +751,15 @@ function allocateMultiPoolReviewers(input) {
     ...row, maxConcurrentRuns: row.allocated,
     reason: row.allocated === row.running ? 'floor-running' : blockingPriority ? 'proportional' : 'reviewer-headroom',
   }));
-  const routedTarget = Math.max(0, totalCeiling - kept.reduce((sum, row) => sum + row.allocated, 0));
-  const routedCeiling = Math.max(1, routedTarget);
+  const keptTotal = kept.reduce((sum, row) => sum + row.allocated, 0);
+  // A physical running census alone must not turn the ordinary soft target
+  // into a hard ceiling. Constrained grants still consume the fleet remainder.
+  const routedTarget = keptTotal === 0
+    ? target
+    : (target == null ? null : Math.max(0, totalCeiling - keptTotal));
+  const routedCeiling = Math.max(1, Math.floor(keptTotal === 0
+    ? maxTotal
+    : Math.min(maxTotal - keptTotal, totalCeiling - keptTotal)));
   const routed = blockingPriority ? rows.filter(row => !constrainedIds.has(row.agentId)).map(({ allocationWeight, ...row }) => ({
     ...row, maxConcurrentRuns: row.allocated, reason: row.allocated === row.running ? 'floor-running' : 'proportional',
   })) : allocateDemandCaps(routedTarget, agents.filter(a => !constrainedIds.has(a.agentId)), routedCeiling);
