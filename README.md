@@ -1691,8 +1691,12 @@ The implementation is grounded in upstream checkout `e2cfdc7e`:
   valid, working prior native binding per agent, configured through the normal
   native management flow. Unbound agents can still dry-run/stage; activation is
   refused before any writes rather than leave an un-rollbackable binding.
-  Binding writes use the host's `configurationRevision` for optimistic checks,
-  retain unrelated settings and verify the saved binding afterwards.
+  Binding writes obtain both the HMAC `configurationRevision` and redacted
+  `runtimeConfig` PATCH base from `GET /agents/:id/configuration` (not the
+  detail endpoint, which has no revision). The server restores redactions
+  against that display when the revision matches. Writes retain unrelated
+  settings and verify the saved binding afterwards. A prior `responsible_user`
+  binding must include its provider **and method**, as upstream requires.
 
 Keep the batch quiescent (no queued/running work or concurrent roster/connection
 edits) until it completes. Live sessions without an explicit per-agent `reset`
@@ -1739,9 +1743,12 @@ not a cross-object transaction.
 
 Tests include HTTP end-to-end CLI requests, lost responses/partial compensation,
 registry growth and a two-protocol U18 golden. Portable fixtures in
-`test/fixtures/upstream-schemas/` are unmodified upstream emitted schema modules
-with source checkout and SHA256 provenance. Tests parse real emitted POST bodies
-with those Zod schemas. Run `npm ci --ignore-scripts --legacy-peer-deps` then
+`test/fixtures/upstream-schemas/` are upstream emitted schema modules or exact declaration
+excerpts (unused exports/imports pruned), with source checkout and SHA256
+provenance. Tests parse every emitted mutation body with upstream Zod schemas:
+connection create/PATCH, pool save/DELETE, installs PUT, agent PATCH (including
+rollback restoration), reset-session and wake. Bodyless connection DELETE is
+also checked. The CLI test server rejects unverified mutation routes. Run `npm ci --ignore-scripts --legacy-peer-deps` then
 `npm test`; the runtime CLI has no Zod dependency. Per amendment A1, runtime quota
 job enforcement / U14 remains slice 3 and runtime effort-floor enforcement remains
 slice 4. The spec's U15 lane-job and U16 scorecard tests are not generator tests

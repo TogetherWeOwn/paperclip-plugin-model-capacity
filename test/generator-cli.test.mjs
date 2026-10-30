@@ -9,7 +9,8 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { createAiConnectionSchema } from './fixtures/upstream-schemas/ai-connections.js';
 import { aiConnectionPoolConfigSchema } from './fixtures/upstream-schemas/ai-connection-router.js';
-import { NativeApi, registry, batch, companyId, ownerUserId, agentId } from './support/native-api.mjs';
+import { NativeApi, registry, batch, companyId, ownerUserId, agentId, originalBinding } from './support/native-api.mjs';
+import { parseUpstreamWrite } from './support/upstream-http-schema.mjs';
 const exec=promisify(execFile),script=new URL('../scripts/generate-pool.mjs',import.meta.url).pathname;
 const saveSchema=z.object({pluginKey:z.literal('togetherweown.model-capacity'),id:z.string().uuid().optional(),expectedRevision:z.number().int().positive().optional(),config:aiConnectionPoolConfigSchema}).strict();
 
@@ -22,7 +23,7 @@ async function fixture(t) {
     try {
       assert.equal(req.headers.authorization,'Bearer BOARD_DUMMY');
       const input=body?JSON.parse(body):undefined,path=new URL(req.url,'http://localhost').pathname;
-      requests.push({method:req.method,path,input});let out;
+      requests.push({method:req.method,path,input});parseUpstreamWrite(req.method,path,input);let out;
       const tail=path.replace(`/api/companies/${companyId}`,'');
       if(req.method==='GET'&&tail==='/ai-connections')out=await api.listConnections();
       else if(req.method==='GET'&&tail==='/ai-connection-pools')out=await api.listPools();
@@ -95,6 +96,13 @@ test('HTTP apply activates, resets only approved sessions, preserves unrelated a
   const wake=f.requests.find(r=>r.path.endsWith('/wakeup'));assert.equal(wake.input.payload.issueId,taskKey.slice(6));
   const reset=f.requests.find(r=>r.path.endsWith('/runtime-state/reset-session'));assert.deepEqual(reset.input,{taskKey});
   assert.equal(f.requests.some(r=>r.path.includes('comment')),false);assert.deepEqual(f.errors,[]);
+  // Native drain/disable is required before compensating a completed migration.
+  for(const pool of [...f.api.pools])await f.api.savePool({companyId,id:pool.id,expectedRevision:pool.revision,config:{name:pool.name,enabled:false,mode:pool.mode,thresholdPercent:pool.thresholdPercent,members:pool.members}});
+  await f.run(['--rollback',join(f.dir,'active.jsonl')]);
+  assert.deepEqual(f.api.agents.get(agentId).runtimeConfig.aiConnection,originalBinding);
+  assert.equal(f.api.agents.get(agentId).runtimeConfig.unrelated,true);
+  assert.deepEqual(f.errors,[]);
+  assert.equal(f.api.connections.length,0);assert.equal(f.api.pools.length,0);
 });
 
 test('mapping caches reverify connection AND grant IDs; a deleted mapping is never written to',async t=>{

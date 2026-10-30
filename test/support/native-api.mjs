@@ -5,7 +5,7 @@ import { join } from 'node:path';
 export const companyId='10000000-0000-4000-8000-000000000001';
 export const ownerUserId='20000000-0000-4000-8000-000000000002';
 export const agentId='30000000-0000-4000-8000-000000000003';
-export const originalBinding={mode:'responsible_user',provider:'openai'};
+export const originalBinding={mode:'responsible_user',provider:'openai',method:'api_key'};
 export const secondAgent='30000000-0000-4000-8000-000000000004';
 export const registry={companyId,ownerUserId,allowMessages:true,pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[
   {accountKey:'one',prefix:'one',connectionName:'One',provider:'openai',protocol:'responses',harnessProfile:'codex',pools:{builder:{model:'terra'},thinker:{model:'sol'}}},

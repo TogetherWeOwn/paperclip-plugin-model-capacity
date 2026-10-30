@@ -15,7 +15,7 @@ export function reversibleBinding(b) {
   if(!b || typeof b!=='object' || Array.isArray(b))return false;
   if(b.mode==='router')return uuid(b.connectionId) && Object.keys(b).every(k=>['mode','connectionId'].includes(k));
   if(!['openai','anthropic','openrouter','xai','github','google'].includes(b.provider))return false;
-  if(b.mode==='responsible_user')return Object.keys(b).every(k=>['mode','provider'].includes(k));
+  if(b.mode==='responsible_user')return ['api_key','subscription'].includes(b.method) && Object.keys(b).every(k=>['mode','provider','method'].includes(k));
   return ['shared','delegated'].includes(b.mode) && ['api_key','subscription'].includes(b.method) && uuid(b.connectionId) && uuid(b.grantId) && Object.keys(b).every(k=>['mode','provider','method','connectionId','grantId'].includes(k));
 }
 export function batchAgents(batch) {

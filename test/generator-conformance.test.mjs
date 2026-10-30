@@ -1,4 +1,7 @@
 import test from 'node:test';
+import { parseUpstreamWrite } from './support/upstream-http-schema.mjs';
+import { reversibleBinding } from '../scripts/generator-safety.mjs';
+import { updateAgentSchema } from './fixtures/upstream-schemas/validators/agent.js';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { createAiConnectionSchema } from './fixtures/upstream-schemas/ai-connections.js';
@@ -62,4 +65,49 @@ test('binding uses configuration revision AND redacted PATCH base, never detail 
   assert.deepEqual(calls.map(c=>[c.method,new URL(c.url).pathname]),[
     ['GET',`/api/agents/${agentId}/configuration`],['PATCH',`/api/agents/${agentId}`],['GET',`/api/agents/${agentId}`],
   ]);
+});
+
+
+test('responsible-user rollback bindings must carry the upstream-required method',()=>{
+  const incomplete={mode:'responsible_user',provider:'openai'};
+  assert.equal(updateAgentSchema.safeParse({runtimeConfig:{aiConnection:incomplete}}).success,false);
+  assert.equal(reversibleBinding(incomplete),false,'reject rollback bindings upstream will reject');
+  assert.equal(updateAgentSchema.safeParse({runtimeConfig:{aiConnection:originalBinding}}).success,true);
+  assert.equal(reversibleBinding(originalBinding),true);
+});
+
+test('all non-create HTTP bodies conform to their upstream schemas, including binding restoration',async()=>{
+  const sent=[];let binding=originalBinding;
+  const api=generator.createPaperclipApi({target:'https://paperclip.example',companyId,token:'BOARD_DUMMY',fetchImpl:async(url,init)=>{
+    const path=new URL(url).pathname,body=init.body===undefined?undefined:JSON.parse(init.body);
+    parseUpstreamWrite(init.method,path,body);
+    if(init.method!=='GET')sent.push({path,method:init.method,body});
+    if(init.method==='PATCH'&&path===`/api/agents/${agentId}`)binding=body.runtimeConfig.aiConnection;
+    return Response.json({id:agentId,companyId,...(path.endsWith('/configuration')?{configurationRevision:'c'.repeat(64)}:{}),runtimeConfig:{aiConnection:binding}});
+  }});
+  const routerBinding={mode:'router',connectionId:companyId};
+  await api.bindAgent(agentId,routerBinding,originalBinding);
+  await api.bindAgent(agentId,originalBinding,routerBinding);
+  await api.updateConnection(companyId,{name:'Renamed',enabled:false});
+  await api.putInstalls(companyId,[{targetType:'agent',targetId:agentId}]);
+  await api.putInstalls(companyId,[]);
+  await api.resetSession(agentId,'issue:'+ownerUserId);
+  await api.wakeAgent(agentId,{source:'automation',triggerDetail:'system',reason:'native-pool-session-reset',payload:{issueId:ownerUserId},idempotencyKey:'test-reset'});
+  await api.deletePool(companyId,2);
+  await api.deleteConnection(companyId);
+  assert.equal(sent.length,9,'exercise every emitted non-create mutation shape');
+  assert.equal(sent[1].body.runtimeConfig.aiConnection.method,'api_key');
+});
+
+
+test('binding fails closed on absent or malformed configuration revision before PATCH',async()=>{
+  for(const revision of [undefined,null,'detail-only','a'.repeat(63),'A'.repeat(64)]) {
+    let writes=0;
+    const api=generator.createPaperclipApi({target:'https://paperclip.example',companyId,token:'BOARD_DUMMY',fetchImpl:async(url,init)=>{
+      if(init.method!=='GET')writes++;
+      return Response.json({companyId,configurationRevision:revision,runtimeConfig:{aiConnection:originalBinding}});
+    }});
+    await assert.rejects(api.bindAgent(agentId,{mode:'router',connectionId:companyId},originalBinding),/configuration revision required/);
+    assert.equal(writes,0);
+  }
 });
