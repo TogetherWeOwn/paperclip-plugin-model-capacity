@@ -50,6 +50,31 @@ test('account-less upstream lifecycle events are reported as unattributed, never
   assert.deepEqual(r.deltas('company',0),{});
 });
 
+test('restart census releases an absent run and can seed that run again on reappearance', () => {
+  const r=runtime();
+  r.publish('company',1,r.capture('company'),{},['reappearing']);
+  assert.equal(r.status('company').unattributedInFlight,1);
+  r.publish('company',2,r.capture('company'),{},[]);
+  assert.equal(r.status('company').unattributedInFlight,0,'absence releases a census-owned run');
+  r.publish('company',3,r.capture('company'),{},['reappearing']);
+  assert.equal(r.status('company').unattributedInFlight,1,'reappearance must not be suppressed as a terminal duplicate');
+  r.publish('company',4,r.capture('company'),{},[]);
+  assert.equal(r.status('company').unattributedInFlight,0,'a re-added run must also be released by a later census');
+  r.publish('company',5,r.capture('company'),{},['reappearing']);
+  observe(r,'reappearing','finished',null);
+  assert.equal(r.status('company').unattributedInFlight,0);
+  assert.deepEqual(r.deltas('company',5),{});
+});
+
+test('repeated restart censuses retain ownership until a later census releases the run', () => {
+  const r=runtime();
+  r.publish('company',1,r.capture('company'),{},['retained']);
+  r.publish('company',2,r.capture('company'),{},['retained']);
+  assert.equal(r.status('company').unattributedInFlight,1);
+  r.publish('company',3,r.capture('company'),{},[]);
+  assert.equal(r.status('company').unattributedInFlight,0,'an already-present run must remain census-owned on the second publication');
+});
+
 test('a terminal event cannot release a different base run when its own start was never attributed', () => {
   const r=runtime();
   observe(r,'unattributed','running',null);

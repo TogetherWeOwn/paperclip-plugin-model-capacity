@@ -12,6 +12,7 @@ import { tickScorecard, scorecardView, scorecardAccounts } from './scorecard.mjs
 import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { routeDecision } from './router.mjs';
 import { MIN_ATTRIBUTED_RUNS } from './calibration.mjs';
+import { parseLaneBody } from './cliproxy.mjs';
 
 const WARNING_INTERVAL_MS = 10 * 60_000;
 const SHADOW_CAP = 120;
@@ -96,11 +97,16 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     let built;
     const overlayCheckpoint=captureOverlay(companyId);
     const nowMs=clock(), meanRunWeeklyPctByAccount={}, meanRunFiveHourPctByAccount={};
+    let feedByKey;
+    try {feedByKey=new Map((parseLaneBody(feed,nowMs)?.accounts ?? []).map(a=>[a.accountKey,a]));}
+    catch {return failure(companyId,'quota-feed-invalid');}
     for (const account of registry.accounts) {
-      // The legacy calibration state is keyed by provider plus feed accountKey.
+      // Calibration is keyed by the parsed feed identity (codex/claude), not
+      // the gateway binding provider (openai/anthropic). Join by accountKey.
       // Only validated, fresh individual measurements are evidence, not a
       // guessed group prior or a rejected sample.
-      const sample=calibration?.accountE?.[`${account.provider}:${account.accountKey}`];
+      const feedAccount=feedByKey.get(account.accountKey);
+      const sample=feedAccount ? calibration?.accountE?.[feedAccount.accountId] : null;
       const age=nowMs-sample?.atMs;
       if (!sample || !Number.isFinite(age) || age<0 || age>(config.smoothing?.staleHours ?? 6)*3_600_000
           || sample.rejectionReason != null || !['account-weekly','account-five-hour'].includes(sample.source)

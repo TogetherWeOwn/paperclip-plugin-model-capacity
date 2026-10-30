@@ -92,6 +92,17 @@ test('projection uses ledger run truth by prefix, ignores shadow-decided account
   assert.ok(Math.abs(s.accounts.one.view.projectedUsed-.21)<1e-12); assert.ok(Math.abs(s.accounts.one.view.headroomPct-.79)<1e-12);
 });
 
+test('restart census treats config-seeded actualModel as unattributed but trusts observed run models', () => {
+  const ledger=new Map([
+    ['configured',{runId:'configured',status:'running',startedAt:NOW,actualModel:'p1/model',actualModelSource:'agent-config'}],
+    ['event',{runId:'event',status:'running',startedAt:NOW,eventModel:'p1/model'}],
+    ['decision',{runId:'decision',status:'running',startedAt:NOW,actualModel:'p1/model',actualModelSource:'run-decision'}],
+  ]);
+  const s=build({ledger}).snapshot;
+  assert.deepEqual(s.unattributedRunIds,['configured'],'a configured prefix cannot remove the A4 attribution-gap warning');
+  assert.equal(s.accounts.one.inFlightBase,3,'the interim ledger still conservatively counts all active runs');
+});
+
 test('rate history measures actual observations and resets with the weekly window', () => {
   const old=build({nowMs:NOW-30*MIN,feed:feed([row({observedAt:new Date(NOW-30*MIN).toISOString(),weekly:{used:.1,resetsAt:NOW+84*HOUR}})],NOW-30*MIN)});
   const result=build({histories:old.histories,controllers:old.controllers,previous:old.snapshot});

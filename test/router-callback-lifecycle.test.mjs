@@ -19,7 +19,17 @@ async function start({ledger=[], calibration=null, used=.2}={}) {
     {slug:'claude-high',intelligenceIndex:55,intelligenceIndexCostPerTask:4},
   ]});
   const context={state:h.state,logger:h.logger,config:{get:async()=>cfg},secrets:{resolve:async()=> 'TEST_SECRET_NEVER_LOGGED'},
-    http:{fetch:async()=>({status:200,json:async()=>quotaFeed(now,{used})})},jobs:{register:(key,fn)=>jobs.set(key,fn)},events:{on:(key,fn)=>events.set(key,fn)},
+    http:{fetch:async()=>({status:200,json:async()=>{
+      const feed=quotaFeed(now,{used});
+      // Gateway bindings use openai/anthropic; CLIProxy meters and calibration
+      // use codex/claude. Preserve that real boundary in integration fixtures.
+      for (const account of feed.accounts) {
+        account.provider=account.provider==='openai'?'codex':'claude';
+        for (const model of account.credentialAvailability.models)
+          Object.assign(model,{provider:account.provider,accountId:`${account.provider}:${account.accountKey}`});
+      }
+      return feed;
+    }})},jobs:{register:(key,fn)=>jobs.set(key,fn)},events:{on:(key,fn)=>events.set(key,fn)},
     agents:{get:async()=>null,list:async()=>[]},issues:{get:async()=>null,list:async()=>[]}};
   const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false});
   await plugin.setup(context);await plugin.onConfigChanged(cfg,{companyId});
@@ -116,11 +126,33 @@ test('agent-config-seeded ledger cannot attribute a model-less lifecycle event o
 });
 
 
-test('quota job projects validated account calibration onto an attributed active run',async()=>{
-  const s=await start({used:.98,ledger:[{runId:'active',status:'running',startedAt:NOW,eventModel:'one/terra'}],
-    calibration:{'openai:one':{source:'account-weekly',burnPerRunPct:.02,fiveHourBurnPerRunPct:.03,
+test('config-seeded run starting after publication is unattributed without restart census masking',async()=>{
+  const s=await start({ledger:[{
+    // Decision/config backfill precedes the first started event, so the
+    // persisted record has no running status for the restart census to seed.
+    runId:'config-pending',agentId:'agent',decidedAt:NOW,
+    actualModel:'one/terra',actualModelSource:'agent-config',unverified:false,
+  }]});
+  const snapshot=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot;
+  assert.deepEqual(snapshot.unattributedRunIds,[],'a not-yet-started run must not seed the overlay census');
+  assert.equal((await s.capacity()).unattributedInFlight,0);
+  const persisted=s.store.get(JSON.stringify({...s.keyFor(companyId),stateKey:'ledger-v1'}));
+  assert.equal(persisted.find(r=>r.runId==='config-pending').actualModelSource,'agent-config');
+
+  await s.fire('config-pending','started');
+  assert.equal((await s.capacity()).unattributedInFlight,1,'only the event path can register this account-less start');
+  await s.fire('config-pending','started');
+  assert.equal((await s.capacity()).unattributedInFlight,1);
+  await s.fire('config-pending','finished');
+  assert.equal((await s.capacity()).unattributedInFlight,0);
+});
+
+for (const [accountKey,feedId,model] of [['one','codex:one','one/terra'],['two','claude:two','two/claude']])
+test(`quota job joins ${feedId} calibration to the registry account and exhausts projected weekly quota`,async()=>{
+  const s=await start({used:.98,ledger:[{runId:'active',status:'running',startedAt:NOW,eventModel:model}],
+    calibration:{[feedId]:{source:'account-weekly',burnPerRunPct:.02,fiveHourBurnPerRunPct:.03,
       attributedRuns:10,rejectionReason:null,atMs:NOW,epoch:'keeper-1'}}});
-  const account=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot.accounts.one;
+  const account=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot.accounts[accountKey];
   assert.equal(account.inFlightBase,1);
   assert.equal(account.view.projectedUsed,1);
   assert.equal(account.view.projectedFiveHourUsed,.13);
@@ -141,17 +173,17 @@ test('fresh worker reconciles a persisted model-less run and subsequent events e
 test('quota publication excludes absent, rejected, stale and weak calibration while preserving five-hour-only evidence',async()=>{
   const active=[{runId:'active',status:'running',startedAt:NOW,eventModel:'one/terra'}];
   for (const calibration of [null,
-    {'openai:one':{source:'group-prior',burnPerRunPct:.02,atMs:NOW}},
-    {'openai:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:10,rejectionReason:'low-attributed-runs',atMs:NOW}},
-    {'openai:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:10,atMs:NOW-7*3600000}},
-    {'openai:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:1,atMs:NOW}},
+    {'codex:one':{source:'group-prior',burnPerRunPct:.02,atMs:NOW}},
+    {'codex:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:10,rejectionReason:'low-attributed-runs',atMs:NOW}},
+    {'codex:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:10,atMs:NOW-7*3600000}},
+    {'codex:one':{source:'account-weekly',burnPerRunPct:.02,attributedRuns:1,atMs:NOW}},
   ]) {
     const s=await start({used:.98,ledger:active,calibration});
     const a=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot.accounts.one;
     assert.equal(a.view.projectedUsed,.98);
     assert.notEqual(a.skipReason,'weekly-exhausted');
   }
-  const s=await start({ledger:active,calibration:{'openai:one':{source:'account-five-hour',fiveHourBurnPerRunPct:.04,atMs:NOW}}});
+  const s=await start({ledger:active,calibration:{'codex:one':{source:'account-five-hour',fiveHourBurnPerRunPct:.04,atMs:NOW}}});
   const a=s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot.accounts.one;
   assert.equal(a.view.projectedUsed,.2);
   assert.equal(a.view.projectedFiveHourUsed,.14);
