@@ -88,3 +88,11 @@ test('expiry without a new job tick restores the independently built never-burne
   assert.equal(expected.memberId,memberIdFor('builder','one'));
   assert.deepEqual(decide(cfg,active,NOW+2*MINUTE),expected);
 });
+
+test('exclusive burn ignores non-target retry clocks even when a stronger quota gate masks burn-not-target',()=>{
+  const cfg={...config(),burn:burn({mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()})};
+  const snapshot=structuredClone(build(cfg).snapshot);
+  snapshot.accounts.one.credentialReady=false;snapshot.accounts.one.nextEligibleAtMs=NOW+HOUR;
+  snapshot.accounts.two.weeklyUsed=1;snapshot.accounts.two.weeklyResetsAtMs=NOW+2*MINUTE;
+  assert.equal(Date.parse(decide(cfg,snapshot).retryAt),NOW+10*MINUTE);
+});

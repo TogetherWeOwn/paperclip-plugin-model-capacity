@@ -172,8 +172,10 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
     } else if (!reason) reason = 'account-reading-stale';
     if (reason) {
       skipped[i.id] = reason;
-      if (reason === 'unmapped-member') retries.push({at:now + MINUTE, credible:false});
-      else if (reason !== 'burn-not-target') retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99, config.pacing?.deadband ?? .02));
+      if (!exclusive || burnActive(a)) {
+        if (reason === 'unmapped-member') retries.push({at:now + MINUTE, credible:false});
+        else retries.push(nextTime(a, reason, now, recheck, hardCap, router.hardCapFiveHour ?? .99, config.pacing?.deadband ?? .02));
+      }
     }
   }
   if (pin && eligible.length) return {kind:'selected', memberId:pin};
