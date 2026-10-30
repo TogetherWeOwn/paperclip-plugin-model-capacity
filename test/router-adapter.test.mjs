@@ -19,6 +19,7 @@ function fixture() {
     const {connectionId,grantId}=entry.members.find(m=>m.memberId===member.id);
     Object.assign(member.binding,{connectionId,grantId});
   }
+  for (const c of params.candidates) c.runtimeConfig.modelReasoningEffort='high';
   const snapshot=buildQuotaSnapshot({registry,feed:quotaFeed(),nowMs:NOW,config}).snapshot;
   const evidence={atMs:NOW,arms:[{armId:'terra-high',model:'terra',effort:'high',family:'terra',qFleet:.8},{armId:'claude-high',model:'claude',effort:'high',family:'claude',qFleet:.7}],records:[]};
   const h=stateHarness();let delta={},reads=0;

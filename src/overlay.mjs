@@ -32,11 +32,17 @@ export function overlayCount(state, accountKey, base) {
 export function createRunOverlay() {
   const companies = new Map();
   const company = id => {
-    if (!companies.has(id)) companies.set(id, {version:0,sequence:0,runs:new Map(),journal:[],overlay:createOverlay()});
+    if (!companies.has(id)) companies.set(id, {version:0,sequence:0,runs:new Map(),journal:[],baseRuns:{},overlay:createOverlay()});
     return companies.get(id);
   };
-  const apply = (state, event) => event.status === 'running'
-    ? overlayStart(state,event.accountKey,event.runId) : overlayFinish(state,event.accountKey,event.runId);
+  const apply = (state,event,baseRuns) => {
+    if (event.status === 'running') return overlayStart(state,event.accountKey,event.runId);
+    // F_pre contains only runs actually included in this published base. An
+    // unknown terminal must not release another running member's pressure.
+    if (state[event.accountKey]?.post.has(event.runId) || baseRuns[event.runId] === event.accountKey)
+      return overlayFinish(state,event.accountKey,event.runId);
+    return state;
+  };
   return {
     observe(companyId,{runId,status,accountKey=null}) {
       if (typeof runId !== 'string' || !runId || runId === 'unknown') return;
@@ -47,13 +53,14 @@ export function createRunOverlay() {
       if (!key) return; // Native lifecycle events may lack run-account metadata.
       const event={runId,status,accountKey:key,sequence:++s.sequence};
       s.journal.push(event);
-      s.overlay=apply(s.overlay,event);
+      s.overlay=apply(s.overlay,event,s.baseRuns);
     },
     capture(companyId) { return company(companyId).sequence; },
-    publish(companyId,version,checkpoint) {
+    publish(companyId,version,checkpoint,baseRuns={}) {
       const s=company(companyId);
       s.journal=s.journal.filter(e=>e.sequence>checkpoint);
-      s.overlay=s.journal.reduce(apply,resetOverlay());
+      s.baseRuns=baseRuns;
+      s.overlay=s.journal.reduce((overlay,event)=>apply(overlay,event,baseRuns),resetOverlay());
       s.version=version;
       // Keep cross-tick duplicate suppression bounded. Active runs are never
       // evicted by a burst of terminal records.

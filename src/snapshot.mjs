@@ -83,12 +83,15 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
   const byKey = new Map(parsed.accounts.map(a => [a.accountKey, a]));
   const router = config.router ?? registry, pacing = {...DEFAULT_PACING, ...config.pacing};
   const staleMs = Math.min(router.accountStaleMs ?? 900_000, CREDENTIAL_MAX_AGE_MS);
-  const counts = new Map();
+  const counts = new Map(), inFlightRunAccounts = {};
   for (const run of ledger.values()) {
     if (!isInflight(run, nowMs, horizonMs)) continue;
     // Observed actual prefixed model only. A shadow decision is not a run.
     const key = accountKeyForModel(run.actualModel ?? run.eventModel, registry.accounts);
-    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (key) {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      if (typeof run.runId === 'string') Object.defineProperty(inFlightRunAccounts,run.runId,{value:key,enumerable:true});
+    }
   }
   const outHistories = {}, outControllers = {}, accounts = {}, skipReasons = {...memberSkipReasons};
   for (const registered of registry.accounts) {
@@ -155,7 +158,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     a.view.targetShare = a.targetShare;
   }
   const snapshot = freezeSnapshot({version:(previous?.version ?? 0) + 1,atMs:nowMs,accounts,
-    memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,
+    inFlightRunAccounts,memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,
     memberSkipReasons:skipReasons,unavailablePoolIds:[...unavailablePoolIds],unavailablePoolKeys:[...unavailablePoolKeys],drift});
   return {snapshot,histories:outHistories,controllers:outControllers,warnings:joined.warnings};
 }

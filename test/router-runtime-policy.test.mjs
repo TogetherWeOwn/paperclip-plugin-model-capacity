@@ -38,13 +38,17 @@ test('selection checks the effective effort, not the generation-time existential
   assert.equal(skips(f)[b], undefined);
 });
 
-test('an unspecified runner default qualifies only if every known effort meets the floor', () => {
+test('an unspecified runner default cannot prove a configured floor even when all scored variants pass', () => {
   const f = fixture(), [a,b] = f.params.memberOrder;
-  assert.deepEqual(skips(f), {[a]:'quality-floor'});
+  assert.deepEqual(skips(f), {[a]:'quality-floor',[b]:'quality-floor'});
   f.evidence.arms[0].qFleet = .5;
+  assert.deepEqual(skips(f), {[a]:'quality-floor',[b]:'quality-floor'});
+  f.config.roles.minQuality.doer=null;
   assert.deepEqual(skips(f), {});
-  f.evidence.arms[2].qFleet = null;
-  assert.equal(skips(f)[b], 'quality-floor');
+  f.config.roles.minQuality.doer=.5;
+  for (const c of f.params.candidates) c.runtimeConfig.modelReasoningEffort='high';
+  f.evidence.arms[2].qFleet=null;
+  assert.deepEqual(skips(f), {[b]:'quality-floor'},'an explicit effort still needs a scored floor verdict');
 });
 
 test('effective runtime model drift and absent, stale or unknown policy evidence fail closed', () => {
@@ -75,10 +79,17 @@ test('current role floors and exclusions apply without mutating frozen inputs or
 test('outcome-gated effective families are skipped and reviewers use the configured other-role floor', () => {
   const f=fixture(), [a,b]=f.params.memberOrder;
   f.config.roles.minQuality.doer=0;
+  for (const c of f.params.candidates) c.runtimeConfig.modelReasoningEffort='high';
   f.config.roles.outcomeGate={enabled:true,minRuns:2,minProgressRate:.5,relativeToBest:.75};
   f.evidence.records=['terra','claude'].flatMap(family=>[0,1].map(i=>({runId:family+i,agentId:'agent',status:'finished',terminalAt:NOW-1,progress:family==='terra'?'noChange':'progressed',family})));
   assert.deepEqual(skips(f), {[a]:'outcome-gated'});
   f.config.router.pools[0].role='reviewer';
   f.config.roles.minQuality.other=.85;
-  assert.deepEqual(skips(f), {[a]:'quality-floor',[b]:'quality-floor'});
+  assert.deepEqual(skips(f), {[b]:'quality-floor'});
+});
+
+test('a single scored effort does not attest an omitted runner default that may use an unscored effort', () => {
+  const f=fixture(),[a,b]=f.params.memberOrder;
+  f.evidence.arms=f.evidence.arms.filter(a=>a.effort==='high');
+  assert.deepEqual(skips(f),{[a]:'quality-floor',[b]:'quality-floor'});
 });

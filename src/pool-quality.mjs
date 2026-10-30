@@ -43,7 +43,8 @@ export function computePoolQualityVerdicts(rawRegistry, { arms, roles = {}, reco
 /** Call-time policy for the ACTUAL host-authorized runtime, not a model's best
  * possible effort. Upstream poolMemberRuntimeConfig (server/services/
  * ai-connection-router.ts) supplies one of these effort keys. If it supplies
- * none, the runner's default is not attested: every known variant must qualify.
+ * none, the runner's default is not attested: a finite floor fails closed.
+ * A null floor still requires every known variant to pass the remaining gates.
  * A fixed-profile router cannot raise effort or suspend a floor to rescue a
  * member. No IO, mutations, or provider-default guesses are permitted here.
  */
@@ -77,7 +78,7 @@ export function computeRuntimePolicySkips(params, snapshot, config, evidence) {
       const matching = evidence.arms.filter(a => a.model === membership.model && a.family && a.family.toLowerCase() !== 'unknown'
         && (!efforts.length || a.effort === efforts[0]));
       const excluded = new Set(normalizeExcludedFamilies(roles.excludeFamilies?.[role]));
-      if (ambiguous || !matching.length || matching.some(a => quality[role][a.armId]?.ok !== true)) reason = 'quality-floor';
+      if (ambiguous || (!efforts.length && Number.isFinite(minQuality[role])) || !matching.length || matching.some(a => quality[role][a.armId]?.ok !== true)) reason = 'quality-floor';
       else if (matching.some(a => excluded.has(a.family.toLowerCase()) || excluded.has(armToken(a.armId)))) reason = 'role-excluded';
       else if (matching.some(a => outcomes[role].gated.includes(a.family))) reason = 'outcome-gated';
     }

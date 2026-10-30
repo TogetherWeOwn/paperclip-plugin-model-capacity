@@ -95,9 +95,15 @@ and unambiguous dropped-member cases additionally emit error/warning evidence.
 Runtime quality/outcome policy reads the current role configuration and the
 legacy quota tick's in-memory scored fleet/outcome evidence. It checks the
 candidate's **effective runtime effort**, not generation's existential model
-verdict. An omitted effort is accepted only when every known variant passes;
-unknown/unscored evidence with a configured floor fails closed. Runtime floors
+verdict. An omitted effort cannot attest the runner default and fails closed
+when a finite floor is configured, even if every *scored* variant passes. With
+a null floor, every known variant must still pass the other gates. Unknown or
+unscored evidence with a configured floor also fails closed. Runtime floors
 are not suspended to rescue an empty role, and neither pins nor burn bypass them.
+The current generator does not choose a saved profile effort. A finite-floor
+pool therefore needs explicit, host-supported effort in its native saved member
+profiles, followed by the ordinary operator `--check` and re-attestation sequence;
+an omitted runner default is not an activation-ready substitute.
 
 **R2 activation blocker, verified against the target upstream source:**
 `server/src/services/heartbeat/run-lifecycle.ts:1342-1406` publishes
@@ -113,9 +119,11 @@ run-account event/read contract (or an explicit revised acceptance contract) is
 required before R2/U21 can be claimed end-to-end or activation proceeds.
 
 For attributable events, run-ID sets deduplicate starts/terminal notifications
-across ticks. A successful quota publication replaces the base and rebases the
-overlay in one synchronous step. Sequence checkpoints retain events received
-while persistence is awaiting IO; failed/superseded ticks do not reset it.
+across ticks. A successful quota publication replaces the base (including the
+IDs of runs actually counted there) and rebases the overlay in one synchronous
+step. A terminal event never releases another run's base pressure. Sequence
+checkpoints retain events received while persistence is awaiting IO;
+failed/superseded ticks do not reset it.
 
 The transitional resolver body is byte-identical to branch handoff `52f4c97`.
 That handoff already differs from the supplied read-only 0.2.72 reference;

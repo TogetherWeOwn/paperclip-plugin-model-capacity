@@ -12,13 +12,13 @@ test('observed run IDs add starts and subtract pre-tick finishes exactly once ac
   const r=runtime();
   observe(r,'old','running');
   const checkpoint=r.capture('company');
-  r.publish('company',1,checkpoint);
+  r.publish('company',1,checkpoint,{old:'a'});
   assert.deepEqual(r.deltas('company',1),{});
   observe(r,'new','running');observe(r,'new','running');
   assert.deepEqual(r.deltas('company',1),{a:1});
   observe(r,'old','finished');observe(r,'old','failed');
   assert.deepEqual(r.deltas('company',1),{a:0});
-  r.publish('company',2,r.capture('company'));
+  r.publish('company',2,r.capture('company'),{new:'a'});
   observe(r,'old','cancelled');
   assert.deepEqual(r.deltas('company',2),{},'a terminal duplicate from the previous tick cannot consume a different base run');
   observe(r,'new','finished',null);
@@ -32,7 +32,7 @@ test('events arriving while a snapshot is persisted survive the atomic base repl
   observe(r,'before','running');
   const checkpoint=r.capture('company');
   observe(r,'during','running');observe(r,'before','finished');
-  r.publish('company',1,checkpoint);
+  r.publish('company',1,checkpoint,{before:'a'});
   assert.deepEqual(r.deltas('company',1),{a:0});
   observe(r,'during','finished');
   assert.deepEqual(r.deltas('company',1),{a:-1});
@@ -48,4 +48,14 @@ test('account-less upstream lifecycle events are reported as unattributed, never
   observe(r,'unattributed','finished',null);
   assert.equal(r.status('company').unattributedInFlight,0);
   assert.deepEqual(r.deltas('company',0),{});
+});
+
+test('a terminal event cannot release a different base run when its own start was never attributed', () => {
+  const r=runtime();
+  observe(r,'unattributed','running',null);
+  r.publish('company',1,r.capture('company'),{'other-base-run':'a'});
+  observe(r,'unattributed','finished','a');
+  assert.deepEqual(r.deltas('company',1),{},'this run was neither S_post nor included in this account base');
+  observe(r,'other-base-run','finished','a');
+  assert.deepEqual(r.deltas('company',1),{a:-1},'persisted base runs need no worker-local start to be released');
 });
