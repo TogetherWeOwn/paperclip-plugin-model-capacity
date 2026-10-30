@@ -143,7 +143,8 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
   const feedStaleMembers = new Set(snapshot.staleMemberIds ?? []);
   const burnConfig = snapshot.burn ?? config.burn ?? router.burn ?? {};
   const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(a.burn.endAtUsedPct) ? a.burn.endAtUsedPct : Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
-  const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && infos.some(i => burnActive(i.account));
+  const burnTargets = Object.values(snapshot.accounts ?? {}).filter(burnActive);
+  const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && burnTargets.length > 0;
   for (const i of infos) {
     const a = i.account;
     let reason = null;
@@ -194,8 +195,8 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
   const credible = retries.filter(r => r.credible);
   let retry = Math.min(...(credible.length ? credible : retries).map(r => r.at));
   if (exclusive) {
-    const expiry = infos.map(i => i.account?.burn?.expiresAtMs).filter(t => Number.isFinite(t) && t > now);
-    if (expiry.length) retry = Math.min(retry, ...expiry);
+    const targetTimes = burnTargets.flatMap(a => [a.burn.expiresAtMs, a.nextEligibleAtMs]).filter(t => Number.isFinite(t) && t > now);
+    if (targetTimes.length) retry = Math.min(retry, ...targetTimes);
   }
   return wait(now, skipped, Number.isFinite(retry) ? retry : now + MINUTE);
 }

@@ -79,3 +79,12 @@ test('native burn expiry is visible in job diagnostics and persisted scorecard b
   assert.ok(s.logs.some(l=>l.details.reason==='burn-exclusive'));
   assert.ok(s.logs.some(l=>l.details.reason==='burn-expired'));
 });
+
+test('exclusive burn non-targets cannot accumulate eligible-unpicked minutes or a no-demand explanation',async()=>{
+  const s=start();s.cfg.burn={accountKeys:['one'],mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()};
+  await s.tick();s.setNow(NOW+MINUTE);await s.tick();
+  const row=s.rows().find(r=>r.accountKey==='two');
+  assert.equal(row.minutesEligible,0);assert.equal(row.minutesEligibleUnpicked,0);assert.notEqual(row.leftoverReason,'no-demand');
+  s.setNow(NOW+10*MINUTE);await s.tick();
+  assert.equal(s.rows().find(r=>r.accountKey==='two').minutesEligible,2,'after expiry the gap-capped ordinary eligibility returns');
+});

@@ -47,7 +47,7 @@ function explanation(row) {
   if(row.status==='feed-unknown'||row._feedGap)return 'feed-gap';
   const unused=row.closed?row.finalUnusedAtReset:row.projectedUnusedAtReset;
   if(!(unused>0))return null;
-  if(row.minutesEligibleUnpicked>0&&row.runsServed===0)return 'no-demand';
+  if(row.minutesEligibleUnpicked>0&&row.runsServed===0&&!row.attributionMismatch)return 'no-demand';
   if(row.minutesPaceHeld>0)return 'pace-held';
   return null;
 }
@@ -151,10 +151,11 @@ export function scorecardAccounts({registry,snapshot,feed,previous,ledger,member
     const paceHeld=quota?.skipReason==='pace-held'&&burn?.active!==true;
     const underCaps=Number.isFinite(quota?.view.projectedUsed)&&quota.view.projectedUsed<hardCapWeekly
       &&(quota.view.projectedFiveHourUsed==null||quota.view.projectedFiveHourUsed<hardCapFiveHour);
-    const eligible=policyReady && underCaps && (quota?.eligible===true || (quota?.skipReason==='pace-held'&&burn?.active===true));
+    const burnExcluded=snapshot.burn?.mode==='exclusive' && Object.values(snapshot.accounts).some(a=>a.burn?.active===true) && burn?.active!==true;
+    const eligible=!burnExcluded && policyReady && underCaps && (quota?.eligible===true || (quota?.skipReason==='pace-held'&&burn?.active===true));
     return {accountKey,prefix:reg?.prefix ?? null,inScope:Boolean(reg),weeklyResetsAtMs:reset,
       weeklyUsed:a?.weekly?.utilization ?? null,projectedUsed:quota?.view.projectedUsed ?? a?.weekly?.utilization ?? null,
-      quality:a?.quality ?? 'unknown',observedAtMs,eligible,paceHeld:policyReady&&paceHeld,
+      quality:a?.quality ?? 'unknown',observedAtMs,eligible,paceHeld:!burnExcluded&&policyReady&&paceHeld,
       requiredRatePerHour:quota?.view.requiredRatePerHour ?? null,
       measuredRatePerHour:quota?.view.weeklyMeasuredRatePerHour ?? null,
       usage:a?.usage ?? null,ledgerRuns:reg ? runs.get(accountKey) ?? [] : undefined,burn};

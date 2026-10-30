@@ -145,3 +145,9 @@ test('burn expiry gaps close at the expiry or removal tick and mode switches rem
   state=tick(state,NOW+2*MINUTE,[account({observedAtMs:NOW+2*MINUTE})]);
   assert.deepEqual(rows(state)[0].burnWindows,[{from:NOW,to:NOW+MINUTE,mode:'prefer'},{from:NOW+MINUTE,to:NOW+2*MINUTE,mode:'exclusive'}]);
 });
+
+test('served ledger evidence contradicting a flat Keeper counter cannot claim no-demand',()=>{
+  let state=tick(null,NOW,[account({runsServedLedger:0})]);
+  state=tick(state,NOW+MINUTE,[account({observedAtMs:NOW+MINUTE,usage:{epoch:'keeper-1',requests:100,observedAtMs:NOW+MINUTE},runsServedLedger:1})]);
+  const row=rows(state)[0];assert.equal(row.attributionMismatch,true);assert.notEqual(row.leftoverReason,'no-demand');
+});

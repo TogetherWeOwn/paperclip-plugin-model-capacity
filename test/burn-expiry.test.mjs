@@ -69,3 +69,22 @@ test('exclusive burn waits for targets or expiry, not an earlier non-target retr
   eligible.accounts.one.view.weeklyUsed=1;
   assert.equal(decide(cfg,eligible).kind,'exhausted','burn cannot override projected hard caps');
 });
+
+test('exclusive burn still fences non-targets when the host prefilters every target out of candidates',()=>{
+  const cfg={...config(),burn:burn({mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()})};
+  const snapshot=structuredClone(build(cfg).snapshot),params=syntheticRouterRequest(normalizeRegistry(cfg.router),'builder',NOW);
+  snapshot.accounts.one.credentialReady=false;snapshot.accounts.one.nextEligibleAtMs=NOW+HOUR;
+  params.candidates=params.candidates.filter(c=>c.member.id!==memberIdFor('builder','one'));
+  const d=routeDecision(params,snapshot,{...cfg,router:{...cfg.router,enabled:true}},{syntheticShadow:true});
+  assert.equal(d.kind,'exhausted');assert.equal(d.skipped[memberIdFor('builder','two')],'burn-not-target');
+  assert.equal(Date.parse(d.retryAt),NOW+10*MINUTE);
+});
+
+test('expiry without a new job tick restores the independently built never-burned ranking exactly',()=>{
+  const cfg={...config(),burn:burn({accountKeys:['two']})};
+  const active=structuredClone(build(cfg).snapshot),never=structuredClone(build(config()).snapshot);
+  for(const snapshot of [active,never]) {snapshot.accounts.one.view.deficit=.2;snapshot.accounts.two.view.deficit=.01;}
+  const expected=decide(config(),never,NOW+2*MINUTE);
+  assert.equal(expected.memberId,memberIdFor('builder','one'));
+  assert.deepEqual(decide(cfg,active,NOW+2*MINUTE),expected);
+});
