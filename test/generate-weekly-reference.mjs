@@ -21,7 +21,7 @@ import {
 
 const fixtureUrl = new URL('./fixtures/weekly-77d8049-src-package.tar.gz.b64', import.meta.url);
 const provenanceUrl = new URL('./fixtures/weekly-77d8049-src-package.provenance.json', import.meta.url);
-const harnessUrl = new URL('../scripts/aa-replay.mjs', import.meta.url);
+const harnessUrl = new URL('./fixtures/weekly-77d8049-aa-replay.mjs', import.meta.url);
 const root = fileURLToPath(new URL('..', import.meta.url));
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 

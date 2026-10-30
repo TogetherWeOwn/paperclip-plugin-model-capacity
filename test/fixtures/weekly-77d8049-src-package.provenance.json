@@ -72,10 +72,13 @@
     "reproducible": "Same revision, paths, and pipeline produce identical bytes. Verify with sha256sum on the base64 file, on base64 -d output, and on gzip -dc output."
   },
   "harness": {
-    "sourcePath": "scripts/aa-replay.mjs",
+    "sourcePath": "test/fixtures/weekly-77d8049-aa-replay.mjs",
+    "originalSourcePath": "scripts/aa-replay.mjs",
+    "originalRevision": "ff0108cb7b309a6401600c2acbff9ecf5903db0b",
     "sha256": "adf0d02c908057342e47efdaf985a71f37868807ab130cac69b6f3ebd0063b14",
     "bytes": 9120,
-    "note": "Current offline replay script copied into the assembly at test runtime. The script did not exist on the pinned implementation revision."
+    "recipe": "git show ff0108cb7b309a6401600c2acbff9ecf5903db0b:scripts/aa-replay.mjs > test/fixtures/weekly-77d8049-aa-replay.mjs",
+    "note": "Frozen, byte-identical pre-native offline replay script copied into the assembly at test runtime. It invokes the pinned implementation's shadow-tick job, not the moving native harness's quota-refresh job. No shim or implementation rewrite is applied. The script did not exist on the pinned implementation revision."
   },
   "loader": "test/weekly-reference.mjs verifies base64, compressed, and uncompressed hashes plus the harness hash without requiring the pinned git object. No network and no branch or tag fetch.",
   "history": "Historical reference a368f5c remains reachable from the main line and continues to use git archive. This artifact covers only the independent weekly implementation that is absent after squash."

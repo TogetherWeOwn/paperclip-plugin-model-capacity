@@ -1,7 +1,7 @@
 // Weekly-compatible reference: synthetic assembly, never a live capture.
 // Implementation is src+package from the pinned weekly revision, carried as a
 // self-contained compressed archive fixture in text-safe base64 encoding.
-// Harness is the unchanged current offline replay script copied into the
+// Harness is the frozen pre-native offline replay fixture copied into the
 // assembly at test runtime. The replay script did not exist on the pinned revision.
 //
 // Portable loader: verifies fixture and harness hashes without requiring the
@@ -25,7 +25,7 @@ export async function loadWeeklyReference() {
   const { gunzipSync } = await import('node:zlib');
   const fixtureUrl = new URL('./fixtures/weekly-77d8049-src-package.tar.gz.b64', import.meta.url);
   const provenanceUrl = new URL('./fixtures/weekly-77d8049-src-package.provenance.json', import.meta.url);
-  const harnessUrl = new URL('../scripts/aa-replay.mjs', import.meta.url);
+  const harnessUrl = new URL('./fixtures/weekly-77d8049-aa-replay.mjs', import.meta.url);
   const dir = await mkdtemp(join(tmpdir(), 'aa-replay-weekly-'));
   try {
     const provenance = JSON.parse(await readFile(provenanceUrl, 'utf8'));
