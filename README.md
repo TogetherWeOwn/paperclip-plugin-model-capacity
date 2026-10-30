@@ -31,18 +31,33 @@ missing non-exempt accounts produce warnings and `staleMemberIds`. An exemption
 suppresses only the join warning, never inventing a meter. Snapshot age remains
 independent of account observation age.
 
-**A1 inspection integration is blocked on an upstream SDK capability gap.**
-`packages/plugins/sdk/src/types.ts` in the upstream contract tree exposes no
-pool/connection/grant/install inspection client; `scripts/pool-saga.mjs`'s
-`checkPoolDrift` requires those reads and a board-owner identity. The quota
-coordinator has an explicit `inspectPools` integration seam (not a fictional
-`ctx` method). With a supported adapter, it calls the real read-only drift
-checker per tick, marks drifted members `unmapped-member`, and logs wrong
-plugin ownership at ERROR before making the pool unavailable. The production
-worker does **not** supply that adapter: it reports `pool-inspection-unavailable`
-and fails all native pools closed. No board token, loopback HTTP, direct DB,
-or host automation workaround is included. An upstream-native inspection
-surface or an explicitly revised contract is required before activation.
+**A1 runtime inspection is not implemented in the production worker; slice 3
+is not activation-ready.** There are two independent contract gaps:
+
+- `packages/plugins/sdk/src/types.ts` in the upstream contract tree exposes no
+  pool/connection/grant/install inspection client; `scripts/pool-saga.mjs`'s
+  `checkPoolDrift` also requires a board-owner identity. Adding a pool list alone
+  would not supply its other reads or authorize them.
+- The injected `inspectPools({companyId, registry, config})` test/operator seam
+  returns generator options: `api`, `batch`, `baseUrl`, `qualityVerdicts`, and
+  `expectedEnabled`. `batch` comes from an operator migration file (and is
+  deliberately not plugin config per §7-I); the target gateway URL, planner
+  verdicts, and per-pool expected activation state are also operator inputs.
+  The worker has no producer or defined runtime source for this context. The
+  tests supply it explicitly from their generator fixture; that is not SDK or
+  production integration proof.
+
+Given that externally supplied context, the coordinator consumes the real
+read-only drift checker each tick, marks drifted members `unmapped-member`, and
+logs wrong plugin ownership at ERROR before making that pool unavailable. The
+production worker supplies **no** adapter: it reports
+`pool-inspection-unavailable` and fails every native pool closed. It cannot
+claim per-tick native inspection or the native V0 startup ownership check.
+No board token, loopback HTTP, direct DB, host automation, or new config fields
+work around these gaps. Activation needs an upstream-native inspection surface
+**and** an approved runtime input contract, or a spec-owner amendment assigning
+runtime drift/ownership inspection to the existing R9 operator `--check` path.
+Neither is supplied by this branch.
 
 For unbound pools, the job runs synthetic requests through the same pure
 `routeDecision` with `router.enabled` overridden to `true`. This is a registry

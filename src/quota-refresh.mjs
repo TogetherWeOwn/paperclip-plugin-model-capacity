@@ -1,6 +1,9 @@
 /** Native quota job coordinator. All IO stays here, never in routeDecision.
- * Upstream's SDK currently has no pool-inspection client. inspectPools is an
- * explicit integration seam, NOT a fabricated ctx API or a board-token fallback.
+ * Upstream's SDK currently has no pool-inspection client. inspectPools is a
+ * test/operator seam, NOT an implemented production bridge or a ctx API.
+ * Its result must supply the generator's api, batch, baseUrl, qualityVerdicts
+ * and expectedEnabled context; the plugin worker has no source for those
+ * operator inputs. An SDK reader alone would not close that separate gap.
  * Without it all native pools are unavailable (the retained hook is untouched).
  */
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
