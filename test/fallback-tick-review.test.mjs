@@ -618,3 +618,30 @@ test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account f
     else assert.doesNotMatch(answer.reason, /exhaustion scan:/);
   }
 });
+
+test('X-T02(f): newest survivor admission materializes and routes in the live resolver', async () => {
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const models = [old, newer, ...names.slice(2)];
+  const liveLane = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: [
+    account('weak', [old, newer]), account('strong', models.slice(2)),
+  ] }, nowMs);
+  liveLane.accounts[0].weekly.used = .05;
+  liveLane.accounts[0].weekly.resetsAt = '2026-10-30T12:00:00Z';
+  liveLane.accounts[1].weekly.used = .95;
+  const armMap = models.map((model, i) => ({ aaSlug: model, model, effort: 'high', family: i < 2 ? 'sonnet' : `family${i}`, providers: ['fixture'] }));
+  const scored = { fetchedAt: new Date(nowMs).toISOString(), duplicateSlugs: [], rows: models.map((slug, i) => ({
+    slug, intelligenceIndex: i === 0 ? 30 : i === 1 ? 20 : 50 + 5 * i, intelligenceIndexCostPerTask: i === 0 ? 2 : i === 1 ? 1 : 12 - i,
+  })) };
+  const options = { ...config, enforce: true, placement: { qualityWeight: 0 }, armMap,
+    calibration: { referenceArmId: newer, referenceBurnPerRunPct: .001 }, roles: { ...config.roles,
+      doerAgentIds: ['worker'], doerCeilingRung: 0, newestVersionOnly: { enabled: true } } };
+  const result = await runTick({ lane: liveLane, snapshot: scored, config: options, states: { 'ledger-v1': [running('newest-tick')] } });
+  assert.equal(result.live.accountAdmissions.doer['fixture:weak'].armId, newer);
+  assert.ok(result.capacity.newestVersion.accounts['fixture:weak'].supersededLegacyArmIds.includes(old));
+  const tick = result.ledger.find(row => row.runId === 'newest-tick');
+  assert.equal(tick.armId, newer);
+  result.live.accounts = result.live.accounts.filter(a => a.accountId === 'fixture:weak');
+  const livePick = await result.plugin.onResolveRunModel({ companyId: 'offline-test', runId: 'newest-live', agentId: 'worker', adapterType: 'claude-code' });
+  assert.equal(livePick.kind, 'decide');
+  assert.equal(livePick.model, newer);
+});
