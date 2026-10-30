@@ -621,12 +621,18 @@ function allocateMultiPoolReviewers(input) {
     pacedLeft.set(pool, bounded);
   }
   // Conservatively charge fixed reservations to the shared pool before helpers.
+  // A hold-exempt account's slots are restored for one reviewer role only, so
+  // a fixed pin must never consume them: spilling there would strand the
+  // reviewer the restoration was fenced for. Unheld pool mates may absorb the
+  // charge (they are ordinary shared capacity); held non-exempt ones cannot.
   for (const row of fixed.kept) {
     const servingId = keptByAgent[row.agentId]?.accountId;
+    if (hardHeld.has(servingId) && !exemptions.has(servingId)) continue;
     const pool = accountPool.get(servingId);
     poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - row.allocated));
     let charge = row.allocated;
-    const ids = [...accountLeft.keys()].filter(id => accountPool.get(id) === pool)
+    const ids = [...accountLeft.keys()].filter(id => accountPool.get(id) === pool
+      && (!hardHeld.has(id) || id === servingId))
       .sort((a, b) => Number(b === servingId) - Number(a === servingId));
     for (const id of ids) {
       const used = Math.min(charge, accountLeft.get(id));
