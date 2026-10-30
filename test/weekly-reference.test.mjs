@@ -23,16 +23,22 @@ async function portableReference(t) {
   return { dir, loadWeeklyReference };
 }
 
-test('weekly reference loads and checks without the moving harness or git history', async t => {
+test('weekly reference ignores absent or changed moving harnesses without git history', async t => {
   const { dir, loadWeeklyReference } = await portableReference(t);
-  const reference = await loadWeeklyReference();
-  t.after(reference.cleanup);
-  const output = execFileSync(process.execPath, [join(dir, 'test/generate-weekly-reference.mjs')], {
-    cwd: dir,
-    encoding: 'utf8',
-  });
-  assert.match(output, /pinned git object absent; regeneration skipped, fixture check stands alone/);
-  assert.match(output, /weekly reference check passed/);
+  for (const movingHarnessPresent of [false, true]) {
+    if (movingHarnessPresent) {
+      await mkdir(join(dir, 'scripts'));
+      await writeFile(join(dir, 'scripts/aa-replay.mjs'), 'throw new Error("moving harness executed");\n');
+    }
+    const reference = await loadWeeklyReference();
+    t.after(reference.cleanup);
+    const output = execFileSync(process.execPath, [join(dir, 'test/generate-weekly-reference.mjs')], {
+      cwd: dir,
+      encoding: 'utf8',
+    });
+    assert.match(output, /pinned git object absent; regeneration skipped, fixture check stands alone/);
+    assert.match(output, /weekly reference check passed/);
+  }
 });
 
 test('weekly reference rejects a changed frozen harness before executing it', async t => {

@@ -23,7 +23,7 @@ function project(result) {
 // The checked-in golden was captured from a368f5c's behavior before N2.
 // Weekly-compatible golden is a synthetic reference assembly, never a live capture:
 // implementation src+package from 77d8049bb50b3a8bf15be66873580add9040c66b
-// (tree 6d7d8c7895e2db20fa4d1a627ad9a947c1dca37b) with the unchanged current offline
+// (tree 6d7d8c7895e2db20fa4d1a627ad9a947c1dca37b) with the frozen pre-native offline
 // replay harness (SHA-256 adf0d02c908057342e47efdaf985a71f37868807ab130cac69b6f3ebd0063b14)
 // copied in. The replay script did not exist on the pinned revision.
 test('N-T19 Gate S: off, false and malformed configurations preserve full published state', async () => {
