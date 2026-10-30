@@ -129,18 +129,26 @@ borrow the profile's stronger score. Fresh AA/scored-fleet **and outcome**
 evidence is an activation precondition even when all role floors are `null`:
 stale or absent policy evidence fails closed before floor evaluation.
 
-**R2 activation blocker, verified against the target upstream source:**
+**A4 interim attribution contract, verified against target upstream source:**
 `server/src/services/heartbeat/run-lifecycle.ts:1342-1406` publishes
 `agent.run.*` events without model, account, or `contextSnapshot.aiRouterSelection`.
 A run-start event is a claim, not evidence of the subsequently selected account.
-The SDK agents/issues clients expose no run-selection reader. Therefore these
-native events alone cannot satisfy the promised between-tick account overlay.
-Model-attributed event fixtures prove the overlay mechanism, **not upstream
-availability of that metadata**. Account-less starts are counted visibly under
-`/capacity.nativeRouter.unattributedInFlight` and on R8 logs; they are never
-attributed from an agent default or a callback reservation. An upstream native
-run-account event/read contract (or an explicit revised acceptance contract) is
-required before R2/U21 can be claimed end-to-end or activation proceeds.
+The SDK agents/issues clients expose no run-selection reader. These native events
+alone cannot prove end-to-end per-account R2 anti-herding. Until upstream provides
+that contract, the existing ledger (including agent-config-seeded records) and
+lifecycle events remain the accepted interim source. Agent-config attribution is
+not promoted to observed run-account evidence: a model-less lifecycle start counts
+under `/capacity.nativeRouter.unattributedInFlight` and R8 logs, even when its
+ledger record contains a configured model. Its terminal event cannot subtract
+another run's observed account pressure. Model-attributed fixtures prove the overlay
+mechanism, **not upstream availability of that metadata**. Exit the interim when a
+native run-account event/read contract ships; never add callback reservations.
+
+Per amendment A4, G-1 pristine-upstream and G-T fork-image staging proofs belong to
+**slice 5 rollout**, not slice-4 code acceptance. Slice 4 is accepted on code and
+local package/tests with `router.enabled` defaulting false. Do not claim native
+staging, deployed-hook parity, or end-to-end account attribution from those tests;
+complete rollout gates before enabling or deploying the router.
 
 For attributable events, run-ID sets deduplicate starts/terminal notifications
 across ticks. A successful quota publication replaces the base (including the

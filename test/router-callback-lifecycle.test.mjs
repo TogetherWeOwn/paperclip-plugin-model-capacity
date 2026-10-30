@@ -7,8 +7,9 @@ import { verifiedConfig } from './support/verified-pools.mjs';
 import { NOW, MINUTE, quotaFeed, stateHarness } from './support/quota.mjs';
 import { companyId } from './support/native-api.mjs';
 
-async function start() {
+async function start({ledger=[]}={}) {
   const h=stateHarness(),cfg=verifiedConfig(),jobs=new Map(),events=new Map();let now=NOW;
+  h.store.set(JSON.stringify({...h.keyFor(companyId),stateKey:'ledger-v1'}),structuredClone(ledger));
   cfg.router.enabled=true;cfg.roles={minQuality:{doer:null,thinker:null,other:null}};
   cfg.armMap=[{aaSlug:'terra-high',model:'terra',effort:'high',family:'terra',providers:['codex']},
     {aaSlug:'claude-high',model:'claude',effort:'high',family:'haiku',providers:['claude']}];
@@ -83,4 +84,32 @@ test('current upstream account-less lifecycle payloads expose the R2 attribution
   assert.equal((await s.capacity()).unattributedInFlight,1);
   assert.equal(s.logs.filter(l=>l.message==='model-capacity: native route').at(-1)?.details.accountKey,undefined);
   await s.fire('native-shape','failed');assert.equal((await s.capacity()).unattributedInFlight,0);
+});
+
+test('agent-config-seeded ledger cannot attribute a model-less lifecycle event or release observed base pressure',async()=>{
+  const s=await start({ledger:[{
+    runId:'config-seeded',agentId:'agent',status:'running',startedAt:NOW,
+    actualModel:'one/terra',actualModelSource:'agent-config',unverified:false,
+  }]});
+  const [a,b]=s.params.memberOrder;
+  const persisted=s.store.get(JSON.stringify({...s.keyFor(companyId),stateKey:'ledger-v1'}));
+  const seeded=persisted.find(r=>r.runId==='config-seeded');
+  assert.equal(seeded.actualModel,'one/terra');
+  assert.equal(seeded.actualModelSource,'agent-config','the fixture must exercise the non-authoritative fallback');
+
+  await s.fire('observed-base','started','one/terra');
+  await s.fire('config-seeded','started');
+  await s.fire('config-seeded','started');
+  assert.equal((await s.capacity()).unattributedInFlight,1,'a configured model is not evidence of the run account');
+  assert.equal(s.route().memberId,b,'unattributed starts must not erase observed pressure');
+
+  s.setNow(NOW+MINUTE);await s.tick();
+  assert.equal((await s.capacity()).unattributedInFlight,1,'publication cannot silently discard the unattributed run');
+  await s.fire('config-seeded','finished');
+  await s.fire('config-seeded','finished');
+  assert.equal((await s.capacity()).unattributedInFlight,0);
+  assert.equal(s.route().memberId,b,'an account-less terminal cannot release the observed base run');
+  await s.fire('observed-base','finished');
+  s.setNow(NOW+2*MINUTE);await s.tick();
+  assert.equal(s.route().memberId,a,'terminal ledger truth clears pressure at the next publication');
 });

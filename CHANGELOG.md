@@ -5,7 +5,7 @@
 - Native `ai.connections.route` manifest metadata and memory-only `onRouteAiConnection` callback, current operator-attestation tripwire, effective-effort quality/outcome checks, sanitized per-call diagnostics, and event-owned in-flight overlays rebased atomically with quota publication.
 - Variant-locked clean/transitional npm packages with source-stamped entrypoints and actual-tarball upstream manifest conformance tests. Transitional retains the fork resolver unchanged from the approved branch handoff; clean omits its handler, capability, env declaration and enforce field.
 ### Activation limits
-- Target upstream lifecycle events do not publish selected run model/account metadata; unattributed in-flight starts are reported, not guessed. End-to-end R2 anti-herding, deployed-hook parity, and native staging install/reinstall proofs remain activation gates. No deployment or publish is part of this source change.
+- Amendment A4 accepts the existing ledger/lifecycle interim attribution path for slice-4 code acceptance. A model-less lifecycle start remains visibly unattributed even with an agent-config-seeded ledger model, and its terminal cannot free another run's account pressure; a mutation-proven regression protects that fence. Native run-account metadata remains an upstream follow-up, not a code-acceptance blocker. G-1/G-T staging install/reinstall and deployed-hook parity proofs belong to slice 5 rollout. Router defaults off; no deployment or publish is part of this source change.
 
 ## 0.2.73
 ### Fixed
