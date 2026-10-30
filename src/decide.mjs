@@ -371,6 +371,19 @@ export function roleRungWindow(band, groupCount) {
   return { topRung, floor, ceiling };
 }
 
+/** Seat a fallback candidate inside the role window without mutating shared groups. */
+export function seatFallbackArm(groups, candidate, band) {
+  if (groups.length === 0) return groups;
+  const { floor, ceiling } = roleRungWindow(band, groups.length);
+  if (groups.some((group, index) => index >= floor && index <= ceiling
+    && (group.arms ?? []).some(arm => arm.armId === candidate.armId))) return groups;
+  const existing = groups.flatMap(group => group.arms ?? []).find(arm => arm.armId === candidate.armId);
+  const result = groups.map(group => ({ ...group,
+    arms: (group.arms ?? []).filter(arm => arm.armId !== candidate.armId) }));
+  result[floor].arms.push({ ...(existing ?? candidate), rung: floor });
+  return result;
+}
+
 /**
  * Can this role be placed on this ladder at all? Mirrors decide()'s
  * reachability (family exclusions, the role's floor..ceiling rung window,

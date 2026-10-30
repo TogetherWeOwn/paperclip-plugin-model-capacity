@@ -60,7 +60,7 @@ import {
   scheduleError, stepController, stepRateController, appendUtilReading, appendTickLog, robustRatePerHour,
   measuredRatePerHour, requiredRatePerHour, orderAccounts, DEFAULT_PACING,
 } from './pacing.mjs';
-import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, roleTakesTrial, adapterAllowsTrial, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken } from './decide.mjs';
+import { decide, contextCapsEnv, normalizeContextCaps, validateServedIdCaps, needsContextCap, DEFAULT_ROLE_BANDS, DEFAULT_TRIALS, roleTakesTrial, adapterAllowsTrial, normalizeExcludedFamilies, filterRungsByExcludedFamilies, rungsHaveEligibleArms, roleLadderAccess, placementArm, armToken, seatFallbackArm } from './decide.mjs';
 import { burnHorizon, normalizeBurnHorizon } from './burnhorizon.mjs';
 import { normalizeBurnMode, validateBurnMode, isBurnAccount, burnDeadlineAtMs, burnPaceTarget, burnEligibleAccounts, applyBurnFloors } from './burnmode.mjs';
 import {
@@ -909,6 +909,99 @@ function windowStartMs(resetsAtMs) {
   return resetsAtMs - WEEKLY_WINDOW_MS;
 }
 
+/** Check fallback materialization in precedence order; the view is explicit. */
+export function fallbackSeatCandidate(ranking, armId, nowMs, enforce,
+  { excludedIds = ranking?.excludedArmIds, supersessionView = null, newestEnabled = false } = {}) {
+  if (!ranking || !ranking.rankingRungs?.length) return { reason: 'no-benchmark-rungs' };
+  const candidate = ranking.candidates?.find(c => c.armId === armId);
+  if (!candidate) return { reason: 'candidate-absent' };
+  if ((newestEnabled && supersessionView == null) || isSupersededArm(supersessionView, candidate)) {
+    return { reason: 'superseded-version' };
+  }
+  if (new Set(excludedIds ?? []).has(armId)) return { reason: 'cross-account-excluded' };
+  if (!Number.isFinite(candidate.Q) || !Number.isFinite(candidate.C)) return { reason: 'missing-cost-or-quality' };
+  if (enforce && !credentialReadiness(candidate.credentialEvidence, nowMs).eligible) return { reason: 'not-ready' };
+  return { candidate };
+}
+
+/** Materialize account groups using the plugin's injected clock. */
+export function createCredentialGroupHelpers(clock = Date.now) {
+  function groupByRung(rungs) {
+    const byRung = new Map();
+    for (const r of rungs) {
+      if (!byRung.has(r.rung)) byRung.set(r.rung, { rung: r.rung, arms: [] });
+      byRung.get(r.rung).arms.push(r);
+    }
+    return [...byRung.values()].sort((a, b) => a.rung - b.rung);
+  }
+
+  // Omit the flag and admission stays legacy: the default must fail open so
+  // a new or merged call site cannot silently re-enable the readiness filter
+  // in an opt-in-off installation.
+  function credentialLadderFor(ranking, nowMs, enforce = false, admits = null) {
+    const trusted = ranking.candidates.filter(c => c.taskRanking !== true
+      || (c.eligible === true && (!admits || admits(c))));
+    const ready = enforce
+      ? trusted.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
+      : trusted;
+    const byArm = new Map(ready.map(c => [c.armId, c]));
+    const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
+    const benchmark = ranking.rankingRungs;
+    const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
+    const candidatesByArm = new Map(ranking.candidates.map(c => [c.armId, c]));
+    const excluded = new Set(ranking.excludedArmIds ?? []);
+    // Admission may revive dominated backups, but must not move the pacing
+    // pointer or role bands into another benchmark rung. A revived backup
+    // occupies the lowest benchmark rung whose incumbent strictly dominates it.
+    const rungs = admitted.rungs.flatMap(r => {
+      if (excluded.has(r.armId)) return [];
+      const rung = rungByArm.get(r.armId) ?? benchmark.find(b =>
+        byArm.get(r.armId)?.taskRanking === true
+          ? ladderDominates({ ...candidatesByArm.get(b.armId), ...b }, { ...byArm.get(r.armId), ...r })
+          : b.Q >= r.Q && b.C <= r.C && (b.Q > r.Q || b.C < r.C))?.rung;
+      if (rung == null) return [];
+      return [{
+        ...byArm.get(r.armId), ...r, rung,
+        maxRung: r.coverage < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : benchmark.length - 1,
+      }];
+    });
+    return { ...admitted, rungs };
+  }
+
+  function credentialGroupsFor(ladder, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null, fallbackAdmission = null) {
+    const roleRanking = (taskMode ?? ladder?.taskRankingMode) === 'enforce' ? ladder?.taskRoles?.[role] : null;
+    const ranking = roleRanking ?? ladder?.credentialRanking;
+    if (!ranking) {
+      const groups = ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []);
+      return enforce ? filterCredentialRungs(groups, nowMs) : groups;
+    }
+    const admitted = credentialLadderFor(ranking, nowMs, enforce, roleRanking ? c =>
+      (!c.trial || roleTakesTrial(ladder.taskTrialRoles ?? DEFAULT_TRIALS.roles, role, c.family)) && (!admits || admits(c)) : null);
+    const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
+    // decide and placement use group count as topRung; retain empty shells
+    // just like the breaker and family-exclusion filters.
+    const groups = ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
+    if (!fallbackAdmission) return groups;
+    const { candidate } = fallbackSeatCandidate(ranking, fallbackAdmission.armId, nowMs, enforce, fallbackAdmission);
+    return candidate ? seatFallbackArm(groups, candidate, fallbackAdmission.band) : groups;
+  }
+
+  // Per-arm aggregator fallback (owner rule 2026-09-17): duplicate arms of a
+  // Devin lane are held back from the first routing pass.
+  function routableGroupsFor(ladder, duplicates = true, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null, fallbackAdmission = null) {
+    const duplicateIds = ladder?.credentialRanking?.duplicateArmIds ?? [];
+    const duplicateSlugs = new Set((ladder?.credentialRanking?.candidates ?? []).filter(c => duplicateIds.includes(c.armId)).map(c => c.armId));
+    const taskIds = (ladder?.taskRoles?.[role]?.candidates ?? []).filter(c => duplicateSlugs.has(c.aaSlug)).map(c => c.armId);
+    const held = duplicates ? null : new Set([...duplicateIds, ...taskIds]);
+    const groups = credentialGroupsFor(ladder, nowMs, enforce, role, taskMode,
+      c => (!held || !held.has(c.armId)) && (!admits || admits(c)), fallbackAdmission);
+    if (!held || held.size === 0) return groups;
+    return groups.map(g => ({ ...g, arms: (g.arms ?? []).filter(a => !held.has(a.armId)) }));
+  }
+
+  return { credentialLadderFor, credentialGroupsFor, routableGroupsFor, groupByRung };
+}
+
 // `requirePinnedLaneHost` is a test seam: the unit suite drives the lane
 // read against the public placeholder pin with a fake http client. The
 // worker entry never passes it, so every deployed plugin refuses to read
@@ -916,6 +1009,7 @@ function windowStartMs(resetsAtMs) {
 // onReviewerAdmission is an optional test observer for the two admission consumers;
 // the worker does not supply it, so it cannot affect deployed routing.
 export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map(), onReviewerAdmission = null } = {}) {
+  const { credentialLadderFor, credentialGroupsFor, routableGroupsFor, groupByRung } = createCredentialGroupHelpers(clock);
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -4911,67 +5005,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       && live?.credentialReadinessEnforced === true;
   }
 
-  // Omit the flag and admission stays legacy: the default must fail open so
-  // a new or merged call site cannot silently re-enable the readiness filter
-  // in an opt-in-off installation.
-  function credentialLadderFor(ranking, nowMs, enforce = false, admits = null) {
-    const trusted = ranking.candidates.filter(c => c.taskRanking !== true
-      || (c.eligible === true && (!admits || admits(c))));
-    const ready = enforce
-      ? trusted.filter(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
-      : trusted;
-    const byArm = new Map(ready.map(c => [c.armId, c]));
-    const admitted = buildLadder(ready, ranking.previousRungs, ranking.gateByArm, ranking.heldPairs);
-    const benchmark = ranking.rankingRungs;
-    const rungByArm = new Map(benchmark.map(r => [r.armId, r.rung]));
-    const candidatesByArm = new Map(ranking.candidates.map(c => [c.armId, c]));
-    const excluded = new Set(ranking.excludedArmIds ?? []);
-    // Admission may revive dominated backups, but must not move the pacing
-    // pointer or role bands into another benchmark rung. A revived backup
-    // occupies the lowest benchmark rung whose incumbent strictly dominates it.
-    const rungs = admitted.rungs.flatMap(r => {
-      if (excluded.has(r.armId)) return [];
-      const rung = rungByArm.get(r.armId) ?? benchmark.find(b =>
-        byArm.get(r.armId)?.taskRanking === true
-          ? ladderDominates({ ...candidatesByArm.get(b.armId), ...b }, { ...byArm.get(r.armId), ...r })
-          : b.Q >= r.Q && b.C <= r.C && (b.Q > r.Q || b.C < r.C))?.rung;
-      if (rung == null) return [];
-      return [{
-        ...byArm.get(r.armId), ...r, rung,
-        maxRung: r.coverage < LOW_COVERAGE_THRESHOLD ? LOW_COVERAGE_MAX_RUNG : benchmark.length - 1,
-      }];
-    });
-    return { ...admitted, rungs };
-  }
-
-  function credentialGroupsFor(ladder, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null) {
-    const roleRanking = (taskMode ?? ladder?.taskRankingMode) === 'enforce' ? ladder?.taskRoles?.[role] : null;
-    const ranking = roleRanking ?? ladder?.credentialRanking;
-    if (!ranking) {
-      const groups = ladder?.ladderRungs ?? groupByRung(ladder?.rungs ?? []);
-      return enforce ? filterCredentialRungs(groups, nowMs) : groups;
-    }
-    const admitted = credentialLadderFor(ranking, nowMs, enforce, roleRanking ? c =>
-      (!c.trial || roleTakesTrial(ladder.taskTrialRoles ?? DEFAULT_TRIALS.roles, role, c.family)) && (!admits || admits(c)) : null);
-    const byRung = new Map(groupByRung(admitted.rungs).map(g => [g.rung, g]));
-    // decide and placement use group count as topRung; retain empty shells
-    // just like the breaker and family-exclusion filters.
-    return ranking.rankingRungs.map(r => byRung.get(r.rung) ?? { rung: r.rung, arms: [] });
-  }
-
-  // Per-arm aggregator fallback (owner rule 2026-09-17): duplicate arms of a
-  // Devin lane are held back from the first routing pass.
-  function routableGroupsFor(ladder, duplicates = true, nowMs = clock(), enforce = false, role = 'doer', taskMode = null, admits = null) {
-    const duplicateIds = ladder?.credentialRanking?.duplicateArmIds ?? [];
-    const duplicateSlugs = new Set((ladder?.credentialRanking?.candidates ?? []).filter(c => duplicateIds.includes(c.armId)).map(c => c.armId));
-    const taskIds = (ladder?.taskRoles?.[role]?.candidates ?? []).filter(c => duplicateSlugs.has(c.aaSlug)).map(c => c.armId);
-    const held = duplicates ? null : new Set([...duplicateIds, ...taskIds]);
-    const groups = credentialGroupsFor(ladder, nowMs, enforce, role, taskMode,
-      c => (!held || !held.has(c.armId)) && (!admits || admits(c)));
-    if (!held || held.size === 0) return groups;
-    return groups.map(g => ({ ...g, arms: (g.arms ?? []).filter(a => !held.has(a.armId)) }));
-  }
-
   // Run-local feasibility precedes Pareto pruning in the task path. Calling
   // the same pure decision on a singleton prevents a context/adapter/burn/
   // trial/breaker-ineligible dominator from hiding an executable backup.
@@ -5012,15 +5045,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }], clock());
     }
     return { kind: 'defer', retryAfterMs: 60000, reason };
-  }
-
-  function groupByRung(rungs) {
-    const byRung = new Map();
-    for (const r of rungs) {
-      if (!byRung.has(r.rung)) byRung.set(r.rung, { rung: r.rung, arms: [] });
-      byRung.get(r.rung).arms.push(r);
-    }
-    return [...byRung.values()].sort((a, b) => a.rung - b.rung);
   }
 
   /**
