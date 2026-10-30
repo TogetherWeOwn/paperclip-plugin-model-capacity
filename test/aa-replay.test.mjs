@@ -124,14 +124,27 @@ test('X-R4(a): provenance requires a recorded producer and matching replay state
 });
 
 test('X-R4(b): fidelity rejects even an empty enabled-newest ladder evidence key', async () => {
-  const { replayTick, assertFidelity } = await import('../scripts/aa-replay.mjs');
-  const replay = await replayTick(replayInputs());
-  assertFidelity(replay, replay);
-  const stored = structuredClone(replay);
-  const key = Object.keys(stored.ladders.ladders)[0];
-  assert.ok(key, 'fixture must have a ladder');
-  stored.ladders.ladders[key].supersededArmEvidence = [];
-  assert.throws(() => assertFidelity(stored, replay), /Replay fidelity failed: ladders/);
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { pathToFileURL, fileURLToPath } = await import('node:url');
+  const { assertFidelity } = await import('../scripts/aa-replay.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-baseline-'));
+  try {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
+    execFileSync('tar', ['-x', '-C', dir], { input: archive });
+    const { replayTick } = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
+    const input = replayInputs();
+    const stored = await replayTick(structuredClone(input));
+    const replay = await replayTick(structuredClone(input));
+    assertFidelity(stored, replay);
+    const key = Object.keys(stored.ladders.ladders)[0];
+    assert.ok(key, 'fixture must have a ladder');
+    stored.ladders.ladders[key].supersededArmEvidence = [];
+    assert.throws(() => assertFidelity(stored, replay), /Replay fidelity failed: ladders/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('X-R4(c,d): enabled producer judges itself; its inputs still support disabled baseline parity', async () => {

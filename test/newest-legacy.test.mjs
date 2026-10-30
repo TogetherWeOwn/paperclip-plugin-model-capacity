@@ -109,7 +109,7 @@ test('N3: cross-account dominance preserves superseded exclusions in the same la
   assert.deepEqual(new Set(reversed.ladders.ladders['fixture:old'].credentialRanking.excludedArmIds), new Set(names.slice(0, 2)));
 });
 
-test('X-T03: full-fleet newest and fallback flag matrix preserves supersession boundaries', async () => {
+test('X-T03: full-fleet newest and fallback flag matrix preserves supersession boundaries', async t => {
   const { readFile } = await import('node:fs/promises');
   const { accounts } = JSON.parse(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url)));
   const arms = JSON.parse(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url)));
@@ -138,6 +138,46 @@ test('X-T03: full-fleet newest and fallback flag matrix preserves supersession b
       assert.ok(rows.every(row => row.accountId !== 'fixture:matrix-weak' || !view.rejectedCandidates.some(candidate => candidate.armId === row.armId)));
     }
   }
+  const diffPaths = (a, b, path = '') => {
+    if (Object.is(a, b)) return [];
+    if (a && b && typeof a === 'object' && typeof b === 'object' && Array.isArray(a) === Array.isArray(b)) {
+      return [...new Set([...Object.keys(a), ...Object.keys(b)])].flatMap(key => diffPaths(a[key], b[key], path ? `${path}.${key}` : key));
+    }
+    return [path];
+  };
+  for (const newest of [false, true]) {
+    const off = results.get(`${newest}:false`), on = results.get(`${newest}:true`);
+    const { projectForParity } = await import('../scripts/aa-replay.mjs');
+    const paths = diffPaths(projectForParity(off), projectForParity(on));
+    // This fixture exercises a narrow subset of §8's allowlist; fail closed for
+    // every other path, including all non-admitted account picks and translated exclusions.
+    const allowed = /^(capacity\.eligibility\.accountFallback|capacity\.eligibility\.warnings\.\d+|capacity\.eligibility\.arms\.\d+\.eligible\.(doer|thinker|other)\.reasons\.\d+|capacity\.taskRanking\.routeComparisons\.\d+\.(legacy|current|changed))$/;
+    t.diagnostic(`Synthetic E-F newest=${newest} paths: ${JSON.stringify(paths)}`);
+    assert.ok(paths.length > 0, 'fallback toggle must exercise the gate');
+    assert.deepEqual(paths.filter(path => !allowed.test(path)), [], `E-F newest=${newest}: ${paths.join(', ')}`);
+    assert.deepEqual(off.ladders, on.ladders, 'ladder-v1 is literal');
+    for (const field of ['reviewer', 'reviewReserve', 'roleExclusions', 'roleExclusionsEffective', 'newestVersion', 'perAccount']) {
+      assert.deepEqual(off.capacity[field], on.capacity[field], `E-F denylist ${field}`);
+    }
+    for (const field of ['minQuality', 'outcomeGate', 'manual']) {
+      assert.deepEqual(off.capacity.eligibility[field], on.capacity.eligibility[field], `E-F denylist eligibility.${field}`);
+    }
+    assert.deepEqual(off.capacity.taskRanking?.translatedExclusions, on.capacity.taskRanking?.translatedExclusions);
+    for (const [i, arm] of off.capacity.eligibility.arms.entries()) {
+      const changed = on.capacity.eligibility.arms[i];
+      for (const role of ['doer', 'thinker', 'other']) {
+        assert.equal(arm.eligible[role].ok, changed.eligible[role].ok);
+        const added = changed.eligible[role].reasons.filter(reason => !arm.eligible[role].reasons.includes(reason));
+        const removed = arm.eligible[role].reasons.filter(reason => !changed.eligible[role].reasons.includes(reason));
+        assert.deepEqual(removed, []);
+        assert.ok(added.every(reason => typeof reason === 'string' && reason.startsWith('account-fallback-admitted: ')));
+      }
+    }
+    const oldWarnings = off.capacity.eligibility.warnings;
+    const newWarnings = on.capacity.eligibility.warnings;
+    assert.ok(oldWarnings.every(warning => newWarnings.some(next => JSON.stringify(next) === JSON.stringify(warning))));
+    assert.ok(newWarnings.filter(warning => !oldWarnings.some(old => JSON.stringify(old) === JSON.stringify(warning))).every(warning => warning.code.startsWith('account-fallback-')));
+  }
   const both = results.get('true:true');
   const weak = both.capacity.eligibility.accountFallback.admitted.find(row => row.accountId === 'fixture:matrix-weak' && row.role === 'doer');
   assert.equal(weak?.armId, 'claude-sonnet-5-5-xhigh');
@@ -154,7 +194,8 @@ test('X-T03: full-fleet newest and fallback flag matrix preserves supersession b
     assert.deepEqual(both.capacity.newestVersion.accounts[key], newestOnly.capacity.newestVersion.accounts[key], key);
     assert.deepEqual(newestOnly.capacity.newestVersion.accounts[key].supersededCanonicalModels, expected[index], key);
   }
-  assert.ok(results.get('false:true').capacity.eligibility.accountFallback.admitted.some(row => row.accountId === 'fixture:matrix-weak'));
+  const fallbackOnly = results.get('false:true').capacity.eligibility.accountFallback.admitted.find(row => row.accountId === 'fixture:matrix-weak' && row.role === 'doer');
+  assert.equal(fallbackOnly?.armId, 'claude-sonnet-5-5-xhigh');
   assert.equal(Object.hasOwn(results.get('false:false').capacity, 'newestVersion'), false);
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');

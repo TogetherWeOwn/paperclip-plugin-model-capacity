@@ -167,11 +167,15 @@ test('F-T16: live-shaped Antigravity pool admits its best-Q seatable flash arm',
     { armId: 'gemini-3.5-flash-lite', family: 'gemini-lite', qFleet: -1.41 },
   ];
   const e = build({ arms: [arms[0], ...candidates], accountCandidates: { weak: candidates },
-    accountFallback: { ...cfg, minQuality: -1.5 } });
+    accountFallback: cfg });
   const admission = e.accountAdmissions.doer.weak;
   assert.equal(admission.armId, 'gemini-3.8-flash-high');
   assert.deepEqual(e.report.accountFallback.admitted.filter(row => row.accountId === 'weak' && row.role === 'doer').map(row => row.armId), ['gemini-3.8-flash-high']);
+  for (const barred of candidates.slice(1)) {
+    const alone = build({ arms: [arms[0], barred], accountCandidates: { weak: [barred] } });
+    assert.equal(alone.accountAdmissions.doer.weak, undefined, `${barred.armId} is below the default floor`);
+  }
   const local = candidates.map(a => ({ ...a, model: a.armId, Q: a.qFleet, C: 1 }));
-  const ranking = { candidates: local, rankingRungs: [{ armId: local[0].armId, rung: 0, Q: local[0].Q, C: 1 }], excludedArmIds: [] };
+  const ranking = { candidates: local, rankingRungs: local.map((a, rung) => ({ armId: a.armId, rung, Q: a.Q, C: 1 })), excludedArmIds: [] };
   assert.equal(fallbackSeatCandidate(ranking, admission.armId, 1, false).candidate.armId, admission.armId);
 });
