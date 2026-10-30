@@ -10,13 +10,25 @@ free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 The `router` block in `config.example.json` contains fictitious IDs and a worked
 example account; replace them before use. It documents the future native pool
 registry. Its company and owner UUIDs are placeholders, not real identities;
-replace them before using a generator. `enabled` defaults to `false`, and this
-branch does not yet register the native router or implement the operator CLI.
+replace them before using the generator. `enabled` defaults to `false`; this
+branch does not yet register the native router. The operator CLI and pure
+registry, quality, and drift libraries are present (see the generator section).
 Pool `thresholdPercent` is ignored by this plugin; pacing is reset-relative.
 The policy-backed planner uses the existing `roles.other` floor and outcome
 gate for reviewer pools because the existing eligibility configuration has no
 reviewer key. It fails closed on unknown models and requires scored arm and
-outcome evidence; it is not yet connected to the operator CLI or saga.
+outcome evidence.
+
+Amendment A1 assigns runtime enforcement to **slice 3**, not these libraries:
+the quota-refresh producer must call `joinRegistryFeed` from `src/registry.mjs`
+each tick, publish its `staleMemberIds`, emit its `warnings`, and consume the
+read-only `checkPoolDrift` from `scripts/pool-saga.mjs` each tick. Startup must
+use `poolHasExpectedPluginKey` from `src/registry.mjs` to report V0 ownership
+mismatches as ERROR and unavailable. These runtime actions are not wired yet;
+V0–V5 runtime enforcement is not complete. The model-level quality verdict is
+existential over effort variants and does not guarantee the runtime-selected
+effort clears the floor. **Slice 4** owns that runtime-effort guarantee before
+selection wiring may claim §9(b) compliance.
 
 **v0.2.5 = SHADOW BY DEFAULT, enforce-capable opt-in.** The default
 manifest (`manifest`, the one `package.json` points at) holds NO

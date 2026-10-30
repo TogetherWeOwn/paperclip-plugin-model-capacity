@@ -3,7 +3,7 @@
  * name-only PATCH and PUT installs, and services/ai-connections.ts immutable
  * routing check. Pools are saved LAST, disabled, checked, then activated.
  */
-import { normalizeRegistry, memberIdFor, PLUGIN_KEY } from '../src/registry.mjs';
+import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey } from '../src/registry.mjs';
 import { buildPoolPlan } from './pool-plan.mjs';
 import { planGatewayConnections } from './gateway-batch.mjs';
 import { batchAgents, selectableVerdict, sessionEvidence, issueIdForTaskKey, poolConfig, equal, installsFor, orderedInstalls, connectionShape, reversibleBinding } from './generator-safety.mjs';
@@ -75,7 +75,7 @@ export async function planPoolSaga(options) {
   for(const {poolKey} of state.registry.pools) {
     if(!plan.pools.some(p=>p.config.name===poolKey))errors.push({poolKey,reason:'no-eligible-members'});
     const existing=state.pools.find(p=>p.name===poolKey);
-    if(existing?.pluginKey!==undefined && existing.pluginKey!==PLUGIN_KEY)errors.push({poolKey,reason:'plugin-key-drift'});
+    if(existing?.pluginKey!==undefined && !poolHasExpectedPluginKey(existing))errors.push({poolKey,reason:'plugin-key-drift'});
   }
   return {...plan,connections:state.accounts.map(e=>({accountKey:e.account.accountKey,inputWithoutSecret:e.input,action:!e.row?'create':sameConnection(e)?'adopt':'replace-immutable-routing',identity:e.row?{connectionId:e.row.id,grantId:e.row.grantId}:{provisional:true,connectionId:memberIdFor('planned-connection',e.account.accountKey),grantId:memberIdFor('planned-grant',e.account.accountKey)}})),selectableVerdicts:verdictsFor(state,plan),sessionBlockers:sessions.blockers,resets:sessions.resets,errors,provisional:state.accounts.some(e=>!e.row),expectedEnabled:options.activate!==false};
 }
@@ -87,7 +87,7 @@ async function assertSessionsEmpty(api,ids) {
 async function checkOwnership(state) {
   for(const {poolKey} of state.registry.pools) {
     const p=state.pools.find(p=>p.name===poolKey);
-    if(p && p.pluginKey!==PLUGIN_KEY)throw new Error(`wrong pluginKey: ${poolKey}`);
+    if(p && !poolHasExpectedPluginKey(p))throw new Error(`wrong pluginKey: ${poolKey}`);
   }
 }
 export async function applyPoolSaga(options) {
@@ -186,6 +186,8 @@ export async function applyPoolSaga(options) {
   } finally {await journal.close();}
 }
 
+/** Read-only drift check. Slice 3 owns calling this each quota-refresh tick
+ * and surfacing its result; this library does not schedule runtime checks. */
 export async function checkPoolDrift(options) {
   const {expectedEnabled=true}=options;
   if(typeof expectedEnabled!=='boolean' && (!expectedEnabled || typeof expectedEnabled!=='object' || Array.isArray(expectedEnabled)))throw new Error('invalid expectedEnabled');
@@ -201,7 +203,7 @@ export async function checkPoolDrift(options) {
   for(const {poolKey} of state.registry.pools) {
     const current=state.pools.find(p=>p.name===poolKey),desired=plan.pools.find(p=>p.config.name===poolKey);
     if(!current) {drift.push({type:'missing-pool',poolKey});continue;}
-    if(current.pluginKey!==PLUGIN_KEY)drift.push({type:'plugin-key-drift',poolKey});
+    if(!poolHasExpectedPluginKey(current))drift.push({type:'plugin-key-drift',poolKey});
     if(!desired) {drift.push({type:'pool-drift',poolKey});continue;}
     for(const member of desired.config.members) {
       if(!current.members?.some(m=>m.id===member.id))drift.push({type:'missing-member',poolKey,memberId:member.id});

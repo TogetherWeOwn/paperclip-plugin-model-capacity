@@ -1,8 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeRegistry, memberIdFor, validatePoolMember } from '../src/registry.mjs';
+import * as registryLibrary from '../src/registry.mjs';
 
 const fixture = () => ({companyId:'10000000-0000-4000-8000-000000000001', ownerUserId:'20000000-0000-4000-8000-000000000002', pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}], accounts:[{accountKey:'codex-1',prefix:'codex1',provider:'openai',protocol:'responses',harnessProfile:'codex',connectionName:'codex-1',pools:{builder:{model:'gpt-6.1-terra',probeEligible:true},thinker:{model:'gpt-6.1-sol'}}}]});
+
+test('V0 ownership check exposes a fail-closed startup predicate', () => {
+  assert.equal(typeof registryLibrary.poolHasExpectedPluginKey, 'function');
+  assert.equal(registryLibrary.poolHasExpectedPluginKey({pluginKey:registryLibrary.PLUGIN_KEY}), true);
+  for (const pool of [undefined, null, {}, {pluginKey:null}, {pluginKey:'other'}, {pluginKey:` ${registryLibrary.PLUGIN_KEY}`}]) {
+    assert.equal(registryLibrary.poolHasExpectedPluginKey(pool), false);
+  }
+});
 
 test('registry derives deterministic pool-scoped UUIDs and role joins', () => {
   const r=normalizeRegistry(fixture()); const a=memberIdFor('builder','codex-1'), b=memberIdFor('thinker','codex-1');

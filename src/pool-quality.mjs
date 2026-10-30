@@ -7,7 +7,8 @@ import { roleLadderAccess } from './decide.mjs';
  * Reviewer uses the legacy other role. Each saved model is represented by all
  * its known effort arms: it qualifies if any variant survives the policy.
  * This is existential, not a promise that an upstream fixed profile can select
- * that effort; the caller must ensure the saved profile's runtime semantics.
+ * that effort. Slice 4 owns the runtime-effort floor guarantee and must resolve
+ * upstream effort selection before claiming that guarantee.
  * Gate suspension follows legacy policy, scoped to the pool; onReport receives
  * its full report, including suspensions. Unknown families are never evidence.
  */

@@ -11,6 +11,13 @@
   "files": [
     "src",
     "test",
+    "scripts/generate-pool.mjs",
+    "scripts/paperclip-api.mjs",
+    "scripts/pool-saga.mjs",
+    "scripts/pool-plan.mjs",
+    "scripts/gateway-batch.mjs",
+    "scripts/generator-safety.mjs",
+    "scripts/pool-journal.mjs",
     "README.md",
     "LICENSE",
     "config.example.json"

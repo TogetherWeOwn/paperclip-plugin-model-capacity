@@ -4,6 +4,12 @@
 import { createHash } from 'node:crypto';
 
 export const PLUGIN_KEY = 'togetherweown.model-capacity';
+
+/** V0 ownership predicate for upstream pool read objects. Slice 3 must check
+ * startup pools and surface failures as ERROR and unavailable; this is pure. */
+export function poolHasExpectedPluginKey(pool) {
+  return pool?.pluginKey === PLUGIN_KEY;
+}
 export const ROUTER_CONFIG_KEYS = Object.freeze({
   router: Object.freeze(['enabled','allowMessages','companyId','ownerUserId','staleSnapshotMs','accountStaleMs','recheckMs','hardCapWeekly','hardCapFiveHour','accounts','pools']),
   pool: Object.freeze(['poolKey','role']),
@@ -73,8 +79,9 @@ export function normalizeRegistry(raw) {
     accountByPrefix:Object.fromEntries(accounts.map(a => [a.prefix, a.accountKey]))};
 }
 
-/** Join validated feed identities to registry members; callers must apply the
- * stale-member set to their snapshot, not treat an exemption as a reading. */
+/** Join validated feed identities to registry members. Slice 3's per-tick
+ * quota producer owns applying staleMemberIds to the published snapshot and
+ * emitting warnings; an exemption is not a reading. */
 export function joinRegistryFeed(registry, feed) {
   const validKey = value => typeof value === 'string' && keyPattern.test(value);
   if (!registry || !Array.isArray(registry.accounts) || !registry.memberIndex || typeof registry.memberIndex !== 'object' || Array.isArray(registry.memberIndex)

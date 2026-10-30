@@ -4,7 +4,7 @@
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { applyInFlightOverlay } from './views.mjs';
 import { accountKeyForModel } from './ledger.mjs';
-import { PLUGIN_KEY } from './registry.mjs';
+import { poolHasExpectedPluginKey } from './registry.mjs';
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -20,7 +20,7 @@ const nowOf = params => {
 const freshAt = (at, now, maxAge) => Number.isFinite(at) && now - at >= -60_000 && now - at <= maxAge;
 const wait = (now, skipped, retry = now + MINUTE) => ({kind: 'exhausted', retryAt: new Date(clamp(retry, now + MINUTE, now + 7 * DAY)).toISOString(), skipped});
 const unavailable = skipped => ({kind: 'unavailable', skipped});
-const validPool = p => p && typeof p.id === 'string' && p.id.trim().length > 0 && typeof p.name === 'string' && p.name.trim().length > 0 && p.pluginKey === PLUGIN_KEY && Array.isArray(p.members);
+const validPool = p => p && typeof p.id === 'string' && p.id.trim().length > 0 && typeof p.name === 'string' && p.name.trim().length > 0 && poolHasExpectedPluginKey(p) && Array.isArray(p.members);
 const registry = config => Array.isArray(config?.router?.accounts) ? config.router.accounts : [];
 
 export function taskKeyKind(key) {
