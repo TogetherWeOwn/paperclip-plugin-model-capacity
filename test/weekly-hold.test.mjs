@@ -45,17 +45,29 @@ test('one held sibling cannot contribute allowance or block its behind-plan sibl
   assert.deepEqual(p.pacedAccountIds, ['ahead']);
 });
 
-test('role-empty safety suspends only hard holds and retains the ordinary in-flight cap', () => {
+test('a sole held role stays closed, even when a sibling cannot serve the role', () => {
   const first = order([lane('only')]);
-  assert.deepEqual(ids(first), ['only']);
-  assert.deepEqual(first.holdSuspendedAccountIds, ['only']);
-  assert.equal(first.pools[0].cap, 1);
+  assert.deepEqual(ids(first), []);
+  assert.deepEqual(first.holdSuspendedAccountIds, []);
+  assert.equal(first.pools[0].cap, 0);
   const busy = order([lane('only', { inFlight: 1 })]);
   assert.deepEqual(ids(busy), []);
-  assert.deepEqual(busy.holdSuspendedAccountIds, ['only']);
-  // A peer that cannot serve this role must not suppress safety.
-  assert.deepEqual(ids(order([lane('only'), lane('wrong-role', { planAhead: -0.1, roleEligible: false })])).filter(id => id === 'only'), ['only']);
+  assert.deepEqual(busy.holdSuspendedAccountIds, []);
+  assert.ok(!ids(order([lane('only'), lane('wrong-role', { planAhead: -0.1, roleEligible: false })])).includes('only'));
 });
+
+for (const mode of ['off', 'shadow', 'enforce']) {
+  for (const full of [false, true]) {
+    test(`temporary reactive fullness never restores hard-held allowance (ranking=${mode}, full=${full})`, () => {
+      const r = order([lane('held'), lane('reactive', { pool: 'reactive', meter: 'reactive', reactive: true,
+        planAhead: -0.1, roleEligible: true, taskFeasible: !full, inFlight: full ? 2 : 0 })],
+      { taskRanking: { mode } });
+      assert.ok(!ids(r).includes('held'), 'temporary feasibility is not permission to release a hard hold');
+      assert.deepEqual(r.holdSuspendedAccountIds, []);
+      if (!full) assert.ok(ids(r).includes('reactive'), 'a genuinely usable alternative remains selectable');
+    });
+  }
+}
 
 test('role-empty safety cannot lift reserve or health exclusions', () => {
   const r = order([lane('reserved'), lane('sick', { health: 'unavailable' })],
@@ -104,10 +116,10 @@ test('caps preserve running work but give no new fixed-model slots to a hard-hel
   assert.equal(out.kept.find(a => a.agentId === 'kept').allocated, 1);
 });
 
-test('unknown weekly allowance is not alternate role capacity for empty-role safety', () => {
+test('unknown weekly allowance cannot release a sole hard-held role', () => {
   const r = order([lane('only'), lane('unknown', { planAhead: null, remainingKnown: false })]);
-  assert.deepEqual(r.holdSuspendedAccountIds, ['only']);
-  assert.ok(ids(r).includes('only'));
+  assert.deepEqual(r.holdSuspendedAccountIds, []);
+  assert.ok(!ids(r).includes('only'));
 });
 
 test('floating-point noise at exactly ten points ahead does not prolong a weekly hold', () => {
@@ -115,10 +127,10 @@ test('floating-point noise at exactly ten points ahead does not prolong a weekly
   assert.ok(ids(r).includes('edge'));
 });
 
-test('a role-local routing exception cannot reopen globally pinned capacity for another role', async () => {
+test('neither the requesting role nor another pin can reopen a sole held account', async () => {
   const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
   const local = order([lane('ahead')]);
-  assert.ok(ids(local).includes('ahead'), 'the requesting role keeps its safety exception');
+  assert.deepEqual(ids(local), [], 'role emptiness is no longer a weekly-hold exemption');
   const out = allocateKeptAndRoutedCaps({ target: 10,
     agents: [{ agentId: 'other-role-pin', running: 0, queued: 3 }], keepAgentIds: ['other-role-pin'],
     keptByAgent: { 'other-role-pin': { accountId: 'ahead' } },
@@ -129,7 +141,7 @@ test('a role-local routing exception cannot reopen globally pinned capacity for 
 });
 
 for (const blockingPriority of [false, true]) {
-  test(`role-local exception shares one soft-cap slot without admitting other roles (priority=${blockingPriority})`, async () => {
+  test(`obsolete role-local rescue credits authorize no held work (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const out = allocateKeptAndRoutedCaps({ target: 5, blockingPriority,
       agents: [{ agentId: 'review', running: 0, queued: 2 }, { agentId: 'peer', running: 0, queued: 1 },
@@ -142,14 +154,14 @@ for (const blockingPriority of [false, true]) {
       pacePools: [{ pool: 'shared', cap: 1, hardHeldAccountIds: ['ahead'] }],
     });
     const row = id => [...out.kept, ...out.routed].find(a => a.agentId === id);
-    assert.equal(row('review').allocated, 1);
+    assert.equal(row('review').allocated, 0);
     assert.equal(row('peer').allocated, 0);
     assert.equal(row('fixed').allocated, 0);
   });
 }
 
 for (const blockingPriority of [false, true]) {
-  test(`an idle reviewer's restored pool budget is not fungible for another reviewer (priority=${blockingPriority})`, async () => {
+  test(`neither active nor idle reviewers restore held allowance (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const input = { target: 10, blockingPriority,
       agents: [{ agentId: 'exempt', running: 0, queued: 0 }, { agentId: 'peer', running: 0, queued: 5 }],
@@ -167,16 +179,16 @@ for (const blockingPriority of [false, true]) {
     const both = allocateKeptAndRoutedCaps({ ...input,
       agents: [{ agentId: 'exempt', running: 0, queued: 1 }, { agentId: 'peer', running: 0, queued: 5 }] });
     const rows = [...both.kept, ...both.routed];
-    assert.equal(rows.find(a => a.agentId === 'exempt').allocated, 1, 'the exemption still serves its own role');
+    assert.equal(rows.find(a => a.agentId === 'exempt').allocated, 0, 'held-only demand supplies no restored credit');
     assert.equal(rows.find(a => a.agentId === 'peer').allocated, 3);
-    assert.equal(rows.reduce((sum, row) => sum + row.allocated, 0), 4, 'one restored slot, spent once');
-    assert.equal(peer.allocated, 3, 'a peer cannot spend the idle reviewer\'s restored fourth slot');
+    assert.equal(rows.reduce((sum, row) => sum + row.allocated, 0), 3, 'only the original ordinary budget exists');
+    assert.equal(peer.allocated, 3, 'an idle held reviewer cannot change the ordinary cap');
   });
 }
 
 for (const blockingPriority of [false, true]) {
   for (const heldFirst of [false, true]) {
-    test(`overlapping reviewer admissions retain both funded slots (priority=${blockingPriority}, heldFirst=${heldFirst})`, async () => {
+    test(`overlapping reviewers share only the unheld budget (priority=${blockingPriority}, heldFirst=${heldFirst})`, async () => {
       const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
       const input = { target: 2, blockingPriority,
         agents: [{ agentId: 'a', running: 0, queued: 1 }, { agentId: 'b', running: 0, queued: 1 }],
@@ -199,26 +211,26 @@ for (const blockingPriority of [false, true]) {
       assert.equal(rows(fenced).reduce((sum, row) => sum + row.allocated, 0), 1,
         'without the exception the single raw pool slot remains the limit');
       const out = rows(allocateKeptAndRoutedCaps(input));
-      assert.deepEqual(Object.fromEntries(out.map(row => [row.agentId, row.allocated])), { a: 1, b: 1 },
-        'fund A from its held exception so B can still use the ordinary pool slot');
-      assert.equal(out.reduce((sum, row) => sum + row.allocated, 0), 2);
+      for (const row of out) assert.ok(row.allocated <= 1, 'no reviewer can spend a removed held-lane credit');
+      assert.equal(out.reduce((sum, row) => sum + row.allocated, 0), 1,
+        'the raw one-slot budget is not expanded by overlapping role views');
     });
   }
 
   test(`unequal reviewer-local caps stay bound to their own agent (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const accounts = [
-      lane('held-a', { pool: 'shared', targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.04 }),
-      lane('held-b', { pool: 'shared', targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.01 }),
+      lane('held-a', { pool: 'shared', planAhead: 0.08, targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.04 }),
+      lane('held-b', { pool: 'shared', planAhead: 0.08, targetShare: 20, requiredRatePerHour: 0.01, measuredRatePerHour: 0.01 }),
     ];
     const raw = pools(accounts);
-    const aPace = order(accounts.map(a => ({ ...a, roleEligible: a.accountId === 'held-a' })));
-    const bPace = order(accounts.map(a => ({ ...a, roleEligible: a.accountId === 'held-b' })));
-    assert.deepEqual(raw[0].hardHeldAccountIds, ['held-a', 'held-b']);
-    assert.deepEqual(aPace.holdSuspendedAccountIds, ['held-a']);
-    assert.deepEqual(bPace.holdSuspendedAccountIds, ['held-b']);
-    // Both C* allowances are 20 * 0.2 = 4, but A's measured-rate correction is 1/4.
-    assert.deepEqual([raw[0].cap, aPace.pools[0].cap, bPace.pools[0].cap], [0, 1, 4]);
+    const aPace = order(accounts.filter(a => a.accountId === 'held-a'));
+    const bPace = order(accounts.filter(a => a.accountId === 'held-b'));
+    assert.deepEqual(raw[0].hardHeldAccountIds ?? [], []);
+    assert.deepEqual(aPace.holdSuspendedAccountIds, []);
+    assert.deepEqual(bPace.holdSuspendedAccountIds, []);
+    // Non-held positive control: C* is 4 per lane, with A corrected by 1/4.
+    assert.deepEqual([raw[0].cap, aPace.pools[0].cap, bPace.pools[0].cap], [5, 1, 4]);
     const out = allocateKeptAndRoutedCaps({ target: 4, blockingPriority,
       agents: [{ agentId: 'a', running: 0, queued: 4 }, { agentId: 'b', running: 0, queued: 0 }],
       reviewerAccountIdsByAgent: { a: ['held-a'], b: ['held-b'] },
@@ -227,13 +239,13 @@ for (const blockingPriority of [false, true]) {
     });
     const rows = [...out.kept, ...out.routed];
     assert.equal(rows.find(a => a.agentId === 'a').allocated, 1,
-      'A cannot borrow idle B\'s four-slot exception past its own local cap of one');
+      'A cannot borrow idle B\'s four-slot allowance past its own local cap of one');
     assert.equal(rows.reduce((sum, row) => sum + row.allocated, 0), 1);
   });
 }
 
 for (const blockingPriority of [false, true]) {
-  test(`reviewer exceptions share capacity and cannot bypass breakers (priority=${blockingPriority})`, async () => {
+  test(`obsolete reviewer exceptions cannot bypass hard holds or breakers (priority=${blockingPriority})`, async () => {
     const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
     const input = { target: 4, blockingPriority,
       agents: [{ agentId: 'a', running: 0, queued: 2 }, { agentId: 'b', running: 0, queued: 2 }],
@@ -243,15 +255,15 @@ for (const blockingPriority of [false, true]) {
       accounts: [{ accountId: 'ahead', pool: 'shared' }], perAccount: [{ accountId: 'ahead', slots: 4 }],
       pacePools: [{ pool: 'shared', cap: 0, hardHeldAccountIds: ['ahead'] }] };
     const total = result => result.kept.reduce((n, row) => n + row.allocated, 0);
-    assert.equal(total(allocateKeptAndRoutedCaps(input)), 1);
+    assert.equal(total(allocateKeptAndRoutedCaps(input)), 0);
     assert.equal(total(allocateKeptAndRoutedCaps({ ...input, unavailableAccountIds: ['ahead'] })), 0);
   });
 }
 
-// Fixed spill uses unheld mates, never an exempt reviewer's restored slot.
+// Fixed spill uses unheld mates; a held reviewer has no restored slot.
 for (const blockingPriority of [false, true]) {
   for (const orderName of ['held-middle', 'held-last']) {
-    test(`fixed spill onto unheld mate preserves exempt reviewer slot (${orderName}, priority=${blockingPriority})`, async () => {
+    test(`fixed spill uses only unheld capacity with no reviewer rescue (${orderName}, priority=${blockingPriority})`, async () => {
       const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
       const order = orderName === 'held-middle' ? ['u1', 'held', 'u2'] : ['u1', 'u2', 'held'];
       const slotsById = { u1: 1, held: 1, u2: 1 };
@@ -267,8 +279,8 @@ for (const blockingPriority of [false, true]) {
       const rows = [...out.kept, ...out.routed];
       const row = id => rows.find(a => a.agentId === id);
       assert.equal(row('fixed').allocated, 2);
-      assert.equal(row('reviewer').allocated, 1);
-      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 3);
+      assert.equal(row('reviewer').allocated, 0);
+      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 2);
     });
   }
 }
@@ -291,8 +303,8 @@ for (const blockingPriority of [false, true]) {
       const rows = [...out.kept, ...out.routed];
       const row = id => rows.find(a => a.agentId === id);
       assert.equal(row('fixed').allocated, 2);
-      assert.equal(row('reviewer').allocated, 1);
-      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 3);
+      assert.equal(row('reviewer').allocated, 0);
+      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 2);
     });
   }
 }

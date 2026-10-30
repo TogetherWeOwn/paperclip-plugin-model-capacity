@@ -37,6 +37,9 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
 });
 
 function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, coolingMeta = false, metaOnly = false, agentModels = {} } = {}) {
+  // Quality/outcome/manual/fallback gates retain their own safety semantics;
+  // their positive fixtures must not borrow the removed weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const metaLane = lane('meta-1', 'meta', 'm1', 0.05, 0.05);
   if (coolingMeta) metaLane.credentialAvailability = syntheticAvailability(metaLane, TICK, { serving: 1, ready: 0 });
   const claudeLane = spentClaude
@@ -423,7 +426,8 @@ test('the published family outcomes and the gate attribute a run to the same fam
 });
 
 test('active fallback selects its finalized account without changing global exclusions or serialized ladders', async () => {
-  const common = { enforce: true, roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
+  const common = { enforce: true, pacing: { holdAheadPts: 0.10 },
+    roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
   const off = drive({ config: common });
   const on = drive({ config: { ...common, roles: { ...common.roles, accountFallback: { enabled: true, minQuality: -3 } } } });
   await off.setup(); await on.setup();
@@ -439,13 +443,14 @@ test('active fallback selects its finalized account without changing global excl
   assert.deepEqual({ kind: onPick.kind, model: onPick.model, effort: onPick.effort },
     { kind: 'decide', model: 'muse-spark-1.3-contributor', effort: 'xhigh' });
   assert.deepEqual({ kind: offPick.kind, model: offPick.model, effort: offPick.effort },
-    { kind: 'decide', model: 'claude-sonnet-5-5', effort: 'xhigh' });
+    { kind: 'defer', model: undefined, effort: undefined });
   await on.tick(); await off.tick();
   const selected = on.ledger().find(row => row.runId === 'f2-run');
   const control = off.ledger().find(row => row.runId === 'f2-run');
   assert.deepEqual({ accountId: selected.decidedAccount, armId: selected.armId, rung: selected.rung, agentId: selected.agentId },
     { accountId: 'meta:m1', armId: 'muse-spark-1-3-xhigh', rung: 0, agentId: 'eng-doer' });
-  assert.deepEqual({ accountId: control.decidedAccount, rung: control.rung }, { accountId: 'claude:a1', rung: 2 });
+  assert.deepEqual({ accountId: control?.decidedAccount, rung: control?.rung },
+    { accountId: undefined, rung: undefined }, 'the control cannot rescue its sole weekly-held account');
   assert.equal(b.eligibility.accountFallback.admitted.filter(row => row.accountId === selected.decidedAccount
     && row.armId === selected.armId && row.role === 'doer').length, 1,
   'the selected doer arm belongs to a finalized admission, not a global exclusion rewrite');

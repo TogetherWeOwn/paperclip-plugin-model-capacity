@@ -28,6 +28,10 @@ function project(result) {
 // copied in. The replay script did not exist on the pinned revision.
 test('N-T19 Gate S: off, false and malformed configurations preserve full published state', async () => {
   const golden = JSON.parse(await readFile(new URL('./fixtures/newest-config-off-weekly-golden.json', import.meta.url), 'utf8'));
+  // The archived capture remains immutable. Only the two expressly removed
+  // rescue outputs differ under the conservative contract; every other field stays pinned.
+  golden.capacity.paceGuard.roleSafety = [];
+  golden.capacity.paceGuard.pools = structuredClone(golden.capacity.paceGuard.rawPools);
   const baseline = await replayTick({ ...inputs, config: baseConfig });
   const again = await replayTick({ ...inputs, config: baseConfig });
   assert.notEqual(baseline.capacity.reviewAdmissionEpoch, again.capacity.reviewAdmissionEpoch);

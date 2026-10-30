@@ -355,7 +355,7 @@ test('order: the review reserve never holds a burn account', () => {
 
 test('plugin: an ahead lane in burn mode is never paced, paces to the 60-min horizon, and is reported', async () => {
   // 90% spent with 48h left: 18.6 points ahead of plan -> normally cap 1.
-  const plain = drive({ config: { enforce: true, reviewReserve: { enabled: false } }, accounts: [lane(0.9, 48)] });
+  const plain = drive({ config: { enforce: true, pacing: { holdAheadPts: null }, reviewReserve: { enabled: false } }, accounts: [lane(0.9, 48)] });
   await plain.setup();
   await plain.tick();
   assert.equal((await plain.hook('run-1')).kind, 'decide');

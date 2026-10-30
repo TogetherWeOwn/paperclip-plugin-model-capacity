@@ -347,7 +347,7 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
     payload: { run: { agentId: 'reviewer-1', provider, model } }, occurredAt: new Date(TICK).toISOString() });
   // Claude 90% spent with 48h left: far ahead of plan, so its pace cap is 1.
   const held = drive({
-    config: { ...BASE, reviewerRouting: { arms: [ARMS[0]] } },
+    config: { ...BASE, pacing: { holdAheadPts: null }, reviewerRouting: { arms: [ARMS[0]] } },
     accounts: [claudeLane(0.9, 48)],
   });
   await held.setup();
@@ -368,7 +368,7 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   // Claude, filling its pace cap of 1, and the next review skips the held
   // Claude lane for Meta (without the pace guard it would stay on Claude).
   const mixed = drive({
-    config: { ...BASE, reviewerRouting: { arms: ARMS } },
+    config: { ...BASE, pacing: { holdAheadPts: null }, reviewerRouting: { arms: ARMS } },
     accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.9, 72)],
   });
   await mixed.setup();
@@ -385,7 +385,7 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   // instead of deferring on the pace retry scale. The unfiltered recheck
   // pins this: without it the held lane alone would trigger a defer, yet
   // releasing the hold could never make an unservable arm servable.
-  const unservableCfg = { ...BASE, reviewerRouting: { arms: [ARMS[0]] } };
+  const unservableCfg = { ...BASE, pacing: { holdAheadPts: null }, reviewerRouting: { arms: [ARMS[0]] } };
   const unservable = drive({
     config: unservableCfg,
     accounts: [claudeLane(0.9, 48), metaLane('meta-lane-3', 0.1, 24)],
@@ -410,7 +410,7 @@ test('hook: reviewer routing obeys the pace guard (skip held lanes, defer when o
   assert.equal(ulast.deferred ?? false, false);
 });
 
-test('role-empty reviewer routes and receives its soft-capped slot without reopening another pinned role', async () => {
+test('a sole held reviewer and another pinned role both receive zero new slots', async () => {
   const d = drive({
     config: { ...BASE, roles: { keepAgentIds: ['reviewer-1', 'other-pin'] },
       reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[0]] } },
@@ -421,17 +421,17 @@ test('role-empty reviewer routes and receives its soft-capped slot without reope
   await d.tick();
   const capacity = (await d.api('capacity')).body;
   assert.deepEqual(capacity.paceGuard.rawPools[0].hardHeldAccountIds, ['claude:a1']);
-  assert.ok(capacity.paceGuard.roleSafety.some(r => r.accountIds.includes('claude:a1')));
+  assert.deepEqual(capacity.paceGuard.roleSafety, []);
   const route = await d.hook('reviewer-run');
-  assert.equal(route.kind, 'decide');
-  assert.match(route.reason, /claude:a1/);
+  assert.equal(route.kind, 'defer');
+  assert.equal(route.model, undefined);
   // Supply calibrated sizing; admission and pace verdicts come from the real tick.
   d.updateCapacity(cap => {
     cap.target = 2; cap.calibration = 'measured'; cap.perAccount[0].slots = 2;
     cap.keptByAgent['other-pin'] = { accountId: 'claude:a1' };
   });
   const caps = (await d.api('caps')).body;
-  assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 1, JSON.stringify(caps));
+  assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 0, JSON.stringify(caps));
   assert.equal(caps.agents.find(a => a.agentId === 'other-pin')?.allocated, 0, JSON.stringify(caps));
 });
 
@@ -464,14 +464,14 @@ for (const blockingPriority of [false, true]) {
     const bPace = capacity.reviewerPaceByAgent['reviewer-b'];
     assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-a'], ['claude:a1']);
     assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-b'], ['claude:a2']);
-    assert.deepEqual(aPace.holdSuspendedAccountIds, ['claude:a1']);
+    assert.deepEqual(aPace.holdSuspendedAccountIds, []);
     assert.deepEqual(bPace.holdSuspendedAccountIds, []);
     // Y's measured 0.01/h corrects its 20/3 C* slots to 25/9 (cap 3).
-    // Restoring X adds 7/15 slots, so only A has a local pool cap of 4.
+    // X stays held: A has no new work and cannot restore capacity for B.
     assert.deepEqual(capacity.paceGuard.rawPools.find(p => p.pool === 'claude')?.hardHeldAccountIds, ['claude:a1']);
     assert.deepEqual({ raw: capacity.paceGuard.rawPools.find(p => p.pool === 'claude')?.cap,
       a: aPace.pools.find(p => p.pool === 'claude')?.cap, b: bPace.pools.find(p => p.pool === 'claude')?.cap },
-    { raw: 3, a: 4, b: 3 });
+    { raw: 3, a: 0, b: 3 });
     assert.ok(capacity.perAccount.find(a => a.accountId === 'claude:a2').slots > 3);
     d.updateCapacity(cap => { cap.target = 10; cap.calibration = 'measured'; });
     const caps = (await d.api('caps')).body;
@@ -549,7 +549,7 @@ async function policyReviewerSafetyFixture({ accounts = [metaLane('review', 0.85
 }
 
 for (const ordinaryAlternative of [false, true]) {
-  test(`policy reviewer safety: admitted policy-only lane keeps its local soft-cap slot (ordinaryAlternative=${ordinaryAlternative})`, async t => {
+  test(`policy reviewer hard hold: a sole held policy lane receives no restored slot (ordinaryAlternative=${ordinaryAlternative})`, async t => {
     const d = await policyReviewerSafetyFixture({ accounts: [metaLane('review', 0.85, 120),
       ...(ordinaryAlternative ? [claudeLane(0.1, 120)] : [])] });
     const capacity = (await d.api('capacity')).body;
@@ -583,9 +583,9 @@ for (const ordinaryAlternative of [false, true]) {
       fixedGrant: caps.agents.find(a => a.agentId === 'other-pin')?.allocated,
       hooks: decisions.map(d => d.kind), admittedAccounts };
     t.diagnostic(JSON.stringify(actual));
-    assert.deepEqual(actual, { suspended: ['meta:review'], cap: 1, reviewerGrant: 1, fixedGrant: 0,
-      hooks: ['decide', 'defer'], admittedAccounts: ['meta:review'] },
-    'an actually admitted policy-only reviewer has role-empty safety, not an unrestricted grant or a global hold release');
+    assert.deepEqual(actual, { suspended: [], cap: 0, reviewerGrant: 0, fixedGrant: 0,
+      hooks: ['defer', 'defer'], admittedAccounts: [] },
+    'policy-only admission is not permission to rescue a weekly-held role');
   });
 }
 
@@ -620,7 +620,7 @@ for (const refusal of ['unready', 'manual-exclusion']) {
 }
 
 for (const includeDeniedAlternative of [false, true]) {
-  test(`policy reviewer safety: a denied trial alternative cannot remove local safety (configured=${includeDeniedAlternative})`, async t => {
+  test(`policy reviewer hard hold: a denied trial alternative cannot rescue held capacity (configured=${includeDeniedAlternative})`, async t => {
     const admissions = [];
     const trialModel = 'devin/swe-2';
     const d = drive({
@@ -671,8 +671,8 @@ for (const includeDeniedAlternative of [false, true]) {
       fixedGrant: caps.agents.find(agent => agent.agentId === 'other-pin')?.allocated,
       hooks: decisions.map(decision => decision.kind), selected };
     t.diagnostic(JSON.stringify(actual));
-    assert.deepEqual(actual, { suspended: ['meta:review'], cap: 1, reviewerGrant: 1, fixedGrant: 0,
-      hooks: ['decide', 'defer'], selected: [{ model: WONDER, effort: 'max', accountId: 'meta:review' }] },
+    assert.deepEqual(actual, { suspended: [], cap: 0, reviewerGrant: 0, fixedGrant: 0,
+      hooks: ['defer', 'defer'], selected: [] },
     'a non-admitted unscored policy record is not a usable alternative to the sole admitted reviewer');
   });
 }

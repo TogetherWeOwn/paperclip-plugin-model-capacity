@@ -33,7 +33,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
   const agentCalls = [];
   const errors = [];
   const fake = {
-    config: { get: async () => ({ cliproxy: { laneKeySecretRef: SECRET } }) },
+    config: { get: async () => ({ pacing: { holdAheadPts: null }, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
       get: async k => store.get(skey(k)) ?? null,
       set: async (k, v) => { store.set(skey(k), v); },
@@ -81,7 +81,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup(fake);
   store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
-  await plugin.onConfigChanged({}, { companyId: 'acme' });
+  await plugin.onConfigChanged({ pacing: { holdAheadPts: null } }, { companyId: 'acme' });
   await handlers.get('agent.run.started')({
     type: 'agent.run.started', companyId: 'acme', entityId: 'run-1',
     payload: { run: { agentId: 'agent-9', issueId: 'iss-1' } },

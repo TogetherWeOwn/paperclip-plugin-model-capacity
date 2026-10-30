@@ -193,6 +193,7 @@ function windowFixture() {
 
 test('F-T26: preview threads both exclusion subtraction and out-of-window seating', async () => {
   const input = windowFixture();
+  input.config.pacing = { holdAheadPts: null }; // seating-only control, not weekly rescue
   const on = await runTick(input);
   input.config.roles.accountFallback.enabled = false;
   const off = await runTick(input);
@@ -257,15 +258,12 @@ test('F-T8 default hard hold: per-run trial denial cannot reopen the held strong
       assert.equal(candidate.trial, true);
       const suspendedForDoer = result.capacity.paceGuard.roleSafety.some(row => row.role === 'doer'
         && row.accountIds.includes('fixture:strong'));
-      assert.equal(suspendedForDoer, scenario === 'role-blocked', 'only structural role emptiness suspends the hold');
+      assert.equal(suspendedForDoer, false, 'even true role emptiness never suspends the weekly hold');
       const decision = result.ledger.find(row => row.runId === 'trial-candidate');
       if (scenario === 'allowed') {
         assert.equal(decision.decidedAccount, 'fixture:weak');
         assert.equal(decision.armId, 'a-best');
         assert.equal(decision.trial, true);
-      } else if (scenario === 'role-blocked') {
-        assert.equal(decision.decidedAccount, 'fixture:strong');
-        assert.equal(decision.armId, 'fixture-model-8');
       } else {
         assert.equal(decision.decidedAccount, undefined, 'neither the denied weak trial nor the held strong lane may run');
         assert.equal(decision.armId, undefined);

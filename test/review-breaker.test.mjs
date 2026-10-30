@@ -56,7 +56,7 @@ function rig({ failBreakerReads = false } = {}) {
   let failBreaker = failBreakerReads;
   let plugin = null;
   const io = {
-    config: { get: async () => ({ enforce: true, cliproxy: { laneKeySecretRef: SECRET } }) },
+    config: { get: async () => ({ enforce: true, pacing: { holdAheadPts: null }, cliproxy: { laneKeySecretRef: SECRET } }) },
     state: {
       get: async k => {
         if (failBreaker && skey(k).includes('"breaker-v1"')) throw new Error('boom: breaker read');
@@ -80,7 +80,7 @@ function rig({ failBreakerReads = false } = {}) {
       plugin = createModelCapacityPlugin({ clock: () => T, requirePinnedLaneHost: false });
       await plugin.setup(io);
       store.set(skey(AA_SKEY), { fetchedAt: new Date(T).toISOString(), rows: aaRows(), duplicateSlugs: [] });
-      await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
+      await plugin.onConfigChanged({ enforce: true, pacing: { holdAheadPts: null } }, { companyId: 'acme' });
     },
     tick: () => jobs.get('quota-refresh')({}),
     hook: (runId) => plugin.onResolveRunModel({

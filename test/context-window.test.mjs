@@ -40,6 +40,8 @@ const runEvent = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
 });
 
 function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = [] }) {
+  // Context decoration is independent of weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

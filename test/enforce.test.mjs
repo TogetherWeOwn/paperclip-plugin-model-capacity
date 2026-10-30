@@ -52,6 +52,8 @@ const strictGet = (table, fail) => async (id, companyId) => {
 };
 
 function drive({ nowMs, config = {}, laneUsed = 0.3, fiveHourUsed = 0.1, issueGets = {}, agentGets = {}, issueLists = {}, issuesListError = null, failIssueGet = null, failAgentGet = null }) {
+  // Keep resolver IO/readiness behavior testable without a weekly liveness exception.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

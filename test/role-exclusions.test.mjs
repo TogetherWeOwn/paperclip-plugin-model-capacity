@@ -89,6 +89,8 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
 });
 
 function drive({ config = {} }) {
+  // Preserve the original role-exclusion behavior without weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

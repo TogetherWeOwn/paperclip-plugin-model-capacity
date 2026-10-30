@@ -578,6 +578,7 @@ test('reviewer pace-hold defers then answers from the final attempt (reviewer pa
   // 99% spent has a pace cap of 1, so the first review routes (filling the
   // cap through the ledger) and the rest of the chain waits.
   const config = baseConfig({
+    pacing: { holdAheadPts: null, guard: { enabled: true } }, // ordinary pace-hold parity
     reviewerRouting: { agentIds: ['agent-R'], arms: [{ provider: 'claude', model: HAIKU }] },
   });
   const d = drive({ accounts: [claudeReviewerPaced(), nimTrial({ health: 'degraded' })], config });
@@ -610,6 +611,7 @@ test('reviewer pace-hold defers then answers from the final attempt (reviewer pa
 test('reviewer pace-hold with flag off defers through attempt 12 (no exhaustion answer)', async () => {
   const config = baseConfig({
     exhaustion: { enabled: false },
+    pacing: { holdAheadPts: null, guard: { enabled: true } }, // ordinary pace-hold parity
     reviewerRouting: { agentIds: ['agent-R'], arms: [{ provider: 'claude', model: HAIKU }] },
   });
   const d = drive({ accounts: [claudeReviewerPaced(), nimTrial({ health: 'degraded' })], config });

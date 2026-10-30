@@ -100,7 +100,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
 // mark lives until the next defer arrives, so the pool reads empty and the
 // guard admits a run over the cap.
 test('hook: a deferred run abandoned past the retry budget counts as in-flight again', async () => {
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9)] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9)] });
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
@@ -188,7 +188,7 @@ test('hook: an unattributed waiting run fails open and is exposed in /capacity',
 // deciding role, so the loop skips everything it can see.
 test('hook: a paced pool plus unselectable unpaced accounts defers on the guard retry', async () => {
   const d = drive({
-    config: { enforce: true, roles: { excludeFamilies: { doer: ['gemini'] } } },
+    config: { enforce: true, pacing: { holdAheadPts: null }, roles: { excludeFamilies: { doer: ['gemini'] } } },
     accounts: [claudeLane(0.9), geminiLane()],
   });
   await d.setup();

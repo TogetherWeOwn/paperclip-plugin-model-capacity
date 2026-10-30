@@ -99,7 +99,7 @@ const AHEAD = () => [claudeLane(0.9, 48)];
 const BEHIND = () => [claudeLane(0.5, 48)];
 
 test('hook: an ahead pool serves one run, then defers the next with the guard\'s retry interval', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.killIo();
@@ -126,7 +126,7 @@ test('hook: a pool that is behind plan is never held', async () => {
 });
 
 test('hook: the cap releases when the run finishes and the next tick republishes the pool', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
@@ -140,7 +140,7 @@ test('hook: the cap releases when the run finishes and the next tick republishes
 
 test('hook: the guard releases when time catches the plan up', async () => {
   // 90% spent with 48h left is ahead; with 5h left the linear plan is at 97%.
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
@@ -160,11 +160,11 @@ test('hook: enabled=false restores the old behaviour (no cap)', async () => {
 
 test('hook: a custom margin and retry interval are honoured', async () => {
   // A 25-point margin: 18.6 points ahead is within it, so no cap.
-  const wide = drive({ config: { enforce: true, pacing: { guard: { marginPct: 0.25 } } }, accounts: AHEAD() });
+  const wide = drive({ config: { enforce: true, pacing: { holdAheadPts: null, guard: { marginPct: 0.25 } } }, accounts: AHEAD() });
   await wide.setup();
   await wide.tick();
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await wide.hook(id)).kind, 'decide', id);
-  const slow = drive({ config: { enforce: true, pacing: { guard: { retryAfterMs: 120000 } } }, accounts: AHEAD() });
+  const slow = drive({ config: { enforce: true, pacing: { holdAheadPts: null, guard: { retryAfterMs: 120000 } } }, accounts: AHEAD() });
   await slow.setup();
   await slow.tick();
   await slow.hook('run-1');
@@ -192,7 +192,7 @@ test('hook: a run the event-time path already decided does not hold the pool aga
   // The host fires agent.run.started at claim, the event-time path decides
   // the run, a tick publishes the view with that decision counted in the
   // pool, and only then does the hook resolve the same run.
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 30000);
@@ -205,7 +205,7 @@ test('hook: a run the event-time path already decided does not hold the pool aga
 
 test('event-time shadow path holds the pool at its cap: the third concurrent run records no decision', async () => {
   // A 0.9h mean run turns the share into 1.67 slots: cap 2.
-  const d = drive({ config: { concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD() });
+  const d = drive({ config: { concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 }, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 60000);
@@ -219,7 +219,7 @@ test('event-time shadow path holds the pool at its cap: the third concurrent run
 });
 
 test('shadow tick agrees with the hook: it holds the second run and decides it once a slot frees', async () => {
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 60000);
@@ -239,7 +239,7 @@ test('shadow tick does not count the run being decided against its own pool', as
   // run-a started before any tick, so only its model ties it to the pool.
   // The census counts it there; the pool is at its cap of 1 only because of
   // run-a itself, so the guard must not hold it.
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   d.setNow(TICK + 60000);
   await d.fire({
@@ -254,7 +254,7 @@ test('shadow tick does not count the run being decided against its own pool', as
 });
 
 test('shadow tick holds both of two running runs on a one-slot pool: the pool really is full', async () => {
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   d.setNow(TICK + 60000);
   for (const [i, id] of ['run-a', 'run-b'].entries()) {
@@ -277,7 +277,7 @@ test('plugin loop: six contended hours hold the ahead pool at its cap and refill
   const RETRY_MIN = 5;
   const RUN_MIN = 54;
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 }, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   const running = new Map(); // runId -> finish minute
@@ -333,7 +333,7 @@ test('runs the hook deferred do not hold the pool: it refills once the real runs
   // two waiting runs would hold an idle one-slot pool at its cap until the
   // host gave up on them.
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   let at = TICK + 30000;
@@ -378,7 +378,7 @@ test('a lane without ready credentials is outside the pool: its position does no
 
 test('a deferred run that later runs anyway (the hook keeps it) counts as executing again', async () => {
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   let at = TICK + 30000;
@@ -436,7 +436,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
   // it is breaker-open, so it cannot serve and is not part of the pool. The
   // hook already built the pool from breaker-filtered rungs; the tick must too.
   const mk = () => [claudeLane(0.9, 48), { ...claudeLane(0.2, 48), accountKey: 'a2', lane: 'claude-2' }];
-  const probe = drive({ config: { enforce: true }, accounts: mk() });
+  const probe = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: mk() });
   await probe.setup();
   await probe.tick();
   const ladders = (await probe.api('ladder')).body.ladders;
@@ -448,7 +448,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
     recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 120000, errorText: 'auth_unavailable' }, TICK - 120000, cfg);
     recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 60000, errorText: 'auth_unavailable' }, TICK - 60000, cfg);
   }
-  const d = drive({ config: { enforce: true }, accounts: mk() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: mk() });
   await d.setup();
   d.seed({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' }, breakerStoreToJSON(seed, { nowMs: TICK, cfg }));
   await d.tick();
@@ -463,7 +463,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
 });
 
 test('/capacity reports the guard state per pool', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   await d.hook('run-1');
@@ -508,7 +508,7 @@ test('a window that has just reset (reset one week out, clock skew of minutes) i
   await d.setup();
   await d.tick();
   const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
-  assert.equal(pool.state, 'ahead', '30% used at hour 0 is ahead of plan');
+  assert.equal(pool.state, 'hard-held', '30% used at hour 0 is measured and exceeds the hard-hold band');
   assert.ok(Math.abs(pool.planAhead - 0.3) < 1e-9);
 });
 
@@ -564,15 +564,15 @@ test('weekly hard hold: hook and capacity keep a deeply ahead idle lane at zero 
   assert.notEqual(cap.paceGuard.pools.find(p => p.pool === 'claude').cap, 0);
 });
 
-test('weekly hard hold: role-empty suspension is reported and keeps ordinary pacing', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+test('weekly hard hold: a sole held role defers without a suspension diagnostic', async () => {
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: 0.10 } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   const cap = (await d.api('capacity')).body;
-  assert.ok(cap.paceGuard.roleSafety.some(w => w.role === 'doer' && w.accountIds.includes('claude:a1')));
+  assert.deepEqual(cap.paceGuard.roleSafety, []);
   assert.equal(cap.paceGuard.rawPools.find(p => p.pool === 'claude').cap, 0);
   assert.deepEqual(cap.paceGuard.rawPools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
-  assert.equal((await d.hook('safety-first')).kind, 'decide');
+  assert.equal((await d.hook('safety-first')).kind, 'defer');
   assert.equal((await d.hook('safety-second')).kind, 'defer');
 });
 
