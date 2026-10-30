@@ -212,3 +212,15 @@ test('fleet-wide staged installs still retain batch session gates during rollbac
   api.sessions.set(agentId,[{taskKey:'issue:10000000-0000-4000-8000-000000000009'}]);api.writes=[];
   await assert.rejects(rollbackPoolSaga({api,journalPath}),/session/);assert.deepEqual(api.writes,[]);
 });
+
+test('binding verification failure reports applied operations, pending binding and recovery without secrets',async t=>{
+  const api=new NativeApi(),journalPath=await scratch(t),rev='10000000-0000-4000-8000-000000000003';
+  api.bindAgent=async()=>{const e=new Error('PRIVATE_API_ERROR');e.bindingRecovery={agentId,baseRevisionId:rev,baseUpdatedAt:'2026-10-30T12:00:00Z'};throw e;};
+  await assert.rejects(applyPoolSaga({...options(api),journalPath}),e=>{
+    assert.ok(e.applied.some(x=>x.kind==='pool-save'&&x.enabled===true&&x.after.enabled===true));
+    assert.ok(e.pendingIntents.some(x=>x.kind==='binding'));
+    assert.deepEqual(e.bindingRecovery,{agentId,baseRevisionId:rev,baseUpdatedAt:'2026-10-30T12:00:00Z'});
+    return true;
+  });
+  const text=await readFile(journalPath,'utf8');assert.match(text,/binding-failed/);assert.doesNotMatch(text,/PRIVATE_API_ERROR/);
+});

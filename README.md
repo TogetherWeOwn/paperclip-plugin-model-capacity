@@ -311,6 +311,24 @@ fresh target are explicitly marked: they are only valid-schema plan placeholders
 not claims that connections or grants already exist. Apply always discovers the
 real host-generated IDs; member UUIDv5 identities stay stable.
 
+On pinned native 2026.1023.0 the agent configuration endpoint has no revision
+CAS and redacts runtime values. Binding checks permission there but uses the
+unrestricted agent detail as its whole-object base, refusing restricted or
+redacted details. It records the newest config revision and updatedAt before
+reading the base and verifies one new revision and the full result after PATCH.
+**This detects but cannot prevent concurrent writes lost between read and
+PATCH.** Use only during a controlled single-writer cutover. The upstream
+revision-bearing endpoint still uses CAS. CLI `--help` states this limitation.
+
+On failure the CLI reports completed operations, unresolved intents and a
+`rollbackArgv` array for the journal rollback command. A binding verification
+failure also records the base revision and timestamp in the journal and reports
+the native revision rollback route when available. Inspect live state first:
+revision rollback restores the whole agent configuration and may overwrite other
+changes; journal rollback rebinds only when its conflict checks allow it. A lost
+PATCH response may leave the write applied; pending does not mean absent. If no
+base revision exists, use the journal's rebind recovery, subject to its checks.
+
 Inputs are operator files, never plugin startup configuration:
 
 - `--registry registry.json`: the validated `router` block, including `companyId`

@@ -16,7 +16,11 @@ export async function newJournal(path,{companyId,ownerUserId,target=null,batchAg
   await append(handle,header);
   return {header,entries,async record(entry){await append(handle,entry);entries.push(entry);},async step(api,operation){
     const op={type:'intent',seq:entries.filter(e=>e.type==='intent').length+1,...operation};
-    await this.record(op);const result=await perform(api,op);
+    await this.record(op);let result;
+    try {result=await perform(api,op);} catch(error) {
+      if(op.kind==='binding' && error.bindingRecovery)await this.record({type:'binding-failed',seq:op.seq,...error.bindingRecovery});
+      throw error;
+    }
     const receipt={type:'done',seq:op.seq,...result};await this.record(receipt);return receipt;
   },async close(){await handle.close();}};
 }
@@ -61,7 +65,8 @@ function validate(lines) {
       if(intents.get(e.seq).kind.startsWith('pool-') && (!Number.isSafeInteger(e.revision)||e.revision<1)) throw new Error('invalid journal revision');
       if(e.secretRefs!==undefined && (!Array.isArray(e.secretRefs)||e.secretRefs.some(x=>!uuid(x))))throw new Error('invalid journal secret refs');
       done.set(e.seq,e);
-    } else if(!['complete','mapping','failed','undo-intent','undone','rolled-back','secret-refs'].includes(e.type)) throw new Error('invalid journal entry');
+    } else if(!['complete','mapping','failed','undo-intent','undone','rolled-back','secret-refs','binding-failed'].includes(e.type)) throw new Error('invalid journal entry');
+    if(e.type==='binding-failed' && (intents.get(e.seq)?.kind!=='binding' || e.agentId!==intents.get(e.seq).id || (e.baseRevisionId!==null&&!uuid(e.baseRevisionId)) || typeof e.baseUpdatedAt!=='string'))throw new Error('invalid binding recovery');
     if(e.type==='secret-refs' && (!Array.isArray(e.ids)||e.ids.some(x=>!uuid(x))))throw new Error('invalid journal secret refs');
     if(['undo-intent','undone'].includes(e.type) && !intents.has(e.seq)) throw new Error('invalid journal undo');
   }

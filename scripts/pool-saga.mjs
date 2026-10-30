@@ -178,10 +178,12 @@ export async function applyPoolSaga(options) {
     await journal.record({type:'mapping',accounts:mapping,pools:(await api.listPools(state.registry.companyId)).filter(p=>state.registry.pools.some(q=>q.poolKey===p.name)).map(p=>({poolKey:p.name,id:p.id,revision:p.revision}))});
     await journal.record({type:'complete'});
     return {...plan,mapping,selectableVerdicts,journalPath,enabled:activate};
-  } catch {
+  } catch (cause) {
     await journal.record({type:'failed'}).catch(()=>{});
     const error=new Error('pool saga failed; inspect journal and recover pending intents with --rollback');
     error.journalPath=journalPath;error.orphans=created;error.pendingIntents=journal.entries.filter(e=>e.type==='intent'&&!journal.entries.some(d=>d.type==='done'&&d.seq===e.seq)).map(({seq,kind})=>({seq,kind}));
+    error.applied=journal.entries.filter(e=>e.type==='done').map(receipt=>{const op=journal.entries.find(e=>e.type==='intent'&&e.seq===receipt.seq);return {seq:op.seq,kind:op.kind,id:receipt.id,...(op.after!==undefined?{after:op.after}:{}),...(op.accountKey!==undefined?{accountKey:op.accountKey}:{}),...(op.taskKey!==undefined?{taskKey:op.taskKey}:{}),...(op.kind==='pool-save'?{enabled:op.after.enabled}:{}),...(receipt.revision?{revision:receipt.revision}:{})};});
+    if(cause.bindingRecovery)error.bindingRecovery=cause.bindingRecovery;
     throw error;
   } finally {await journal.close();}
 }

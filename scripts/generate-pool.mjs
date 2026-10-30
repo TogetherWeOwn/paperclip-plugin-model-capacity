@@ -23,6 +23,7 @@ const usage=`Usage: node scripts/generate-pool.mjs [--dry-run | --apply | --chec
   --all-agents                         requires allAgentsApproved:true in the batch
 Board auth: PAPERCLIP_BOARD_TOKEN environment variable. Never put keys in argv or JSON.
 Exit codes: 0 plan/success, 2 drift, 1 refusal/failure. Dry-run never writes files or APIs.
+Pinned 2026.1023.0 binding has no CAS: use a controlled single writer; verification detects but cannot prevent lost updates.
 Routing models are immutable upstream: update via disabled-pool replacement, never config PATCH.
 `;
 function argsFor(argv) {
@@ -45,8 +46,9 @@ async function jsonFile(path) {
   return JSON.parse(await readFile(path,'utf8'));
 }
 export async function runGenerator(argv,{env=process.env,stdout=process.stdout,stderr=process.stderr,fetchImpl=globalThis.fetch}={}) {
+  let args;
   try {
-    const args=argsFor(argv);if(args.help){stdout.write(usage);return 0;}
+    args=argsFor(argv);if(args.help){stdout.write(usage);return 0;}
     if(!args.target)throw new Error('target required');
     if(args.mode==='--apply'&&!args.journal)throw new Error('apply journal required');
     const refs=args['secret-refs']?await jsonFile(args['secret-refs']):{};
@@ -79,12 +81,12 @@ export async function runGenerator(argv,{env=process.env,stdout=process.stdout,s
     if(args.mode==='--apply')result=await applyPoolSaga({...options,journalPath:args.journal});
     else if(args.mode==='--check')result=await checkPoolDrift({...options,expectedEnabled:!args['keep-disabled']});
     else result=await planPoolSaga(options);
-    stdout.write(JSON.stringify({...result,...(cache?{mappingCache:cache}:{})},null,2)+'\n');
+    stdout.write(JSON.stringify({...result,...(args.mode==='--apply'?{bindingSafety:'Pinned 2026.1023.0 has no binding CAS: verification detects but cannot prevent lost updates; use a controlled single writer.'}:{}),...(cache?{mappingCache:cache}:{})},null,2)+'\n');
     return args.mode==='--check'&&!result.ok?2:0;
   } catch(error) {
     // Do not echo JSON parse snippets, API error bodies, fetch URLs, auth env,
     // lane keys or arbitrary provider messages, even on partial saga failure.
-    stderr.write(JSON.stringify({error:'generator refused or failed; credentials and API responses suppressed',...(error.journalPath?{journalPath:error.journalPath,orphans:error.orphans??[],pendingIntents:error.pendingIntents??[]}:{})})+'\n');
+    stderr.write(JSON.stringify({error:'generator refused or failed; credentials and API responses suppressed',...(error.journalPath?{journalPath:error.journalPath,bindingSafety:'Pinned 2026.1023.0 has no binding CAS: verification detects but cannot prevent lost updates; use a controlled single writer.',orphans:error.orphans??[],pendingIntents:error.pendingIntents??[],applied:error.applied??[],rollbackArgv:['node','scripts/generate-pool.mjs','--target',args['target'],'--rollback',error.journalPath],...(error.bindingRecovery?{bindingRecovery:{...error.bindingRecovery,revisionRollbackRoute:error.bindingRecovery.baseRevisionId?`POST /api/agents/${error.bindingRecovery.agentId}/config-revisions/${error.bindingRecovery.baseRevisionId}/rollback`:null,note:'Inspect concurrent changes before rollback; revision rollback restores the whole agent configuration. Journal rollback rebinds if state permits.'}}:{})}:{})})+'\n');
     return 1;
   }
 }

@@ -56,7 +56,7 @@ async function fixture(t, owner=ownerUserId) {
   const target=`http://127.0.0.1:${server.address().port}`;
   const args=['--registry',join(dir,'registry.json'),'--batch',join(dir,'batch.json'),'--quality-evidence',join(dir,'quality.json'),'--target',target,'--gateway-base-url','https://gateway.example/v1'];
   const run=async(extra=[])=>exec(process.execPath,[script,...args,...extra],{env:{...process.env,PAPERCLIP_BOARD_TOKEN:'BOARD_DUMMY',LANE_ONE:'DUMMY_ONE',LANE_TWO:'DUMMY_TWO'},maxBuffer:4*1024*1024});
-  return {api,run,dir,requests,errors};
+  return {api,run,dir,requests,errors,target};
 }
 
 test('operator CLI defaults to dry-run: complete member JSON, selectable verdicts and session blockers, exit 0, zero writes',async t=>{
@@ -114,7 +114,7 @@ test('HTTP apply activates, resets only approved sessions, preserves unrelated a
   f.api.sessions.set(agentId,[{taskKey}]);
   await writeFile(join(f.dir,'batch.json'),JSON.stringify({pools:batch,sessionPlans:{[agentId]:'reset'}}));
   const {stdout}=await f.run(['--apply','--secret-refs',join(f.dir,'refs.json'),'--journal',join(f.dir,'active.jsonl')]);
-  assert.equal(JSON.parse(stdout).enabled,true);assert.ok(f.api.pools.every(p=>p.enabled));
+  assert.equal(JSON.parse(stdout).enabled,true);assert.match(JSON.parse(stdout).bindingSafety,/cannot prevent/);assert.ok(f.api.pools.every(p=>p.enabled));
   assert.equal(f.api.agents.get(agentId).runtimeConfig.unrelated,true);
   assert.equal(Object.hasOwn(await f.api.getAgent(agentId),'configurationRevision'),false);
   assert.ok(f.requests.some(r=>r.method==='GET'&&r.path.endsWith('/configuration')));
@@ -171,4 +171,15 @@ test('rollback rejects tampered or mismatched opaque owners before any writes',a
     await assert.rejects(f.run(['--rollback',journal]));
     assert.deepEqual(f.api.writes,[]);
   }
+});
+
+test('CLI reports applied pools and exact rollback argv after binding failure',async t=>{
+  const f=await fixture(t),journal=join(f.dir,'failed-binding.jsonl');
+  f.api.afterWrite=kind=>{if(kind==='bind')throw new Error('PRIVATE_API_ERROR');};
+  await assert.rejects(f.run(['--apply','--secret-refs',join(f.dir,'refs.json'),'--journal',journal]),e=>{
+    const report=JSON.parse(e.stderr);assert.ok(report.applied.some(x=>x.kind==='pool-save'&&x.enabled));
+    assert.ok(report.pendingIntents.some(x=>x.kind==='binding'));
+    assert.deepEqual(report.rollbackArgv,['node','scripts/generate-pool.mjs','--target',f.target,'--rollback',journal]);
+    assert.match(report.rollbackArgv[3],/^http:\/\/127\.0\.0\.1:\d+$/);assert.doesNotMatch(e.stderr,/PRIVATE_API_ERROR|BOARD_DUMMY/);return true;
+  });
 });

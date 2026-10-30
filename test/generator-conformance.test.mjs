@@ -100,14 +100,14 @@ test('all non-create HTTP bodies conform to their upstream schemas, including bi
 });
 
 
-test('binding fails closed on absent or malformed configuration revision before PATCH',async()=>{
+test('binding fails closed if no CAS revision and native revision history is invalid',async()=>{
   for(const revision of [undefined,null,'detail-only','a'.repeat(63),'A'.repeat(64)]) {
     let writes=0;
     const api=generator.createPaperclipApi({target:'https://paperclip.example',companyId,token:'BOARD_DUMMY',fetchImpl:async(url,init)=>{
       if(init.method!=='GET')writes++;
       return Response.json({companyId,configurationRevision:revision,runtimeConfig:{aiConnection:originalBinding}});
     }});
-    await assert.rejects(api.bindAgent(agentId,{mode:'router',connectionId:companyId},originalBinding),/configuration revision required/);
+    await assert.rejects(api.bindAgent(agentId,{mode:'router',connectionId:companyId},originalBinding),/invalid agent configuration revisions/);
     assert.equal(writes,0);
   }
 });

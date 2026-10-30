@@ -67,17 +67,40 @@ export function createPaperclipApi({target,companyId,token,secretRefs={},env=pro
     async resetSession(agentId,taskKey) {return request('POST',`/agents/${id(agentId)}/runtime-state/reset-session`,{taskKey});},
     async bindAgent(agentId,binding,expectedBinding) {
       if(!reversibleBinding(binding))throw new Error('no reversible native binding update for an absent binding');
-      // agents.ts:4162 exposes the HMAC revision only on /configuration.
-      // PATCH restoration (:5420) compares against that redacted display, so
-      // the runtimeConfig base MUST come from the same response as its revision.
-      const a=await request('GET',`/agents/${id(agentId)}/configuration`);
+      const path=`/agents/${id(agentId)}`;
+      const a=await request('GET',`${path}/configuration`);
       if(a.companyId!==companyId)throw new Error('agent company mismatch');
-      if(expectedBinding!==undefined && !equal(a.runtimeConfig?.aiConnection??null,expectedBinding))throw new Error('agent binding changed before write');
-      if(typeof a.configurationRevision!=='string' || !/^[a-f0-9]{64}$/.test(a.configurationRevision))throw new Error('agent configuration revision required');
-      const runtimeConfig={...a.runtimeConfig,aiConnection:binding};
-      await request('PATCH',`/agents/${id(agentId)}`,{runtimeConfig,expectedConfigurationRevision:a.configurationRevision});
-      const saved=await request('GET',`/agents/${id(agentId)}`);
-      if(!equal(saved.runtimeConfig?.aiConnection,binding))throw new Error('host did not retain requested binding');
+      if(typeof a.configurationRevision==='string' && /^[a-f0-9]{64}$/.test(a.configurationRevision)) {
+        if(expectedBinding!==undefined && !equal(a.runtimeConfig?.aiConnection??null,expectedBinding))throw new Error('agent binding changed before write');
+        const runtimeConfig={...a.runtimeConfig,aiConnection:binding};
+        await request('PATCH',path,{runtimeConfig,expectedConfigurationRevision:a.configurationRevision});
+        const saved=await request('GET',path);
+        if(!equal(saved.runtimeConfig?.aiConnection,binding))throw new Error('host did not retain requested binding');
+        return {ok:true};
+      }
+      // Pinned 2026.1023.0 has no CAS or runtimeConfig redaction restoration.
+      // This is detection, not prevention; only use with a controlled single writer.
+      const revisions=await request('GET',`${path}/config-revisions`);
+      if(!Array.isArray(revisions)||revisions.some(r=>!uuid(r?.id))||new Set(revisions.map(r=>r.id)).size!==revisions.length)throw new Error('invalid agent configuration revisions');
+      const first=await request('GET',path);
+      if(first.companyId!==companyId || typeof first.updatedAt!=='string' || !first.updatedAt)throw new Error('invalid agent detail baseline');
+      const base=await request('GET',path);
+      const raw=base.runtimeConfig;
+      const redacted=x=>typeof x==='string'?x.includes('***REDACTED***'):Array.isArray(x)?x.some(redacted):x && typeof x==='object' && Object.values(x).some(redacted);
+      if(base.companyId!==companyId || !raw || typeof raw!=='object' || Array.isArray(raw) || !Object.keys(raw).length || redacted(raw))throw new Error('agent detail restricted or redacted');
+      if(base.updatedAt!==first.updatedAt)throw new Error('agent changed before base read');
+      if(expectedBinding!==undefined && !equal(raw.aiConnection??null,expectedBinding))throw new Error('agent binding changed before write');
+      const runtimeConfig={...raw,aiConnection:binding};
+      const recovery={agentId,baseRevisionId:revisions[0]?.id??null,baseUpdatedAt:first.updatedAt};
+      try {
+        await request('PATCH',path,{runtimeConfig});
+        const saved=await request('GET',path);
+        const after=await request('GET',`${path}/config-revisions`);
+        if(!Array.isArray(after) || after.length!==revisions.length+1 || !uuid(after[0]?.id) || revisions.some((r,i)=>after[i+1]?.id!==r.id) || after[0].id===revisions[0]?.id)throw new Error('agent revision verification failed');
+        if(saved.companyId!==companyId || !equal(saved.runtimeConfig,runtimeConfig))throw new Error('agent runtimeConfig verification failed');
+      } catch(error) {
+        const failure=new Error(error.message);failure.bindingRecovery=recovery;throw failure;
+      }
       return {ok:true};
     },
     async wakeAgent(agentId,input) {return request('POST',`/agents/${id(agentId)}/wakeup`,input);},

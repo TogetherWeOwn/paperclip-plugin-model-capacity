@@ -2,6 +2,7 @@
 
 ## 0.3.0-clean / 0.3.0-transitional (unreleased; activation gates outstanding)
 ### Added
+- Support the pinned native no-revision binding shape using unrestricted detail and post-write revision/full-config checks, with journal recovery reporting. This is detect-and-report only, not CAS; controlled single-writer cutovers remain required.
 - Native expiring `burn` config with per-account/provider scope, runtime expiry, prefer/exclusive handling and visible standing expiry warnings; the transitional hook's legacy `burnMode` stays unchanged.
 - Durable job-side account/reset-window scorecards with capped incremental time, reset latching, window/24h rates, Keeper/observed-ledger cross-checks and honest null wait attribution. Company-scoped `GET /scorecard` shares its persisted view with `/capacity` and survives worker restart.
 - Native `ai.connections.route` manifest metadata and memory-only `onRouteAiConnection` callback, current operator-attestation tripwire, effective-effort quality/outcome checks, sanitized per-call diagnostics, and event-owned in-flight overlays rebased atomically with quota publication.
