@@ -40,6 +40,18 @@ test('a model qualifies when at least one of its effort variants can serve', () 
   assert.equal(v.b.thinker,true);
   assert.equal(v.a.reviewer,true);
 });
+test('a later effort variant can qualify when the first variant fails the floor', () => {
+  const variants=[{armId:'strong-low',model:'strong',family:'strong',qFleet:-2,qFleetThinker:-2},
+    ...arms.map(a=>a.model==='basic'?{...a,qFleet:0.8,qFleetThinker:0.8}:a)];
+  const reports=[];
+  const v=computePoolQualityVerdicts(registry,{...context,arms:variants,onReport:(pool,report)=>reports.push([pool,report])});
+  assert.equal(v.a.thinker,true);
+  assert.equal(v.b.reviewer,true);
+  assert.equal(v.b.thinker,true);
+  assert.equal(v.a.reviewer,true);
+  assert.ok(!reports.find(([pool])=>pool==='thinker')[1].roles.thinker.suspendedGates.includes('quality'));
+  assert.ok(!reports.find(([pool])=>pool==='reviewer')[1].roles.other.suspendedGates.includes('quality'));
+});
 test('minimum boundary is inclusive and untrusted arms are excluded when a trusted alternative serves', () => {
   const variants=arms.map(a=>a.model==='basic'?{...a,qFleetThinker:0.4,roleTrusted:{doer:false}}:a);
   const v=computePoolQualityVerdicts(registry,{...context,arms:variants});
