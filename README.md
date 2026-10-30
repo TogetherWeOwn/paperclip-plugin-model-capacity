@@ -181,26 +181,32 @@ failed/superseded ticks do not reset it.
 
 The integration pass merges already-reviewed mainline `dc86ae4` (PRs #74/#75),
 restoring the superseded-default defer guards and reviewer
-`suppressAccountFallback` inputs missing from the original port handoff. It
-introduced no new hook algorithm at that integration checkpoint. Its
-transitional resolver body matched BOTH mainline and the supplied read-only
-0.2.72 reference byte-for-byte, SHA256
+`suppressAccountFallback` inputs missing from the original port handoff. At that
+checkpoint the transitional resolver matched both mainline and the supplied
+read-only 0.2.72 reference: 20,712 bytes, SHA256
 `a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2`.
-Extraction is from the exact `async onResolveRunModel(params)` declaration
-through its closing property delimiter, with whitespace retained. The tarball
-regression still pins that independent reference hash (not a hash of our own
-source) and checks the entire packaged transitional source after only the
-build-time factory lock. The conservative weekly overlay subsequently added
-default, pinned-agent and stale-default emission guards inside this body; its
-current hash is `edd6abfca260ae46e31d5bbf291366f98cd9394aebabb86e36afe3ca02f037f1`.
-The independent-hash assertion therefore remains red pending an explicit
-contract disposition; current reference parity or release readiness is not
-claimed. The stale handoff hash was `18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
-the assertion failed on that hash before mainline reconciliation. Mainline's
-frozen default-parity corpus and reviewer/Devin regression suites also execute
-against the unpacked transitional artifact. Package/source equality does not
-establish live fork-image install or production behavior; G-T and independent
-integration review remain open.
+The conservative weekly overlay adds exactly three mandatory emission guards
+(default, pinned-agent and stale-default), totaling 1,051 bytes. It does not
+claim that the resulting 21,763-byte hook is identical to the historical body.
+
+The retention verifier pins each insertion's literal bytes, unique occurrence
+and fixed historical/current byte offsets. Removing only those three spans
+must recover the unchanged historical length and fingerprint; reinserting them
+must reconstruct the complete current hook byte-for-byte. Strict extraction
+retains whitespace from the exact `async onResolveRunModel(params)` declaration
+through its closing property delimiter. Missing, changed, duplicated or moved
+guards, the unmodified historical body, and any other byte change are rejected;
+21,798 offline negative inputs exercise this boundary. No reference, archive,
+frozen harness or golden is repinned. The actual tarball regression also
+requires raw source/packaged-hook equality and equality of the entire packaged
+transitional source after only the build-time factory lock.
+
+Both unpacked variants pass native router/lifecycle smoke tests. Mainline's
+frozen default-parity corpus and reviewer/Devin regressions also run against the
+transitional artifact, alongside weekly-emission behavioral controls. These
+local package proofs establish neither live fork-image installation nor
+production behavior; G-T, exact-head independent integration review and the
+existing rollout gates remain separate requirements.
 
 Operator sequence (no deployment is authorized by this documentation):
 
