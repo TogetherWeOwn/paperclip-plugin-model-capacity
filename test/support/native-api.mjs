@@ -23,7 +23,7 @@ const uuid=()=>`40000000-0000-4000-8000-${String(++next).padStart(12,'0')}`;
 // are replaced, and pool saves use optimistic revisions. No invented grant API.
 export class NativeApi {
   connections=[]; pools=[]; writes=[]; reads=[]; agents=new Map(); sessions=new Map(); fail; afterWrite;
-  constructor() { for(const id of [agentId,secondAgent]) { this.agents.set(id,{id,companyId,adapterType:'paperclip_runner',status:'idle',configurationRevision:'a'.repeat(64),runtimeConfig:{unrelated:true,aiConnection:copy(originalBinding)}}); this.sessions.set(id,[]); } }
+  constructor() { for(const id of [agentId,secondAgent]) { this.agents.set(id,{id,companyId,adapterType:'paperclip_runner',status:'idle',runtimeConfig:{unrelated:true,aiConnection:copy(originalBinding)}}); this.sessions.set(id,[]); } }
   async mutate(type,action,input) { this.writes.push({type,input:copy(input)}); if(this.fail?.(type,input)) throw new Error('PRIVATE_API_ERROR'); const result=action(); await this.afterWrite?.(type,input,result); return copy(result); }
   async listConnections() { this.reads.push('connections'); return {currentUserId:ownerUserId,canManageConnections:true,connections:this.connections.filter(c=>c.enabled && c.status!=='archived').map(c=>({id:c.id,grantId:c.grantId,companyId,name:c.name,provider:c.provider,method:'api_key',ownership:'shared',status:'connected',routing:c.routing}))}; }
   async getConnection(id) { this.reads.push('detail'); return copy(this.connections.find(c=>c.id===id)??null); }
@@ -31,6 +31,7 @@ export class NativeApi {
   async getInstalls(id) { return copy(this.connections.find(c=>c.id===id)?.installs??[]); }
   async listPools() { this.reads.push('pools'); return copy(this.pools); }
   async getAgent(id) { this.reads.push('agent'); return copy(this.agents.get(id)); }
+  async getAgentConfiguration(id) { this.reads.push('configuration'); return {...copy(this.agents.get(id)),configurationRevision:'a'.repeat(64)}; }
   async listSessions(id) { this.reads.push('sessions'); return copy(this.sessions.get(id)); }
   async createConnection(input,accountKey) { return this.mutate('create',()=>{ const c={...copy(input),id:uuid(),grantId:uuid(),secretId:uuid(),companyId,createdByUserId:ownerUserId,enabled:true,status:'active',healthStatus:'ok',installs:input.allAgents?[{targetType:'company',targetId:companyId}]:input.agentIds.map(targetId=>({targetType:'agent',targetId}))}; this.connections.push(c); return {connectionId:c.id,grantId:c.grantId}; },{...input,accountKey}); }
   async updateConnection(id,input) { assert.equal(input.config,undefined,'upstream forbids AI config PATCH'); assert.equal(input.routing,undefined,'upstream forbids routing PATCH'); return this.mutate('patch',()=>{const c=this.connections.find(c=>c.id===id); Object.assign(c,copy(input));return c;},{id,...input}); }

@@ -66,7 +66,10 @@ export function createPaperclipApi({target,companyId,token,secretRefs={},env=pro
     async resetSession(agentId,taskKey) {return request('POST',`/agents/${id(agentId)}/runtime-state/reset-session`,{taskKey});},
     async bindAgent(agentId,binding,expectedBinding) {
       if(!reversibleBinding(binding))throw new Error('no reversible native binding update for an absent binding');
-      const a=await request('GET',`/agents/${id(agentId)}`);
+      // agents.ts:4162 exposes the HMAC revision only on /configuration.
+      // PATCH restoration (:5420) compares against that redacted display, so
+      // the runtimeConfig base MUST come from the same response as its revision.
+      const a=await request('GET',`/agents/${id(agentId)}/configuration`);
       if(a.companyId!==companyId)throw new Error('agent company mismatch');
       if(expectedBinding!==undefined && !equal(a.runtimeConfig?.aiConnection??null,expectedBinding))throw new Error('agent binding changed before write');
       if(typeof a.configurationRevision!=='string' || !/^[a-f0-9]{64}$/.test(a.configurationRevision))throw new Error('agent configuration revision required');

@@ -41,6 +41,7 @@ async function fixture(t) {
       } else if(path.startsWith('/api/agents/')) {
         const [, , ,id,sub]=path.split('/');
         if(req.method==='GET'&&!sub)out=await api.getAgent(id);
+        else if(req.method==='GET'&&sub==='configuration')out=await api.getAgentConfiguration(id);
         else if(req.method==='GET'&&sub==='task-sessions')out=await api.listSessions(id);
         else if(req.method==='POST'&&sub==='runtime-state')out=await api.resetSession(id,input.taskKey);
         else if(req.method==='POST'&&sub==='wakeup')out=await api.wakeAgent(id,input);
@@ -89,6 +90,8 @@ test('HTTP apply activates, resets only approved sessions, preserves unrelated a
   const {stdout}=await f.run(['--apply','--secret-refs',join(f.dir,'refs.json'),'--journal',join(f.dir,'active.jsonl')]);
   assert.equal(JSON.parse(stdout).enabled,true);assert.ok(f.api.pools.every(p=>p.enabled));
   assert.equal(f.api.agents.get(agentId).runtimeConfig.unrelated,true);
+  assert.equal(Object.hasOwn(await f.api.getAgent(agentId),'configurationRevision'),false);
+  assert.ok(f.requests.some(r=>r.method==='GET'&&r.path.endsWith('/configuration')));
   const wake=f.requests.find(r=>r.path.endsWith('/wakeup'));assert.equal(wake.input.payload.issueId,taskKey.slice(6));
   const reset=f.requests.find(r=>r.path.endsWith('/runtime-state/reset-session'));assert.deepEqual(reset.input,{taskKey});
   assert.equal(f.requests.some(r=>r.path.includes('comment')),false);assert.deepEqual(f.errors,[]);

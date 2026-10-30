@@ -5,7 +5,7 @@ import { createAiConnectionSchema } from './fixtures/upstream-schemas/ai-connect
 import { aiConnectionPoolConfigSchema } from './fixtures/upstream-schemas/ai-connection-router.js';
 import { planPoolSaga } from '../scripts/pool-saga.mjs';
 import * as generator from '../scripts/generate-pool.mjs';
-import { NativeApi, options, companyId, ownerUserId } from './support/native-api.mjs';
+import { NativeApi, options, companyId, ownerUserId, agentId, originalBinding } from './support/native-api.mjs';
 
 // Exact route envelope from server/src/routes/ai-connections.ts:175 at e2cfdc7e.
 const saveBody=z.object({pluginKey:z.string().min(1).max(160),id:z.string().uuid().optional(),expectedRevision:z.number().int().positive().optional(),config:aiConnectionPoolConfigSchema}).strict();
@@ -39,4 +39,27 @@ test('HTTP adapter refuses missing secret refs and never exposes provider error 
   const api=generator.createPaperclipApi({target:'http://127.0.0.1:9080/api',companyId,token:'BOARD_DUMMY',secretRefs:{},env:{},fetchImpl:async()=>{calls++;return Response.json({error:'SECRET_ECHO'},{status:422});}});
   await assert.rejects(api.createConnection({name:'x'},'one'),/secret reference/);assert.equal(calls,0);
   await assert.rejects(api.listPools(companyId),e=>{assert.doesNotMatch(e.message,/SECRET_ECHO|BOARD_DUMMY/);return true;});
+});
+
+
+test('binding uses configuration revision AND redacted PATCH base, never detail configuration',async()=>{
+  const binding={mode:'router',connectionId:companyId},calls=[];
+  let current=originalBinding;
+  const api=generator.createPaperclipApi({target:'https://paperclip.example',companyId,token:'BOARD_DUMMY',fetchImpl:async(url,init)=>{
+    calls.push({url,method:init.method});
+    if(init.method==='PATCH') {
+      const body=JSON.parse(init.body);
+      assert.deepEqual(body,{expectedConfigurationRevision:'b'.repeat(64),runtimeConfig:{sensitive:'[REDACTED]',unrelated:true,aiConnection:binding}});
+      current=body.runtimeConfig.aiConnection;
+      return Response.json({});
+    }
+    if(url.endsWith('/configuration'))return Response.json({id:agentId,companyId,configurationRevision:'b'.repeat(64),runtimeConfig:{sensitive:'[REDACTED]',unrelated:true,aiConnection:current}});
+    // Actual detail shape has no configurationRevision, and is NOT the
+    // redacted display the server uses when restoring configuration secrets.
+    return Response.json({id:agentId,companyId,runtimeConfig:{sensitive:'DETAIL_DUMMY',aiConnection:current}});
+  }});
+  await api.bindAgent(agentId,binding,originalBinding);
+  assert.deepEqual(calls.map(c=>[c.method,new URL(c.url).pathname]),[
+    ['GET',`/api/agents/${agentId}/configuration`],['PATCH',`/api/agents/${agentId}`],['GET',`/api/agents/${agentId}`],
+  ]);
 });
