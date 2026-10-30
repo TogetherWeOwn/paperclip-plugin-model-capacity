@@ -568,7 +568,7 @@ test('a shadow tick refuses unscored admission for a slug the classic pass retir
     lastError: null,
     lastLeaderboardError: null,
   });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const cap = store.get(skey({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'capacity-v1' }));
   assert.ok(cap, 'capacity report persisted');
   const armIds = (cap.accounts ?? []).flatMap(a => (a.arms ?? []).map(x => x.armId));
