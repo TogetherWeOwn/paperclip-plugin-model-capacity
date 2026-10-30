@@ -3814,14 +3814,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
       const universalPools = opts.universalPools === true;
       // A configured policy model is not an admission. Raw pool membership
-      // must apply the same reviewer credential-readiness gate as
-      // reviewerArmAdmission, or an unready sibling resizes a qualified cap.
-      const hasReadyPolicyArm = v => {
-        const policy = ladders[v.accountId]?.policyReviewerArms ?? [];
-        return config.credentialReadiness.enforce
-          ? policy.some(c => credentialReadiness(c.credentialEvidence, nowMs).eligible)
-          : policy.length > 0;
-      };
+      // must apply the same reviewer credential-readiness AND breaker gate as
+      // reviewerArmCheck, or an unready or breaker-open sibling resizes a
+      // qualified cap.
+      const hasReadyPolicyArm = v => policyArmQualifies(ladders[v.accountId]?.policyReviewerArms, v.accountId,
+        breakers, breakersCfg, nowMs, config.credentialReadiness.enforce);
       return orderAccountsWithPacing(
         accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
           || (opts.forReview === true && config.taskRanking.mode === 'enforce' && hasReadyPolicyArm(v))
@@ -5096,9 +5093,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const routesRun = (a, dups) => filterBreakerRungs(routableGroupsFor(a, dups, nowMs,
       credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg)),
     bstore, a.accountId, nowMs, bcfg);
+    // A policy record is not an admission here either: the live pool must
+    // apply the same readiness and breaker gate as the tick, or an unready or
+    // breaker-open sibling reopens the reviewer pool and admits a second run.
+    const hasPolicyArm = a => policyArmQualifies(a.policyReviewerArms, a.accountId, bstore, bcfg, nowMs,
+      credentialReadinessEnforced(companyId));
     return orderAccountsWithPacing(
       (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (rungsHaveEligibleArms(routesRun(a, true))
-        || (forReview && live.taskRanking?.mode === 'enforce' && (a.policyReviewerArms?.length ?? 0) > 0))).map(a => {
+        || (forReview && live.taskRanking?.mode === 'enforce' && hasPolicyArm(a)))).map(a => {
         const p = poolOf(a.accountId);
         const ladderRungs = routesRun(a, duplicates);
         const preview = live.taskRanking?.mode === 'enforce' ? decide({ ...inputsFor(a), ladderRungs }) : null;
@@ -5233,6 +5235,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       else if (g && typeof g === 'object' && g.model != null) out.push(g);
     }
     return out;
+  }
+
+  /**
+   * One membership predicate for configured policy reviewer arms, shared by
+   * the tick's raw pools and the hook's live pools. A policy record is an
+   * admission only when its own arm reads exactly what reviewerArmCheck
+   * demands of a routed pick: credentials eligible (when readiness is
+   * enforced) and the arm's breaker closed. Presence alone must never
+   * qualify a lane, or a sibling that cannot run erases a qualified soft
+   * cap and reopens the pool fail-open.
+   */
+  function policyArmQualifies(arms, accountId, store, cfg, nowMs, enforce) {
+    const breakerGated = cfg?.enabled !== false;
+    return (arms ?? []).some((c) => {
+      if (enforce && !credentialReadiness(c.credentialEvidence, nowMs).eligible) return false;
+      return !breakerGated || breakerState(store, accountId, c?.armId, nowMs, cfg) === 'closed';
+    });
   }
 
   /** One admission policy for routed reviewer capacity, preview and hook. */
