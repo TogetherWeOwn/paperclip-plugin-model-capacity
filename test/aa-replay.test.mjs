@@ -248,3 +248,62 @@ test('synthetic Gate S compares baseline and patched for absent, false and malfo
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+// A widened projection could hide a routing or lifecycle regression even when
+// two particular replay fixtures happen to agree. Pin the closed contract with
+// independent sentinels, including fields outside Gate H's seven-field subset.
+test('X-R0/X-R1: parity projects only the epoch value, never presence or other fields', async () => {
+  const { projectForParity } = await import('../scripts/aa-replay.mjs');
+  const input = {
+    capacity: { reviewAdmissionEpoch: 'instance-epoch', reviewAdmissionGeneration: 2,
+      capacityChange: { added: ['account-x'], removed: [] }, target: 7,
+      newestVersion: { enabled: true }, perAccount: [{ accountId: 'account-x', inFlight: 3 }] },
+    ladders: { ladders: { 'account-x': { supersededArmEvidence: [], rungs: [] } } },
+    diagnostics: [],
+  };
+  const before = structuredClone(input);
+  assert.deepEqual(projectForParity(input), {
+    capacity: { reviewAdmissionEpoch: '<epoch>', reviewAdmissionGeneration: 2,
+      capacityChange: { added: ['account-x'], removed: [] }, target: 7,
+      newestVersion: { enabled: true }, perAccount: [{ accountId: 'account-x', inFlight: 3 }] },
+    ladders: { ladders: { 'account-x': { supersededArmEvidence: [], rungs: [] } } },
+    diagnostics: [],
+  });
+  assert.deepEqual(input, before, 'the original capture must remain unmodified');
+  const absent = { capacity: { target: 7 }, ladders: { ladders: {} } };
+  assert.deepEqual(projectForParity(absent), absent, 'a missing epoch must not be manufactured');
+  assert.notStrictEqual(projectForParity(absent).capacity, absent.capacity);
+});
+
+test('X-R3 offline scope: synthetic tick uses the supplied clock, not wall-clock defaults', async () => {
+  const { replayTick, projectForParity } = await import('../scripts/aa-replay.mjs');
+  const input = replayInputs();
+  const wallClock = Date.now;
+  try {
+    Date.now = () => { throw new Error('uncontrolled wall-clock read in synthetic replay'); };
+    let first, second;
+    await assert.doesNotReject(async () => {
+      first = await replayTick(structuredClone(input));
+      second = await replayTick(structuredClone(input));
+    }, 'replay must not fall through to an unpinned wall clock');
+    assert.equal(first.capacity.atMs, input.nowMs);
+    assert.equal(first.ladders.atMs, input.nowMs);
+    assert.deepEqual(projectForParity(first), projectForParity(second));
+  } finally { Date.now = wallClock; }
+});
+
+test('X-R4(a): provenance also fences the fallback flag and rejects unresolved feature states', async () => {
+  const { assertReplayProvenance } = await import('../scripts/aa-replay.mjs');
+  const provenance = { implementationRevision: 'producer', newestVersionOnlyEnabled: true,
+    accountFallbackEnabled: false, capturedAt: '2026-10-30T00:00:00Z' };
+  const options = { replayRevision: 'producer', replayFeatureState: {
+    newestVersionOnlyEnabled: true, accountFallbackEnabled: false } };
+  assert.doesNotThrow(() => assertReplayProvenance(provenance, options));
+  assert.throws(() => assertReplayProvenance(provenance, { ...options,
+    replayFeatureState: { ...options.replayFeatureState, accountFallbackEnabled: true } }), /provenance/i);
+  for (const unresolved of [undefined, 'false', 0, null]) {
+    assert.throws(() => assertReplayProvenance({ ...provenance, accountFallbackEnabled: unresolved }, options), /provenance/i);
+    assert.throws(() => assertReplayProvenance(provenance, { ...options,
+      replayFeatureState: { ...options.replayFeatureState, accountFallbackEnabled: unresolved } }), /provenance/i);
+  }
+});

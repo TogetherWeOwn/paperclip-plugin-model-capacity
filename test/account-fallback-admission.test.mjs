@@ -153,7 +153,7 @@ test('X-T02(b,d): superseded passer cannot make the weak account strong; newest-
   const pool = { weak: [passingOld, arms[2]] };
   const updated = arms.map(arm => arm.armId === 'old' ? passingOld : arm);
   const on = build({ arms: updated, accountCandidates: pool, supersededByAccount: { weak: ['old'] } });
-  assert.equal(on.accountAdmissions.doer.weak.armId, 'new');
+  assert.equal(on.accountAdmissions.doer.weak?.armId, 'new', 'a superseded passer must not prevent admission of the newest survivor');
   const offPasser = build({ arms: updated, accountCandidates: pool, supersededByAccount: {} });
   assert.equal(offPasser.accountAdmissions.doer.weak, undefined);
   const offWeak = build({ accountCandidates: { weak: [arms[1], arms[2]] }, supersededByAccount: {} });
