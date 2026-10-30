@@ -5543,7 +5543,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   /** One admission policy for routed reviewer capacity, preview and hook. */
-  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock(), consumer = 'route') {
+  function reviewerArmAdmission(live, companyId, agentId, nowMs = clock(), { selfId = null, adapterType = null, consumer = 'route' } = {}) {
     const role = roleOf({ roles: { thinkerAgentIds: live.thinkerAgentIds, doerAgentIds: live.doerAgentIds } }, agentId);
     const roleExcluded = normalizeExcludedFamilies((live.taskRanking?.mode === 'enforce'
       ? live.reviewerPolicyExclusions?.[role] : live.excludeFamilies?.[role]) ?? []);
@@ -5563,14 +5563,46 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           : readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
         roleExcluded, bannedModels: lastConfig.get(companyId)?.bannedModels ?? [], bstore, bcfg, nowMs, supersessionView: a.newestVersion ?? null,
       };
-      const result = reviewerArmCheck(a, arm, options);
-      onReviewerAdmission?.({ consumer, accountId: a.accountId, arm, result, ladderArms: options.ladderArms, readyArms: options.readyArms });
-      return result;
+      const admission = reviewerArmCheck(a, arm, options);
+      onReviewerAdmission?.({ consumer, accountId: a.accountId, arm, result: admission, ladderArms: options.ladderArms, readyArms: options.readyArms });
+      if (admission.ok !== true) return admission;
+      const config = lastConfig.get(companyId);
+      const allowlist = config?.trials.unscoredServedIds ?? [];
+      if (admission.match?.unscoredTrial || allowlist.some(e => e.model === canonicalModelName(arm.model))) {
+        // The model-list fallback is not trial admission. Missing-AA arms
+        // require their own exact served id and a price that is valid NOW,
+        // independently of the opt-in credential-readiness filter.
+        if (!admission.match?.unscoredTrial
+          || admission.match.unscoredServedId !== admission.model
+          || !allowlist.some(e => e.servedId === admission.model)
+          || !freeCostServedIdEntry(config?.placement.freeCostServedIds, admission.model, nowMs)) {
+          return { ok: 'unscored reviewer has no admitted current-price arm' };
+        }
+        const priced = repriceServedIdFree(admission.match, nowMs);
+        if (!priced) return { ok: 'unscored reviewer price expired' };
+        if (priced.trial) {
+          const family = priced.family;
+          const budget = effectiveTrialBudget(live, companyId, selfId);
+          const self = ledgers.get(companyId)?.get(selfId);
+          // The frozen tick budget already includes this run's reservation.
+          // Pending reservations are excluded above; credit a counted self
+          // only by the same census that built the tick's family budget.
+          const own = live.decidedRunIds?.has(selfId)
+            ? trialInflight(new Map([[selfId, self]]), { nowMs })[family] ?? 0 : 0;
+          if (!roleTakesTrial(live.trialRoles ?? DEFAULT_TRIALS.roles, role, family)
+            || !adapterAllowsTrial(live.trialAdapters ?? {}, adapterType ?? liveAdapterFor(live, agentId), family)
+            || (budget[family] ?? 0) + own <= 0) {
+            return { ok: 'unscored reviewer trial role, adapter or family budget unavailable' };
+          }
+        }
+        return { ...admission, match: priced };
+      }
+      return admission;
     };
   }
 
   /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
-  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null) {
+  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null, adapterType = null) {
     const cfg = live?.reviewerRouting;
     const pending = pendingByAccount(live, companyId, selfId);
     const self = ledgers.get(companyId)?.get(selfId);
@@ -5581,7 +5613,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const eligibleAccounts = (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId) && !managedFreeAccount(live, companyId, a));
     const capped = a => a.reactive && inFlightOf(a) >= liveTrialInflightCapFor(live, a);
     const accounts = eligibleAccounts.filter(a => !capped(a));
-    const admit = reviewerArmAdmission(live, companyId, agentId, nowMs);
+    const admit = reviewerArmAdmission(live, companyId, agentId, nowMs, { selfId, adapterType });
     const capHeld = eligibleAccounts.some(a => capped(a) && reviewerServable(a)
       && (cfg?.arms ?? []).some(arm => arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true));
     const dupKey = lastConfig.get(companyId)?.placement.duplicateVersionPunctuationFolding ? aliasKey : canonicalKey;
@@ -5627,7 +5659,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       contextWindow: match?.contextWindow ?? null }, adapter) ?? `${emitModel}(${pick.arm.effort ?? 'default'})`;
     recordDecision(ledger, { runId: String(run.runId), agentId: run.agentId, accountId: pick.accountId,
       armId: match?.armId ?? null, effort: pick.arm.effort ?? null, enforced: false,
-      wouldModel: model, family: inferFamily(canonicalModelName(emitModel)), reason: pick.reason, eventTime }, clock());
+      wouldModel: model, ...(match?.unscoredTrial ? { trial: match.trial === true } : {}),
+      family: match?.unscoredTrial ? match.family : inferFamily(canonicalModelName(emitModel)), reason: pick.reason, eventTime }, clock());
     return { kind: 'decide', model: emitModel, effort: pick.arm.effort, accountId: pick.accountId, env };
   }
 
@@ -6070,7 +6103,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true).paced ?? [])
       : [];
     const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
-    const { pick, admissionOf, capHeld } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds);
+    const { pick, admissionOf, capHeld } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds, params.adapterType);
     if (pick.none) {
       // A legacy keep fallback still starts provider work. It cannot escape
       // the shared credential cap when an approved reviewer route is full.
@@ -6081,7 +6114,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       // Only the pace guard stood in the way: wait for a run to finish instead
       // of falling back to keep, which would run on the held lane unpaced.
-      if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs).pick.none) {
+      if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, null, params.adapterType).pick.none) {
         const retryAfterMs = live.paceGuard?.retryAfterMs ?? 300000;
         markDeferred(companyId, params.runId, clock(), live.staleHorizonMs ?? 2 * 3600 * 1000, retryAfterMs);
         const reason = `pace guard: reviewer lanes held (${paced.map(pacedPoolText).join('; ')})`;
@@ -6114,7 +6147,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       enforced: true,
       wouldModel: decorated ?? `${emitModel}(${arm.effort ?? 'default'})`,
       rung: match?.rung ?? null,
-      family: inferFamily(canonicalModelName(arm.model)),
+      ...(match?.unscoredTrial ? { trial: match.trial === true } : {}),
+      family: match?.unscoredTrial ? match.family : inferFamily(canonicalModelName(arm.model)),
       reason: pick.reason,
     }, nowMs);
     note({

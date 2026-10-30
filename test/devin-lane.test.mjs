@@ -116,7 +116,7 @@ async function driveDevin({ mode = 'off', until = '2026-11-30T23:59:59Z', free =
     trials: { roles: ['doer'], adapters: { 'claude-code': ['*'] }, maxInFlightPerAccount: 8, maxInFlightPerAccountByProvider: { devin: cap }, unscoredServedIds: [{ servedId: 'devin/swe-2', reason: 'documented trial' }], ...trialSettings },
     placement: { duplicateVersionPunctuationFolding: folding, freeCostServedIds: free ? { 'devin/swe-2': { until, reason: 'documented offer' }, 'nvidia-nim/swe-2': { until, reason: 'fixture' }, ...(scoredFree ? { [priceRace === 'growth' ? 'devin/gpt-6-1-sol' : 'devin/kimi-k3']: { until, reason: 'test price' } } : {}) } : {} }, ...configExtra };
   const io = { config: { get: async () => config }, state: { get: async k => store.get(JSON.stringify(k)) ?? null, set: async (k,v) => store.set(JSON.stringify(k),v) },
-    secrets: { resolve: async () => 'test' }, http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now, { emitted: { devin: [...models.slice(0, 2), 'devin/gpt-6-1-sol', 'devin/gpt-5-6-sol', 'devin/glm-5'], 'nvidia-nim': [models[2]] } }) }) },
+    secrets: { resolve: async () => 'test' }, http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness(lane, now, { emitted: { devin: [...models.slice(0, 2), 'swe-2', 'devin/gpt-6-1-sol', 'devin/gpt-5-6-sol', 'devin/glm-5'], 'nvidia-nim': [models[2]] } }) }) },
     agents: { get: async () => ({ adapterType: 'claude-code' }) }, issues: { get: async () => ({ assigneeAdapterOverrides: { adapterConfig: { model: 'devin/swe-2' } } }), list: async () => [] },
     jobs: { register: (n,f) => jobs.set(n,f) }, events: { on: (n, fn) => handlers.set(n, fn) }, logger: { info() {}, error() {}, warn() {} } };
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
@@ -570,3 +570,89 @@ for (const mode of ['off', 'shadow']) {
     assert.equal((await d.hook('kept-review', 'reviewer')).kind, 'defer');
   });
 }
+
+for (const readiness of [false, true]) {
+  test(`unscored reviewer requires current included pricing with readiness ${readiness}`, async () => {
+    const until = '2026-11-01T00:01:00Z';
+    const configExtra = {
+      credentialReadiness: { enforce: readiness },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+    };
+    const opts = { onlySwe: true, trialSettings: { roles: ['other'] }, configExtra };
+    const d = await driveDevin({ ...opts, until });
+    assert.equal((await d.hook('free-review', 'reviewer')).model, 'devin/swe-2');
+    d.setNow(Date.parse(until));
+    assert.equal((await d.hook('boundary-review', 'reviewer')).model, 'devin/swe-2');
+    d.setNow(Date.parse(until) + 1);
+    assert.notEqual((await d.hook('expired-review', 'reviewer')).model, 'devin/swe-2');
+    const unpriced = await driveDevin({ ...opts, free: false });
+    assert.notEqual((await unpriced.hook('unpriced-review', 'reviewer')).model, 'devin/swe-2');
+    await d.tick();
+    assert.notEqual((await d.hook('expired-after-tick', 'reviewer')).model, 'devin/swe-2');
+  });
+}
+
+test('reviewer model-list fallback cannot borrow another served id admission', async () => {
+  const d = await driveDevin({ onlySwe: true, trialSettings: {
+    roles: ['other'], unscoredServedIds: [{ servedId: 'nvidia-nim/swe-2', reason: 'not the Devin credential' }],
+  }, configExtra: {
+    reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+  } });
+  assert.notEqual((await d.hook('wrong-id-review', 'reviewer')).model, 'devin/swe-2');
+});
+
+for (const readiness of [false, true]) {
+  test(`unpriced unscored reviewer cannot use account-model-list fallback with readiness ${readiness}`, async () => {
+    const d = await driveDevin({ onlySwe: true, free: false, trialSettings: { roles: ['other'] }, configExtra: {
+      credentialReadiness: { enforce: readiness },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+    } });
+    assert.notEqual((await d.hook('unpriced-review', 'reviewer')).model, 'devin/swe-2');
+  });
+}
+
+for (const [name, trialSettings] of [
+  ['role excluded', { roles: [] }],
+  ['different family role', { roles: ['other:kimi'] }],
+  ['adapter excluded', { roles: ['other'], adapters: {} }],
+  ['different adapter family', { roles: ['other'], adapters: { 'claude-code': ['kimi'] } }],
+]) {
+  test(`unscored reviewer retains normal trial gate: ${name}`, async () => {
+    const d = await driveDevin({ onlySwe: true, trialSettings, configExtra: {
+      reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+    } });
+    assert.notEqual((await d.hook('blocked-trial', 'reviewer')).model, 'devin/swe-2');
+  });
+}
+
+test('unscored reviewer reservations share the family budget and exclude self across ticks', async () => {
+  const d = await driveDevin({ onlySwe: true, trialSettings: {
+    roles: ['doer:swe', 'other:swe'], maxInFlightPerFamily: 1,
+  }, configExtra: {
+    reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+  } });
+  assert.equal((await d.hook('family-self', 'reviewer')).model, 'devin/swe-2');
+  assert.equal((await d.hook('family-self', 'reviewer')).model, 'devin/swe-2');
+  assert.notEqual((await d.hook('family-other', 'reviewer')).model, 'devin/swe-2');
+  assert.notEqual((await d.hook('family-builder', 'builder')).model, 'devin/swe-2');
+  await d.fire('family-self', 'agent.run.started');
+  await d.tick();
+  const entry = (await d.shadow()).entries.find(e => e.runId === 'family-self');
+  assert.equal(entry.trial, true);
+  assert.equal(entry.family, 'swe');
+  assert.equal((await d.hook('family-self', 'reviewer')).model, 'devin/swe-2');
+  assert.notEqual((await d.hook('family-other-after-tick', 'reviewer')).model, 'devin/swe-2');
+  await d.fire('family-self', 'agent.run.finished');
+  await d.tick();
+  assert.equal((await d.hook('family-released', 'reviewer')).model, 'devin/swe-2');
+});
+
+test('ordinary trial reservations consume the same reviewer family budget', async () => {
+  const d = await driveDevin({ onlySwe: true, trialSettings: {
+    roles: ['doer', 'other'], maxInFlightPerFamily: 1,
+  }, configExtra: {
+    reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+  } });
+  assert.equal((await d.hook('ordinary-trial')).model, 'devin/swe-2');
+  assert.notEqual((await d.hook('review-after-ordinary', 'reviewer')).model, 'devin/swe-2');
+});
