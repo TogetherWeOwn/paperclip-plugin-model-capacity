@@ -209,3 +209,29 @@ test('X-R4(a): replay CLI rejects inadmissible captures before loading fidelity 
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('synthetic Gate S compares baseline and patched for absent, false and malformed flags', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { pathToFileURL, fileURLToPath } = await import('node:url');
+  const { replayTick, projectForParity } = await import('../scripts/aa-replay.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-parity-'));
+  try {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
+    execFileSync('tar', ['-x', '-C', dir], { input: archive });
+    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
+    for (const features of [{}, { newestVersionOnly: { enabled: false }, accountFallback: { enabled: false } },
+      { newestVersionOnly: { enabled: 'true' }, accountFallback: { enabled: 'true' } }]) {
+      const input = replayInputs();
+      Object.assign(input.config.roles, features);
+      const old = await baseline.replayTick(structuredClone(input));
+      const patched = await replayTick(structuredClone(input));
+      assert.equal(Object.hasOwn(old.capacity, 'reviewAdmissionEpoch'), Object.hasOwn(patched.capacity, 'reviewAdmissionEpoch'));
+      for (const output of [old, patched]) assert.match(output.capacity.reviewAdmissionEpoch, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      assert.deepEqual(projectForParity(old), projectForParity(patched));
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
