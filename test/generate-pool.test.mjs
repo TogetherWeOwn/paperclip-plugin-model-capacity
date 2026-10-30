@@ -67,3 +67,32 @@ test('policy planner reports gates suspended to keep a pool serving', async () =
   assert.equal(plan.pools[0].config.members.length,1);
   assert.ok(plan.policyReports.thinker.roles.thinker.suspendedGates.includes('quality'));
 });
+
+test('generated member identities join callback pools independent of host UUID and display name', async () => {
+  const {normalizeRegistry} = await import('../src/registry.mjs');
+  const {routeDecision,routerDiagnostics} = await import('../src/router.mjs');
+  const {snapshotAccountView} = await import('../src/views.mjs');
+  const raw=registry(), normalized=normalizeRegistry(raw), plan=buildPoolPlan(raw,rows(),verdicts());
+  assert.deepEqual(plan.memberIndex,normalized.memberIndex);
+  const now=Date.parse('2026-10-29T12:00:00Z');
+  const account={weeklyUsed:.4,weeklyResetsAtMs:now+72*3600000,quality:'live',observedAtMs:now,credentialReady:true,measuredRatePerHour:.002,eligible:true,inFlightBase:0};
+  const accounts=Object.fromEntries(raw.accounts.map(a=>[a.accountKey,{...account,view:snapshotAccountView(a.accountKey,account,{nowMs:now})}]));
+  const members=plan.pools[0].config.members;
+  const candidates=members.map(member=>({member,runtimeConfig:{model:member.profile.model},notes:[]}));
+  const params={pool:{id:'9ae3390d-d254-4542-8a71-029c90a19458',pluginKey:'togetherweown.model-capacity',name:'builder',members},candidates,memberOrder:members.map(m=>m.id),taskKey:'work',now:new Date(now).toISOString()};
+  const snapshot={atMs:now,accounts,memberIndex:normalized.memberIndex,poolRoles:normalized.poolRoles};
+  const config={router:{enabled:true,accounts:normalized.accounts}};
+  const selected=routeDecision(params,snapshot,config);
+  assert.equal(selected.kind,'selected');
+  params.pool.name='changed-label';
+  assert.deepEqual(routeDecision(params,snapshot,config),selected);
+  assert.equal(routerDiagnostics(params,snapshot).poolNameMismatch,true);
+  const thinker=plan.pools[1].config.members[0];
+  params.candidates.push({member:thinker,runtimeConfig:{model:thinker.profile.model},notes:[]});
+  params.pool.members.push(thinker);
+  const conflict=routeDecision(params,snapshot,config);
+  assert.equal(routerDiagnostics(params,snapshot).level,'error');
+  assert.deepEqual(Object.values(conflict.skipped),['unmapped-member','unmapped-member','unmapped-member']);
+  params.pool.name='builder'; params.candidates=[]; params.pool.members=[];
+  assert.equal(routerDiagnostics(params,snapshot).poolKey,'builder');
+});
