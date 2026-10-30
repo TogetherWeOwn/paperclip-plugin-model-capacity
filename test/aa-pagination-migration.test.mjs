@@ -157,20 +157,87 @@ test('task discovery never scores a historical-only row', async () => {
   assert.equal(discoverTaskArms(back, ['retired-model'], {}).arms.length, 1);
 });
 
-// Review finding 3: a kept layer must never hand the marker to a row the fresh
-// feed serves, or a re-served slug stays blocked forever (contrary to C3).
-test('gap fill marks kept-only slugs and never leaks the marker onto fresh rows', async () => {
+// A kept layer must never hand the marker to a row the fresh feed serves, or a
+// re-served slug stays blocked forever (contrary to C3). It must also never
+// *invent* the marker: this path runs only while the leaderboard is failing,
+// so absence from the fresh API is not retirement evidence -- a
+// leaderboard-only model would otherwise lose its rung on an outage.
+test('gap fill never leaks or invents the marker onto fresh and kept-only rows', async () => {
   const { mergeAaRowsGapFill } = await import('../src/aa.mjs');
   const merged = mergeAaRowsGapFill(
     [{ slug: 'live-model', scicode: 0.8 }],
-    [{ slug: 'live-model', scicode: 0.7, historicalOnly: true }, { slug: 'retired-model', scicode: 0.9 }],
+    [{ slug: 'live-model', scicode: 0.7, historicalOnly: true }, { slug: 'board-only', scicode: 0.9 }],
   );
   const live = merged.rows.find(r => r.slug === 'live-model');
-  const retired = merged.rows.find(r => r.slug === 'retired-model');
+  const boardOnly = merged.rows.find(r => r.slug === 'board-only');
   assert.equal(live.historicalOnly, undefined, 'the fresh feed serves this slug: no marker');
   assert.equal(live.scicode, 0.8, 'fresh API value still wins');
-  assert.equal(retired.historicalOnly, true, 'kept-only slug is carried history');
-  assert.equal(retired.scicode, 0.9, 'and still keeps its values for reporting');
+  assert.equal(boardOnly.historicalOnly, undefined, 'absent from the API during an outage is not retirement');
+  assert.equal(boardOnly.scicode, 0.9, 'and its values are still kept for reporting');
+});
+
+// A leaderboard outage must leave a live leaderboard-only arm routing exactly
+// as it does when both sources are healthy (2026-10-17 ladder-emptying rule).
+test('a leaderboard-only arm keeps routing through an outage, as it does when healthy', async () => {
+  const { mergeAaRows, mergeAaRowsGapFill } = await import('../src/aa.mjs');
+  const { resolveArms } = await import('../src/arms.mjs');
+  const map = [{ aaSlug: 'board-only', model: 'board/model', effort: 'max', family: 'claude', providers: ['claude'] }];
+  const api = [{ slug: 'api-only', scicode: 0.5 }];
+  const healthy = resolveArms(mergeAaRows(api, [{ slug: 'board-only', scicode: 0.9 }]).rows, map);
+  const outage = resolveArms(mergeAaRowsGapFill(api, [{ slug: 'board-only', scicode: 0.9 }]).rows, map);
+  assert.deepEqual(outage.arms.map(a => a.armId), healthy.arms.map(a => a.armId));
+  assert.equal(outage.arms.length, 1, 'a failed leaderboard source is not retirement evidence');
+  assert.deepEqual(outage.skipped, []);
+});
+
+// Retiring a slug is only proven when the feed itself stops serving it. A
+// re-served slug must shed the carried marker, including on the API-failure
+// path where the previous merged rows are the base layer.
+test('a re-served slug sheds a stale marker on the API-failure merge path', async () => {
+  const { mergeAaRows } = await import('../src/aa.mjs');
+  const { resolveArms } = await import('../src/arms.mjs');
+  const map = [{ aaSlug: 'revived', model: 'x/revived', effort: 'max', family: 'claude', providers: ['claude'] }];
+  const merged = mergeAaRows(
+    [{ slug: 'revived', scicode: 0.8, historicalOnly: true }],
+    [{ slug: 'revived', scicode: 0.85 }],
+  );
+  assert.equal(merged.rows.length, 1);
+  assert.equal(merged.rows[0].historicalOnly, undefined, 'the fresh leaderboard serves it again');
+  assert.equal(resolveArms(merged.rows, map).arms.length, 1);
+});
+
+// A duplicate slug whose rows are ALL carried history is retired, not merely
+// ambiguous. Falling through to the unscored allowlist would re-admit it.
+test('an all-historical duplicate slug reports retirement instead of ambiguity', async () => {
+  const { buildDynamicBindings, resolveDynamicArms } = await import('../src/arms.mjs');
+  const rows = [{ slug: 'dup', scicode: 0.7, historicalOnly: true }, { slug: 'dup', scicode: 0.8, historicalOnly: true }];
+  const { bindings } = buildDynamicBindings(['dup']);
+  const allowlist = new Map([['dup', [{ servedId: 'dup', reason: 'documented trial' }]]]);
+  const result = resolveDynamicArms(rows, bindings, { unscoredAllowlist: allowlist });
+  assert.deepEqual(result.arms, [], 'no unscored trial may resurrect a retired slug');
+  assert.deepEqual(result.unscored, [{ model: 'dup', reason: 'slug-prior-only', tried: ['dup'] }]);
+});
+
+// A classic binding pins its own AA slug, so a retired model can be skipped
+// out of the dynamic pass entirely and be re-admitted by an unscored entry
+// that predates the retirement. Retirement must survive that slug mismatch.
+test('classic-pass retirement evidence blocks unscored admission under another slug', async () => {
+  const { resolveArms, buildDynamicBindings, resolveDynamicArms, canonicalModelName } = await import('../src/arms.mjs');
+  const armMap = [{ aaSlug: 'foo-retired', model: 'm/foo', effort: 'max', family: 'claude', providers: ['claude'] }];
+  const rows = [{ slug: 'foo-retired', scicode: 0.9, historicalOnly: true }];
+  const classic = resolveArms(rows, armMap);
+  assert.deepEqual(classic.skipped, [{ aaSlug: 'foo-retired', reason: 'slug-prior-only' }]);
+  const { bindings } = buildDynamicBindings(['m/foo'], { coveredModels: classic.arms.map(a => a.model) });
+  const allowlist = new Map([['foo', [{ servedId: 'm/foo', reason: 'documented trial' }]]]);
+  // Mirrors the plugin wiring: the set is keyed by canonical id, like the
+  // dynamic bindings it is compared against.
+  const retiredModels = new Set(armMap.filter(b => b.aaSlug === 'foo-retired').map(b => canonicalModelName(b.model)));
+  const guarded = resolveDynamicArms(rows, bindings, { unscoredAllowlist: allowlist, retiredModels });
+  assert.deepEqual(guarded.arms, [], 'history known to the classic pass still retires the model');
+  assert.deepEqual(guarded.unscored, [{ model: 'foo', reason: 'slug-prior-only', tried: ['foo'] }]);
+  // Without the evidence the same allowlist still admits: the guard is the
+  // cross-pass set, not a blanket ban on unscored trials.
+  assert.equal(resolveDynamicArms(rows, bindings, { unscoredAllowlist: allowlist }).arms.length, 1);
 });
 
 test('rejects a changed final page size that can skip rows', async () => {

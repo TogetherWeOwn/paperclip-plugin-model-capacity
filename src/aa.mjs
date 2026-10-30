@@ -533,6 +533,11 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
       bySlug.set(row.slug, { ...row });
       continue;
     }
+    // The fresh leaderboard serves this slug, so any carried `historicalOnly`
+    // marker on the base is stale: the feed has not retired it (2026-10-29
+    // review finding: a prior merged row must not keep a re-served slug
+    // blocked forever).
+    delete base.historicalOnly;
     for (const [k, v] of Object.entries(row)) {
       if (MERGE_META_FIELDS.includes(k)) continue;
       if (v != null) {
@@ -555,10 +560,13 @@ export function mergeAaRows(apiRows = [], leaderboardRows = []) {
  * codingIndex) while the leaderboard is failing. Returns the same shape
  * as mergeAaRows, with leaderboardSlugs taken from the kept layer.
  *
- * A slug that only the KEPT layer has is not served by the fresh API: it is
- * carried history, so it is marked `historicalOnly` and cannot resolve into an
- * arm. The row itself still appears, so ladders and reporting keep their rows
- * through a leaderboard outage (2026-10-17).
+ * A slug only the KEPT layer has is NOT marked `historicalOnly`: this path
+ * runs only while the leaderboard is failing, so a slug missing from the
+ * fresh API may simply be a leaderboard-only model whose own source is down.
+ * Absence here is not evidence of retirement (2026-10-17: an outage must not
+ * empty a ladder), so the row stays routable as before. Retirement is
+ * established only where a refresh sees BOTH fresh sources succeed -- and a
+ * stale marker already on a kept row is never propagated onto a fresh row.
  */
 export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
   const bySlug = new Map();
@@ -575,9 +583,13 @@ export function mergeAaRowsGapFill(apiRows = [], keptRows = []) {
     leaderboardSlugs.add(row.slug);
     const base = bySlug.get(row.slug);
     if (!base) {
-      bySlug.set(row.slug, { ...row, historicalOnly: true });
+      const { historicalOnly: _carriedMarker, ...keptOnly } = row;
+      bySlug.set(row.slug, keptOnly);
       continue;
     }
+    // The fresh API serves this slug, so it is not retired: a marker carried
+    // on the kept layer describes the layer, not this row.
+    delete base.historicalOnly;
     for (const [k, v] of Object.entries(row)) {
       if (MERGE_META_FIELDS.includes(k)) continue;
       if (v != null && base[k] == null) {

@@ -299,14 +299,18 @@ export function buildDynamicBindings(servedModels, { coveredModels = [], overrid
  * did, otherwise `no-aa-match` (the model stays unrankable, never silently
  * dropped). A `slug-prior-only` model is not admitted by the unscored
  * allowlist either: that path is for models AA never scored, not for one the
- * feed retired.
+ * feed retired. `retiredModels` carries retirement the classic pass already
+ * proved under a different slug, because that binding is covered out of this
+ * pass and its history would otherwise go unseen here.
  */
-export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new Map(), bannedModels = [] } = {}) {
+export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new Map(), bannedModels = [], retiredModels = new Set() } = {}) {
   const bySlug = new Map();
   const counts = new Map();
+  const historicalCounts = new Map();
   for (const row of aaRows ?? []) {
     counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
     if (!bySlug.has(row.slug)) bySlug.set(row.slug, row);
+    if (row.historicalOnly) historicalCounts.set(row.slug, (historicalCounts.get(row.slug) ?? 0) + 1);
   }
   const arms = [];
   const unscored = [];
@@ -316,7 +320,12 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
     let row = null;
     let historical = false;
     for (const candidate of tried) {
-      if ((counts.get(candidate) ?? 0) > 1) continue;
+      if ((counts.get(candidate) ?? 0) > 1) {
+        // An ambiguous slug cannot route, but if every row under it is
+        // carried history the model is still retired, not merely unmatched.
+        if ((historicalCounts.get(candidate) ?? 0) === counts.get(candidate)) historical = true;
+        continue;
+      }
       const hit = bySlug.get(candidate);
       // History cannot route, but must not mask a later fresh alias either.
       if (hit?.historicalOnly) {
@@ -333,8 +342,10 @@ export function resolveDynamicArms(aaRows, bindings, { unscoredAllowlist = new M
       // History is decisive. The unscored allowlist admits a model AA has no
       // data for; a slug AA served and then retired is a different thing, and
       // converting its carried history into a null-score trial arm would
-      // resurrect it anyway (the entry may predate the retirement).
-      if (historical) {
+      // resurrect it anyway (the entry may predate the retirement). The same
+      // holds when the classic table already proved the retirement under a
+      // different slug for this id (retiredModels).
+      if (historical || retiredModels.has(b.model)) {
         unscored.push({ model: b.model, reason: 'slug-prior-only', tried });
         continue;
       }

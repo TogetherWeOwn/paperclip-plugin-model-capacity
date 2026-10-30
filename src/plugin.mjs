@@ -1773,13 +1773,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
     const classicModels = new Set(classic.arms.map(a => a.model));
+    // A classic binding skipped for a carried historical row names a retired
+    // model, even when the dynamic pass would try a different slug for the
+    // same id and miss the history (2026-10-29 review finding). Carry that
+    // evidence across: the model still routes if a FRESH candidate matches,
+    // but it can no longer be admitted as an unscored trial.
+    const retiredModels = new Set();
+    const retiredSlugs = new Set(classic.skipped.filter(s => s.reason === 'slug-prior-only').map(s => s.aaSlug));
+    for (const binding of config.armMap ?? []) {
+      if (!retiredSlugs.has(binding?.aaSlug)) continue;
+      // Dynamic bindings are keyed by canonical id; match that key exactly.
+      const canon = canonicalModelName(binding?.model);
+      if (canon) retiredModels.add(canon);
+    }
     const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides, bannedModels: config.bannedModels });
     const unscoredAllowlist = new Map();
     for (const entry of config.trials.unscoredServedIds) {
       if (!unscoredAllowlist.has(entry.model)) unscoredAllowlist.set(entry.model, []);
       unscoredAllowlist.get(entry.model).push(entry);
     }
-    const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings, { unscoredAllowlist, bannedModels: config.bannedModels });
+    const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings, { unscoredAllowlist, bannedModels: config.bannedModels, retiredModels });
     return { classic, dynamic, accountModels, arms: [...classic.arms, ...dynamic.arms] };
   }
 

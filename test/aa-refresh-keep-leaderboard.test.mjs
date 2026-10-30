@@ -489,3 +489,90 @@ test('API failure stores full raw leaderboard for a subsequent leaderboard failu
   await jobs.get('aa-refresh')({});
   assert.equal(store.get(key).rows.find(r=>r.slug===GOOD_SLUGS[0]).contextWindowTokens,128000);
 });
+
+// Retirement is proven only by the feed itself. This drives the real refresh
+// job through three cycles -- served, retired, served again -- and checks the
+// persisted snapshot, so the end-to-end merge/carry chain is covered and not
+// just its helpers.
+test('a refresh cycle marks a retired slug historical-only and clears it when served again', async () => {
+  const { store, jobs, fake, plugin, skey, setSources } = drive({ boardHtml: null });
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({ cliproxy: { laneKeySecretRef: SECRET }, aa: { apiKeySecretRef: SECRET } }, { companyId: 'acme' });
+  const key = skey({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' });
+  const board = JSON.stringify({ initialModels: [{ slug: GOOD_SLUGS[0], intelligenceIndex: 57.6, price1mInputTokens: 4, scores: { scicode: 0.66 } }] });
+  const apiServing = slug => JSON.stringify({
+    data: [{ slug, evaluations: { artificial_analysis_intelligence_index: 30 }, pricing: {} }],
+    intelligence_index_version: '5.0',
+    pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false },
+  });
+  const setApi = slug => {
+    const http = fake.http.fetch;
+    fake.http.fetch = async url => (String(url).includes('/api/v2/language/models/free')
+      ? { status: 200, headers: { get: () => null }, text: async () => apiServing(slug) }
+      : http(url));
+  };
+  const rowFor = slug => store.get(key)?.rows?.find(r => r.slug === slug);
+
+  // Cycle 1: both sources serve the slug -> routable, no marker.
+  setSources({ apiStatus: 200, boardHtml: board });
+  setApi(GOOD_SLUGS[0]);
+  await jobs.get('aa-refresh')({});
+  assert.equal(rowFor(GOOD_SLUGS[0])?.historicalOnly, undefined, 'a served slug is never marked');
+
+  // Cycle 2: BOTH sources stop serving it -> carried history, marked.
+  setSources({ apiStatus: 200, boardHtml: JSON.stringify({ initialModels: [{ slug: 'other-board-model', intelligenceIndex: 20 }] }) });
+  setApi('some-other-model');
+  await jobs.get('aa-refresh')({});
+  assert.equal(rowFor(GOOD_SLUGS[0])?.historicalOnly, true, 'retired slug is carried as history');
+  assert.equal(rowFor(GOOD_SLUGS[0])?.scicode, 0.66, 'its benchmarks survive for reporting');
+
+  // Cycle 3: the board serves it again -> the marker is gone.
+  setSources({ apiStatus: 200, boardHtml: board });
+  setApi('some-other-model');
+  await jobs.get('aa-refresh')({});
+  assert.equal(rowFor(GOOD_SLUGS[0])?.historicalOnly, undefined, 'a re-served slug routes again');
+});
+
+// The cross-pass guard only exists if the plugin actually passes the classic
+// pass's retirement evidence into the dynamic pass. This drives the real
+// shadow tick, where a classic arm map pins a DIFFERENT slug than the id's own
+// candidates, so the dynamic pass would otherwise admit the retired model as
+// an unscored trial.
+test('a shadow tick refuses unscored admission for a slug the classic pass retired', async () => {
+  const { store, jobs, fake, plugin, skey } = drive({ boardHtml: null });
+  fake.config.get = async () => ({
+    cliproxy: { laneKeySecretRef: SECRET },
+    aa: { apiKeySecretRef: SECRET },
+    armMap: [{ aaSlug: 'kimi-k3-retired', model: 'kimi-k3', family: 'kimi', effort: 'max', providers: ['claude'] }],
+    trials: { unscoredServedIds: [{ servedId: 'kimi-k3', reason: 'documented trial' }] },
+  });
+  fake.http.fetch = async url => {
+    if (String(url).includes('/api/v2/language/models/free')) {
+      return { status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ data: [], intelligence_index_version: '5.0', pagination: { page: 1, total_pages: 1, page_size: 1000, has_more: false } }) };
+    }
+    if (String(url).includes('/leaderboards/models')) return { status: 200, headers: { get: () => null }, text: async () => '' };
+    const lane = { observedAt: new Date(TICK).toISOString(), accounts: [{ ...rawAcct(), models: ['kimi-k3'] }] };
+    return { status: 200, json: async () => withSyntheticReadiness(lane, TICK) };
+  };
+  await plugin.setup(fake);
+  await plugin.onConfigChanged({ cliproxy: { laneKeySecretRef: SECRET }, aa: { apiKeySecretRef: SECRET } }, { companyId: 'acme' });
+  // Seed the snapshot with the retirement the classic pass can see.
+  store.set(skey({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }), {
+    fetchedAt: '2026-10-16T04:17:00.000Z',
+    intelligenceIndexVersion: '5.0',
+    rows: [{ slug: 'kimi-k3-retired', scicode: 0.9, historicalOnly: true }],
+    duplicateSlugs: [],
+    leaderboardSlugs: [],
+    leaderboardAt: '2026-10-16T04:17:00.000Z',
+    lastAttemptAt: '2026-10-16T04:17:00.000Z',
+    lastError: null,
+    lastLeaderboardError: null,
+  });
+  await jobs.get('shadow-tick')({});
+  const cap = store.get(skey({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'capacity-v1' }));
+  assert.ok(cap, 'capacity report persisted');
+  const armIds = (cap.accounts ?? []).flatMap(a => (a.arms ?? []).map(x => x.armId));
+  assert.ok(!armIds.includes('kimi-k3'), `retired id must not be admitted, got ${JSON.stringify(armIds)}`);
+  const keys = (cap.skippedArms ?? []).map(s => `${s.model ?? s.aaSlug}:${s.reason}`);
+  assert.ok(keys.some(k => k === 'kimi-k3:slug-prior-only'), `expected a retirement skip, got ${JSON.stringify(keys)}`);
+});
