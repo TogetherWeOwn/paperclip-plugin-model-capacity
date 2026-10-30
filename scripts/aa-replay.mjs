@@ -10,6 +10,15 @@ const REF = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-55555555555
 const COMPANY = 'offline-replay';
 const clone = x => structuredClone(x);
 
+// Only the per-instance epoch is nondeterministic across otherwise identical ticks.
+export function projectForParity(result) {
+  const projected = clone(result);
+  if (Object.hasOwn(projected.capacity, 'reviewAdmissionEpoch')) {
+    projected.capacity.reviewAdmissionEpoch = '<epoch>';
+  }
+  return projected;
+}
+
 function fakeContext({ config, lane, states, demand, nowMs, pages, leaderboard }) {
   const raw = clone(config);
   raw.cliproxy = { ...raw.cliproxy, baseUrl: LANE_BASE_URLS[0], laneKeySecretRef: REF };

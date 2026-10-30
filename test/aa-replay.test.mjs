@@ -52,3 +52,38 @@ test('buildSuccessor refreshes recorded pages and leaderboard rather than clonin
   assert.ok(!next.rows.some(r=>r.slug==='obsolete-test-model'));
   assert.equal(next.leaderboardRows.find(r=>r.slug==='jt-35b-flash').fieldSources.gpqa,'public-leaderboard');
 });
+
+test('X-R0: baseline replay self-consistency has only an epoch difference', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { pathToFileURL, fileURLToPath } = await import('node:url');
+  const { projectForParity } = await import('../scripts/aa-replay.mjs');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-baseline-'));
+  try {
+    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
+    execFileSync('tar', ['-x', '-C', dir], { input: archive });
+    const { replayTick } = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
+    const nowMs = Date.parse('2026-10-29T12:00:00Z');
+    const config = { roles: { keepAgentIds: ['review'], doerAgentIds: ['doer'], thinkerAgentIds: ['thinker'] }, reviewerRouting: { agentIds: ['review'], arms: [{ provider: 'codex', model: 'gpt-6.1-sol' }] } };
+    const lane = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: [{ lane: 'codex-a', provider: 'codex', accountKey: 'a', health: 'healthy', models: ['gpt-6.1-sol'], observedAt: new Date(nowMs).toISOString(), quality: 'live', weekly: { used: 0.2, resetsAt: '2026-11-05T12:00:00Z' }, fiveHour: { used: 0.1, resetsAt: '2026-10-29T17:00:00Z' } }] }, nowMs);
+    const inputs = { config, lane, states: {}, snapshot: { fetchedAt: new Date(nowMs).toISOString(), rows: [], duplicateSlugs: [] }, demand: { doer: 2, thinker: 1, other: 0 }, nowMs };
+    const a = await replayTick(structuredClone(inputs));
+    const b = await replayTick(structuredClone(inputs));
+    const diff = (x, y, prefix = '') => {
+      if (Object.is(x, y)) return [];
+      if (x && y && typeof x === 'object' && typeof y === 'object' && Array.isArray(x) === Array.isArray(y)) {
+        return [...new Set([...Object.keys(x), ...Object.keys(y)])].flatMap(k => diff(x[k], y[k], prefix ? `${prefix}.${k}` : k));
+      }
+      return [prefix];
+    };
+    assert.deepEqual(diff(a.capacity, b.capacity), ['reviewAdmissionEpoch']);
+    assert.deepEqual(a.ladders, b.ladders);
+    assert.equal(a.capacity.reviewAdmissionGeneration, b.capacity.reviewAdmissionGeneration);
+    assert.deepEqual(a.capacity.capacityChange, b.capacity.capacityChange);
+    for (const result of [a, b]) assert.match(result.capacity.reviewAdmissionEpoch, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.deepEqual(projectForParity(a), projectForParity(b));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
