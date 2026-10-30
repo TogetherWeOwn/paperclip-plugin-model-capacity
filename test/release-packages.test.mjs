@@ -1,5 +1,4 @@
 import test from 'node:test';
-import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -7,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { buildVariantPackages } from '../scripts/build-variants.mjs';
+import { extractRetainedHook, verifyRetainedHook } from './retained-hook.mjs';
 
 async function files(dir, prefix = '') {
   const out = [];
@@ -57,14 +57,13 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
         }
       }
     } else {
-      // The exact hook body, not normalized whitespace, must survive packaging.
-      const source = await readFile(new URL('../src/plugin.mjs',import.meta.url),'utf8');
-      const hook = s => s.slice(s.indexOf('    async onResolveRunModel(params) {'),s.lastIndexOf('\n    },\n  };')+'\n    },'.length);
-      assert.equal(hook(plugin),hook(source));
-      // §17 pins the read-only 0.2.72 reference and main dc86ae4, not the
-      // stale port handoff. Mainline integration must not regress that hook.
-      assert.equal(createHash('sha256').update(hook(plugin)).digest('hex'),
-        'a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2');
+      // Preserve raw source/package equality and the historical fingerprint,
+      // allowing only the three mandatory position-bound weekly guard insertions.
+      const sourceBytes = await readFile(new URL('../src/plugin.mjs',import.meta.url));
+      const source = sourceBytes.toString('utf8');
+      const packagedHook = extractRetainedHook(await readFile(join(roots[p.variant],'src/plugin.mjs')));
+      assert.deepEqual(packagedHook,extractRetainedHook(sourceBytes));
+      verifyRetainedHook(packagedHook);
       const expected = source.replace("if (!['transitional','clean'].includes(variant))", "if (variant !== 'transitional')")
         .replace("  if (variant === 'clean') delete plugin.onResolveRunModel;\n", '');
       assert.equal(plugin,expected,'transitional helpers changed beyond the build-time factory guard');
