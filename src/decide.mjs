@@ -562,6 +562,14 @@ export function decide({
       return Number(!x) - Number(!y) || (x && y ? compareTaskCosts(x, y) : 0) || a - b;
     });
   }
+  // Explicit missing-AA canaries must collect outcomes instead of always
+  // losing a shared rung to measured quality. Explore only the free, still-
+  // trial arm at rung zero, after ALL feasibility/trial-budget gates above.
+  // Role windows and retries retain authority; graduation removes this
+  // preference, with Q left null throughout (never a synthetic score).
+  const canary = a => !taskEnforce && escalation === 0 && a.unscoredTrial === true
+    && a.trial === true && a.Q === null && a.C === 0;
+  if (fittingByRung.get(0)?.some(canary)) order.sort((a, b) => Number(b === 0) - Number(a === 0));
   for (const rung of order) {
     const fitting = fittingByRung.get(rung);
     if (fitting.length === 0) continue;
@@ -569,7 +577,8 @@ export function decide({
     // other role ranks on the ladder Q (doer blend). Arms without a thinker
     // blend (AA-only, or ladders built before it existed) fall back to Q.
     const rankQ = (a) => { const q = role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q; return Number.isFinite(q) ? q : -Infinity; };
-    fitting.sort((a, b) => (taskEnforce ? compareTaskCosts(a, b) : 0)
+    fitting.sort((a, b) => (rung === 0 ? Number(canary(b)) - Number(canary(a)) : 0)
+      || (taskEnforce ? compareTaskCosts(a, b) : 0)
       || (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     // Sol window (a tier cap may only lower it), else the tier cap, else the

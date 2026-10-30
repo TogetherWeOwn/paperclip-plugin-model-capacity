@@ -437,21 +437,6 @@ test('legacy stored ladder without ranking withdraws expired unscored arms', asy
   assert.notEqual((await d.hook()).model, 'devin/swe-2');
 });
 
-test('no-tick expiration grows benchmark shells to the fresh paid thinker window', async () => {
-  const until = '2026-11-01T00:01:00Z';
-  const free = await driveDevin({ priceRace: 'growth', scoredFree: true, until });
-  const paid = await driveDevin({ priceRace: 'growth', free: false });
-  assert.equal((await free.ladder()).ladders['devin:d'].credentialRanking.rankingRungs.length, 1);
-  assert.equal((await paid.ladder()).ladders['devin:d'].credentialRanking.rankingRungs.length, 2);
-  free.setNow(Date.parse(until) + 1);
-  const expired = await free.hook('expired-growth', 'thinker');
-  assert.equal(expired.kind, 'decide');
-  assert.equal(expired.model, 'devin/gpt-6-1-sol');
-  assert.equal(expired.model, (await paid.hook('paid-growth', 'thinker')).model);
-  assert.match(expired.reason, /rung 1 /);
-});
-
-
 for (const mode of ['off', 'shadow', 'enforce']) {
   for (const readiness of [false, true]) {
     for (const [model, extraBans] of [['devin/gpt-6-sol', []], ['devin/gpt-5-6-terra', []], ['devin/kimi-k3', ['kimi-k3']]]) {
@@ -486,6 +471,41 @@ test('paid reviewer shares the reactive cap with a pending free run', async () =
   assert.equal(answer.kind, 'defer', JSON.stringify(answer));
 });
 
+test('mixed-account canary receives bounded traffic then returns to scored selection on graduation', async () => {
+  const d = await driveDevin({ cap: 1, onlyDevin: true, trialSettings: { minRuns: 3, minSuccessRate: 1 } });
+  const selected = [];
+  for (let i = 0; i < 6; i++) {
+    const id = `mixed-${i}`;
+    const answer = await d.hook(id);
+    assert.equal(answer.kind, 'decide');
+    selected.push(answer.model);
+    assert.notEqual((await d.hook(`blocked-${i}`)).kind, 'decide', 'shared cap still bounds canary and paid runs');
+    await d.fire(id, 'agent.run.started');
+    await d.fire(id, 'agent.run.finished');
+    await d.tick(); await d.tick();
+  }
+  assert.deepEqual(selected, ['devin/swe-2', 'devin/swe-2', 'devin/swe-2', 'devin/kimi-k3', 'devin/kimi-k3', 'devin/kimi-k3']);
+  const swe = (await d.ladder()).ladders['devin:d'].credentialRanking.candidates.find(c => c.armId === 'swe-2');
+  assert.equal(swe.trial, false);
+  assert.equal(swe.Q, null);
+  assert.equal(swe.qFleet, null);
+});
+
+
+test('no-tick expiration grows benchmark shells to the fresh paid thinker window', async () => {
+  const until = '2026-11-01T00:01:00Z';
+  const free = await driveDevin({ priceRace: 'growth', scoredFree: true, until });
+  const paid = await driveDevin({ priceRace: 'growth', free: false });
+  assert.equal((await free.ladder()).ladders['devin:d'].credentialRanking.rankingRungs.length, 1);
+  assert.equal((await paid.ladder()).ladders['devin:d'].credentialRanking.rankingRungs.length, 2);
+  free.setNow(Date.parse(until) + 1);
+  const expired = await free.hook('expired-growth', 'thinker');
+  assert.equal(expired.kind, 'decide');
+  assert.equal(expired.model, 'devin/gpt-6-1-sol');
+  assert.equal(expired.model, (await paid.hook('paid-growth', 'thinker')).model);
+  assert.match(expired.reason, /rung 1 /);
+});
+
 test('reviewer shared cap excludes its own reservation before and after a tick', async () => {
   const d = await driveDevin({ cap: 1, onlyDevin: true, configExtra: {
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/kimi-k3' }] },
@@ -517,6 +537,28 @@ test('reviewer native-first fallback releases when the native arm breaker opens'
   const held = await driveDevin({ twins: true, folding: true, configExtra, initialBreakers: breakerStoreToJSON(breakers, { nowMs: now, cfg: DEFAULT_BREAKERS }) });
   assert.equal((await held.hook('native-open', 'reviewer')).model, 'devin/gpt-6-1-sol');
 });
+
+for (const [name, overrides, want] of [
+  ['eligible', {}, 'devin/swe-2'],
+  ['family budget exhausted', { trialBudget: { swe: 0 } }, 'devin/kimi-k3'],
+  ['role excluded', { trialRoles: ['other'] }, 'devin/kimi-k3'],
+  ['adapter excluded', { trialAdapters: { 'claude-code': ['kimi'] } }, 'devin/kimi-k3'],
+  ['family excluded', { excludedFamilies: ['swe'] }, 'devin/kimi-k3'],
+  ['context excluded', { contextTokens: 100 }, 'devin/kimi-k3'],
+  ['retry retains scored selection', { retryCount: 1 }, 'devin/kimi-k3'],
+]) {
+  test(`unscored canary exploration preserves admission gate: ${name}`, async () => {
+    const { decide } = await import('../src/decide.mjs');
+    const trial = { armId: 'swe-2', model: 'devin/swe-2', family: 'swe', Q: null, C: 0, trial: true, unscoredTrial: true, contextWindow: 100 };
+    const scored = { armId: 'kimi-k3', model: 'devin/kimi-k3', family: 'kimi', Q: 0, C: 5, trial: false, contextWindow: 1000 };
+    const answer = decide({ runId: 'canary', agentId: 'builder', role: 'doer', accountId: 'devin:d',
+      ladderRungs: [{ rung: 0, arms: [scored, trial] }], trialBudget: { swe: 1 },
+      trialRoles: ['doer'], trialAdapters: { 'claude-code': ['*'] }, adapterType: 'claude-code', ...overrides });
+    assert.equal(answer.kind, 'decide');
+    assert.equal(answer.model, want);
+    assert.equal(trial.Q, null);
+  });
+}
 
 for (const mode of ['off', 'shadow']) {
   test(`reviewer reactive cap cannot fall through to a kept default (${mode})`, async () => {
