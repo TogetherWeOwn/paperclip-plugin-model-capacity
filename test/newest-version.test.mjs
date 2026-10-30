@@ -286,6 +286,9 @@ test('N-T26: ambiguous slug identities fall back to parsing without applying a m
   assert.equal(isSupersededArm(v, 'old-1-5@high'), true);
   const ambiguous = view(['old-1.5-free', 'old-1.5-contributor', 'old-2'], {keep:['model:old-1.5-free']});
   assert.equal(isSupersededArm(ambiguous, 'old-1-5@high'), true);
+  // The first sorted match is kept: choosing it on ambiguity would leak the keep.
+  const firstKept = view(['old-1.5-free', 'old-1.5-contributor', 'old-2'], {keep:['model:old-1.5-contributor']});
+  assert.equal(isSupersededArm(firstKept, 'old-1-5@high'), true);
 });
 
 test('N-T26: aaSlug keep protects the represented arm but not a sibling', () => {
