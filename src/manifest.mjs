@@ -493,6 +493,15 @@ const CONFIG_SCHEMA = {
             },
           },
         },
+        accountFallback: {
+          type: 'object', additionalProperties: false,
+          description: 'Opt-in account-local fallback for doer and other roles; never relaxes thinker eligibility. minQuality is a fleet Q z-score floor.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            roles: { type: 'array', default: ['doer', 'other'], items: { type: 'string', enum: ['doer', 'other'] } },
+            minQuality: { type: 'number', default: -0.5 },
+          },
+        },
         minQuality: {
           type: 'object', additionalProperties: false,
           description: 'Per-role minimum on the fleet-scored quality Q (AA plus the EEE prior, the ladder\'s weights and blend). An arm below the minimum is ineligible for that role on every account. null turns the minimum off for the role. Defaults: doer -1.0, thinker 0.4, other -1.0.',

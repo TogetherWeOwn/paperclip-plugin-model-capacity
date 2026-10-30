@@ -99,6 +99,15 @@ export function normalizeMinQuality(raw) {
   return out;
 }
 
+/** Fallback is opt-in and cannot relax the thinker/reviewer quality gate. */
+export function normalizeAccountFallback(raw) {
+  return {
+    enabled: raw?.enabled === true,
+    roles: Array.isArray(raw?.roles) ? raw.roles.filter(role => role === 'doer' || role === 'other') : ['doer', 'other'],
+    minQuality: isFiniteNumber(raw?.minQuality) ? raw.minQuality : -0.5,
+  };
+}
+
 /** Normalize structural supersession settings; only the literal boolean enables it. */
 export function normalizeNewestVersionOnly(raw) {
   const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};

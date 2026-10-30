@@ -28,6 +28,11 @@
         "parsePins": {}
       }
     },
+    "accountFallback": {
+      "enabled": false,
+      "roles": ["doer", "other"],
+      "minQuality": -0.5
+    },
     "minQuality": {
       "doer": -1.0,
       "thinker": 0.4,

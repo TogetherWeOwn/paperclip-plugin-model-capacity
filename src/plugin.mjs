@@ -84,7 +84,7 @@ import {
   issueSnapshot, classifyOutcome, familyOutcomes,
   OUTCOME_EVAL_WINDOW_MS, OUTCOME_READS_PER_TICK, OUTCOME_MAX_TRIES, OUTCOME_BASELINE_MAX_AGE_MS,
 } from './outcomes.mjs';
-import { normalizeMinQuality, normalizeNewestVersionOnly, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
+import { normalizeMinQuality, normalizeNewestVersionOnly, normalizeAccountFallback, normalizeOutcomeGate, buildEligibility, MAX_WINDOW_HOURS } from './eligibility.mjs';
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT, deficitOf, isOverBurning } from './select.mjs';
 import {
   isAggregatorAccount, isFallbackOnlyView, nativeQualifiedModels,
@@ -621,6 +621,7 @@ export function resolveConfig(raw = {}) {
       // and a measured-outcome gate decide which arms serve a role. The
       // excludeFamilies list above is the emergency override.
       newestVersionOnly: normalizeNewestVersionOnly(raw.roles?.newestVersionOnly),
+      accountFallback: normalizeAccountFallback(raw.roles?.accountFallback),
       minQuality: normalizeMinQuality(raw.roles?.minQuality),
       outcomeGate: normalizeOutcomeGate(raw.roles?.outcomeGate),
       thinkerFloorRung: raw.roles?.thinkerFloorRung ?? 2,
