@@ -451,3 +451,80 @@ test('no-tick expiration grows benchmark shells to the fresh paid thinker window
   assert.match(expired.reason, /rung 1 /);
 });
 
+
+for (const mode of ['off', 'shadow', 'enforce']) {
+  for (const readiness of [false, true]) {
+    for (const [model, extraBans] of [['devin/gpt-6-sol', []], ['devin/gpt-5-6-terra', []], ['devin/kimi-k3', ['kimi-k3']]]) {
+      test(`reviewer admission rejects ${model} (${mode}, readiness ${readiness})`, async () => {
+        const d = await driveDevin({ mode, devinModels: [model, 'devin/swe-2'], configExtra: {
+          bannedModels: extraBans, credentialReadiness: { enforce: readiness },
+          reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model }] },
+        } });
+        const answer = await d.hook('banned-review', 'reviewer');
+        assert.equal(answer.kind === 'decide' && arms.isBannedModel(answer.model, extraBans), false, JSON.stringify(answer));
+      });
+    }
+  }
+  test(`reviewer duplicates stay native-first and release on native outage (${mode})`, async () => {
+    const configExtra = { burnMode: { accounts: ['devin:d'] }, reviewerRouting: { agentIds: ['reviewer'], arms: [
+      { provider: 'devin', model: 'devin/gpt-6-1-sol' }, { provider: 'codex', model: 'gpt-6.1-sol' },
+    ] } };
+    const native = await driveDevin({ mode, twins: true, folding: true, configExtra });
+    assert.equal((await native.hook('native-review', 'reviewer')).model, 'gpt-6.1-sol');
+    const outage = await driveDevin({ mode, twins: true, folding: true, nativeUnavailable: true, configExtra });
+    assert.equal((await outage.hook('fallback-review', 'reviewer')).model, 'devin/gpt-6-1-sol');
+  });
+}
+
+test('paid reviewer shares the reactive cap with a pending free run', async () => {
+  const d = await driveDevin({ cap: 1, trialSettings: { roles: ['doer'] }, configExtra: {
+    roles: { doerAgentIds: ['builder'], excludeFamilies: { doer: ['kimi'] }, minQuality: { doer: null, thinker: null, other: null } },
+    reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/kimi-k3' }] },
+  } });
+  assert.equal((await d.hook('free-builder')).model, 'devin/swe-2');
+  const answer = await d.hook('paid-review', 'reviewer');
+  assert.equal(answer.kind, 'defer', JSON.stringify(answer));
+});
+
+test('reviewer shared cap excludes its own reservation before and after a tick', async () => {
+  const d = await driveDevin({ cap: 1, onlyDevin: true, configExtra: {
+    reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/kimi-k3' }] },
+  } });
+  assert.equal((await d.hook('review-self', 'reviewer')).model, 'devin/kimi-k3');
+  assert.equal((await d.hook('review-self', 'reviewer')).kind, 'decide');
+  assert.equal((await d.hook('other-review', 'reviewer')).kind, 'defer');
+  assert.equal((await d.hook('other-free')).kind, 'defer');
+  await d.fire('review-self', 'agent.run.started'); await d.tick();
+  assert.equal((await d.hook('review-self', 'reviewer')).kind, 'decide');
+  assert.equal((await d.hook('other-review', 'reviewer')).kind, 'defer');
+  await d.fire('review-self', 'agent.run.finished'); await d.tick();
+  assert.equal((await d.hook('released-review', 'reviewer')).kind, 'decide');
+});
+
+test('reviewer native-first fallback releases when the native arm breaker opens', async () => {
+  const { createBreakerStore, recordArmFailure, breakerStoreToJSON, DEFAULT_BREAKERS } = await import('../src/breakers.mjs');
+  const configExtra = {
+    burnMode: { accounts: ['devin:d'] },
+    reviewerRouting: { agentIds: ['reviewer'], arms: [
+      { provider: 'devin', model: 'devin/gpt-6-1-sol', effort: 'max' },
+      { provider: 'codex', model: 'gpt-6.1-sol', effort: 'max' },
+    ] },
+  };
+  const d = await driveDevin({ twins: true, folding: true, configExtra });
+  assert.equal((await d.hook('native-closed', 'reviewer')).model, 'gpt-6.1-sol');
+  const now = Date.parse('2026-11-01T00:00:00Z'), breakers = createBreakerStore();
+  for (const armId of ['gpt-6-1-sol', 'gpt-6-1-sol-high']) for (const atMs of [now - 120000, now - 60000]) recordArmFailure(breakers, 'codex:native', armId, { atMs, errorText: 'model not found' }, atMs, DEFAULT_BREAKERS);
+  const held = await driveDevin({ twins: true, folding: true, configExtra, initialBreakers: breakerStoreToJSON(breakers, { nowMs: now, cfg: DEFAULT_BREAKERS }) });
+  assert.equal((await held.hook('native-open', 'reviewer')).model, 'devin/gpt-6-1-sol');
+});
+
+for (const mode of ['off', 'shadow']) {
+  test(`reviewer reactive cap cannot fall through to a kept default (${mode})`, async () => {
+    const d = await driveDevin({ mode, cap: 1, onlyDevin: true, configExtra: {
+      roles: { doerAgentIds: ['builder'], keepAgentIds: ['reviewer'], excludeFamilies: { doer: ['kimi'] }, minQuality: { doer: null, thinker: null, other: null } },
+      reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/kimi-k3' }] },
+    } });
+    assert.equal((await d.hook('free-running')).model, 'devin/swe-2');
+    assert.equal((await d.hook('kept-review', 'reviewer')).kind, 'defer');
+  });
+}

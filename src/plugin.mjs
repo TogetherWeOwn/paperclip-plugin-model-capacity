@@ -110,7 +110,7 @@ import { credentialEvidenceFor, credentialReadiness, filterCredentialRungs } fro
 import { diffCapacityFeed, WARMUP_MIN_SPAN_MS, isWarmupSpan, predictGuard } from './capacitychange.mjs';
 import { buildModelInventory } from './inventory.mjs';
 import { DEFAULT_REVIEWER, normalizeReviewer, computeReviewerCapacity, computeSupplySignal, computeDoerStarvation } from './reviewer.mjs';
-import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute } from './reviewerrouting.mjs';
+import { validateReviewerRouting, normalizeReviewerRouting, burnModeTokens, selectReviewerRoute, reviewerServable } from './reviewerrouting.mjs';
 import { validateReviewDemand, normalizeReviewDemand, createReviewDemandReader } from './review-demand.mjs';
 import { normalizeFreeLanes, validateFreeLanes, freeProvider, lowRiskRun, freeArmVerdict, freeLaneBudget, reserveFreeRun, freeLaneCaps, paidTrialLedger } from './free-lanes.mjs';
 import {
@@ -4269,6 +4269,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const pressure = freshPressure();
         const reviewLive = { atMs: nowMs, taskRanking: config.taskRanking,
           reviewerRouting: config.reviewerRouting, burnModeTokens: config.burnModeTokens,
+          maxTrialInFlightPerAccount: config.trials.maxInFlightPerAccount,
+          maxTrialInFlightPerAccountByProvider: config.trials.maxInFlightPerAccountByProvider,
           thinkerAgentIds: config.roles.thinkerAgentIds, doerAgentIds: config.roles.doerAgentIds,
           reviewerPolicyExclusions: config.roles.excludeFamilies, excludeFamilies: roleExclusions,
           roleBands, contextCaps: config.contextCaps, decidedRunIds: new Set([...ledger.values()].filter(r => r.decidedAccount).map(r => r.runId)),
@@ -5487,7 +5489,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * breaker (open and half-open probes route nothing here). Returns true or
    * a refusal string; `match` is the ladder arm used for attribution.
    */
-  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock(), supersessionView = null } = {}) {
+  function reviewerArmCheck(account, arm, { ladderArms = [], readyArms = null, roleExcluded = [], bannedModels = [], bstore = null, bcfg = DEFAULT_BREAKERS, nowMs = clock(), supersessionView = null } = {}) {
+    if (isBannedModel(arm.model, bannedModels)) return { ok: 'model banned' };
     const canon = String(canonicalModelName(arm.model) ?? '').toLowerCase();
     if (!canon) return { ok: 'model unmappable' };
     const sameModel = (m) => String(canonicalModelName(m) ?? '').toLowerCase() === canon;
@@ -5558,7 +5561,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         readyArms: taskEnforce
           ? policy.filter(c => !readiness || credentialReadiness(c.credentialEvidence, nowMs).eligible)
           : readiness ? credentialGroupsFor(a, nowMs, true).flatMap((g) => g?.arms ?? []) : null,
-        roleExcluded, bstore, bcfg, nowMs, supersessionView: a.newestVersion ?? null,
+        roleExcluded, bannedModels: lastConfig.get(companyId)?.bannedModels ?? [], bstore, bcfg, nowMs, supersessionView: a.newestVersion ?? null,
       };
       const result = reviewerArmCheck(a, arm, options);
       onReviewerAdmission?.({ consumer, accountId: a.accountId, arm, result, ladderArms: options.ladderArms, readyArms: options.readyArms });
@@ -5570,23 +5573,45 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null) {
     const cfg = live?.reviewerRouting;
     const pending = pendingByAccount(live, companyId, selfId);
+    const self = ledgers.get(companyId)?.get(selfId);
+    const inFlightOf = a => Math.max(0, (a.inFlight ?? 0)
+      - (live.decidedRunIds?.has(selfId) && attributedAccount(self) === a.accountId
+        && isInflight(self, nowMs, live.staleHorizonMs ?? 2 * 3600 * 1000) ? 1 : 0))
+      + (pending.get(a.accountId) ?? 0);
+    const eligibleAccounts = (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId) && !managedFreeAccount(live, companyId, a));
+    const capped = a => a.reactive && inFlightOf(a) >= liveTrialInflightCapFor(live, a);
+    const accounts = eligibleAccounts.filter(a => !capped(a));
     const admit = reviewerArmAdmission(live, companyId, agentId, nowMs);
+    const capHeld = eligibleAccounts.some(a => capped(a) && reviewerServable(a)
+      && (cfg?.arms ?? []).some(arm => arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true));
+    const dupKey = lastConfig.get(companyId)?.placement.duplicateVersionPunctuationFolding ? aliasKey : canonicalKey;
+    // Apply native-first per MODEL, not per mixed account or provider. A
+    // native route counts only when this same reviewer can actually use it
+    // (health, quota, pace holds, shared cap, readiness and breaker).
+    const nativeReady = new Set();
+    for (const a of accounts) {
+      if (isAggregatorAccount(a) || !reviewerServable(a)) continue;
+      for (const arm of cfg?.arms ?? []) {
+        if (arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true) nativeReady.add(dupKey(arm.model));
+      }
+    }
     const admissionOf = new Map();
     const pick = selectReviewerRoute({
       cfg,
-      accounts: (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId) && !managedFreeAccount(live, companyId, a)),
+      accounts,
       burnTokens: new Set(live.burnModeTokens ?? []),
       taskRanking: live.taskRanking,
       primaryUnavailableReasons: (live.accounts ?? []).filter(a => excludeIds?.has(a.accountId)
         && String(a.pool ?? a.provider).toLowerCase() === 'meta').map(() => 'pace guard holds the approved Meta lane'),
-      inFlightOf: (a) => (a.inFlight ?? 0) + (pending.get(a.accountId) ?? 0),
+      inFlightOf,
       serves: (a, arm) => {
+        if (isAggregatorAccount(a) && nativeReady.has(dupKey(arm.model))) return 'duplicate held for native reviewer route';
         const r = admit(a, arm);
         if (r.ok === true) admissionOf.set(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`, r);
         return r.ok;
       },
     });
-    return { pick, admissionOf };
+    return { pick, admissionOf, capHeld };
   }
 
   function configuredTaskReviewer(live, agentId) {
@@ -6045,8 +6070,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true).paced ?? [])
       : [];
     const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
-    const { pick, admissionOf } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds);
+    const { pick, admissionOf, capHeld } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds);
     if (pick.none) {
+      // A legacy keep fallback still starts provider work. It cannot escape
+      // the shared credential cap when an approved reviewer route is full.
+      if (capHeld) {
+        const reason = 'reviewer reactive account in-flight cap reached';
+        note({ routed: false, deferred: true, reason });
+        return { kind: 'defer', retryAfterMs: 20000, reason };
+      }
       // Only the pace guard stood in the way: wait for a run to finish instead
       // of falling back to keep, which would run on the held lane unpaced.
       if (pacedIds.size > 0 && !pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs).pick.none) {
