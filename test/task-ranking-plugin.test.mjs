@@ -46,8 +46,8 @@ async function drive({ mode = 'enforce', served = ['gpt-6.1-sol', 'gpt-5.6-terra
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(now).toISOString(), rows: aaRows, duplicateSlugs: [] });
   await plugin.onConfigChanged(raw, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
-  return { store, io, lane, config: raw, plugin, tick: () => jobs.get('shadow-tick')({}), setNow: ms => { now = ms; },
+  await jobs.get('quota-refresh')({});
+  return { store, io, lane, config: raw, plugin, tick: () => jobs.get('quota-refresh')({}), setNow: ms => { now = ms; },
     hook: (p = {}) => plugin.onResolveRunModel({ runId: 'hook', companyId: 'acme', agentId: 'builder',
       issueId: 'issue', adapterType: 'claude-code', agentDefaultModel: null, issueOverrideModel: null, ...p }),
     fire: (runId = 'event', agentId = 'builder') => events.get('agent.run.started')({ type: 'agent.run.started', companyId: 'acme', entityId: runId,

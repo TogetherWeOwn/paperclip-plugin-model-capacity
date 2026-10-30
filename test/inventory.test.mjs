@@ -199,7 +199,7 @@ async function capacityFor(lane, rows) {
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
 }
 

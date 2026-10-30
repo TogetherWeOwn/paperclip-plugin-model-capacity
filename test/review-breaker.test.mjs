@@ -82,7 +82,7 @@ function rig({ failBreakerReads = false } = {}) {
       store.set(skey(AA_SKEY), { fetchedAt: new Date(T).toISOString(), rows: aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     hook: (runId) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', issueId: null,
       adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,
@@ -104,8 +104,8 @@ test('finding 1: breaker load failure aborts the tick without wiping; retry load
   const seedJSON = breakerStoreToJSON(seed, { nowMs: T, cfg });
   r.seed(BREAKER_SKEY, seedJSON);
 
-  // The job wrapper reports per-company failures as shadow-tick-failed.
-  await assert.rejects(r.tick(), /shadow-tick-failed/);
+  // The job wrapper reports per-company failures as quota-refresh-failed.
+  await assert.rejects(r.tick(), /quota-refresh-failed/);
   // Nothing persisted over the saved breakers: the seed is untouched.
   assert.deepEqual(r.read(BREAKER_SKEY), seedJSON);
 

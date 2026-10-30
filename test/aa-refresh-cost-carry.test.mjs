@@ -260,7 +260,7 @@ test('refresh that nulls one family costs keeps that family ladders and the targ
     },
   });
 
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const before = store.get(skey(CAP_KEY));
   assert.ok(before && before.target > 0, `pre-refresh target must be concrete and positive (got ${before?.target})`);
 
@@ -284,7 +284,7 @@ test('refresh that nulls one family costs keeps that family ladders and the targ
   assert.ok(errors.some(([msg]) => String(msg).includes('carried forward from previous snapshot')),
     'refresh logs the carry at error level');
 
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const ladders = store.get(skey(LADDER_KEY))?.ladders ?? {};
   const metaKeys = Object.keys(ladders).filter(k => k.startsWith('meta:'));
   assert.ok(metaKeys.length > 0, 'meta lane still has a ladder entry');
@@ -342,7 +342,7 @@ test('costless new slug with no carry source stays laddered via the median backs
     lastLeaderboardError: null,
   });
 
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const cap = store.get(skey(CAP_KEY));
   const metaView = (cap.accounts ?? []).find(a => a.provider === 'meta');
   assert.ok(metaView && metaView.arms.length > 0, 'costless arms keep their ladder rungs');
@@ -399,7 +399,7 @@ test('costless arm with a measured same-family sibling prices at the family medi
     lastLeaderboardError: null,
   });
 
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const cap = store.get(skey(CAP_KEY));
   const metaView = (cap.accounts ?? []).find(a => a.provider === 'meta');
   const arms = metaView?.arms ?? [];

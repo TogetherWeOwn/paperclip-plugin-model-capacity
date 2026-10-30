@@ -237,7 +237,7 @@ function drive({ config = {} } = {}) {
       store.set(skey(AA_SKEY), { fetchedAt: new Date(TICK).toISOString(), rows: aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     hook: (runId, agentId = 'eng') => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',
       invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,

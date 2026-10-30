@@ -235,7 +235,7 @@ async function drive({ cap = capacity(), raw = config(), issues = [], heads = 0,
   await plugin.onConfigChanged(raw, { companyId: COMPANY });
   return { store, barrier, reads, censusCalls: () => censusCalls,
     configure: next => plugin.onConfigChanged(next, { companyId: COMPANY }),
-    tick: () => jobs.get('shadow-tick')({ companyId: COMPANY }),
+    tick: () => jobs.get('quota-refresh')({ companyId: COMPANY }),
     caps: async () => {
       const result = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
       assert.equal(result.status, 200);

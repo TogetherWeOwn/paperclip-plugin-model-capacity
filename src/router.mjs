@@ -87,7 +87,10 @@ function nextTime(account, reason, now, recheck, hardCap = .995, hardCapFiveHour
 
 export function routeDecision(params, snapshot, config = {}) {
   const now = nowOf(params), candidates = candidatesOf(params), router = config.router ?? {};
-  if (!validPool(params?.pool)) return unavailable(allSkipped(candidates, 'unmapped-member'));
+  const inspectedKeys = new Set(candidates.map(c => snapshot?.memberIndex?.[memberId(c)]?.poolKey).filter(Boolean));
+  const inspectedUnavailable = snapshot?.unavailablePoolIds?.includes(params?.pool?.id)
+    || [...inspectedKeys].some(key => snapshot?.unavailablePoolKeys?.includes(key));
+  if (!validPool(params?.pool) || inspectedUnavailable) return unavailable(allSkipped(candidates, 'unmapped-member'));
   if (!candidates.length) return unavailable({});
   // A pure decision cannot construct a future retry without a trustworthy clock.
   if (!Number.isFinite(now)) return unavailable(allSkipped(candidates, 'quota-snapshot-stale'));
@@ -111,6 +114,7 @@ export function routeDecision(params, snapshot, config = {}) {
     const a = i.account;
     let reason = null;
     if (!poolKey || !snapshot.poolRoles?.[poolKey] || !i.key || !a) reason = 'unmapped-member';
+    else if (allowedReasons.has(snapshot.memberSkipReasons?.[i.id])) reason = snapshot.memberSkipReasons[i.id];
     else if (feedStaleMembers.has(i.id) || !['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE) || [a.weeklyUsed, a.fiveHourUsed].some(u => u != null && (!Number.isFinite(u) || u < 0 || u > 1))) reason = 'account-reading-stale';
     else if (a.credentialReady === false) reason = 'credential-unavailable';
     else if (Number.isFinite(a.weeklyUsed) && a.weeklyUsed >= hardCap) reason = 'weekly-exhausted';

@@ -89,7 +89,7 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     advance: (ms) => { nowMs += ms; },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     hook: (runId, agentId) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId, issueId: null,
       adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,

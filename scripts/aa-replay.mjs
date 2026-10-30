@@ -61,7 +61,7 @@ export async function replayTick({ config, lane, states, snapshot, demand, nowMs
   if (!Number.isFinite(nowMs) || !demand || !lane || !config) throw new Error('Missing replay inputs');
   const fake = await start({ config, lane, states, demand, nowMs });
   fake.store.set('aa-snapshot-v1', clone(snapshot));
-  try { await fake.jobs.get('shadow-tick')({}); }
+  try { await fake.jobs.get('quota-refresh')({}); }
   catch (e) { throw new Error(`Offline shadow tick failed: ${JSON.stringify(fake.failures)}`, { cause: e }); }
   const capacity = fake.store.get('capacity-v1');
   const ladders = fake.store.get('ladder-v1');

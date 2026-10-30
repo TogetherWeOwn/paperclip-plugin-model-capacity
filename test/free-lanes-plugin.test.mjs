@@ -54,11 +54,11 @@ async function drive({ free = freeConfig, config: extra = {}, records = [], usag
   if (!state) store.set(skey('ledger-v1'), records);
   if (usage) store.set(skey('free-lanes-v1'), usage);
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  if (initialTick) await jobs.get('shadow-tick')({});
+  if (initialTick) await jobs.get('quota-refresh')({});
   return {
     store, io, lane, plugin, hook: extra => plugin.onResolveRunModel(params(extra)),
     api: async routeKey => (await plugin.onApiRequest({ companyId: 'acme', routeKey })).body,
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     fire: e => handlers.get(e.type)(e), setNow: v => { now = v; },
     configure: async patch => { config = { ...config, ...patch }; await plugin.onConfigChanged(config, { companyId: 'acme' }); },
     killIo: () => { for (const k of ['config', 'state', 'secrets', 'http', 'agents', 'issues']) io[k] = new Proxy({}, { get() { throw Error(`io-forbidden:${k}`); } }); },

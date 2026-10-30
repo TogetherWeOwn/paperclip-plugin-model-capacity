@@ -75,7 +75,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
     duplicateSlugs: [],
   });
   // Gen1: live view + enforced hook decision, persisted.
-  await jobs1.get('shadow-tick')({});
+  await jobs1.get('quota-refresh')({});
   const hookOut = await plugin.onResolveRunModel({
     runId: 'run-hook', companyId: 'acme', agentId: 'agent-9', issueId: null,
     adapterType: 'claude-code', invocationSource: 'test', wakeReason: null,
@@ -84,7 +84,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
   });
   assert.equal(hookOut.kind, 'decide');
   await handlers1.get('agent.run.started')(started('run-hook', TICK));
-  await jobs1.get('shadow-tick')({});
+  await jobs1.get('quota-refresh')({});
   const persisted1 = store.get(skey(LEDGER_STATE_KEY));
   assert.ok(persisted1.some(r => r.runId === 'run-hook' && r.enforced === true), 'gen1 hook decision persisted');
 
@@ -95,7 +95,7 @@ test('runs recorded while the ledger load is pending survive in persisted state'
   await plugin.setup(io(jobs2, handlers2));
   await plugin.onConfigChanged({ enforce: true }, { companyId: 'acme' });
   gateLoad = true;
-  const tickP = jobs2.get('shadow-tick')({});
+  const tickP = jobs2.get('quota-refresh')({});
   // Wait until the tick is genuinely parked INSIDE the ledger-v1 read
   // (past the overlay snapshot the old code took here). Only then fire,
   // so the write provably lands during the await -- the interleaving the

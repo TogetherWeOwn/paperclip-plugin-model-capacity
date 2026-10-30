@@ -170,7 +170,7 @@ function drive(extraAccounts, configCredits, { baseModels = ['gpt-6.1-sol'], bas
       step = i;
       now = T0 + i * 5 * 60000;
     }
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
   };
   return {
@@ -399,7 +399,7 @@ function driveCreditGroup() {
         await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `cr-run-${i}-${n}`,
           payload: { run: { agentId: 'eng', model: 'gpt-6.1-sol' } }, occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
       }
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
   };
@@ -468,7 +468,7 @@ function driveDrain({ fractions, creditResetsAtH = 48, creditFromStep = 0, preCr
     tick: async i => {
       now = T0 + i * 5 * MIN;
       step = i;
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
   };
@@ -639,7 +639,7 @@ function driveCreditHorizons() {
         await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `hz-run-${i}-${n}`,
           payload: { run: { agentId: 'eng', model: 'gpt-6.1-sol' } }, occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
       }
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
   };

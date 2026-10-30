@@ -154,7 +154,7 @@ async function tickFixture() {
       }
     }
     try {
-      await jobs.get('shadow-tick')({ companyId: 'acme' });
+      await jobs.get('quota-refresh')({ companyId: 'acme' });
     } catch (error) {
       throw new Error(`synthetic tick ${step}: ${JSON.stringify(errors)}`, { cause: error });
     }

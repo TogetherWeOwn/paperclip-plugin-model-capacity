@@ -207,7 +207,7 @@ async function capacityBody({ config = {}, feedExtra = {}, lane = null, smoothE 
   // (C* defined) without a multi-tick history.
   if (smoothE) store.set(skey(SMOOTH_SKEY), { E: smoothE });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({ companyId: 'acme' });
+  await jobs.get('quota-refresh')({ companyId: 'acme' });
   return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
 }
 

@@ -81,7 +81,7 @@ test('credential readiness admission is a strict opt-in object', () => {
 test('jobs and API routes are declared', () => {
   const jobs = new Map(manifest.jobs.map(j => [j.jobKey, j.schedule]));
   assert.equal(jobs.get('aa-refresh'), '17 4 * * *');
-  assert.equal(jobs.get('shadow-tick'), '* * * * *');
+  assert.equal(jobs.get('quota-refresh'), '* * * * *');
   const routes = new Map(manifest.apiRoutes.map(r => [r.routeKey, r.path]));
   assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'shadow']);
   assert.equal(routes.get('caps'), '/caps');

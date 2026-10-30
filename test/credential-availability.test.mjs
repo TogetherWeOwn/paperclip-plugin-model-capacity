@@ -71,7 +71,7 @@ async function start(accounts, rows = null, configure = () => {}) {
       config.credentialReadiness.enforce = value;
       return plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     hook: runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 }),
     startRun: runId => events.get('agent.run.started')({
@@ -424,7 +424,7 @@ test('enforce off stops stale-snapshot deferral during a failing tick', async ()
   await d.tick();
   d.setFetchStatus(503);
   d.setNow(NOW + 180000);
-  await assert.rejects(d.tick(), /shadow-tick-failed/);
+  await assert.rejects(d.tick(), /quota-refresh-failed/);
   assert.equal((await d.hook('outage-enforced')).kind, 'defer');
   await d.setEnforce(false);
   assert.deepEqual(await d.hook('outage-disabled'), { kind: 'keep' });
@@ -645,7 +645,7 @@ test('disabling enforcement during a lane fetch holds after the tick lands', asy
     fetchedAt: ISO, duplicateSlugs: [], rows: [{ slug: MODEL, intelligenceIndex: 70, intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 }],
   });
   await plugin.onConfigChanged(structuredClone(current), { companyId: 'acme' });
-  const tick = () => jobs.get('shadow-tick')({});
+  const tick = () => jobs.get('quota-refresh')({});
   const hook = runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 });
   await tick();
   assert.equal((await hook('race-on')).kind, 'defer');

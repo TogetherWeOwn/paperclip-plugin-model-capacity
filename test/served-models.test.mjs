@@ -80,7 +80,7 @@ async function start(lane, rows) {
   store.set(key(AA_KEY), { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
   return {
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
     hook: runId => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',

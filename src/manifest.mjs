@@ -1005,9 +1005,9 @@ export function buildManifest({ modelResolve = false } = {}) {
         schedule: '17 4 * * *',
       },
       {
-        jobKey: 'shadow-tick',
-        displayName: 'Shadow capacity tick',
-        description: 'Every minute: refresh CLIProxy readings on demand, step per-account pacing pointers, recompute the concurrency target, and record what would have been decided for recently started runs. Writes shadow state only.',
+        jobKey: 'quota-refresh',
+        displayName: 'Refresh quota and shadow capacity',
+        description: 'Every minute: read the single quota feed, publish immutable native-router snapshots and per-pool synthetic shadow decisions, and retain the legacy hook capacity tick during migration.',
         schedule: '* * * * *',
       },
     ],

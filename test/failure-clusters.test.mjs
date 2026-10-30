@@ -851,7 +851,7 @@ test('tick maintenance runs even when the shadow tick itself fails', async () =>
   // loudly while maintenance lands the exit write.
   harness.setNow(T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
   harness.breakConfig();
-  await assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  await assert.rejects(harness.jobs.get('quota-refresh')({}), /quota-refresh-failed/);
   assert.equal(issues.calls.update.length, 1);
   assert.equal(issues.calls.update[0].patch.status, 'done');
 });
@@ -886,7 +886,7 @@ test('queued maintenance re-reads alert config after disable', async () => {
   harness.context.logger.error = message => {
     if (message.includes('shadow tick failed')) queued();
   };
-  const tick = assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  const tick = assert.rejects(harness.jobs.get('quota-refresh')({}), /quota-refresh-failed/);
   await tickFailed;
   await harness.plugin.onConfigChanged({ failureClusterAlert: { enabled: false } }, { companyId: 'acme' });
   release();
@@ -936,7 +936,7 @@ test('health reports error while alert writes fail', async () => {
   assert.equal(health.details.failureClusters.writeErrors, 1);
   harness.setNow(T0 + FAILURE_CLUSTER_WINDOW_MS + 5000);
   harness.breakConfig();
-  await assert.rejects(harness.jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+  await assert.rejects(harness.jobs.get('quota-refresh')({}), /quota-refresh-failed/);
   const expired = await harness.plugin.onHealth();
   assert.equal(expired.details.failureClusters.activeClusters, 0);
   assert.equal(expired.details.failureClusters.writeErrors, 1);

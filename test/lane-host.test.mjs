@@ -78,7 +78,7 @@ test('the lane secret is read only after the pin check, by default', async () =>
     issues: { get: async () => null },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on() {} },
-    logger: { info() {}, error: (_m, e) => calls.errors.push(e?.error) },
+    logger: { info() {}, error: (_m, e) => calls.errors.push(e?.reason) },
   };
   // No requirePinnedLaneHost override: this is the deployed configuration.
   const plugin = createModelCapacityPlugin({ clock: () => now });
@@ -86,12 +86,12 @@ test('the lane secret is read only after the pin check, by default', async () =>
   store.set(JSON.stringify(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: [], duplicateSlugs: [] });
   await plugin.onConfigChanged({ cliproxy: { laneKeySecretRef: SECRET } }, { companyId: 'acme' });
   if (isPlaceholderLaneHost()) {
-    await assert.rejects(() => jobs.get('shadow-tick')({}), /shadow-tick-failed/);
+    await assert.rejects(() => jobs.get('quota-refresh')({}), /quota-refresh-failed/);
     assert.deepEqual(calls.errors, ['cliproxy-lane-host-unpinned']);
     assert.equal(calls.resolve, 0, 'unpinned build must not resolve the lane secret');
     assert.deepEqual(calls.fetch, [], 'unpinned build must not issue any request');
   } else {
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     assert.equal(calls.resolve, 1);
     assert.equal(calls.fetch.length, 1);
     assert.ok(calls.fetch[0].startsWith(LANE_BASE_URLS[0]));

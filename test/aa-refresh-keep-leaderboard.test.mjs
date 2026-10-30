@@ -143,7 +143,7 @@ test('leaderboard parse failure keeps prior leaderboard rows, ladders and target
   // (Fleet target reads null until measured runs calibrate burn -- weak, not
   // stalled. The 10-17 stall read target 0 with empty ladders; this asserts
   // the opposite: ladders non-empty, per-account share positive, target never 0.)
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const LADDER_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'ladder-v1' };
   const CAP_KEY = { scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'capacity-v1' };
   const ladders = store.get(skey(LADDER_KEY))?.ladders ?? {};
@@ -326,9 +326,9 @@ test('all-ladders-empty alarm fires once across repeated ticks (rate-limited)', 
     { companyId: 'acme' },
   );
   // No AA snapshot seeded: every ladder is empty.
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   setNow(TICK + 60 * 1000);
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const alarms = errors.filter(([msg]) => String(msg).includes('all account ladders empty'));
   assert.equal(alarms.length, 1, `alarm logged once across two ticks (got ${alarms.length})`);
 });
@@ -364,7 +364,7 @@ test('target-zero-with-headroom alarm fires through the tick when calibrated cap
       },
     },
   });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const empty = errors.filter(([msg]) => String(msg).includes('all account ladders empty'));
   assert.equal(empty.length, 1, 'empty ladders alarm fires');
   const alarms = errors.filter(([msg]) => String(msg).includes('capacity target is 0 with healthy accounts'));
