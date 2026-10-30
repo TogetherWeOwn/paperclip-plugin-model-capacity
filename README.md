@@ -179,19 +179,22 @@ step. A terminal event never releases another run's base pressure. Sequence
 checkpoints retain events received while persistence is awaiting IO;
 failed/superseded ticks do not reset it.
 
-The transitional resolver body is byte-identical to branch handoff `52f4c97`.
-That handoff already differs from the supplied read-only 0.2.72 reference;
-this release slice does not port or undo those inherited differences. The
-branch hook SHA256 is
-`18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
-the reference hook SHA256 is
+The integration pass merges already-reviewed mainline `dc86ae4` (PRs #74/#75),
+restoring the superseded-default defer guards and reviewer
+`suppressAccountFallback` inputs missing from the original port handoff. It
+introduces no new hook algorithm. The transitional resolver body now matches
+BOTH mainline and the supplied read-only 0.2.72 reference byte-for-byte, SHA256
 `a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2`.
 Extraction is from the exact `async onResolveRunModel(params)` declaration
-through its closing property delimiter, with whitespace retained. Missing
-superseded-default guards and differing reviewer/account-fallback inputs are
-inherited differences, NOT proof of deployed-hook parity. The §17 empty-diff
-criterion is therefore OPEN; release/merge must not claim it is met. Resolve
-that discrepancy and prove deployed behavior before transitional rollout.
+through its closing property delimiter, with whitespace retained. The tarball
+regression pins that independent reference hash (not a hash of our own source)
+and checks the entire packaged transitional source after only the build-time
+factory lock. The stale handoff hash was `18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
+the new assertion failed on that hash before mainline reconciliation. Mainline's
+frozen default-parity corpus and reviewer/Devin regression suites also execute
+against the unpacked transitional artifact. This establishes source/package
+retention, NOT live fork-image install or production behavior proof; G-T and
+independent integration review remain open.
 
 Operator sequence (no deployment is authorized by this documentation):
 
@@ -671,10 +674,11 @@ must distinguish those from actual native staging installs and real traffic.
 - [x] Draft companion registry rows include every Q3 dependency, named Keeper
   writer, reserve uncertainty, caps disposition, residual and MCP audit gap.
   They are NOT applied host changes; remaining census work is explicit.
-- [ ] **Inherited hook parity discrepancy**: branch handoff hook is retained
-  byte-for-byte by this slice, but its hash differs from the read-only 0.2.72
-  reference above. Deployed-hook behavioral parity and §17 empty-diff evidence
-  are not established; resolve before release/merge, not by a silent rewrite.
+- [x] **Reference/mainline hook source parity**: merge mainline PRs #74/#75
+  in a distinct integration commit; transitional artifact resolver hash matches
+  both main `dc86ae4` and the read-only 0.2.72 reference above, with an empty
+  byte diff. Test-first regression rejects the stale port handoff. Independent
+  integration review and live G-T behavior proof are still required below.
 - [ ] Full-src reserve/caps-consumer/producer census and any required Q7 clean
   route retirement; local port-call-site tests are narrower evidence.
 - [ ] Staging evidence G-1, G-T (both handlers simultaneously on fork image,
@@ -719,3 +723,118 @@ No local core patch is required. Intended native mechanisms are documented in
 Paperclip `doc/plugins/LOCAL_PLUGIN_DEVELOPMENT.md`, the SDK plugin types and
 `server/src/services/ai-connection-router.ts`; the source fixtures pin the
 contract used here. Upgrade the fixtures deliberately when upstream changes.
+
+## Retained mainline transitional controls
+
+The following controls were already merged in mainline PRs #74/#75. They
+remain opt-in; this port does not activate them or change their hook behavior.
+
+## Newest version per account (opt-in)
+
+`roles.newestVersionOnly.enabled` defaults to `false`; absent or disabled leaves
+legacy routing unchanged. When enabled, each account's served model list (or
+inferred provider arms when the list is absent) defines its own universe. Older
+versions of the same parsed product line are structurally excluded even when the
+newest version is unscored or unavailable. Models with unknown identities or
+versions fail open. Distinct products, such as Flash and Flash Lite, do not
+supersede one another merely because they share a family.
+
+Overrides under `roles.newestVersionOnly.overrides` allow `keep` entries such as
+`arm:<armId>`, `model:<canonicalModel>`, or `product:<productKey>`; a bare arm
+or model ID is also accepted. An effort-scoped arm keep applies only to that
+representation. `productAliases` maps parsed product keys to a shared key, and
+`parsePins` assigns a `product` and numeric `version` to a model or arm when
+parsing needs correction. Inspect the account view under `/capacity.newestVersion`
+and ladder `supersededArmEvidence` before enabling: evidence includes retained
+keeps, while the published exclusion arrays contain only actual exclusions.
+A keep prevents version removal, not strict Pareto, cross-account dominance,
+quality, readiness, breaker, or manual exclusions. Roll back by disabling the
+flag; no model is automatically upgraded.
+
+## Account fallback (opt-in)
+
+`roles.accountFallback` defaults to disabled. When enabled, an account without
+an eligible arm for a configured `doer` or `other` role can admit its best
+eligible fallback candidate for that account and role only. The default roles
+are `['doer', 'other']` and the default `minQuality` is `-0.5`; thinkers and
+recognized reviewers do not receive this fallback. Existing manual, outcome,
+version, readiness, breaker, trial and other safety fences remain in force;
+finalization can suppress a provisional admission. Task-ranking enforce mode
+is not supported. Inspect `/capacity.eligibility.accountFallback` for admitted
+and suppressed rows and warnings. The dashboard reads global exclusions, so a
+fallback admission does not remove the corresponding global exclusion there.
+
+The quality floor is a **fleet-relative z-score**, not an absolute model score:
+it can change as the scored fleet changes. Examine current quality scores and
+floors before choosing a threshold.
+
+For a staged rollout, retain a genuine pre-newest capture and its capture-time
+provenance (producer revision, both resolved feature flags and host timestamp)
+and pass its historical fidelity gate before enabling newest. Deploy fallback
+with the flag disabled and verify the fallback report is absent; only after the
+newest-enabled capture and its producer-matched fidelity and parity gates pass
+should fallback be enabled. Monitor admitted and suppressed rows for 24 hours.
+A `superseded-version` suppression is an integration alarm; persistent
+`cross-account-excluded` suppression on a dead account warrants review.
+A capture without provenance cannot establish historical fidelity.
+
+## Exact-id included pricing and missing-AA canaries (unreleased, opt-in)
+
+These controls admit an arm **inside its existing account**, not a second free
+account. They never enable live enforcement, acquire credentials, or add a job.
+All keys are optional; empty maps/lists and punctuation folding off retain the
+scored routing behavior. Mandatory bans remain unconditional: `gpt-6-sol` and
+`gpt-5.6-terra`, including prefixed/dashed spellings, cannot build arms or enter
+reviewer admission. `bannedModels` can only add bans.
+
+```json
+{
+  "trials": {
+    "unscoredServedIds": [
+      { "servedId": "devin/swe-2", "reason": "Verify offer eligibility for the actual serving integration" }
+    ],
+    "maxInFlightPerAccountByProvider": { "devin": 1 }
+  },
+  "placement": {
+    "duplicateVersionPunctuationFolding": true,
+    "freeCostServedIds": {
+      "devin/swe-2": {
+        "until": "2026-11-30T23:59:59Z",
+        "reason": "Example only; verify the included-price deadline before enabling"
+      }
+    }
+  }
+}
+```
+
+- `trials.unscoredServedIds` requires exact, unique served ids with provenance.
+  It cannot admit banned models or unscored members of already-proven families.
+  Missing AA remains missing: `Q`, `qFleet`, AA row and context remain null.
+  No quality score is borrowed. Admission is limited to legacy routing
+  (`taskRanking.mode=off` or `shadow`), not enforced task ranking.
+- `placement.freeCostServedIds` applies zero monetary cost **only to that exact
+  served id**, through its timezone-explicit real-calendar deadline (inclusive).
+  An expired scored arm resumes normal pricing; an unscored arm without a price
+  is withdrawn. Hooks re-check expiry and rebuild benchmark shells without
+  waiting for the next native tick. An unscored canary shares rung zero without
+  moving scored benchmark rungs.
+- Feasible free, still-ungraduated unscored canaries receive rung-zero exploration
+  preference, bounded by existing role/adapter, family and account in-flight
+  gates. Retry escalation retains authority. Existing terminal outcomes govern
+  `minRuns`/`minSuccessRate` graduation and outcome exclusion. Graduation ends
+  exploration preference without assigning quality; scored siblings can win
+  again. This is not a fleet-wide free-first guarantee.
+- Punctuation folding recognizes duplicate spellings such as `gpt-6-1-sol` and
+  `gpt-6.1-sol`, without changing emitted ids. Only duplicate aggregator arms are
+  held for native routes; unique arms on the same mixed account remain ordinary
+  candidates. Reviewer duplicates likewise wait for an actually usable native
+  reviewer route and release on native outage or holds.
+- Free and paid arms share their account's cap, reservations and breaker namespace.
+  Paid reviewer runs use the same account cap, including pending free work and
+  self-run exclusion; a legacy kept default cannot escape a full reactive cap.
+
+Accepted limits mirror `freeCostProviders`: quota burn still uses real resource
+cost. Enforced task ranking reports zero cash for a scored included-price arm
+but keeps its resource-cost frontier; an inexpensive paid arm may still dominate
+it. The mixed account is **not** marked free, is not added to `freeLanes`, gains
+no account-ordering boost or free-overflow privilege, and acquires no quota meter.

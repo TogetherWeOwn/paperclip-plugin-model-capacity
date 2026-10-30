@@ -5,7 +5,7 @@
 - Native expiring `burn` config with per-account/provider scope, runtime expiry, prefer/exclusive handling and visible standing expiry warnings; the transitional hook's legacy `burnMode` stays unchanged.
 - Durable job-side account/reset-window scorecards with capped incremental time, reset latching, window/24h rates, Keeper/observed-ledger cross-checks and honest null wait attribution. Company-scoped `GET /scorecard` shares its persisted view with `/capacity` and survives worker restart.
 - Native `ai.connections.route` manifest metadata and memory-only `onRouteAiConnection` callback, current operator-attestation tripwire, effective-effort quality/outcome checks, sanitized per-call diagnostics, and event-owned in-flight overlays rebased atomically with quota publication.
-- Variant-locked clean/transitional npm packages with source-stamped entrypoints and actual-tarball upstream manifest conformance tests. Transitional retains the fork resolver unchanged from the approved branch handoff; clean omits its handler, capability, env declaration and enforce field.
+- Variant-locked clean/transitional npm packages with source-stamped entrypoints and actual-tarball upstream manifest conformance tests. Transitional retains the fork resolver byte-identical to mainline dc86ae4 and the read-only 0.2.72 reference; clean omits its handler, capability, env declaration and enforce field.
 ### Release packaging and migration
 - Both installable versions and filenames now name the variant explicitly (`0.3.0-clean`, `0.3.0-transitional`). The source version remains the base `0.3.0` release line. Every boot emits a WARN naming the baked variant; transitional additionally names its hard 2026-11-30 exit.
 - Retire the old `manifest.enforce.mjs` package entrypoint, but keep per-variant `?build=` manifest shims. A loader-mtime negative control reproduces stale ESM dependencies; a changed dependency stamp observes the same-version replacement. Actual staging reinstall proof is still a rollout gate.
@@ -16,7 +16,16 @@
 - The clean package declares `ai.connections.route`, not the fork resolver capability; top-level `enforce` is not accepted by its schema. Remove that field at the separately approved M7 handoff. `router.enabled` independently controls native selection, defaults false, and must be true before binding pools. Zero authorized candidates remains `unavailable`.
 - `thresholdPercent` is inert; reset-relative per-account quota/pacing controls eligibility. Native `burn` requires explicit expiry and does not inherit a standing legacy `burnMode`. Config/burn toggles may restart the worker and create a native-wait wave.
 ### Activation limits
-- Amendment A4 accepts the existing ledger/lifecycle interim attribution path for slice-4 code acceptance. A model-less lifecycle start remains visibly unattributed even with an agent-config-seeded ledger model, and its terminal cannot free another run's account pressure; a mutation-proven regression protects that fence. Native run-account metadata remains an upstream follow-up, not a code-acceptance blocker. G-1/G-T staging install/reinstall proofs belong to rollout. The inherited branch hook differs from the supplied 0.2.72 reference; the §17 empty-diff criterion and deployed-hook parity are explicitly open, not claimed by package-retention tests. Router defaults off; no deployment or publish is part of this source change.
+- Amendment A4 accepts the existing ledger/lifecycle interim attribution path for slice-4 code acceptance. A model-less lifecycle start remains visibly unattributed even with an agent-config-seeded ledger model, and its terminal cannot free another run's account pressure; a mutation-proven regression protects that fence. Native run-account metadata remains an upstream follow-up, not a code-acceptance blocker. G-1/G-T staging install/reinstall proofs belong to rollout. A distinct mainline integration restores already-reviewed PRs #74/#75 and establishes the §17 empty byte diff between the transitional resolver and the supplied 0.2.72 reference/mainline dc86ae4; independent integration review and live G-T behavior proof remain open. Router defaults off; no deployment or publish is part of this source change.
+
+## 0.2.75
+### Added
+- Opt-in per-account fallback for `doer` and `other` roles, preserving reviewer and other safety fences. Inspect admitted and suppressed rows in `/capacity.eligibility.accountFallback`; dashboard exclusions remain global. The fallback quality floor is a fleet-relative z-score, not an absolute benchmark.
+- Offline replay provenance and parity checks for staged newest/fallback rollout. Retain pre-newest capture-time provenance and pass historical fidelity before enabling newest; judge a newest-enabled capture only with its matching producer and flags, then check parity before enabling fallback.
+
+## 0.2.74
+### Added
+- Opt-in account-scoped newest-version filtering with scoped keeps, parser overrides, and auditable supersession views. Disabled by default. Strict Pareto and cross-account dominance remain in force.
 
 ## 0.2.73
 ### Fixed

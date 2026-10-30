@@ -59,10 +59,10 @@ export function canonicalKey(model) {
 }
 
 /** Canonical models a view serves, from its `models` list (raw or canonical ids). */
-export function modelsOfView(view) {
+export function modelsOfView(view, keyFn = canonicalKey) {
   const out = new Set();
   for (const m of view?.models ?? []) {
-    const k = canonicalKey(m);
+    const k = keyFn(m);
     if (k) out.add(k);
   }
   return out;
@@ -73,12 +73,12 @@ export function modelsOfView(view) {
  * views. Views without a `models` list contribute nothing (fail open: an
  * unknown model set never marks an aggregator as duplicate).
  */
-export function nativeQualifiedModels(views, reservePct = 0.05) {
+export function nativeQualifiedModels(views, reservePct = 0.05, keyFn = canonicalKey) {
   const out = new Set();
   for (const v of views ?? []) {
     if (isAggregatorAccount(v)) continue;
     if (!isQualifiedView(v, reservePct)) continue;
-    for (const k of modelsOfView(v)) out.add(k);
+    for (const k of modelsOfView(v, keyFn)) out.add(k);
   }
   return out;
 }
@@ -93,10 +93,10 @@ export function nativeQualifiedModels(views, reservePct = 0.05) {
  * orderAccountsForRun honors an explicit boolean and only computes this
  * when it is absent.
  */
-export function isFallbackOnlyView(view, nativeModels) {
+export function isFallbackOnlyView(view, nativeModels, keyFn = canonicalKey) {
   if (!isAggregatorAccount(view)) return false;
   if (typeof view?.fallbackOnly === 'boolean') return view.fallbackOnly;
-  const served = modelsOfView(view);
+  const served = modelsOfView(view, keyFn);
   if (served.size === 0) return false;
   for (const k of served) {
     if (!nativeModels?.has?.(k)) return false;
@@ -177,15 +177,17 @@ export function crossAccountDominated(arms, qualifiedWithHeadroom, opts = {}) {
     const dominators = group.filter(dominatorUsable);
     if (dominators.length === 0) continue;
     for (const m of group) {
-      const mVer = versionTuple(m.model ?? m.armId);
+      const mVer = opts.requireSameProductForNewer === true ? m.parsedVersion : versionTuple(m.model ?? m.armId);
       let winner = null;
       for (const o of dominators) {
         if (o.accountId === m.accountId && o.armId === m.armId) continue;
         const better = o.Q > m.Q && o.C <= m.C;
         let newer = false;
         if (!better && mVer) {
-          const oVer = versionTuple(o.model ?? o.armId);
-          if (oVer && compareVersions(oVer, mVer) > 0 && o.Q >= m.Q && o.C <= m.C) newer = true;
+          const sameProduct = opts.requireSameProductForNewer !== true
+            || (typeof m.productLine === 'string' && m.productLine.length > 0 && m.productLine === o.productLine);
+          const oVer = opts.requireSameProductForNewer === true ? o.parsedVersion : versionTuple(o.model ?? o.armId);
+          if (sameProduct && oVer && compareVersions(oVer, mVer) > 0 && o.Q >= m.Q && o.C <= m.C) newer = true;
         }
         if (better || newer) {
           if (!winner || winner.Q < o.Q || (winner.Q === o.Q && winner.C > o.C)) winner = o;

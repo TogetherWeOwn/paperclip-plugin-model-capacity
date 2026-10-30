@@ -44,6 +44,9 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
       join(roots[p.variant],'test/router-callback-lifecycle.test.mjs'),
       join(roots[p.variant],'test/snapshot.test.mjs'),
       join(roots[p.variant],'test/router-views.test.mjs'),
+      ...(p.variant === 'transitional' ? [
+        'devin-default-parity.test.mjs', 'devin-lane.test.mjs', 'reviewer-routing.test.mjs',
+      ].map(file => join(roots[p.variant],'test',file)) : []),
     ],{encoding:'utf8',timeout:60000,env:childEnv});
     assert.match(smoke,/# fail 0/);
 
@@ -58,10 +61,10 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
       const source = await readFile(new URL('../src/plugin.mjs',import.meta.url),'utf8');
       const hook = s => s.slice(s.indexOf('    async onResolveRunModel(params) {'),s.lastIndexOf('\n    },\n  };')+'\n    },'.length);
       assert.equal(hook(plugin),hook(source));
-      // Pin the approved branch handoff, NOT the differing 0.2.72 reference.
-      // The README/PR explicitly leave the deployed parity criterion open.
+      // §17 pins the read-only 0.2.72 reference and main dc86ae4, not the
+      // stale port handoff. Mainline integration must not regress that hook.
       assert.equal(createHash('sha256').update(hook(plugin)).digest('hex'),
-        '18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d');
+        'a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2');
       const expected = source.replace("if (!['transitional','clean'].includes(variant))", "if (variant !== 'transitional')")
         .replace("  if (variant === 'clean') delete plugin.onResolveRunModel;\n", '');
       assert.equal(plugin,expected,'transitional helpers changed beyond the build-time factory guard');

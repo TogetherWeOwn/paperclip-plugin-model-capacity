@@ -44,7 +44,12 @@ import { versionTuple, compareVersions } from './cross-account.mjs';
  */
 export function paretoFilter(entries, opts = {}) {
   const usable = (entries ?? []).filter(e => e.Q != null && e.C != null);
-  const dropped = (entries ?? []).filter(e => e.Q == null || e.C == null).map(e => e.armId);
+  const unscored = opts.unscoredArmIds instanceof Set
+    ? (entries ?? []).filter(e => opts.unscoredArmIds.has(e.armId) && e.Q === null && e.C === 0)
+      .map(e => ({ rung: 0, armId: e.armId, Q: null, C: 0, coverage: 0, maxRung: LOW_COVERAGE_MAX_RUNG, unscoredTrial: true }))
+    : null;
+  const admittedIds = new Set((unscored ?? []).map(e => e.armId));
+  const dropped = (entries ?? []).filter(e => (e.Q == null || e.C == null) && !admittedIds.has(e.armId)).map(e => e.armId);
   const incumbents = opts.incumbents instanceof Set ? opts.incumbents : null;
   const gateByArm = opts.gateByArm instanceof Map ? opts.gateByArm
     : (opts.gateByArm && typeof opts.gateByArm === 'object' ? opts.gateByArm : null);
@@ -99,7 +104,7 @@ export function paretoFilter(entries, opts = {}) {
   // Only report pairs where the incumbent actually kept its rung: a block
   // followed by a drop at someone else's hands is not a kept rung.
   const withinNoise = noisyBlocks.filter(w => survived.has(w.incumbent));
-  return { rungs, dominated, dropped, withinNoise };
+  return { rungs, dominated, dropped, withinNoise, ...(unscored !== null ? { unscored } : {}) };
 }
 
 function strictlyDominates(a, b) {
@@ -115,6 +120,7 @@ function strictlyDominates(a, b) {
  * { armId, Q, C } keep bit-identical behavior.
  */
 function sameFamilyNewerDominates(o, m) {
+  if (o?.newestVersionManaged === true && m?.newestVersionManaged === true) return false;
   const famO = typeof o?.family === 'string' ? o.family.toLowerCase() : null;
   const famM = typeof m?.family === 'string' ? m.family.toLowerCase() : null;
   if (!famO || famO !== famM) return false;
@@ -176,13 +182,13 @@ export function pinRungs(freshRungs, previousRungs) {
  * ladder's withinNoise) keeps a held challenger gated against its incumbent
  * across ticks until the CI bar clears. Returns
  * { rungs, dominated, dropped, withinNoise }. */
-export function buildLadder(entries, previousRungs = [], gateByArm = null, heldPairs = []) {
+export function buildLadder(entries, previousRungs = [], gateByArm = null, heldPairs = [], opts = {}) {
   const incumbents = (previousRungs ?? []).length > 0
     ? new Set(previousRungs.map(r => r.armId))
     : null;
-  const { rungs, dominated, dropped, withinNoise } = paretoFilter(entries, { incumbents, gateByArm, heldPairs });
+  const { rungs, dominated, dropped, withinNoise, unscored } = paretoFilter(entries, { incumbents, gateByArm, heldPairs, ...opts });
   const pinned = pinRungs(rungs, previousRungs);
-  return { rungs: pinned, dominated, dropped, withinNoise };
+  return { rungs: pinned, dominated, dropped, withinNoise, ...(unscored !== undefined ? { unscored } : {}) };
 }
 
 /** The same dominance relation for frontier pruning and backup admission.

@@ -306,6 +306,20 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 export const ARM_TOKEN_PREFIX = 'arm:';
 export const armToken = (armId) => `${ARM_TOKEN_PREFIX}${String(armId ?? '').toLowerCase()}`;
 
+/** Resolve the per-account relaxation without modifying global exclusions. */
+export function resolveAccountInputs(baseExclusions, admissions, roleBands, role, accountId,
+  { suppressAccountFallback = false, supersessionView = null, newestEnabled = false } = {}) {
+  const admission = admissions?.[role]?.[accountId];
+  if (suppressAccountFallback || (newestEnabled && supersessionView == null) || !admission) {
+    return { excludedFamilies: baseExclusions, fallbackAdmission: null };
+  }
+  return {
+    excludedFamilies: baseExclusions.filter(token => token !== armToken(admission.armId)),
+    fallbackAdmission: { armId: admission.armId, band: roleBands?.[role] ?? roleBands?.doer ?? DEFAULT_ROLE_BANDS.doer,
+      supersessionView, newestEnabled },
+  };
+}
+
 /** True when the arm's family or the arm itself is in the (normalized) exclusion set. */
 function armExcluded(arm, excludedSet) {
   if (excludedSet.size === 0) return false;
@@ -355,6 +369,19 @@ export function roleRungWindow(band, groupCount) {
   const floor = clamp(band?.floorRung ?? 0, 0, topRung);
   const ceiling = band?.ceilingRung == null ? topRung : clamp(band.ceilingRung, floor, topRung);
   return { topRung, floor, ceiling };
+}
+
+/** Seat a fallback candidate inside the role window without mutating shared groups. */
+export function seatFallbackArm(groups, candidate, band) {
+  if (groups.length === 0) return groups;
+  const { floor, ceiling } = roleRungWindow(band, groups.length);
+  if (groups.some((group, index) => index >= floor && index <= ceiling
+    && (group.arms ?? []).some(arm => arm.armId === candidate.armId))) return groups;
+  const existing = groups.flatMap(group => group.arms ?? []).find(arm => arm.armId === candidate.armId);
+  const result = groups.map(group => ({ ...group,
+    arms: (group.arms ?? []).filter(arm => arm.armId !== candidate.armId) }));
+  result[floor].arms.push({ ...(existing ?? candidate), rung: floor });
+  return result;
 }
 
 /**
@@ -409,7 +436,7 @@ export function placementArm(ladderRungs, {
   const groups = ladderRungs ?? [];
   const { floor, ceiling } = roleRungWindow(roleBands[role] ?? roleBands.doer, groups.length);
   const excluded = new Set(normalizeExcludedFamilies(excludedFamilies));
-  const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
+  const rankQ = (a) => { const q = role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q; return Number.isFinite(q) ? q : -Infinity; };
   // Same walk as decide(): pointer down to the floor, then up to the ceiling.
   const target = clamp(pointer ?? floor, floor, ceiling);
   const order = [];
@@ -535,14 +562,22 @@ export function decide({
       return Number(!x) - Number(!y) || (x && y ? compareTaskCosts(x, y) : 0) || a - b;
     });
   }
+  // Explicit missing-AA canaries must collect outcomes instead of always
+  // losing a shared rung to measured quality. Explore only the free, still-
+  // trial arm at rung zero, after ALL feasibility/trial-budget gates above.
+  // Role windows and retries retain authority; graduation removes this
+  // preference, with Q left null throughout (never a synthetic score).
+  const canary = a => !taskEnforce && escalation === 0 && a.unscoredTrial === true
+    && a.trial === true && a.Q === null && a.C === 0;
   for (const rung of order) {
     const fitting = fittingByRung.get(rung);
     if (fitting.length === 0) continue;
     // Thinkers rank on their own EEE blend (qThinker, alpha 0.10); every
     // other role ranks on the ladder Q (doer blend). Arms without a thinker
     // blend (AA-only, or ladders built before it existed) fall back to Q.
-    const rankQ = (a) => role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q;
-    fitting.sort((a, b) => (taskEnforce ? compareTaskCosts(a, b) : 0)
+    const rankQ = (a) => { const q = role === 'thinker' ? (a.qThinker ?? a.Q) : a.Q; return Number.isFinite(q) ? q : -Infinity; };
+    fitting.sort((a, b) => (rung === 0 ? Number(canary(b)) - Number(canary(a)) : 0)
+      || (taskEnforce ? compareTaskCosts(a, b) : 0)
       || (rankQ(b) - rankQ(a)) || (a.armId < b.armId ? -1 : a.armId > b.armId ? 1 : 0));
     const arm = fitting[0];
     // Sol window (a tier cap may only lower it), else the tier cap, else the

@@ -96,7 +96,9 @@ function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = 
       agentDefaultModel: null, previous: null, issueOverrideModel: null,
       deadlineMs: 1500,
     }),
+    ledger: () => store.get(skey(LEDGER_SKEY)),
     capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+    ladder: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' })).body,
   };
 }
 
@@ -418,4 +420,139 @@ test('the published family outcomes and the gate attribute a run to the same fam
   assert.equal(cap.familyOutcomes.muse?.runs, 1, 'counted under the decision family, not "unknown"');
   assert.equal(cap.familyOutcomes.unknown, undefined);
   assert.equal(cap.eligibility.roles.doer.outcome.families.muse.judged, 1);
+});
+
+test('fallback reporting does not change routing or ladder serialization', async () => {
+  const common = { enforce: true, roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
+  const off = drive({ config: common });
+  const on = drive({ config: { ...common, roles: { ...common.roles, accountFallback: { enabled: true, minQuality: -3 } } } });
+  await off.setup(); await on.setup();
+  await off.tick(); await on.tick();
+  const a = await off.capacity(); const b = await on.capacity();
+  assert.equal('accountFallback' in a.eligibility, false);
+  assert.equal(b.eligibility.accountFallback.supported, true);
+  assert.ok(b.eligibility.accountFallback.admitted.length > 0);
+  assert.deepEqual(b.roleExclusionsEffective, a.roleExclusionsEffective);
+  assert.equal(JSON.stringify(await on.ladder()), JSON.stringify(await off.ladder()));
+  assert.deepEqual(await on.hook('f2-run', 'eng-doer'), await off.hook('f2-run', 'eng-doer'));
+});
+
+
+test('fallback warning and report reflect newest-version configuration at tick', async () => {
+  for (const enabled of [false, true]) {
+    const d = drive({ config: { roles: { ...ROLES_CFG, accountFallback: { enabled: true }, newestVersionOnly: { enabled } } } });
+    await d.setup(); await d.tick();
+    const report = (await d.capacity()).eligibility;
+    assert.equal(report.accountFallback.newestVersionActive, enabled);
+    assert.equal(report.warnings.filter(w => w.code === 'account-fallback-without-newest-version').length, enabled ? 0 : 1);
+  }
+});
+
+test('tick suppresses a provisional fallback when its account has no usable benchmark rungs', async () => {
+  const d = drive({ coolingMeta: true, config: { roles: { ...ROLES_CFG,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 },
+    outcomeGate: { enabled: false },
+  }, credentialReadiness: { enforce: true } } });
+  await d.setup();
+  await d.tick();
+  const fallback = (await d.capacity()).eligibility.accountFallback;
+  assert.ok(fallback.suppressed.some(row => row.role === 'doer' && row.armId === 'muse-spark-1-3-xhigh'), JSON.stringify(fallback));
+  assert.ok(!fallback.admitted.some(row => row.role === 'doer' && row.armId === 'muse-spark-1-3-xhigh'));
+});
+
+
+test('tick shadow routes a doer to its admitted weak account', async () => {
+  const ledger = [{ runId: 'shadow-weak', agentId: 'eng-doer', status: 'running', startedAt: TICK - 1000, unverified: false }];
+  const config = { placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 }, outcomeGate: { enabled: false } } };
+  const d = drive({ config, ledger });
+  await d.setup();
+  await d.tick();
+  const cap = await d.capacity();
+  assert.ok(cap.eligibility.accountFallback.admitted.some(row => row.role === 'doer' && row.accountId === 'meta:m1'));
+  assert.equal(d.ledger().find(r => r.runId === 'shadow-weak').decidedAccount, 'meta:m1');
+});
+
+test('F-T28: finalized fallback is reported once per admitted role without changing fleet verdict', async () => {
+  const roles = { ...ROLES_CFG, outcomeGate: { enabled: false } };
+  const d = drive({ config: { roles: { ...roles,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 } } } });
+  const control = drive({ config: { roles } });
+  await d.setup(); await control.setup();
+  await d.tick(); await control.tick();
+  const e = (await d.capacity()).eligibility;
+  const baseline = (await control.capacity()).eligibility;
+  const verdicts = report => report.arms.map(a => [a.armId,
+    Object.fromEntries(Object.entries(a.eligible).map(([role, v]) => [role, v.ok]))]);
+  assert.deepEqual(verdicts(e), verdicts(baseline), 'fallback does not change fleet verdicts');
+  assert.equal(e.warnings.filter(w => w.code === 'account-fallback-admitted' && w.role === 'doer').length, 1);
+  const muse = e.arms.find(a => a.armId === 'muse-spark-1-3-xhigh');
+  assert.equal(muse.eligible.doer.ok, false);
+  assert.ok(muse.eligible.doer.reasons.some(r => r.startsWith('account-fallback-admitted:')));
+});
+
+test('F-T26: legacy tick preview seats fallback in shadow but enforce stays pinned', async () => {
+  for (const mode of ['shadow', 'enforce']) {
+    const d = drive({ config: { placement: FLAT_PLACEMENT, taskRanking: { mode }, roles: { ...ROLES_CFG,
+      accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 }, outcomeGate: { enabled: false } } } });
+    await d.setup(); await d.tick();
+    const cap = await d.capacity();
+    const comparison = cap.taskRanking.routeComparisons.find(c => c.previewInputs.role === 'doer' && c.previewInputs.adapterType === null);
+    assert.equal(comparison.legacy?.accountId, mode === 'shadow' ? 'meta:m1' : 'claude:a1', `legacy preview in ${mode}: ${JSON.stringify(comparison)}`);
+    if (mode === 'enforce') assert.equal(cap.eligibility.accountFallback.supported, false);
+  }
+});
+
+test('F-T27: fallback never changes serialized ladder with newest either off or on', async () => {
+  for (const enabled of [false, true]) {
+    const roles = { ...ROLES_CFG, newestVersionOnly: { enabled }, outcomeGate: { enabled: false } };
+    const off = drive({ config: { roles } });
+    const on = drive({ config: { roles: { ...roles, accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 } } } });
+    await off.setup(); await on.setup(); await off.tick(); await on.tick();
+    const a = JSON.stringify(await off.ladder());
+    const b = JSON.stringify(await on.ladder());
+    assert.equal(b, a, `serialized ladders differ with newest ${enabled}`);
+    assert.doesNotMatch(b, /accountFallback|accountAdmissions/);
+  }
+});
+
+test('F-T12: reviewer capacity uses global eligibility, not account fallback', async () => {
+  const roles = { ...ROLES_CFG, outcomeGate: { enabled: false } };
+  const common = { reviewer: { providers: ['claude', 'meta'] } };
+  const off = drive({ config: { ...common, roles } });
+  const on = drive({ config: { ...common, roles: { ...roles,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 } } } });
+  await off.setup(); await on.setup(); await off.tick(); await on.tick();
+  const a = await off.capacity(), b = await on.capacity();
+  assert.ok(b.eligibility.accountFallback.admitted.some(row => row.role === 'doer' && row.accountId === 'meta:m1'));
+  assert.deepEqual(a.reviewer.qualifiedAccountIds, ['claude:a1']);
+  assert.deepEqual(b.reviewer.qualifiedAccountIds, a.reviewer.qualifiedAccountIds);
+  assert.equal(b.reviewer.slots, a.reviewer.slots);
+});
+
+test('tick shadow suppresses fallback for a recognized reviewer', async () => {
+  const ledger = [{ runId: 'review-weak', agentId: 'eng-doer', status: 'running', startedAt: TICK - 1000, unverified: false }];
+  const config = { placement: FLAT_PLACEMENT, reviewReserve: { agentIds: ['eng-doer'] }, roles: { ...ROLES_CFG,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 }, outcomeGate: { enabled: false } } };
+  const d = drive({ config, ledger });
+  await d.setup(); await d.tick();
+  const cap = await d.capacity();
+  assert.ok(cap.eligibility.accountFallback.admitted.some(row => row.role === 'doer' && row.accountId === 'meta:m1'));
+  assert.equal(d.ledger().find(r => r.runId === 'review-weak').decidedAccount, 'claude:a1');
+});
+
+test('F-T20: doer admission does not change thinker tick routing', async () => {
+  const ledger = [{ runId: 'thinker-run', agentId: 'planner', status: 'running', startedAt: TICK - 1000, unverified: false }];
+  const roles = { ...ROLES_CFG, outcomeGate: { enabled: false } };
+  const off = drive({ ledger: structuredClone(ledger), config: { placement: FLAT_PLACEMENT, roles } });
+  const on = drive({ ledger: structuredClone(ledger), config: { placement: FLAT_PLACEMENT, roles: { ...roles,
+    accountFallback: { enabled: true, roles: ['doer'], minQuality: -3 } } } });
+  await off.setup(); await on.setup(); await off.tick(); await on.tick();
+  const a = await off.capacity(), b = await on.capacity();
+  assert.ok(b.eligibility.accountFallback.admitted.some(row => row.role === 'doer' && row.accountId === 'meta:m1'));
+  assert.ok(!b.eligibility.accountFallback.admitted.some(row => row.role === 'thinker'));
+  assert.equal(off.ledger().find(r => r.runId === 'thinker-run').decidedAccount, 'claude:a1');
+  assert.equal(on.ledger().find(r => r.runId === 'thinker-run').decidedAccount, 'claude:a1');
+  const thinker = cap => cap.taskRanking.routeComparisons.filter(c => c.previewInputs.role === 'thinker');
+  assert.deepEqual(thinker(b), thinker(a));
 });
