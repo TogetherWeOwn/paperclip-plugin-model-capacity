@@ -91,7 +91,7 @@ function drive({ config = {}, queued = null, issuesList = null } = {}) {
       now = at;
       accounts = fleet({ now, step, metaDeltaPerStep });
       for (const e of fire) await handlers.get(e.type)(e);
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
     },
     capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
     caps: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'caps' })).body,

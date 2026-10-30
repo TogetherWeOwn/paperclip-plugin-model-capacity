@@ -356,7 +356,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {} }) {
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     fire: (e) => handlers.get(e.type)(e),
     api: (routeKey) => plugin.onApiRequest({ companyId: 'acme', routeKey }),
   };

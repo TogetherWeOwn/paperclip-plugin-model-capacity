@@ -93,7 +93,7 @@ async function drive({ failRelations = false } = {}) {
     setUsed: value => { used = value; },
     holdWrite: () => { writeBarrier = barrier(); return writeBarrier; },
     holdList: () => { listBarrier = barrier(); return listBarrier; },
-    tick: () => jobs.get('shadow-tick')({ companyId: COMPANY }),
+    tick: () => jobs.get('quota-refresh')({ companyId: COMPANY }),
     run: (id, type) => handlers.get(type)({
       type, companyId: COMPANY, entityId: id, occurredAt: new Date(now).toISOString(),
       payload: { run: { agentId: 'worker', provider: 'codex', model: 'gpt-6.1-sol' } },

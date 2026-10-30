@@ -156,7 +156,7 @@ async function runTick({ lane, snapshot, config, states = {}, demand = { doer: 4
   await plugin.setup(ctx);
   store.set('aa-snapshot-v1', structuredClone(snapshot));
   await plugin.onConfigChanged(raw, { companyId: 'offline-test' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const capacity = store.get('capacity-v1');
   assert.equal(capacity?.atMs, nowMs, 'real tick published capacity');
   return { capacity, ladders: store.get('ladder-v1'), ledger: store.get('ledger-v1'), live: liveViews.get('offline-test'), plugin, handlers, store };
@@ -239,6 +239,7 @@ test('F-T19: R-1 other-role admission leaves the strong doer pick, groups, and p
   const callback = '__fallbackPlacementProbe';
   try {
     await cp(new URL('../src', import.meta.url), join(dir, 'src'), { recursive: true });
+    await cp(new URL('../scripts', import.meta.url), join(dir, 'scripts'), { recursive: true });
     const path = join(dir, 'src', 'plugin.mjs');
     const code = await readFile(path, 'utf8');
     const marker = `return placementArm(groups, {
@@ -327,11 +328,12 @@ async function withLiveInternals(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'fallback-live-test-'));
   try {
     await cp(new URL('../src', import.meta.url), join(dir, 'src'), { recursive: true });
+    await cp(new URL('../scripts', import.meta.url), join(dir, 'scripts'), { recursive: true });
     const path = join(dir, 'src', 'plugin.mjs');
     let code = await readFile(path, 'utf8');
-    const marker = '  return {\n    multiCompanyConfig: true,';
+    const marker = '  const plugin = {\n    multiCompanyConfig: true,';
     assert.equal(code.split(marker).length, 2);
-    code = code.replace(marker, `  return {\n    internals: { exhaustionAnswer, allocationOrderFromLive, reviewerArmAdmission, reviewerArmCheck, pickReviewerRoute, breakerStores, credentialEnforceCompanies,\n      recognized: typeof liveIsRecognizedReviewAgent === 'function' ? liveIsRecognizedReviewAgent : null,\n      liveAccountInputs: typeof liveAccountInputs === 'function' ? liveAccountInputs : null },\n    multiCompanyConfig: true,`);
+    code = code.replace(marker, `  const plugin = {\n    internals: { exhaustionAnswer, allocationOrderFromLive, reviewerArmAdmission, reviewerArmCheck, pickReviewerRoute, breakerStores, credentialEnforceCompanies,\n      recognized: typeof liveIsRecognizedReviewAgent === 'function' ? liveIsRecognizedReviewAgent : null,\n      liveAccountInputs: typeof liveAccountInputs === 'function' ? liveAccountInputs : null },\n    multiCompanyConfig: true,`);
     await writeFile(path, code);
     const module = await import(pathToFileURL(path));
     const liveViews = new Map();

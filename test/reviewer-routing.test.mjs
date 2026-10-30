@@ -75,7 +75,7 @@ function drive({ config = {}, accounts, rows = aaRows(), onReviewerAdmission = n
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
+    tick: () => jobs.get('quota-refresh')({ companyId: 'acme' }),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'reviewer-1', issueId: null, adapterType: 'opencode_local',
       invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,

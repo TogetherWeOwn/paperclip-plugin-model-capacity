@@ -57,7 +57,7 @@ function drive({ usage = true, smoothing = {}, provider = 'meta', model = 'muse-
         await handlers.get('agent.run.started')({ companyId: 'acme', entityId: `run-${i}-${n}`,
           payload: { run: { agentId: 'eng', model } }, occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
       }
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
       return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
     },
     addLarge: flag => { includeLarge = flag; },

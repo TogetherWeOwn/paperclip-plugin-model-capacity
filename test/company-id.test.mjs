@@ -87,7 +87,7 @@ test('sdk reads pass companyId positionally, exactly once per lookup', async () 
     payload: { run: { agentId: 'agent-9', issueId: 'iss-1' } },
     occurredAt: new Date(TICK - 5 * 60000).toISOString(),
   });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   // One issue lookup (per-tick cache) + one agent lookup for the actual
   // model plus one for the adapter gate (separate cache): single calls, no
   // failed first attempts, companyId on every call.

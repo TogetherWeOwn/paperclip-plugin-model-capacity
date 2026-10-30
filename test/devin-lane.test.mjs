@@ -139,8 +139,8 @@ async function driveDevin({ mode = 'off', until = '2026-11-30T23:59:59Z', free =
       ...(highOnly ? ['gpt-6-1-sol-high'] : ['gpt-6-1-sol', 'gpt-6-1-sol-high']).map((slug, i) => ({ slug, intelligenceIndex: 65-i, intelligenceIndexCostPerTask: 3-i, terminalbenchV40: .8, scicode: .8, lcr: .8, ifbench: .8, omniscienceNonHallucination: .8, hle: .2, gpqa: .2, critpt: .2, gdpvalNormalized: .2 }))], duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
   if (initialBreakers) store.set(JSON.stringify({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' }), initialBreakers);
-  await jobs.get('shadow-tick')({});
-  return { plugin, tick: async () => jobs.get('shadow-tick')({}), fire: async (id, type) => handlers.get(type)({ type, companyId: 'acme', entityId: id, occurredAt: new Date(now).toISOString(), payload: { run: { agentId: 'builder', issueId: 'swe-issue', adapterType: 'claude-code' } } }), setNow: v => { now = v; }, capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
+  await jobs.get('quota-refresh')({});
+  return { plugin, tick: async () => jobs.get('quota-refresh')({}), fire: async (id, type) => handlers.get(type)({ type, companyId: 'acme', entityId: id, occurredAt: new Date(now).toISOString(), payload: { run: { agentId: 'builder', issueId: 'swe-issue', adapterType: 'claude-code' } } }), setNow: v => { now = v; }, capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
     ladder: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' })).body,
     shadow: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' })).body,
     hook: (runId = 'hook', agentId = 'builder') => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId, adapterType: 'claude-code', deadlineMs: 1500 }) };

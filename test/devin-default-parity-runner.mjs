@@ -54,7 +54,8 @@ export async function runDevinParity(factory, extra = {}) {
       store.set(JSON.stringify(key('breaker-v1')), breakerStoreToJSON(breakers, { nowMs: NOW, cfg }));
     }
     await plugin.onConfigChanged(config, { companyId: 'parity' });
-    await jobs.get('shadow-tick')({});
+    // Historical capture uses the old job name; current packages register only quota-refresh.
+    await (jobs.get('quota-refresh') ?? jobs.get('shadow-tick'))({});
     const hook = await plugin.onResolveRunModel({ runId: 'hook', companyId: 'parity', agentId: 'builder', adapterType: 'claude-code', deadlineMs: 1500 });
     const capacity = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'capacity' })).body;
     const ladder = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'ladder' })).body;

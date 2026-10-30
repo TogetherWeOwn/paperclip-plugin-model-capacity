@@ -78,6 +78,11 @@ export const LANE_KEY_HEADER = 'X-Api-Key';
  * telemetry lane, never a link-local host address).
  */
 export function buildLaneRequest(baseUrl = DEFAULT_BASE_URL, accountsPath = DEFAULT_ACCOUNTS_PATH) {
+  // Enforce the build-time origin AND exact path here, not only in config
+  // normalization: a job/request caller cannot broaden its own allowlist.
+  if (!LANE_BASE_URLS.includes(baseUrl) || accountsPath !== DEFAULT_ACCOUNTS_PATH) {
+    throw new Error('cliproxy-request-blocked');
+  }
   let parsed;
   try {
     parsed = new URL(`${baseUrl}${accountsPath}`);

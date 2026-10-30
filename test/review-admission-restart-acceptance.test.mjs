@@ -65,7 +65,7 @@ async function instance({ store, clock, used, raw = config() }) {
   return {
     ticks: () => ticks, feedCalls: () => feedCalls,
     configure: next => plugin.onConfigChanged(next, { companyId: COMPANY }),
-    tick: async () => { ticks++; return jobs.get('shadow-tick')({ companyId: COMPANY }); },
+    tick: async () => { ticks++; return jobs.get('quota-refresh')({ companyId: COMPANY }); },
     event: (id, type) => events.get(type)({ type, companyId: COMPANY, entityId: id,
       occurredAt: new Date(clock()).toISOString(),
       payload: { run: { agentId: 'worker', provider: 'codex', model: 'gpt-6.1-sol' } } }),

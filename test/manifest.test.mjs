@@ -8,8 +8,8 @@ import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.2.76');
-  assert.equal(PLUGIN_VERSION, '0.2.76');
+  assert.equal(manifest.version, '0.3.0-clean');
+  assert.equal(PLUGIN_VERSION, '0.3.0');
 });
 
 test('no database grant: no database block, no db capabilities', () => {
@@ -35,7 +35,7 @@ test('lane endpoint pinned to the allowlist in schema', () => {
   );
 });
 
-test('default manifest is shadow-only: no run.model.resolve, no modelRouting', () => {
+test('default clean manifest has no run.model.resolve or modelRouting', () => {
   assert.ok(!manifest.capabilities.includes('run.model.resolve'));
   assert.equal(manifest.modelRouting, undefined);
   assert.deepEqual(manifest, buildManifest({ modelResolve: false }));
@@ -59,7 +59,7 @@ test('opt-in enforceManifest holds run.model.resolve with the exact env keys', (
 });
 
 test('enforce kill switch defaults false in schema', () => {
-  assert.equal(manifest.instanceConfigSchema.properties.enforce.default, false);
+  assert.equal(enforceManifest.instanceConfigSchema.properties.enforce.default, false);
   assert.equal(
     manifest.instanceConfigSchema.properties.contextCaps.properties.autoCompactEnvKey.default,
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
@@ -81,9 +81,9 @@ test('credential readiness admission is a strict opt-in object', () => {
 test('jobs and API routes are declared', () => {
   const jobs = new Map(manifest.jobs.map(j => [j.jobKey, j.schedule]));
   assert.equal(jobs.get('aa-refresh'), '17 4 * * *');
-  assert.equal(jobs.get('shadow-tick'), '* * * * *');
+  assert.equal(jobs.get('quota-refresh'), '* * * * *');
   const routes = new Map(manifest.apiRoutes.map(r => [r.routeKey, r.path]));
-  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'shadow']);
+  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'scorecard', 'shadow']);
   assert.equal(routes.get('caps'), '/caps');
 });
 
@@ -130,4 +130,21 @@ test('reviewer schema declares every normalized knob (manifest/validator/example
     assert.ok(key in schema.properties, `config.example.json reviewer key ${key} rejected by the schema`);
   }
   assert.deepEqual(validateConfigShape({ reviewer: example.reviewer }), []);
+});
+
+test('router registry is configurable with per-membership probe eligibility and safe defaults', async () => {
+  const router = manifest.instanceConfigSchema.properties.router;
+  assert.equal(router.type, 'object');
+  assert.equal(router.additionalProperties, false);
+  assert.equal(router.properties.enabled.default, false);
+  assert.equal(router.properties.allowMessages.default, false);
+  const account = router.properties.accounts.items;
+  assert.deepEqual(account.required, ['accountKey','prefix','provider','protocol','harnessProfile','connectionName','pools']);
+  assert.equal(account.properties.probeEligible, undefined);
+  assert.equal(account.properties.pools.additionalProperties.properties.probeEligible.default, false);
+  const example = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../config.example.json', import.meta.url)));
+  assert.equal(example.router.enabled, false);
+  assert.ok(example.router.accounts.some(a => a.pools.builder?.probeEligible === true));
+  assert.deepEqual(example.router.pools.map(p => p.role), ['doer', 'thinker', 'reviewer']);
+  assert.deepEqual(validateConfigShape({router: example.router}), []);
 });

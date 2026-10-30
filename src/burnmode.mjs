@@ -420,3 +420,32 @@ export function applyBurnFloors(cfg, accounts, keys = null) {
   });
   return changed ? out : accounts;
 }
+
+/** Native pool burn is separate from the retained fork's burnMode. A deadline
+ * is mandatory, including for provider-wide targets; past deadlines stay valid
+ * config but never become active again after a worker restart. */
+export function validateNativeBurn(raw) {
+  if (raw === undefined) return [];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['burn must be an object'];
+  const errors = [];
+  for (const key of Object.keys(raw)) if (!['accountKeys','providers','expiresAt','endAtUsedPct','mode'].includes(key)) errors.push(`burn.${key} is not a known key`);
+  if (parseBurnDeadlineStamp(raw.expiresAt) === null) errors.push('burn.expiresAt must be a parseable ISO timestamp with an explicit timezone');
+  for (const key of ['accountKeys','providers']) if (raw[key] !== undefined && (!Array.isArray(raw[key]) || raw[key].some(v => typeof v !== 'string' || !v.trim()))) errors.push(`burn.${key} must be an array of nonempty strings`);
+  if (raw.mode !== undefined && !['prefer','exclusive'].includes(raw.mode)) errors.push('burn.mode must be prefer or exclusive');
+  if (raw.endAtUsedPct !== undefined && (!Number.isFinite(raw.endAtUsedPct) || raw.endAtUsedPct <= 0 || raw.endAtUsedPct > 1)) errors.push('burn.endAtUsedPct must be in (0,1]');
+  return errors;
+}
+export function normalizeNativeBurn(raw) {
+  const errors = validateNativeBurn(raw);
+  if (errors.length) throw new Error(errors.join('; '));
+  if (raw === undefined) return null;
+  return {accountKeys:[...new Set(raw.accountKeys ?? [])],providers:[...new Set(raw.providers ?? [])],expiresAt:raw.expiresAt,endAtUsedPct:raw.endAtUsedPct ?? .995,mode:raw.mode ?? 'prefer'};
+}
+export function nativeAccountBurn(burn, account, nowMs) {
+  const expiresAtMs = burn ? parseBurnDeadlineStamp(burn.expiresAt) : null;
+  const target = Boolean(burn && (burn.accountKeys.includes(account.accountKey) || burn.providers.includes(account.provider)));
+  return {active:target && Number.isFinite(expiresAtMs) && nowMs < expiresAtMs
+    && Number.isFinite(account.weeklyUsed) && account.weeklyUsed < burn.endAtUsedPct
+    && Number.isFinite(account.weeklyResetsAtMs) && nowMs < account.weeklyResetsAtMs,
+    target,expiresAtMs,mode:burn?.mode ?? 'prefer',endAtUsedPct:burn?.endAtUsedPct ?? .995};
+}

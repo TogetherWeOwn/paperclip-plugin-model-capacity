@@ -367,7 +367,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGet
         lane = s.lane !== undefined ? s.lane : resolveLane();
         tickNo += 1;
         for (const e of s.fire ?? []) await handlers.get(e.type)(e);
-        await jobs.get('shadow-tick')({});
+        await jobs.get('quota-refresh')({});
       }
       return {
         shadow: await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),
@@ -618,7 +618,7 @@ function driveLive({ nowMs, config = {}, laneAccounts = null, rows = null }) {
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: rows ?? aaRows(), duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: async () => { await jobs.get('shadow-tick')({}); },
+    tick: async () => { await jobs.get('quota-refresh')({}); },
     hook: (runId) => plugin.onResolveRunModel(hookParams(runId)),
     fire: (e) => handlers.get(e.type)(e),
     shadow: () => plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' }),

@@ -23,6 +23,12 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { scorecardView } from './scorecard.mjs';
+import { normalizeNativeBurn, validateNativeBurn } from './burnmode.mjs';
+import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
+import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
+import { createRouterAdapter } from './router.mjs';
+import { createRunOverlay } from './overlay.mjs';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -99,7 +105,7 @@ import {
 } from './reviewreserve.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
-  createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
+  accountKeyForModel, createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
   recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount, attributedAccount,
   trialInflight, reconcileLedger, startedOnCountWhere,
   terminalRecords, shadowEntries, trimLedger, mergeLedger, migrateLegacy,
@@ -192,7 +198,7 @@ export function validateConfigShape(raw) {
   const errors = [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
-  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes));
+  errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes), ...validateRouterConfig(raw.router), ...validateNativeBurn(raw.burn));
   if (raw.bannedModels != null && (!Array.isArray(raw.bannedModels) || raw.bannedModels.some(m => typeof m !== 'string' || !m.trim() || m.includes('/')))) errors.push('bannedModels must be an array of bare model ids (no provider prefix)');
   if (raw.allocation != null) {
     const allocation = raw.allocation;
@@ -641,6 +647,8 @@ export function resolveConfig(raw = {}) {
   const keepAgentIds = (Array.isArray(raw.roles?.keepAgentIds) ? raw.roles.keepAgentIds : []).filter(id => typeof id === 'string');
   const freeCostServedIds = normalizeFreeCostServedIds(raw.placement?.freeCostServedIds);
   return {
+    ...(raw.burn !== undefined ? {burn:normalizeNativeBurn(raw.burn)} : {}),
+    ...(raw.router ? {router:{enabled:false,...structuredClone(raw.router)}} : {}),
     cliproxy: {
       // Belt and braces behind the validator: a non-allowlisted baseUrl
       // falls back to the default instead of ever carrying the lane key.
@@ -1114,9 +1122,12 @@ export function createCredentialGroupHelpers(clock = Date.now) {
 // the lane key unless the build pinned a real host.
 // onReviewerAdmission is an optional test observer for the two admission consumers;
 // the worker does not supply it, so it cannot affect deployed routing.
-export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map(), onReviewerAdmission = null } = {}) {
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map(), onReviewerAdmission = null, inspectPools = null, variant = 'transitional' } = {}) {
+  if (!['transitional','clean'].includes(variant)) throw new Error('invalid plugin variant');
   const { credentialLadderFor, credentialGroupsFor, routableGroupsFor, groupByRung } = createCredentialGroupHelpers(clock);
-  let ctx;
+  let ctx, quotaRefresh, routeConnection;
+  const quotaJobs = new Map();
+  const nativeOverlay = createRunOverlay();
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
   const ledgerReady = new Set(); // companyIds whose memory ledger absorbed persisted state
@@ -1347,7 +1358,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   const configIdentity = value => JSON.stringify(value, (_key, v) =>
     v && typeof v === 'object' && !Array.isArray(v)
       ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v);
-  const policyIdentity = ({ enforce, credentialReadiness, ...policy }) => configIdentity(policy);
+  const policyIdentity = ({ enforce, credentialReadiness, router, ...policy }) => configIdentity(policy);
   const generationOf = companyId => configRevisions.get(companyId)?.generation ?? 0;
   const rememberConfig = (companyId, config) => {
     const identity = configIdentity(config);
@@ -1380,6 +1391,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Config lifecycle owns this fence; a stale tick cannot re-enable a mode
   // after an operator changed it while the tick was awaiting telemetry.
   const taskRankingModes = new Map();
+  // Only onConfigChanged writes this fence. Ticks read unvalidated persisted
+  // config and may update lastConfig, but can never attest/reopen native pools.
+  const noAttestedPools = Object.freeze([]);
+  const attestedPools = new Map();
   const freeLaneConfigs = new Map(); // lifecycle fence; a stale tick cannot re-enable free routing
   const freeLaneUsage = new Map(); // company -> UTC-day request reservations, tick-persisted
   const taskModeCompatible = (live, companyId) => !taskRankingModes.has(companyId)
@@ -1389,6 +1404,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Last resolved config per company, for the memory-only event-time path
   // (the event handler performs zero I/O, so it reads this, not ctx.config).
   const lastConfig = new Map();
+  const routerConfigFor = companyId => {
+    const config = lastConfig.get(companyId) ?? {};
+    return {...config,router:{...config.router,pools:attestedPools.get(companyId) ?? noAttestedPools}};
+  };
   const readReviewDemand = createReviewDemandReader({ clock });
   // Persisted admission must not compare equal after a worker restart, even
   // when its wall clock and first per-company configuration counter match.
@@ -1443,17 +1462,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const req = buildLaneRequest(config.cliproxy.baseUrl, config.cliproxy.accountsPath);
     assertLaneRequest({ method: req.method, url: req.url, body: null },
       { baseUrl: config.cliproxy.baseUrl, accountsPath: config.cliproxy.accountsPath });
-    const res = await ctx.http.fetch(req.url, { method: 'GET', headers: { [LANE_KEY_HEADER]: laneKey } });
-    if (res.status === 401 || res.status === 403) throw new Error('cliproxy-access-denied');
-    if (res.status < 200 || res.status >= 300) throw new Error(`cliproxy-http-${res.status}`);
-    return res.json();
+    return withQuotaTimeout(async signal => {
+      const res = await ctx.http.fetch(req.url, { method: 'GET', headers: { [LANE_KEY_HEADER]: laneKey }, signal });
+      if (res.status === 401 || res.status === 403) throw new Error('cliproxy-access-denied');
+      if (res.status < 200 || res.status >= 300) throw new Error(`cliproxy-http-${res.status}`);
+      return res.json();
+    });
   }
 
   async function readAccounts(companyId, config, nowMs, generation) {
     const entry = cacheFor(companyId, config);
     const cache = entry.cache;
     const cached = cache.get('accounts', nowMs);
-    if (cached) return cached;
+    // Native quota maintenance owns a fresh read each tick; a legacy demand
+    // cache TTL must not turn healthy feed observations stale.
+    if (cached && !config.router) return cached;
     if (!isSecretRef(config.cliproxy.laneKeySecretRef)) {
       return { accounts: [], source: 'no-secret', atMs: nowMs, modelStats: null, pricingTiers: [], eeeSnapshot: null, servedModels: null, freeResets: null };
     }
@@ -1469,6 +1492,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const eee = body?.eeeScores && typeof body.eeeScores === 'object' ? body.eeeScores : null;
     const snapshot = {
       accounts: parsed.accounts, atMs: nowMs, source: 'cliproxy-lane', observedAtMs: parsed.observedAtMs,
+      quotaFeed: body, // Job-only input; never persisted by the legacy hook path.
       modelStats: parsed.modelStats, pricingTiers: parsed.pricingTiers, eeeSnapshot: eee,
       servedModels: parsed.servedModels,
       freeResets: parsed.freeResets ?? null,
@@ -2504,7 +2528,45 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
   }
 
-  async function runShadowTick(companyId, job) {
+  // ONE quota consumer. Both the native snapshot and the retained hook tick
+  // use this same fetched feed. Concurrent jobs in one config generation join;
+  // config changes may admit a new request but the old generation cannot publish.
+  function runQuotaTick(companyId, job) {
+    const admission = configGenerationOf(companyId);
+    const existing = quotaJobs.get(companyId);
+    if (existing?.generation === admission) return existing.pending;
+    const pending = (async () => {
+      const raw = await ctx.config.get(companyId);
+      if (configGenerationOf(companyId) !== admission) return {status:'superseded'};
+      const config = resolveConfig(raw);
+      const generation = rememberConfig(companyId, config);
+      const current = () => configGenerationOf(companyId) === admission && generationOf(companyId) === generation;
+      let feed;
+      try {
+        feed = await readAccounts(companyId, config, clock(), generation);
+      } catch (error) {
+        const code = /^(cliproxy-http-[0-9]{3}|cliproxy-access-denied|cliproxy-lane-host-unpinned|cliproxy-lane-parse-failed|cliproxy-timeout)$/.test(error?.message ?? '')
+          ? error.message : 'quota-fetch-failed';
+        quotaRefresh.failure(companyId, code);
+        throw new Error(code);
+      }
+      if (!feed || !current()) return {status:'superseded'};
+      let native;
+      if (config.router) native = await quotaRefresh.refresh(companyId, config, {
+        feed:feed.quotaFeed, ledger:await loadLedger(companyId), calibration:await ctx.state.get(scopeKey(companyId, SMOOTH_KEY)), isCurrent:current,
+      });
+      if (!current()) return {status:'superseded'};
+      await runShadowTick(companyId, job, feed);
+      if (native?.status === 'error') throw new Error('native-quota-failed');
+      return native ?? {status:'ok'};
+    })();
+    quotaJobs.set(companyId, {generation:admission,pending});
+    const clear = () => {if (quotaJobs.get(companyId)?.pending === pending) quotaJobs.delete(companyId);};
+    pending.then(clear,clear);
+    return pending;
+  }
+
+  async function runShadowTick(companyId, job, rawSnapshot) {
     const admissionGeneration = configGenerationOf(companyId);
     const nowMs = clock();
     let generation = generationOf(companyId);
@@ -2523,7 +2585,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       3 * (Number.isFinite(meanHours) && meanHours > 0 ? meanHours : 0.186) * 3600 * 1000,
       2 * 3600 * 1000,
     );
-    const rawSnapshot = await readAccounts(companyId, config, nowMs, generation);
     if (!rawSnapshot || superseded()) return { status: 'superseded' };
     // Burn accounts degraded only by the feed's utilization floor stay
     // allocatable until spent (see burnEligibleAccounts); level floors
@@ -4492,6 +4553,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     if (superseded()) return { status: 'superseded' };
     liveViews.set(companyId, {
+      ...(config.router ? {routerPolicy:{atMs:nowMs,arms:fleetArmScores,
+        records:terminalRecords(ledger).map(r=>({runId:r.runId,agentId:r.agentId,status:r.status,terminalAt:r.terminalAt,progress:r.progress,family:outcomeFamilyOf(r)})),
+        roleOf:id=>roleOf(lastConfig.get(companyId) ?? config,id),familyOf:r=>r.family,
+      }} : {}),
       ...(newestVersion ? { newestVersion } : {}),
       ...(legacyEligibility.accountAdmissions ? { accountAdmissions: legacyEligibility.accountAdmissions } : {}),
       policyGeneration: configRevisions.get(companyId)?.policyGeneration,
@@ -6480,28 +6545,66 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     };
   }
 
-  return {
+  const plugin = {
     multiCompanyConfig: true,
+
+    // Slice 4 must call this synchronously at decision time, never retain a
+    // tick's config as the authority for operator-verified pool metadata.
+    getRouterConfig(companyId) {
+      return routerConfigFor(companyId);
+    },
+
+    onRouteAiConnection(params) { return routeConnection(params); },
 
     async setup(context) {
       ctx = context;
+      // The package builder bakes and guards this variant; config cannot hide
+      // the transitional residual or change its exit date at worker startup.
+      ctx.logger.warn?.(`model-capacity: startup self-check variant=${variant}${variant === 'transitional' ? '; exit=2026-11-30' : ''}`, {
+        variant,
+        ...(variant === 'transitional' ? {exitDate:'2026-11-30'} : {}),
+      });
+      routeConnection = createRouterAdapter({getConfig:routerConfigFor,getSnapshot:id=>quotaRefresh?.get(id),
+        getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
+        getOverlay:(id,version)=>nativeOverlay.deltas(id,version),getOverlayStatus:id=>nativeOverlay.status(id),
+        logger:ctx.logger,
+      });
+      quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
+        getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
+        captureOverlay:id=>nativeOverlay.capture(id),onPublished:(id,snapshot,checkpoint)=>nativeOverlay.publish(id,snapshot.version,checkpoint,snapshot.inFlightRunAccounts,snapshot.unattributedRunIds),
+        keyFor:companyId => scopeKey(companyId, 'router-quota-v1'),
+        listAgents:async companyId => {
+          const agents=[];
+          for(let offset=0;offset<10_000;offset+=200) {
+            const rows=await ctx.agents.list({companyId,limit:200,offset});
+            if(!Array.isArray(rows))throw new Error('invalid agents list');
+            agents.push(...rows);
+            if(rows.length<200)return agents;
+          }
+          throw new Error('agents list exceeds quota inspection bound');
+        },
+      });
       ctx.jobs.register('aa-refresh', async job => {
         const results = await Promise.allSettled([...configured].sort().map(companyId => runAaRefresh(companyId)));
         if (results.some(r => r.status === 'rejected' || (r.status === 'fulfilled' && r.value?.status === 'error'))) throw new Error('aa-refresh-failed');
         return results.map(r => r.value);
       });
-      ctx.jobs.register('shadow-tick', async job => {
+      ctx.jobs.register('quota-refresh', async job => {
         const results = await Promise.allSettled([...configured].sort().map(async companyId => {
           try {
-            await runShadowTick(companyId, job);
+            await runQuotaTick(companyId, job);
           } catch (error) {
-            ctx.logger.error('model-capacity: shadow tick failed', { companyId, error: error?.message ?? String(error) });
+            // Fetch/native failures were already classified and rate-limited.
+            // Unknown legacy tick failures never log raw upstream exception text.
+            if (!/^(cliproxy-|quota-fetch-failed|native-quota-failed)/.test(error?.message ?? '')) {
+              quotaRefresh.failure(companyId, 'quota-refresh-failed', 'model-capacity: shadow tick failed');
+            }
             throw error;
           } finally {
             await runClusterMaintenance(companyId);
           }
         }));
-        if (results.some(r => r.status === 'rejected')) throw new Error('shadow-tick-failed');
+        if (results.some(r => r.status === 'rejected')) throw new Error('quota-refresh-failed');
       });
       // Run facts come from agent.run.* events only (started, finished,
       // failed, cancelled): the sole run feed since the db grant was
@@ -6550,6 +6653,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           recordTerminal(evtLedger, entry, status, entry.at);
           clearDeferred(companyId, entry.runId);
         }
+        // Only observed run models attribute native pressure. Never use a
+        // callback guess, agent default or a synthetic shadow decision. Current
+        // upstream lifecycle events omit account/model metadata; expose those
+        // runs as unattributed rather than fabricating an R2 guarantee.
+        const observed = evtLedger.get(entry.runId);
+        const model = entry.model ?? (observed?.actualModelSource === 'run-decision' ? observed.actualModel : null);
+        nativeOverlay.observe(companyId,{runId:entry.runId,status,
+          accountKey:accountKeyForModel(model,lastConfig.get(companyId)?.router?.accounts ?? []),
+        });
         const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
         st.seen += 1;
         st.lastAtMs = entry.at;
@@ -6594,6 +6706,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (typeof companyId !== 'string' || companyId.length === 0) throw new Error('company-context-required');
       const errors = validateConfigShape(raw);
       if (errors.length > 0) {
+        attestedPools.set(companyId, noAttestedPools);
         ctx.logger.error('model-capacity: config rejected', { companyId, errors });
         throw new Error('invalid-config');
       }
@@ -6611,11 +6724,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       freeLaneConfigs.set(companyId, config.freeLanes);
       // Enforcement switches retain their established immediate-disable /
       // next-compatible-tick-enable semantics, independent of policy identity.
+      attestedPools.set(companyId, config.router
+        ? Object.freeze(normalizeRegistry(config.router).pools.filter(p=>p.poolId)) : noAttestedPools);
       lastConfig.set(companyId, config);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
       if (raw?.credentialReadiness?.enforce === true) credentialEnforceCompanies.add(companyId);
       else credentialEnforceCompanies.delete(companyId);
+      // setup has no company-scoped config until this native lifecycle call.
+      // Start asynchronously so worker readiness never waits for the quota feed.
+      if (config.router) void runQuotaTick(companyId, {trigger:'config'}).catch(() => {});
     },
 
     async onValidateConfig(raw) {
@@ -6658,8 +6776,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     async onApiRequest(input) {
       const companyId = input.companyId;
       if (!configured.has(companyId)) return { status: 404, body: { error: 'company-not-configured' } };
+      if (input.routeKey === 'scorecard') {
+        return {status:200,body:scorecardView(await ctx.state.get(scopeKey(companyId, 'router-quota-v1')))};
+      }
       if (input.routeKey === 'capacity') {
-        return { status: 200, body: projectCapacityPrices((await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null }, clock()) };
+        const body = projectCapacityPrices((await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null }, clock());
+        const verifiedPools = (attestedPools.get(companyId) ?? noAttestedPools).map(
+          ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}) =>
+            ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}));
+        return { status: 200, body: lastConfig.get(companyId)?.router
+          ? {...body,scorecard:scorecardView(await ctx.state.get(scopeKey(companyId, 'router-quota-v1'))),nativeRouter:{...quotaRefresh.status(companyId),...nativeOverlay.status(companyId),verifiedPools}} : body };
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:
@@ -7261,4 +7387,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return deferred(terminal);
     },
   };
+  if (variant === 'clean') delete plugin.onResolveRunModel;
+  return plugin;
 }

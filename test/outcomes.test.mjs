@@ -150,7 +150,7 @@ function drive(issueFor) {
     at: async (t, fire = []) => {
       now = t;
       for (const e of fire) await handlers.get(e.type)(e);
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
     },
     capacity: async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body,
   };

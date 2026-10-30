@@ -90,7 +90,7 @@ function drive({ config = {}, lanes = [], agentGets = {}, aa = baseAa(), ringSee
       if (runsSeed) store.set(skey(RUNS_STATE_KEY), runsSeed);
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', issueId: null,
       adapterType: null, invocationSource: 'test', wakeReason: null,

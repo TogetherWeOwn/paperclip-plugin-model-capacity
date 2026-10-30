@@ -189,7 +189,7 @@ async function runCase(pluginFactory, repoRoot, name) {
     }
   }
 
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const hookRunId = `${name}-hook`;
   if (name === 'stale-view') now = TICK + 121000;
   if (name === 'future-view') now = TICK - 121000;
@@ -205,7 +205,7 @@ async function runCase(pluginFactory, repoRoot, name) {
     payload: { run: { agentId: 'agent-parity', adapterType: 'claude-code' } },
     occurredAt: new Date(now).toISOString(),
   });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const capacity = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'capacity' })).body;
   const caps = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'caps' })).body;
   const shadow = (await plugin.onApiRequest({ companyId: 'parity', routeKey: 'shadow' })).body;

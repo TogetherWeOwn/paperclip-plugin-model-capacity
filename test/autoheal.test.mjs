@@ -75,7 +75,7 @@ function drive({ lanes = [] }) {
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: baseAa(), duplicateSlugs: [] });
       await plugin.onConfigChanged({}, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     api: (routeKey) => plugin.onApiRequest({ companyId: 'acme', routeKey }),
   };
 }

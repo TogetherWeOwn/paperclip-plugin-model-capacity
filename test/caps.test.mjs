@@ -255,7 +255,7 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: snapshotRows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     fire: e => handlers.get(e.type)(e),
     hook: (runId, agentId) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId, issueId: null, adapterType: 'claude-code',

@@ -104,7 +104,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = baseAa(), 
       plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
       await wire();
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', issueId: null,
       adapterType: null, invocationSource: 'test', wakeReason: null,

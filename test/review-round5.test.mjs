@@ -152,6 +152,6 @@ test('(4) concurrent first ticks share one ledger load', async () => {
     duplicateSlugs: [],
   });
   await plugin.onConfigChanged({}, { companyId: 'acme' });
-  await Promise.all([jobs.get('shadow-tick')({}), jobs.get('shadow-tick')({})]);
+  await Promise.all([jobs.get('quota-refresh')({}), jobs.get('quota-refresh')({})]);
   assert.equal(ledgerGets, 1);
 });
