@@ -20,6 +20,14 @@ test('F-T24: seating moves out-of-window arms, revives absent arms and preserves
   const added = decision.seatFallbackArm(groups, arm('backup', 0, 2), { floorRung: 2, ceilingRung: null });
   assert.deepEqual(ids(added), [['sample-1'], ['sample-2'], ['backup']]);
   assert.equal(added[2].arms[0].rung, 2);
+  const wideBand = { floorRung: 0, ceilingRung: 2 };
+  const addedAtFloor = decision.seatFallbackArm(groups, arm('wide-backup', 0, 2), wideBand);
+  assert.deepEqual(ids(addedAtFloor), [['sample-1', 'wide-backup'], ['sample-2'], []]);
+  assert.equal(addedAtFloor[0].arms[1].rung, 0);
+  assert.strictEqual(decision.seatFallbackArm(groups, high, wideBand), groups);
+  const movedUp = decision.seatFallbackArm(groups, low, { floorRung: 1, ceilingRung: 2 });
+  assert.deepEqual(ids(movedUp), [[], ['sample-2', 'sample-1'], []]);
+  assert.equal(movedUp[1].arms[1].rung, 1);
   assert.strictEqual(decision.seatFallbackArm(groups, high, { floorRung: 1, ceilingRung: 1 }), groups);
   assert.deepEqual(groups, before);
   const empty = [];
