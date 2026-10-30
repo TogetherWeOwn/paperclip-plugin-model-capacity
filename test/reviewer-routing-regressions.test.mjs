@@ -71,7 +71,7 @@ function drive({ selected = arm(), accounts = [lane()], overrides = {}, feedExtr
     },
     seed: (stateKey, value) => store.set(JSON.stringify(key(stateKey)), value),
     setNow: ms => { now = ms; },
-    tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
+    tick: () => jobs.get('quota-refresh')({ companyId: 'acme' }),
     hook: runId => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'reviewer-1', issueId: null, adapterType: 'opencode_local',
       invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,

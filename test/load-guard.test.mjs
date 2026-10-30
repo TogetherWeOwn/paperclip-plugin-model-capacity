@@ -86,10 +86,11 @@ test('a failed ledger load aborts the tick and never wipes the saved ledger', as
   });
 
   // Tick 1: the ledger read throws -> the tick aborts (the job wrapper
-  // reports shadow-tick-failed; the outage itself is logged), saved ledger
+  // reports quota-refresh-failed; the outage itself is logged), saved ledger
   // untouched.
-  await assert.rejects(jobs.get('shadow-tick')({}), /shadow-tick-failed/);
-  assert.ok(errors.some(a => String(a[1]?.error ?? a).includes('state-outage')), 'outage logged');
+  await assert.rejects(jobs.get('quota-refresh')({}), /quota-refresh-failed/);
+  assert.ok(errors.some(a => a[1]?.reason === 'quota-refresh-failed'), 'outage logged with stable code');
+  assert.ok(!JSON.stringify(errors).includes('state-outage'), 'raw state errors stay out of job logs');
   assert.deepEqual(store.get(skey(LEDGER_STATE_KEY)), savedJSON);
 
   // A run starts in the failed window: recorded memory-only (fallback logs),
@@ -99,7 +100,7 @@ test('a failed ledger load aborts the tick and never wipes the saved ledger', as
   assert.deepEqual(store.get(skey(LEDGER_STATE_KEY)), savedJSON);
 
   // Tick 2: the read recovers, the load merges the memory run, both persist.
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const persisted = ledgerFromJSON(store.get(skey(LEDGER_STATE_KEY)));
   assert.ok(persisted.has('run-saved'), 'saved run survives the failed load');
   assert.ok(persisted.has('run-live'), 'run recorded during the outage survives');

@@ -79,7 +79,7 @@ function drive({ nowMs, config = {}, laneAccounts = null, steps = null, todoIssu
         else lanePayload = resolveLane();
         tickNo += 1;
         for (const e of s.fire ?? []) await handlers.get(e.type)(e);
-        await jobs.get('shadow-tick')({});
+        await jobs.get('quota-refresh')({});
         bodies.push((await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body);
       }
       return bodies;

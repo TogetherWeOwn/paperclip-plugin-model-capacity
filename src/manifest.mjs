@@ -1,9 +1,9 @@
 /**
  * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
  * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
- * DEFAULT: the default export holds NO `run.model.resolve` capability and no
- * modelRouting; it observes and records only. The enforce-capable variant
- * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
+ * DEFAULT: the clean export holds ai.connections.route, never the fork hook.
+ * The dated transitional variant
+ * (`enforceManifest` = `buildManifest({ variant: 'transitional' })`) is opt-in and
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
@@ -391,9 +391,10 @@
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_ACCOUNTS_PATH_ALLOWLIST } from './cliproxy.mjs';
 import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
+import { PREFIXED_PROFILE_EFFORTS } from './registry.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.77';
+export const PLUGIN_VERSION = '0.3.1';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -430,6 +431,71 @@ const CONFIG_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
+    router: {
+      type: 'object', additionalProperties: false,
+      required: ['companyId', 'ownerUserId', 'accounts', 'pools'],
+      properties: {
+        enabled: { type: 'boolean', default: false },
+        allowMessages: { type: 'boolean', default: false },
+        companyId: { type: 'string', format: 'uuid' },
+        ownerUserId: { type: 'string', pattern: '\\S' },
+        staleSnapshotMs: { type: 'integer', minimum: 1, default: 180000 },
+        accountStaleMs: { type: 'integer', minimum: 1, default: 900000 },
+        recheckMs: { type: 'integer', minimum: 1, default: 300000 },
+        hardCapWeekly: { type: 'number', minimum: 0, maximum: 1, default: 0.995 },
+        hardCapFiveHour: { type: 'number', minimum: 0, maximum: 1, default: 0.99 },
+        accounts: {
+          type: 'array', items: {
+            type: 'object', additionalProperties: false,
+            required: ['accountKey','prefix','provider','protocol','harnessProfile','connectionName','pools'],
+            properties: {
+              accountKey: { type: 'string', minLength: 1 },
+              prefix: { type: 'string', minLength: 1 },
+              provider: { type: 'string', enum: ['openai', 'anthropic'] },
+              protocol: { type: 'string', enum: ['responses', 'messages'] },
+              harnessProfile: { type: 'string', enum: ['codex', 'acpx'] },
+              acpxAgent: { type: 'string', enum: ['claude'] },
+              connectionName: { type: 'string', minLength: 1, maxLength: 160 },
+              feedExempt: { type: 'boolean', default: false },
+              pools: { type: 'object', additionalProperties: {
+                type: 'object', additionalProperties: false, required: ['model'],
+                properties: { model: { type: 'string', minLength: 1 }, effort: { type: 'string', enum: PREFIXED_PROFILE_EFFORTS.codex }, probeEligible: { type: 'boolean', default: false } },
+              } },
+            },
+            allOf: [{
+              if: { properties: { harnessProfile: { const: 'acpx' } }, required: ['harnessProfile'] },
+              then: { properties: { pools: { type: 'object', additionalProperties: {
+                type: 'object', properties: { effort: { type: 'string', enum: PREFIXED_PROFILE_EFFORTS.acpx } },
+              } } } },
+            }],
+          },
+        },
+        pools: { type: 'array', items: {
+          type: 'object', additionalProperties: false, required: ['poolKey', 'role'],
+          // Unverified entries are valid for M1. Attestation is all-or-none.
+          anyOf: [
+            { not: { anyOf: ['poolId','pluginKey','expectedRevision','expectedMemberOrder','members'].map(k=>({required:[k]})) } },
+            { required: ['poolId','pluginKey','expectedRevision','expectedMemberOrder','members'] },
+          ],
+          properties: {
+            poolKey: { type: 'string', minLength: 1, maxLength: 160 },
+            role: { type: 'string', enum: ['doer', 'thinker', 'reviewer'] },
+            poolId: { type: 'string', format: 'uuid' },
+            pluginKey: { type: 'string', enum: ['togetherweown.model-capacity'] },
+            expectedRevision: { type: 'integer', minimum: 0 },
+            expectedMemberOrder: { type: 'array', uniqueItems: true, items: { type: 'string', format: 'uuid' } },
+            members: { type: 'array', items: {
+              type: 'object', additionalProperties: false,
+              required: ['memberId','accountKey','connectionId','grantId'],
+              properties: {
+                memberId: { type: 'string', format: 'uuid' }, accountKey: { type: 'string', minLength: 1 },
+                connectionId: { type: 'string', format: 'uuid' }, grantId: { type: 'string', format: 'uuid' },
+              },
+            } },
+          },
+        } },
+      },
+    },
     cliproxy: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -652,6 +718,17 @@ const CONFIG_SCHEMA = {
           type: 'object', additionalProperties: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 1 },
           description: 'Per-provider quantile overrides, e.g. { codex: 0.25 }.',
         },
+      },
+    },
+    burn: {
+      type: 'object', additionalProperties: false, required: ['expiresAt'],
+      description: 'Native router only: explicit expiring account/provider drain. Past expiry is inactive and visible as a standing warning. Does not change legacy burnMode.',
+      properties: {
+        accountKeys: {type:'array',items:{type:'string',minLength:1},default:[]},
+        providers: {type:'array',items:{type:'string',minLength:1},default:[]},
+        expiresAt: {type:'string',format:'date-time'},
+        endAtUsedPct: {type:'number',exclusiveMinimum:0,maximum:1,default:.995},
+        mode: {type:'string',enum:['prefer','exclusive'],default:'prefer'},
       },
     },
     burnMode: {
@@ -962,13 +1039,15 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. Defaults to the shadow-only variant (no resolve
- * capability, no modelRouting). Pass `{ modelResolve: true }` for the
- * enforcement variant: it holds the `run.model.resolve` capability plus the
- * modelRouting envKeys declaration the host requires with it.
+ * Build-time variant, never a runtime setting. The clean manifest is upstream
+ * compatible. Only the dated fork-image transitional artifact declares the
+ * retained run.model.resolve hook and its env allowlist.
  */
-export function buildManifest({ modelResolve = false } = {}) {
+export function buildManifest({ variant = 'clean' } = {}) {
+  if (!['transitional', 'clean'].includes(variant)) throw new Error('invalid manifest variant');
+  const modelResolve = variant === 'transitional';
   const capabilities = [
+    'ai.connections.route',
     'jobs.schedule',
     'plugin.state.read',
     'plugin.state.write',
@@ -998,16 +1077,17 @@ export function buildManifest({ modelResolve = false } = {}) {
   const out = {
     id: PLUGIN_ID,
     apiVersion: 1,
-    version: PLUGIN_VERSION,
-    displayName: modelResolve ? 'Model Capacity' : 'Model Capacity (Shadow)',
+    version: `${PLUGIN_VERSION}-${variant}`,
+    displayName: modelResolve ? 'Model Capacity (Transitional)' : 'Model Capacity',
     description: modelResolve
-      ? 'Model-capacity routing: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Enforces run models only when the `enforce` config flag is true (default false: hook answers keep).'
-      : 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Observes only; it changes no runs and holds no resolve capability.',
+      ? 'fork-image transitional dual-capability build, exit 2026-11-30. Native per-account pool pacing plus the unchanged opt-in fork hook.'
+      : 'Native AI connection pool routing with reset-relative per-account pacing. No fork model-resolution hook.',
+    aiConnectionRouter: { name: 'Model Capacity pool', description: 'Select host-authorized pool members using per-account quota, pacing and role policy.' },
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
     entrypoints: { worker: './src/worker.mjs' },
-    instanceConfigSchema: CONFIG_SCHEMA,
+    instanceConfigSchema: modelResolve ? CONFIG_SCHEMA : { ...CONFIG_SCHEMA, properties: Object.fromEntries(Object.entries(CONFIG_SCHEMA.properties).filter(([key]) => key !== 'enforce')) },
     jobs: [
       {
         jobKey: 'aa-refresh',
@@ -1016,13 +1096,22 @@ export function buildManifest({ modelResolve = false } = {}) {
         schedule: '17 4 * * *',
       },
       {
-        jobKey: 'shadow-tick',
-        displayName: 'Shadow capacity tick',
-        description: 'Every minute: refresh CLIProxy readings on demand, step per-account pacing pointers, recompute the concurrency target, and record what would have been decided for recently started runs. Writes shadow state only.',
+        jobKey: 'quota-refresh',
+        displayName: 'Refresh quota and shadow capacity',
+        description: 'Every minute: read the single quota feed, publish immutable native-router snapshots and per-pool synthetic shadow decisions, and retain the legacy hook capacity tick during migration.',
         schedule: '* * * * *',
       },
     ],
     apiRoutes: [
+      {
+        routeKey: 'scorecard',
+        method: 'GET',
+        path: '/scorecard',
+        auth: 'board-or-agent',
+        capability: 'api.routes.register',
+        checkoutPolicy: 'none',
+        companyResolution: { from: 'query', key: 'companyId' },
+      },
       {
         routeKey: 'capacity',
         method: 'GET',
@@ -1063,15 +1152,14 @@ export function buildManifest({ modelResolve = false } = {}) {
   };
   if (modelResolve) {
     out.capabilities = [...capabilities, 'run.model.resolve'];
-    out.displayName = 'Model Capacity';
     out.modelRouting = { envKeys: [...MODEL_ROUTING_ENV_KEYS] };
   }
   return out;
 }
 
-/** Default (and installed-by-default) manifest: shadow only, no resolve capability. */
+/** Default clean manifest: native router only, no fork hook. */
 export const manifest = buildManifest();
 
-/** Opt-in enforce-capable manifest (runtime-gated by the `enforce: false` default). */
-export const enforceManifest = buildManifest({ modelResolve: true });
+/** Compatibility export for the dated transitional build. */
+export const enforceManifest = buildManifest({ variant: 'transitional' });
 export default manifest;

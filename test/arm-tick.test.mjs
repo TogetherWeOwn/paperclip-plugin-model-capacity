@@ -87,7 +87,7 @@ function drive(opts = {}) {
       now = at;
       accounts = lanes.map(l => lane(l, now));
       for (const e of fire) await handlers.get(e.type)(e);
-      await jobs.get('shadow-tick')({});
+      await jobs.get('quota-refresh')({});
     },
     // Fire run events at `at` with no tick: the live view published by the
     // previous tick is still fresh, so the event-time shadow path decides.

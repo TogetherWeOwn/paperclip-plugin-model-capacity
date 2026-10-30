@@ -197,7 +197,7 @@ function drive({ accounts, config = {}, nowMs = NOW, rows = aaRows(), servedMode
       );
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: async (at = now) => { now = at; await jobs.get('shadow-tick')({ companyId: 'acme' }); },
+    tick: async (at = now) => { now = at; await jobs.get('quota-refresh')({ companyId: 'acme' }); },
     setNow: (ms) => { now = ms; },
     setAccounts: (next) => { laneAccounts = next; },
     seed: (stateKey, value) => { store.set(key(stateKey), value); },

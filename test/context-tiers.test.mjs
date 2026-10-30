@@ -461,7 +461,7 @@ test('tiered cheap arm loses L0; fields surface in ladder + capacity', async () 
       rows: [aaRow('cheap-sol', 1.0, 55), aaRow('pricey-luna', 2.0, 60)],
       duplicateSlugs: [],
     });
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     const ladder = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' });
     const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
     return { ladder: ladder.body, capacity: capacity.body, plugin };
@@ -638,7 +638,7 @@ test('tier multiplier applies to quota burn: Haiku fractionOver=1 burns ~5x base
       rows: [aaRow('claude-haiku-5-5', 1.0, 55), aaRow('ref-model', 1.0, 50)],
       duplicateSlugs: [],
     });
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     const ladder = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' });
     const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
     return { ladder: ladder.body, capacity: capacity.body };

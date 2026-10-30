@@ -50,7 +50,7 @@ test('devin account emits the exact provider-prefixed served id', async () => {
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const hook = await plugin.onResolveRunModel({
     runId: 'run-1', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
     issueId: null, deadlineMs: 1500,
@@ -157,7 +157,7 @@ test('alias-only claude account decorates the bare id at 1M, devin keeps its pre
     store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
       { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
     await plugin.onConfigChanged(config, { companyId: 'acme' });
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     return plugin.onResolveRunModel({
       runId: 'run-1m', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
       issueId: null, deadlineMs: 1500,
@@ -218,7 +218,7 @@ test('native alias-only account decides the listed alias when the bare id is uns
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
   assert.equal((capacity.body.unservable ?? []).length, 0);
   const ladder = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'ladder' });
@@ -273,7 +273,7 @@ test('native alias-only claude account decides the prefixed 1M id when the bare 
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const hook = await plugin.onResolveRunModel({
     runId: 'run-alias-1m', companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
     issueId: null, deadlineMs: 1500,
@@ -350,7 +350,7 @@ test('shadow modelMatch agrees on bare actuals of prefixed decisions', async () 
     payload: { run: { agentId: 'agent-9', adapterType: 'claude-code', model: 'gpt-5-5' } },
     occurredAt: new Date(NOW).toISOString(),
   });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const capacity = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'shadow' });
   const entry = capacity.body.entries.find(e => e.runId === 'run-bare');
   assert.ok(entry, 'shadow entry recorded');

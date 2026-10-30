@@ -131,7 +131,7 @@ async function harness() {
       configs.set(companyId, structuredClone(raw));
       await plugin.onConfigChanged(structuredClone(raw), { companyId });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     api: async (routeKey, companyId = 'acme') => {
       const response = await plugin.onApiRequest({ companyId, routeKey });
       assert.equal(response.status, 200);
@@ -198,7 +198,7 @@ for (const status of [401, 403]) {
     await d.configure(config(SECRET_B));
     // The existing scheduled-job API may surface fetch failure as an error.
     // Regardless of reporting style, denied evidence cannot authorize a run.
-    await d.tick().catch(error => assert.equal(error.message, 'shadow-tick-failed'));
+    await d.tick().catch(error => assert.equal(error.message, 'quota-refresh-failed'));
     assert.equal((await d.hook('after-access-denied')).kind, 'defer');
     assert.equal(d.requests.at(-1), sourceKey('acme', SECRET_B));
   });

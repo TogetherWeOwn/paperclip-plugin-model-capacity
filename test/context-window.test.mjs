@@ -82,7 +82,7 @@ function drive({ config = {}, laneAccounts = [], agentGets = {}, aa = [] }) {
       store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aa, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: () => jobs.get('shadow-tick')({}),
+    tick: () => jobs.get('quota-refresh')({}),
     fire: (e) => handlers.get(e.type)(e),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', issueId: null,

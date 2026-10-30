@@ -163,7 +163,7 @@ test('free NIM lane emits the exact alias at zero placement cost', async () => {
   store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
     { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
-  await jobs.get('shadow-tick')({});
+  await jobs.get('quota-refresh')({});
   const cap = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' });
 
   // The global cap is untouched by the NIM-scoped override.
@@ -266,7 +266,7 @@ test('NIM-scoped cap holds at one; other providers keep two', async () => {
     store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'aa-snapshot-v1' }),
       { fetchedAt: new Date(NOW).toISOString(), rows, duplicateSlugs: [] });
     await plugin.onConfigChanged(config, { companyId: 'acme' });
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     const hook = (runId) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code',
       issueId: null, deadlineMs: 1500,
@@ -359,7 +359,7 @@ function nimDrive({ scoped, metered = false }) {
         { fetchedAt: new Date(T0).toISOString(), rows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
-    tick: async (at) => { now = at; await jobs.get('shadow-tick')({ companyId: 'acme' }); },
+    tick: async (at) => { now = at; await jobs.get('quota-refresh')({ companyId: 'acme' }); },
     fire: async (e) => { await handlers.get(e.type)(e); },
     started,
     finished,

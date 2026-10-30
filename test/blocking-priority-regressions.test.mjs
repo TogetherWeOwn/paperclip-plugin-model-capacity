@@ -68,7 +68,7 @@ async function drive({ issues, config = enabled, cap = null, failStatus = null }
     reads, api,
     setNow: ms => { now = ms; },
     setUsed: value => { used = value; },
-    tick: () => jobs.get('shadow-tick')({ companyId: COMPANY }),
+    tick: () => jobs.get('quota-refresh')({ companyId: COMPANY }),
     run: (id, type) => handlers.get(type)({
       type, companyId: COMPANY, entityId: id, occurredAt: new Date(now).toISOString(),
       payload: { run: { agentId: 'worker', provider: 'codex', model: 'gpt-6.1-sol' } },

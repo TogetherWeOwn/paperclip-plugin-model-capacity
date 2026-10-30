@@ -1,7 +1,7 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.2.77",
-  "description": "Shadow-by-default model-capacity routing: paced per-account Pareto ladders from Artificial Analysis quality and CLIProxy burn data. v0.2.2 routes all providers. The default manifest holds no run.model.resolve capability; the enforce-capable variant is opt-in and its enforce flag defaults false.",
+  "version": "0.3.1",
+  "description": "Native AI connection pool routing with reset-relative per-account pacing. Build-time clean and fork-image transitional variants; no runtime capability toggle.",
   "license": "MIT",
   "type": "module",
   "paperclipPlugin": {
@@ -11,9 +11,17 @@
   "files": [
     "src",
     "test",
+    "scripts/generate-pool.mjs",
+    "scripts/paperclip-api.mjs",
+    "scripts/pool-saga.mjs",
+    "scripts/pool-plan.mjs",
+    "scripts/gateway-batch.mjs",
+    "scripts/generator-safety.mjs",
+    "scripts/pool-journal.mjs",
     "README.md",
     "LICENSE",
-    "config.example.json"
+    "config.example.json",
+    "scripts/audit-env-pins.mjs"
   ],
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*"
@@ -23,6 +31,14 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check:public-pin": "node scripts/check-public-pin.mjs"
+    "check:public-pin": "node scripts/check-public-pin.mjs",
+    "build:variants": "node scripts/build-variants.mjs",
+    "audit:env-pins": "node scripts/audit-env-pins.mjs"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "zod": "4.6.7"
   }
 }

@@ -184,7 +184,7 @@ test('capacity view names the source, the runs and the rejection reason per lane
         payload: { run: { agentId: 'eng', model: 'muse-spark-1.3-contributor' } },
         occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
     }
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
   };
   // Six ticks (30 min) let the pooled prior calibrate; two runs per tick keep
@@ -247,7 +247,7 @@ test('guard rejection drops the stale individual estimate instead of carrying it
         payload: { run: { agentId: 'eng', model: 'muse-spark-1.3-contributor' } },
         occurredAt: new Date(now - (n + 1) * 1000).toISOString() });
     }
-    await jobs.get('shadow-tick')({});
+    await jobs.get('quota-refresh')({});
     return (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'capacity' })).body;
   };
   for (let i = 0; i <= 6; i++) await tick(i);

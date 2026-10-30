@@ -135,10 +135,10 @@ function drive({ arms = null, accounts, overrides = {}, feedExtra = {}, rows = a
       await plugin.setup(io);
       store.set(JSON.stringify(key('aa-snapshot-v1')), { fetchedAt: new Date(now).toISOString(), rows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
-      await jobs.get('shadow-tick')({ companyId: 'acme' });
+      await jobs.get('quota-refresh')({ companyId: 'acme' });
     },
     setNow: ms => { now = ms; },
-    tick: () => jobs.get('shadow-tick')({ companyId: 'acme' }),
+    tick: () => jobs.get('quota-refresh')({ companyId: 'acme' }),
     hook: (runId, extra = {}) => plugin.onResolveRunModel({
       runId, companyId: 'acme', agentId: 'reviewer-1', issueId: 'issue-1', adapterType: 'claude_local',
       invocationSource: 'test', wakeReason: null, agentDefaultModel: null, previous: null,

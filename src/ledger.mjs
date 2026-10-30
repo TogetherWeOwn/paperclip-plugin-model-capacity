@@ -503,3 +503,12 @@ export function migrateLegacy({ runs, ringEntries, includeTerminalDecisions = fa
   }
   return ledger;
 }
+
+/** Resolve a router model by its exact registry prefix; unprefixed is unattributed. */
+export function accountKeyForModel(model, registry) {
+  if (typeof model !== 'string') return null;
+  const slash = model.indexOf('/');
+  if (slash <= 0 || slash === model.length - 1 || !Array.isArray(registry)) return null;
+  const prefix = model.slice(0, slash);
+  return registry.find(account => account?.prefix === prefix)?.accountKey ?? null;
+}
