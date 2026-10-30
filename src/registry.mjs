@@ -5,14 +5,15 @@ import { createHash } from 'node:crypto';
 
 export const PLUGIN_KEY = 'togetherweown.model-capacity';
 
-/** V0 ownership predicate for upstream pool read objects. Slice 3 must check
- * startup pools and surface failures as ERROR and unavailable; this is pure. */
+/** Ownership predicate for upstream pool read objects. Runtime ownership is
+ * checked per call; full inspection belongs to the operator --check path. */
 export function poolHasExpectedPluginKey(pool) {
   return pool?.pluginKey === PLUGIN_KEY;
 }
 export const ROUTER_CONFIG_KEYS = Object.freeze({
   router: Object.freeze(['enabled','allowMessages','companyId','ownerUserId','staleSnapshotMs','accountStaleMs','recheckMs','hardCapWeekly','hardCapFiveHour','accounts','pools']),
-  pool: Object.freeze(['poolKey','role']),
+  pool: Object.freeze(['poolKey','role','poolId','pluginKey','expectedRevision','expectedMemberOrder','members']),
+  verifiedMember: Object.freeze(['memberId','accountKey','connectionId','grantId']),
   account: Object.freeze(['accountKey','prefix','provider','protocol','harnessProfile','acpxAgent','connectionName','feedExempt','pools']),
   membership: Object.freeze(['model','probeEligible']),
 });
@@ -41,6 +42,28 @@ function uuid5(name, namespace) {
 const pluginNamespace = uuid5(PLUGIN_KEY, DNS_NAMESPACE);
 export function memberIdFor(poolKey, accountKey) {
   return uuid5(`${key(poolKey, 'poolKey')}:${key(accountKey, 'accountKey')}`, pluginNamespace);
+}
+
+const verifiedFields = ['poolId','pluginKey','expectedRevision','expectedMemberOrder','members'];
+/** Shared defensive shape check. An unverified entry is valid configuration,
+ * but callers must separately require poolId before authorizing a real call. */
+export function verifiedPoolError(pool) {
+  if (!pool || typeof pool !== 'object' || Array.isArray(pool)) return 'invalid verified pool';
+  if (!verifiedFields.some(k=>Object.hasOwn(pool,k))) return null;
+  if (!verifiedFields.every(k=>Object.hasOwn(pool,k))) return 'partial verified pool';
+  if (typeof pool.poolId !== 'string' || !uuidPattern.test(pool.poolId) || pool.pluginKey !== PLUGIN_KEY
+      || !Number.isSafeInteger(pool.expectedRevision) || pool.expectedRevision < 0) return 'invalid verified pool identity';
+  const order=pool.expectedMemberOrder, members=pool.members;
+  if (!Array.isArray(order) || order.some(id=>typeof id !== 'string' || !uuidPattern.test(id))
+      || new Set(order).size !== order.length || !Array.isArray(members)) return 'invalid verified member order';
+  if (members.some(m=>!m || typeof m !== 'object' || Array.isArray(m)
+      || Object.keys(m).some(k=>!ROUTER_CONFIG_KEYS.verifiedMember.includes(k))
+      || ['memberId','connectionId','grantId'].some(k=>typeof m[k] !== 'string' || !uuidPattern.test(m[k]))
+      || typeof m.accountKey !== 'string' || !keyPattern.test(m.accountKey))) return 'invalid verified member';
+  if (order.length !== members.length || new Set(members.map(m=>m.memberId)).size !== members.length
+      || members.some(m=>!order.includes(m.memberId))) return 'verified member set mismatch';
+  if (['connectionId','grantId'].some(k=>new Set(members.map(m=>m[k])).size !== members.length)) return 'duplicate verified binding';
+  return null;
 }
 
 export function normalizeRegistry(raw) {
@@ -74,7 +97,19 @@ export function normalizeRegistry(raw) {
     });
     return {...a, pools:Object.fromEntries(memberships)};
   });
-  return {...raw, accounts, poolRoles:Object.fromEntries(roles), memberIndex:Object.fromEntries(index),
+  const poolIds=new Set();
+  const pools=raw.pools.map(p=>{
+    if (!Object.hasOwn(p,'poolId')) return Object.freeze({...p});
+    if (poolIds.has(p.poolId)) throw new Error('duplicate verified poolId');
+    poolIds.add(p.poolId);
+    for (const m of p.members) {
+      const a=accounts.find(a=>a.accountKey===m.accountKey);
+      if (!a?.pools[p.poolKey] || m.memberId!==memberIdFor(p.poolKey,m.accountKey)) throw new Error('verified member not in registry pool');
+    }
+    return Object.freeze({...p,expectedMemberOrder:Object.freeze([...p.expectedMemberOrder]),
+      members:Object.freeze(p.members.map(m=>Object.freeze({...m})))});
+  });
+  return {...raw, pools:Object.freeze(pools), accounts, poolRoles:Object.fromEntries(roles), memberIndex:Object.fromEntries(index),
     prefixByAccount:Object.fromEntries(accounts.map(a => [a.accountKey, a.prefix])),
     accountByPrefix:Object.fromEntries(accounts.map(a => [a.prefix, a.accountKey]))};
 }
@@ -125,6 +160,11 @@ function routerShapeErrors(raw) {
   if (Array.isArray(raw.pools)) for (const pool of raw.pools) {
     if (pool && typeof pool === 'object' && !Array.isArray(pool)) {
       checkKeys(pool, ROUTER_CONFIG_KEYS.pool, 'router.pools[]');
+      const verifiedError=verifiedPoolError(pool);
+      if (verifiedError) errors.push(`router.pools[]: ${verifiedError}`);
+      if (Array.isArray(pool.members)) for (const member of pool.members) {
+        if (member && typeof member === 'object' && !Array.isArray(member)) checkKeys(member, ROUTER_CONFIG_KEYS.verifiedMember, 'router.pools[].members[]');
+      }
       if (typeof pool.poolKey === 'string' && pool.poolKey.length > 160) errors.push('router poolKey exceeds 160 characters');
     }
   }

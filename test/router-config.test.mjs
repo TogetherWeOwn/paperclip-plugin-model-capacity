@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateConfigShape } from '../src/plugin.mjs';
+import { verifiedConfig } from './support/verified-pools.mjs';
 
 const good = () => ({router:{enabled:false,companyId:'10000000-0000-4000-8000-000000000001',ownerUserId:'10000000-0000-4000-8000-000000000002',pools:[{poolKey:'builder',role:'doer'}],accounts:[{accountKey:'a',prefix:'p',provider:'openai',protocol:'responses',harnessProfile:'codex',connectionName:'A',pools:{builder:{model:'model',probeEligible:true}}}]}});
 
@@ -36,15 +37,16 @@ test('schema properties and validator key allowlists stay in parity at each rout
   const levels=[
     [schema.properties,c=>c.router,'router'],
     [schema.properties.pools.items.properties,c=>c.router.pools[0],'router.pools[]'],
+    [schema.properties.pools.items.properties.members.items.properties,c=>c.router.pools[0].members[0],'router.pools[].members[]'],
     [schema.properties.accounts.items.properties,c=>c.router.accounts[0],'router.accounts[]'],
     [schema.properties.accounts.items.properties.pools.additionalProperties.properties,c=>c.router.accounts[0].pools.builder,'router membership'],
   ];
   for (const [properties,get,path] of levels) {
     for (const key of Object.keys(properties)) {
-      const c=good(); get(c)[key]=undefined;
+      const c=verifiedConfig(); get(c)[key]=undefined;
       assert.ok(!validateConfigShape(c).includes(`${path}.${key} is not a known key`),`${path}.${key}`);
     }
-    const c=good(); get(c).notInSchema=true;
+    const c=verifiedConfig(); get(c).notInSchema=true;
     assert.ok(validateConfigShape(c).includes(`${path}.notInSchema is not a known key`));
   }
 });
@@ -53,7 +55,7 @@ test('validator allowlists equal manifest schema keys in both directions', async
   const {ROUTER_CONFIG_KEYS}=await import('../src/registry.mjs');
   const {manifest}=await import('../src/manifest.mjs');
   const s=manifest.instanceConfigSchema.properties.router;
-  const schemas={router:s.properties,pool:s.properties.pools.items.properties,account:s.properties.accounts.items.properties,membership:s.properties.accounts.items.properties.pools.additionalProperties.properties};
+  const schemas={router:s.properties,pool:s.properties.pools.items.properties,account:s.properties.accounts.items.properties,membership:s.properties.accounts.items.properties.pools.additionalProperties.properties,verifiedMember:s.properties.pools.items.properties.members.items.properties};
   for (const [level,properties] of Object.entries(schemas)) {
     assert.deepEqual([...ROUTER_CONFIG_KEYS[level]].sort(),Object.keys(properties).sort(),level);
   }

@@ -457,7 +457,27 @@ const CONFIG_SCHEMA = {
         },
         pools: { type: 'array', items: {
           type: 'object', additionalProperties: false, required: ['poolKey', 'role'],
-          properties: { poolKey: { type: 'string', minLength: 1, maxLength: 160 }, role: { type: 'string', enum: ['doer', 'thinker', 'reviewer'] } },
+          // Unverified entries are valid for M1. Attestation is all-or-none.
+          anyOf: [
+            { not: { anyOf: ['poolId','pluginKey','expectedRevision','expectedMemberOrder','members'].map(k=>({required:[k]})) } },
+            { required: ['poolId','pluginKey','expectedRevision','expectedMemberOrder','members'] },
+          ],
+          properties: {
+            poolKey: { type: 'string', minLength: 1, maxLength: 160 },
+            role: { type: 'string', enum: ['doer', 'thinker', 'reviewer'] },
+            poolId: { type: 'string', format: 'uuid' },
+            pluginKey: { type: 'string', enum: ['togetherweown.model-capacity'] },
+            expectedRevision: { type: 'integer', minimum: 0 },
+            expectedMemberOrder: { type: 'array', uniqueItems: true, items: { type: 'string', format: 'uuid' } },
+            members: { type: 'array', items: {
+              type: 'object', additionalProperties: false,
+              required: ['memberId','accountKey','connectionId','grantId'],
+              properties: {
+                memberId: { type: 'string', format: 'uuid' }, accountKey: { type: 'string', minLength: 1 },
+                connectionId: { type: 'string', format: 'uuid' }, grantId: { type: 'string', format: 'uuid' },
+              },
+            } },
+          },
         } },
       },
     },
