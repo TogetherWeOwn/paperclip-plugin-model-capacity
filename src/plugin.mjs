@@ -5576,9 +5576,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const config = lastConfig.get(companyId);
       const allowlist = config?.trials.unscoredServedIds ?? [];
       if (admission.match?.unscoredTrial || (!admission.match?.aaSlug
+        && !(!taskEnforce && Number.isFinite(admission.match?.Q))
         && allowlist.some(e => e.model === canonicalModelName(arm.model)))) {
-        // AA-backed matches no longer need unscored admission; stale trial
-        // entries are inert once the model has its own AA identity.
+        // AA-backed matches no longer need unscored admission; legacy arms
+        // carry their AA score as Q rather than aaSlug. Stale trial entries
+        // are inert once the model has its own AA identity.
         // The model-list fallback is not trial admission. Missing-AA arms
         // require their own exact served id and a price that is valid NOW,
         // independently of the opt-in credential-readiness filter.
@@ -5624,8 +5626,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const capped = a => a.reactive && inFlightOf(a) >= liveTrialInflightCapFor(live, a);
     const accounts = eligibleAccounts.filter(a => !capped(a));
     const admit = reviewerArmAdmission(live, companyId, agentId, nowMs, { selfId, adapterType });
+    // A hard credential cap still applies when another admission gate (for
+    // example the family trial budget) also refuses the reviewer arm. Keep
+    // that refusal independent so a legacy keep cannot start on a full lane.
     const capHeld = eligibleAccounts.some(a => capped(a) && reviewerServable(a)
-      && (cfg?.arms ?? []).some(arm => arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true));
+      && (cfg?.arms ?? []).some(arm => arm.provider === String(a.pool ?? a.provider).toLowerCase()));
     const dupKey = lastConfig.get(companyId)?.placement.duplicateVersionPunctuationFolding ? aliasKey : canonicalKey;
     // Apply native-first per MODEL, not per mixed account or provider. A
     // native route counts only when this same reviewer can actually use it

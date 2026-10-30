@@ -601,6 +601,27 @@ for (const mode of ['off', 'shadow']) {
     assert.equal((await d.hook('free-running')).model, 'devin/swe-2');
     assert.equal((await d.hook('kept-review', 'reviewer')).kind, 'defer');
   });
+
+  test(`reviewer hard account cap survives simultaneous family-budget refusal (${mode})`, async () => {
+    const d = await driveDevin({ mode, cap: 1, onlySwe: true,
+      trialSettings: { roles: ['doer', 'other'], maxInFlightPerFamily: 1 },
+      configExtra: {
+        roles: { doerAgentIds: ['builder'], keepAgentIds: ['reviewer'], minQuality: { doer: null, thinker: null, other: null } },
+        reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2' }] },
+      },
+    });
+    assert.equal((await d.hook('family-running')).model, 'devin/swe-2');
+    const pending = await d.hook('kept-family-review', 'reviewer');
+    assert.equal(pending.kind, 'defer', JSON.stringify(pending));
+    assert.match(pending.reason, /account in-flight cap/);
+    await d.fire('family-running', 'agent.run.started');
+    await d.tick();
+    assert.equal((await d.hook('kept-family-review-after-tick', 'reviewer')).kind, 'defer');
+    await d.fire('family-running', 'agent.run.finished');
+    await d.tick();
+    assert.equal((await d.hook('released-family-review', 'reviewer')).model, 'devin/swe-2');
+    assert.equal((await d.hook('released-family-review', 'reviewer')).kind, 'decide');
+  });
 }
 
 for (const readiness of [false, true]) {
@@ -622,6 +643,26 @@ for (const readiness of [false, true]) {
     await d.tick();
     assert.notEqual((await d.hook('expired-after-tick', 'reviewer')).model, 'devin/swe-2');
   });
+}
+
+for (const mode of ['off', 'shadow']) {
+  for (const allowlisted of [false, true]) {
+    test(`AA-scored reviewer ignores obsolete unscored admission (${mode}, allowlisted ${allowlisted})`, async () => {
+      const d = await driveDevin({ mode, onlySwe: true, free: false,
+        aaExtraRows: [{ slug: 'swe-2', intelligenceIndex: 55, intelligenceIndexCostPerTask: 5 }],
+        trialSettings: { roles: [], adapters: {}, unscoredServedIds: allowlisted
+          ? [{ servedId: 'devin/swe-2', reason: 'obsolete trial entry' }] : [] },
+        configExtra: {
+          reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'devin', model: 'devin/swe-2', effort: 'max' }] },
+        },
+      });
+      assert.equal((await d.capacity()).reviewer.routing.preview.routed, true);
+      const answer = await d.hook('scored-review', 'reviewer');
+      assert.equal(answer.kind, 'decide');
+      assert.equal(answer.model, 'devin/swe-2');
+      assert.equal(answer.effort, 'max');
+    });
+  }
 }
 
 for (const allowlisted of [false, true]) {
