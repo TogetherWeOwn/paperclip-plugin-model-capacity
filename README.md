@@ -772,21 +772,39 @@ Reactive (unmetered) accounts are never weekly-held. A **known** weekly lead is
 sufficient for a hard hold even when run duration or target share is unknown;
 an unknown weekly position never creates one.
 
-**Role-empty safety:** if hard holds would remove every otherwise eligible
-account for a role, only those hard holds are suspended for that role; the
-ordinary pace cap still applies. This is a structural role-capacity check — a
-temporarily full peer is not permission to spend ahead. Health, headroom,
-review reserves, role exclusions, readiness, trial and breaker gates retain
-authority. `/capacity.paceGuard.roleSafety` reports
-`role-empty-hold-suspended`, role, account IDs and reason.
+**Conservative admission:** weekly holds never suspend for an empty role or a
+temporarily full alternative. A role with only held accounts waits; no restored
+allowance is lent or rematched to another role. Health, headroom, review reserves,
+role exclusions, readiness, current-price, trial and breaker gates retain their
+authority in every task-ranking mode. Compatibility suspension diagnostics remain
+empty (`paceGuard.roleSafety` and `holdSuspendedAccountIds`).
+
+**Shared model routes:** selecting an account label does not bind the proxy's
+credential. If an emitted model can reach any known weekly-held non-burn
+credential, the plugin refuses that emission and chooses an already-approved
+safe alternative or returns a bounded defer. Unknown serving inventory is not
+proof of safety. Defaults, effort changes, policy arms, duplicate passes and
+exhaustion fallback cannot reopen the same route. A burn credential sharing an
+indistinguishable route can therefore wait too; it remains burn-exempt, but does
+not authorize use of the held non-burn credential. Distinct safe emissions and
+burn-only routes remain usable. No credential aliases or proxy changes are made.
 
 Pool verdicts name `hardHeldAccountIds` and report state `hard-held` (all
 non-burn accounts held) or `lanes-paced` (mixed). Existing runs are never
 cancelled. `/caps` preserves running floors but cannot create new fixed-model
 or reviewer slots on a hard-held account. `paceGuard.rawPools` retains
 role-independent hold facts for global `/caps` consumers; `paceGuard.pools` is
-the doer-role admission view. A routing safety exception never authorizes a
-different role's pinned work.
+the doer-role admission view. Every running run continues charging its recorded
+account and pool, even after its route becomes held or ineligible; it is never
+rematched to a new candidate. Reviewer-local ordinary caps include other agents'
+ordinary pool pressure. Burn identity and running pressure survive role filters.
+
+When this layer is enabled, new fixed/reviewer grants require a feature-compatible
+snapshot from the current producer instance and configuration/admission generation,
+no older than 120 seconds and not future-dated. A failed refresh, old-policy,
+pre-feature or incompatible snapshot preserves running floors but grants no
+affected new slots, reporting `weekly-hold-evidence-unavailable`. Opting out of
+the weekly layer retains the existing disabled-hold freshness behavior.
 
 **Plan endpoint:** the linear target is `elapsedFraction * (1 - configuredFloor)`,
 reaching **100% minus the explicit floor at reset**, with no additional pacing
@@ -809,6 +827,8 @@ exclusion or credential gate is weakened.
 (`src/router.mjs`) and has its own ahead and measured-rate-too-fast hold
 (`src/snapshot.mjs`); this weekly hold is **not** native admission protection
 and must not be described as such. Enabling the native router does not port it.
+Protection is limited to compatibility decisions and grants this plugin controls,
+not native or unrelated proxy traffic.
 `/caps` keeps its response shape in both build variants until the consumer
 census proves it empty.
 

@@ -433,10 +433,14 @@ export function allocateKeptAndRoutedCaps({
   target, maxTotal = 75, demandFactor = 1, agents = [], keepAgentIds = [],
   keptByAgent = {}, accounts = [], perAccount = [], pacePools = [], unavailableAccountIds = [],
   reviewerAccountIdsByAgent = {}, reviewerPaceByAgent = {}, blockingPriority = false,
+  actualRunningByAgent = null, externalRunningByPool = {}, unknownExternalRunning = false,
 } = {}) {
-  if (Object.keys(reviewerAccountIdsByAgent).length > 0) {
+  // A physical census can describe runs on accounts other than a fixed pin.
+  // Use the account-aware path even when reviewer routing is disabled.
+  if (Object.keys(reviewerAccountIdsByAgent).length > 0 || actualRunningByAgent != null
+    || agents.some(a => a.runningByAccount != null || a.unattributedRunning != null)) {
     return allocateMultiPoolReviewers({ target, maxTotal, demandFactor, agents, keepAgentIds,
-      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority });
+      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority, actualRunningByAgent });
   }
   const keptIds = new Set(keepAgentIds);
   const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
@@ -457,27 +461,45 @@ export function allocateKeptAndRoutedCaps({
   }
   const pacedPools = new Map(pacePools.map(pool => [pool.pool, pool]));
   const groups = new Map();
+  const heldRunning = new Map();
+  const heldEntries = [];
+  let unknownRunning = unknownExternalRunning;
   for (const agent of agents) {
     if (!keptIds.has(agent.agentId)) continue;
-    const serving = keptByAgent[agent.agentId];
-    const pool = serving?.accountId == null || hardHeld.has(serving.accountId) ? '' : accountPool.get(serving.accountId);
-    const key = typeof pool === 'string' ? pool : '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(agent);
+    const id = keptByAgent[agent.agentId]?.accountId;
+    const pool = accountPool.get(id);
+    const running = Math.max(0, Math.floor(agent.running ?? 0));
+    if (running > 0 && typeof pool !== 'string') unknownRunning = true;
+    if (unavailableAccounts.has(id) || typeof pool !== 'string') {
+      if (running > 0 && typeof pool === 'string') {
+        const pressure = heldRunning.get(pool) ?? { ordinary: 0, burn: 0 };
+        pressure[burnAccounts.has(id) ? 'burn' : 'ordinary'] += running;
+        heldRunning.set(pool, pressure);
+      }
+      heldEntries.push(...allocateDemandCaps(0, [agent], 1));
+      continue;
+    }
+    if (!groups.has(pool)) groups.set(pool, []);
+    groups.get(pool).push(agent);
   }
 
-  const kept = [];
-  const keptCeilings = new Map();
+  const kept = [...heldEntries];
+  const keptCeilings = new Map(heldEntries.map(entry => [entry.agentId, entry.running]));
   const groupInputs = [];
   const groupById = new Map();
   const priorityPools = [];
   for (const [pool, members] of groups) {
     const paced = pacedPools.get(pool);
     const slots = pool === '' ? { paced: 0, burn: 0 } : (poolSlots.get(pool) ?? { paced: 0, burn: 0 });
-    const pacedCapacity = slots.paced * demandFactor;
-    const boundedCapacity = Math.max(0, Math.floor((Number.isFinite(paced?.cap)
-      ? Math.min(pacedCapacity, paced.cap)
-      : pacedCapacity) + slots.burn * demandFactor));
+    const external = externalRunningByPool[pool] ?? {};
+    const held = heldRunning.get(pool) ?? {};
+    const ordinaryPressure = (external.ordinary ?? 0) + (held.ordinary ?? 0);
+    const burnPressure = (external.burn ?? 0) + (held.burn ?? 0);
+    const pacedCapacity = Math.max(0, slots.paced * demandFactor - (external.ordinary ?? 0));
+    const burnCapacity = Math.max(0, slots.burn * demandFactor - burnPressure);
+    const boundedCapacity = unknownRunning ? 0 : Math.max(0, Math.floor((Number.isFinite(paced?.cap)
+      ? Math.min(pacedCapacity, Math.max(0, paced.cap - ordinaryPressure))
+      : pacedCapacity) + burnCapacity));
     const running = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.running ?? 0)), 0);
     const queued = members.reduce((sum, agent) => sum + Math.max(0, Math.floor(agent.queued ?? 0)), 0);
     const groupId = `pool:${JSON.stringify(pool)}`;
@@ -502,13 +524,16 @@ export function allocateKeptAndRoutedCaps({
   // pools reserve shares. Otherwise a low-priority kept queue can take the
   // first slot, or reserve capacity needed by an already-running routed run.
   const priorityEntries = blockingPriority ? allocateDemandCaps(totalTarget, agents, maxTotal,
-    { blockingPriority, priorityPools }) : null;
+    { blockingPriority, priorityPools: [...priorityPools,
+      ...heldEntries.map(entry => ({ agentIds: [entry.agentId], ceiling: entry.running }))] }) : null;
   const priorityShares = new Map(priorityEntries?.map(entry => [entry.agentId, entry]) ?? []);
+  const heldTotal = heldEntries.reduce((sum, row) => sum + row.running, 0);
   const groupCaps = blockingPriority ? groupInputs.map(group => ({
     agentId: group.agentId,
     allocated: groupById.get(group.agentId).members.reduce((sum, member) =>
       sum + (priorityShares.get(member.agentId)?.allocated ?? 0), 0),
-  })) : allocateDemandCaps(totalTarget, groupInputs, totalCeiling);
+  })) : allocateDemandCaps(Math.max(0, totalTarget - heldTotal), groupInputs,
+    Math.max(1, totalCeiling - heldTotal));
   for (const groupCap of groupCaps) {
     const group = groupById.get(groupCap.agentId);
     // The member ceiling is the group's fleet share, never the full pool
@@ -566,186 +591,173 @@ export function allocateKeptAndRoutedCaps({
 // small integer round-robin is bounded by maxTotal, not by PR backlog size.
 function allocateMultiPoolReviewers(input) {
   const { target, maxTotal, demandFactor, agents, keepAgentIds, keptByAgent,
-    accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority } = input;
+    accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent,
+    reviewerPaceByAgent, blockingPriority, actualRunningByAgent } = input;
   const reviewIds = new Set(Object.keys(reviewerAccountIdsByAgent));
-  const fixedIds = keepAgentIds.filter(id => !reviewIds.has(id));
-  const otherRunning = agents.filter(a => !fixedIds.includes(a.agentId)).reduce((s, a) => s + (a.running ?? 0), 0);
-  const fixed = allocateKeptAndRoutedCaps({ ...input, reviewerAccountIdsByAgent: {},
-    target: blockingPriority ? 0 : Math.max(0, (target ?? maxTotal) - otherRunning), maxTotal: Math.max(1, maxTotal - otherRunning),
-    keepAgentIds: fixedIds, agents: agents.filter(a => fixedIds.includes(a.agentId)) });
+  const fixedIds = new Set(keepAgentIds.filter(id => !reviewIds.has(id)));
+  const constrainedIds = new Set([...fixedIds, ...reviewIds]);
   const accountPool = new Map(accounts.map(a => [a.accountId, a.pool]));
   const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
-  const exemptByAgent = new Map(Object.keys(reviewerAccountIdsByAgent).map(id => [id,
-    new Set(reviewerPaceByAgent?.[id]?.holdSuspendedAccountIds ?? [])]));
-  const exemptions = new Set([...exemptByAgent.values()].flatMap(ids => [...ids]));
-  const unavailable = new Set([...unavailableAccountIds, ...[...hardHeld].filter(id => !exemptions.has(id))]);
-  const reviewerAdmissions = Object.fromEntries(Object.entries(reviewerAccountIdsByAgent).map(([agentId, ids]) => [agentId,
-    ids.filter(id => !hardHeld.has(id) || exemptByAgent.get(agentId)?.has(id))]));
+  const unavailable = new Set([...unavailableAccountIds, ...hardHeld]);
   const burn = new Set(pacePools.flatMap(p => p.burnAccountIds ?? []));
-  const paced = new Map(pacePools.map(p => [p.pool, p]));
-  const accountLeft = new Map();
-  const poolLeft = new Map();
-  const pacedLeft = new Map();
-  const rawPacedLeft = new Map();
-  const agentPacedLeft = new Map();
+  const accountLeft = new Map(), poolLeft = new Map(), pacedLeft = new Map();
+  const ordinaryPressure = new Map();
+  let unknownPressure = false;
+
+  // A census, when supplied, is authoritative: its per-agent account counts
+  // must cover every running run. Otherwise retain the legacy kept-account
+  // input as a compatibility fallback for fixed and reviewer identities.
+  const chargesOf = (agent, running) => {
+    if (agent.runningByAccount != null || agent.unattributedRunning != null) {
+      return agent.runningByAccount ?? {};
+    }
+    if (actualRunningByAgent != null) return actualRunningByAgent[agent.agentId] ?? {};
+    const id = keptByAgent[agent.agentId]?.accountId;
+    return id == null ? {} : { [id]: running };
+  };
+  const censusProvided = agents.some(a => a.runningByAccount != null || a.unattributedRunning != null)
+    || actualRunningByAgent != null;
+  for (const agent of agents) {
+    const running = Math.max(0, Math.floor(agent.running ?? 0));
+    if (!running) continue;
+    if (!censusProvided && !constrainedIds.has(agent.agentId)) continue;
+    const charges = chargesOf(agent, running);
+    if ((Number(agent.unattributedRunning) || 0) > 0) unknownPressure = true;
+    let accounted = 0;
+    for (const [id, value] of Object.entries(charges)) {
+      const n = Math.max(0, Math.floor(Number(value) || 0));
+      const pool = accountPool.get(id);
+      if (!n) continue;
+      accounted += n;
+      if (typeof pool !== 'string') { unknownPressure = true; continue; }
+      if (!burn.has(id)) ordinaryPressure.set(pool, (ordinaryPressure.get(pool) ?? 0) + n);
+    }
+    if (accounted !== running) unknownPressure = true;
+  }
+
   for (const a of perAccount) {
     const pool = accountPool.get(a.accountId);
     if (unavailable.has(a.accountId) || typeof pool !== 'string' || !Number.isFinite(a.slots)) continue;
     const n = Math.max(0, a.slots * demandFactor);
     accountLeft.set(a.accountId, n);
     poolLeft.set(pool, (poolLeft.get(pool) ?? 0) + n);
-    if (!burn.has(a.accountId)) {
-      pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
-      if (!hardHeld.has(a.accountId)) rawPacedLeft.set(pool, (rawPacedLeft.get(pool) ?? 0) + n);
-    }
+    if (!burn.has(a.accountId)) pacedLeft.set(pool, (pacedLeft.get(pool) ?? 0) + n);
   }
-  // Held non-exempt lanes contribute no spendable physical slots, but their
-  // fixed running floors still occupy the pool's total in-flight budget.
-  const heldFixedRunning = new Map();
-  for (const row of fixed.kept) {
-    const id = keptByAgent[row.agentId]?.accountId;
-    if (!hardHeld.has(id) || exemptions.has(id)) continue;
-    const pool = accountPool.get(id);
-    heldFixedRunning.set(pool, (heldFixedRunning.get(pool) ?? 0) + row.running);
-  }
-  for (const [pool, n] of pacedLeft) {
-    const rawCap = paced.get(pool)?.cap;
-    const heldRunning = heldFixedRunning.get(pool) ?? 0;
-    // Restored allowance can only fund a suspended account for its own role.
-    // Unheld accounts still share the raw cap, even when another role's
-    // exception increases the total pool budget.
-    const rawSlots = rawPacedLeft.get(pool) ?? 0;
-    rawPacedLeft.set(pool, Number.isFinite(rawCap) ? Math.max(0, Math.min(rawSlots, rawCap - heldRunning)) : rawSlots);
-    const localCaps = Object.entries(reviewerPaceByAgent ?? {}).flatMap(([id, verdict]) => {
-      if (![...(exemptByAgent.get(id) ?? [])].some(account => accountPool.get(account) === pool)) return [];
-      const caps = (verdict.pools ?? []).filter(p => p.pool === pool).map(p => p.cap);
-      if (!agentPacedLeft.has(id)) agentPacedLeft.set(id, new Map());
-      agentPacedLeft.get(id).set(pool, caps.some(c => !Number.isFinite(c)) ? Infinity : Math.max(0, Math.max(...caps) - heldRunning));
-      return caps;
-    });
-    const cap = localCaps.length > 0
-      ? (localCaps.some(c => !Number.isFinite(c)) || !Number.isFinite(rawCap) ? null : Math.max(rawCap, ...localCaps))
-      : rawCap;
-    const bounded = Number.isFinite(cap) ? Math.max(0, Math.min(n, cap - heldRunning)) : n;
-    poolLeft.set(pool, Math.max(0, Math.floor((poolLeft.get(pool) ?? 0) - n + bounded)));
-    pacedLeft.set(pool, bounded);
-  }
-  // Conservatively charge fixed reservations to the shared pool before helpers.
-  // A hold-exempt account's slots are restored for one reviewer role only, so
-  // a fixed pin must never consume them: spilling there would strand the
-  // reviewer the restoration was fenced for. Unheld pool mates may absorb the
-  // charge (they are ordinary shared capacity); held non-exempt ones cannot.
-  for (const row of fixed.kept) {
-    const servingId = keptByAgent[row.agentId]?.accountId;
-    // Its running floor was charged to finite caps above, not to a mate's
-    // physical slots: a held lane has none in accountLeft to reserve again.
-    if (hardHeld.has(servingId) && !exemptions.has(servingId)) continue;
-    const pool = accountPool.get(servingId);
-    poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - row.allocated));
-    let charge = row.allocated;
-    const ids = [...accountLeft.keys()].filter(id => accountPool.get(id) === pool
-      && (!hardHeld.has(id) || id === servingId))
-      .sort((a, b) => Number(b === servingId) - Number(a === servingId));
-    for (const id of ids) {
-      const used = Math.min(charge, accountLeft.get(id));
+  // Physical occupancy stays on its actual account, including if admission
+  // changed. Held accounts have no spendable slots, but still consume the
+  // ordinary cap of their original pool. Burn never consumes that cap.
+  for (const agent of agents) {
+    const running = Math.max(0, Math.floor(agent.running ?? 0));
+    if (!running || (!censusProvided && !constrainedIds.has(agent.agentId))) continue;
+    const charges = chargesOf(agent, running);
+    for (const [id, value] of Object.entries(charges)) {
+      const n = Math.max(0, Math.floor(Number(value) || 0));
+      if (!accountLeft.has(id) || !n) continue;
+      const pool = accountPool.get(id);
+      const used = Math.min(n, accountLeft.get(id));
       accountLeft.set(id, accountLeft.get(id) - used);
-      if (!burn.has(id)) {
-        pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
-        if (!hardHeld.has(id)) rawPacedLeft.set(pool, Math.max(0, (rawPacedLeft.get(pool) ?? 0) - used));
-      }
-      charge -= used;
-      if (charge <= 0) break;
+      poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - used));
+      if (!burn.has(id)) pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
     }
   }
-  const reviews = agents.filter(a => reviewIds.has(a.agentId) && a.running + a.queued > 0)
-    .map(a => ({ agentId: a.agentId, running: Math.max(0, Math.floor(a.running ?? 0)),
-      queued: Math.max(0, Math.floor(a.queued ?? 0)), allocated: Math.max(0, Math.floor(a.running ?? 0)) }))
-    .sort((a, b) => reviewerAccountIdsByAgent[a.agentId].length - reviewerAccountIdsByAgent[b.agentId].length
-      || a.agentId.localeCompare(b.agentId));
-  const spend = row => {
-    const ids = [...new Set(reviewerAdmissions[row.agentId])];
-    for (const pool of new Set(ids.map(id => accountPool.get(id)))) {
-      if ((poolLeft.get(pool) ?? 0) < 1) continue;
-      // Sustainable slots are fractional. Combine admitted fractions inside
-      // one pool without rounding every account up or discarding its share.
-      let need = 1;
-      let pacedBudget = pacedLeft.get(pool) ?? 0;
-      let rawBudget = rawPacedLeft.get(pool) ?? 0;
-      let localBudget = agentPacedLeft.get(row.agentId)?.get(pool) ?? Infinity;
-      const charges = [];
-      // Spend this reviewer's own restored (hold-suspended) capacity first:
-      // it is usable by no other role, so consuming shared raw slots ahead of
-      // it would strand a slot the next reviewer could still have funded.
-      const admitted = ids.filter(id => accountPool.get(id) === pool)
-        .sort((a, b) => Number(hardHeld.has(b)) - Number(hardHeld.has(a)));
-      for (const id of admitted) {
-        const n = Math.min(need, accountLeft.get(id) ?? 0,
-          burn.has(id) ? Infinity : Math.min(pacedBudget, localBudget, hardHeld.has(id) ? Infinity : rawBudget));
-        if (n <= 0) continue;
-        charges.push([id, n]); need -= n;
-        if (!burn.has(id)) {
-          pacedBudget -= n;
-          localBudget -= n;
-          if (!hardHeld.has(id)) rawBudget -= n;
-        }
-        if (need <= 0) break;
-      }
-      if (need > 0) continue;
-      for (const [id, n] of charges) accountLeft.set(id, accountLeft.get(id) - n);
-      poolLeft.set(pool, poolLeft.get(pool) - 1);
-      pacedLeft.set(pool, pacedBudget);
-      rawPacedLeft.set(pool, rawBudget);
-      if (agentPacedLeft.has(row.agentId)) agentPacedLeft.get(row.agentId).set(pool, localBudget);
-      return true;
+  // Every reviewer's local cap measures all ordinary pressure in the pool,
+  // not just that reviewer's own runs. The minimum applicable cap is a
+  // conservative shared bound, including future fixed and reviewer grants.
+  const localCap = new Map();
+  for (const [id, verdict] of Object.entries(reviewerPaceByAgent ?? {})) {
+    if (!reviewIds.has(id) || !agents.some(a => a.agentId === id && a.queued > 0)) continue;
+    for (const p of verdict?.pools ?? []) {
+      if (typeof p.pool !== 'string' || !Number.isFinite(p.cap)) continue;
+      localCap.set(p.pool, Math.min(localCap.get(p.pool) ?? Infinity, p.cap));
     }
-    return false;
-  };
-  for (const row of reviews) for (let i = 0; i < row.running; i++) if (!spend(row)) break;
-  const ordinary = agents.filter(a => !reviewIds.has(a.agentId) && !fixedIds.includes(a.agentId));
+  }
+  // Pool verdicts can include unattributed agents and pending hook decisions
+  // absent from the agent census. They are an independent total, not extra
+  // runs to add to the census; take the maximum to avoid double charging.
+  for (const p of [...pacePools, ...Object.values(reviewerPaceByAgent ?? {}).flatMap(v => v?.pools ?? [])]) {
+    if (typeof p.pool === 'string' && Number.isFinite(p.inFlight)) {
+      ordinaryPressure.set(p.pool, Math.max(ordinaryPressure.get(p.pool) ?? 0, Math.max(0, p.inFlight)));
+    }
+  }
+  const paceByPool = new Map(pacePools.map(p => [p.pool, p]));
+  for (const [pool, n] of pacedLeft) {
+    const rawCap = paceByPool.get(pool)?.cap;
+    const cap = Math.min(Number.isFinite(rawCap) ? rawCap : Infinity, localCap.get(pool) ?? Infinity);
+    const remaining = unknownPressure ? 0 : Math.max(0, Math.min(n, cap - (ordinaryPressure.get(pool) ?? 0)));
+    pacedLeft.set(pool, remaining);
+    poolLeft.set(pool, unknownPressure ? 0 : Math.max(0, Math.floor((poolLeft.get(pool) ?? 0) - n + remaining)));
+  }
+  if (unknownPressure) for (const pool of poolLeft.keys()) poolLeft.set(pool, 0);
+
+  const admissions = new Map();
+  for (const agent of agents) {
+    if (!constrainedIds.has(agent.agentId)) continue;
+    const servingId = keptByAgent[agent.agentId]?.accountId;
+    const ids = reviewIds.has(agent.agentId) ? reviewerAccountIdsByAgent[agent.agentId] ?? []
+      : unavailable.has(servingId) ? [] : [...accountLeft.keys()].filter(id => accountPool.get(id) === accountPool.get(servingId))
+        .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b));
+    admissions.set(agent.agentId, [...new Set(ids)].filter(id => !unavailable.has(id) && accountLeft.has(id)));
+  }
+  const rows = allocateDemandCaps(0, agents, maxTotal).map(row => {
+    const agent = agents.find(a => a.agentId === row.agentId);
+    return { ...row, allocationWeight: Number.isFinite(agent?.allocationWeight) && agent.allocationWeight > 0
+      ? Math.min(404, agent.allocationWeight) : 1 };
+  });
   const totalCeiling = Math.max(0, Math.min(maxTotal, Math.round(target ?? maxTotal)));
-  let left = Math.max(0, totalCeiling - fixed.kept.reduce((s, a) => s + a.allocated, 0)
-    - reviews.reduce((s, a) => s + a.running, 0) - ordinary.reduce((s, a) => s + (a.running ?? 0), 0));
+  let left = Math.max(0, totalCeiling - rows.reduce((sum, row) => sum + row.running, 0));
+  let resourceStatus;
   if (blockingPriority) {
-    // Compete on actual feasible resources before committing ANY new slot.
-    // Funding is rematched, not consumed by demand/id-ordered tentative grants.
-    const noHeadroomIds = new Set([...fixedIds, ...reviewIds]);
-    const weights = new Map(agents.map(a => [a.agentId,
-      Number.isFinite(a.allocationWeight) && a.allocationWeight > 0 ? Math.min(404, a.allocationWeight) : 1]));
-    const rows = allocateDemandCaps(0, agents, maxTotal).map(a => ({ ...a, allocationWeight: weights.get(a.agentId) }));
-    const admissions = new Map(rows.filter(row => noHeadroomIds.has(row.agentId)).map(row => {
-      const servingId = keptByAgent[row.agentId]?.accountId;
-      return [row.agentId, [...new Set(reviewIds.has(row.agentId) ? reviewerAdmissions[row.agentId]
-        : hardHeld.has(servingId) ? [] : [...accountLeft.keys()].filter(id => !hardHeld.has(id) && accountPool.get(id) === accountPool.get(servingId))
-          .sort((a, b) => Number(b === servingId) - Number(a === servingId) || a.localeCompare(b)))]];
-    }));
-    const { extras, resourceStatus } = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds,
-      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn, hardHeld, rawPacedLeft, agentPacedLeft });
-    const entries = rows.map(({ allocationWeight, ...row }, i) => ({ ...row,
-      allocated: row.running + extras[i], maxConcurrentRuns: row.running + extras[i],
-      reason: extras[i] > 0 ? 'proportional' : 'floor-running',
-    }));
-    const kept = entries.filter(row => noHeadroomIds.has(row.agentId));
-    const routedTarget = Math.max(0, totalCeiling - kept.reduce((sum, row) => sum + row.allocated, 0));
-    return { kept, keptCeilings: new Map(kept.map(row => [row.agentId, row.allocated])),
-      routed: entries.filter(row => !noHeadroomIds.has(row.agentId)), routedTarget, routedCeiling: Math.max(1, routedTarget),
-      ...(resourceStatus ? { resourceStatus } : {}) };
-  }
-  while (left > 0) {
-    let changed = false;
-    for (const row of reviews) {
-      if (left <= 0) break;
-      if (row.allocated >= row.running + row.queued || !spend(row)) continue;
-      row.allocated++; left--; changed = true;
+    // Matching is only for new slots; running charges above are never moved.
+    const result = allocatePriorityResourceSlots({ rows, available: left, noHeadroomIds: constrainedIds,
+      admissions, accountPool, accountLeft, poolLeft, pacedLeft, burn });
+    resourceStatus = result.resourceStatus;
+    rows.forEach((row, i) => { row.allocated += result.extras[i]; });
+  } else {
+    const spend = row => {
+      const ids = admissions.get(row.agentId) ?? [];
+      for (const pool of new Set(ids.map(id => accountPool.get(id)))) {
+        if ((poolLeft.get(pool) ?? 0) < 1) continue;
+        let need = 1, pacedBudget = pacedLeft.get(pool) ?? 0;
+        const charges = [];
+        for (const id of ids.filter(id => accountPool.get(id) === pool)) {
+          const n = Math.min(need, accountLeft.get(id) ?? 0, burn.has(id) ? Infinity : pacedBudget);
+          if (!(n > 0)) continue;
+          charges.push([id, n]); need -= n;
+          if (!burn.has(id)) pacedBudget -= n;
+          if (need <= 1e-9) break;
+        }
+        if (need > 1e-9) continue;
+        for (const [id, n] of charges) accountLeft.set(id, accountLeft.get(id) - n);
+        poolLeft.set(pool, poolLeft.get(pool) - 1);
+        pacedLeft.set(pool, pacedBudget);
+        return true;
+      }
+      return false;
+    };
+    // Preserve the default fixed-first policy, then share among reviewers.
+    for (const ids of [fixedIds, reviewIds]) {
+      while (left > 0) {
+        let changed = false;
+        for (const row of rows) {
+          if (!ids.has(row.agentId) || row.allocated >= row.demand || !spend(row)) continue;
+          row.allocated++; left--; changed = true;
+          if (!left) break;
+        }
+        if (!changed) break;
+      }
     }
-    if (!changed) break;
   }
-  const kept = [...fixed.kept, ...reviews.map(a => ({ ...a, demand: a.running + a.queued,
-    maxConcurrentRuns: a.allocated, reason: a.allocated === a.running ? 'floor-running' : 'reviewer-headroom' }))];
-  const keptCeilings = new Map([...fixed.keptCeilings, ...reviews.map(a => [a.agentId, a.allocated])]);
-  const used = kept.reduce((s, a) => s + a.allocated, 0);
-  const routedTarget = Math.max(0, totalCeiling - used);
+  const kept = rows.filter(row => constrainedIds.has(row.agentId)).map(({ allocationWeight, ...row }) => ({
+    ...row, maxConcurrentRuns: row.allocated,
+    reason: row.allocated === row.running ? 'floor-running' : blockingPriority ? 'proportional' : 'reviewer-headroom',
+  }));
+  const routedTarget = Math.max(0, totalCeiling - kept.reduce((sum, row) => sum + row.allocated, 0));
   const routedCeiling = Math.max(1, routedTarget);
-  return { kept, keptCeilings, routed: allocateDemandCaps(routedTarget, ordinary, routedCeiling), routedTarget, routedCeiling };
+  const routed = blockingPriority ? rows.filter(row => !constrainedIds.has(row.agentId)).map(({ allocationWeight, ...row }) => ({
+    ...row, maxConcurrentRuns: row.allocated, reason: row.allocated === row.running ? 'floor-running' : 'proportional',
+  })) : allocateDemandCaps(routedTarget, agents.filter(a => !constrainedIds.has(a.agentId)), routedCeiling);
+  return { kept, keptCeilings: new Map(kept.map(row => [row.agentId, row.allocated])), routed,
+    routedTarget, routedCeiling, ...(resourceStatus ? { resourceStatus } : {}) };
 }
 
 /**

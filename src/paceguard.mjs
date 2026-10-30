@@ -24,8 +24,7 @@
  * still be hard-held without any slot calibration. The
  * minimum of 1 applies only to the ordinary cap. A configured holdAheadPts
  * adds an independent zero-slot hold on each known, deeply-ahead lane; burn
- * and reactive lanes are exempt. The caller applies per-role empty-capacity
- * safety by marking only that role's suspended accounts holdExempt.
+ * and reactive lanes are exempt. Role emptiness never suspends a weekly hold.
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
@@ -58,6 +57,37 @@ export function normalizePaceGuard(raw) {
 }
 
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
+
+/**
+ * Whether a model emission can reach a globally weekly-held credential.
+ * The hard-held IDs must be computed globally, not from a role's candidates;
+ * accounts must be the complete feed inventory, including held accounts.
+ * Model lists are exact served IDs, not ladder or readiness lists. The model
+ * argument is the actual emitted ID, including any effort/context decoration.
+ * A missing held account or its unknown/malformed model set is unsafe. An
+ * explicitly empty model list is known empty. Provider and nominal account do
+ * not constrain reachability: the emitted model, not a label, selects a route.
+ * An empty hard-held set naturally bypasses the overlay when it is disabled.
+ */
+export function isWeeklyHeldModelRoute({ accounts, hardHeldAccountIds, provider, model } = {}) {
+  const held = new Set(hardHeldAccountIds ?? []);
+  if (held.size === 0) return false;
+  if (!Array.isArray(accounts) || typeof model !== 'string' || !model) return true;
+  // These suffixes decorate the same CLIProxy model route rather than
+  // selecting a different served model. Provider prefixes remain significant.
+  const undecorate = id => id.replace(/\[1m\]$/, '').replace(/\([^()]*\)$/, '');
+  const emitted = undecorate(model);
+  if (!emitted) return true;
+  for (const id of held) {
+    const matches = accounts.filter(a => a?.accountId === id);
+    if (matches.length !== 1) return true;
+    const account = matches[0];
+    if (account.burn === true || account.burnMode === true || isReactiveAccount(account)) continue;
+    if (!Array.isArray(account.models) || account.models.some(m => typeof m !== 'string' || !m)) return true;
+    if (account.models.some(m => undecorate(m) === emitted)) return true;
+  }
+  return false;
+}
 
 /**
  * required/measured when a lane is measurably burning faster than its plan
@@ -108,24 +138,38 @@ const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
  *
  * Burn mode: lanes flagged `burn` leave the aggregation entirely (their
  * position, share and own in-flight count) and are never held. A pool whose
- * every lane burns is unpaced (cap null, state 'burn').
+ * every lane burns is unpaced (cap null, state 'burn'). Optional burnAccounts
+ * supplies the full burn inventory, including lanes excluded from this role;
+ * its laneInFlight values take precedence for overlapping account IDs. These
+ * extra views supply pressure and identity only, never ordinary allowance.
  */
-export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
+export function paceGuardPools(lanes, { pacing = null, poolKeyOf, burnAccounts = null } = {}) {
   const groups = new Map();
   for (const v of lanes ?? []) {
     const k = poolKeyOf(v);
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(v);
+    if (!groups.has(k)) groups.set(k, { lanes: [], burn: [] });
+    groups.get(k).lanes.push(v);
+  }
+  for (const v of burnAccounts ?? []) {
+    const k = poolKeyOf(v);
+    if (!groups.has(k)) groups.set(k, { lanes: [], burn: [] });
+    groups.get(k).burn.push(v);
   }
   const enabled = pacing?.enabled === true;
   const out = [];
-  for (const [key, all] of groups) {
-    const pool = all[0]?.pool ?? key;
-    const burners = all.filter(v => v?.burn === true);
-    const members = burners.length > 0 ? all.filter(v => v?.burn !== true) : all;
+  for (const [key, group] of groups) {
+    const all = group.lanes;
+    const pool = (all[0] ?? group.burn[0])?.pool ?? key;
+    const burnersById = new Map();
+    for (const v of all) if (v?.burn === true) burnersById.set(v.accountId, v);
+    for (const v of group.burn) burnersById.set(v.accountId, v);
+    const burners = burnAccounts == null ? all.filter(v => v?.burn === true) : [...burnersById.values()];
+    const members = burnAccounts == null
+      ? all.filter(v => v?.burn !== true)
+      : all.filter(v => !burnersById.has(v.accountId));
     // paceInFlight, when given, is the pooled count without the run being
     // decided (callers whose inFlight still includes it); else inFlight.
-    const pooled = Math.max(0, ...all.map(v => {
+    const pooled = Math.max(0, ...[...all, ...group.burn].map(v => {
       const n = finite(v.paceInFlight) ? v.paceInFlight : v.inFlight;
       return finite(n) ? n : 0;
     }));
@@ -148,7 +192,7 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     // A known weekly lead needs neither calibration nor a duration estimate.
     // Keep this gate independent of the soft cap's fail-open measurement rules.
     // Numerical slack keeps 0.8 - 0.7 inside a ten-point band.
-    const hardHeld = members.filter(v => v.holdExempt !== true && !isReactiveAccount(v) && finite(v.planAhead)
+    const hardHeld = members.filter(v => !isReactiveAccount(v) && finite(v.planAhead)
       && finite(pacing.holdAheadPts) && v.planAhead - pacing.holdAheadPts > 1e-12);
     const hardIds = new Set(hardHeld.map(v => v.accountId));
     if (hardIds.size > 0) {

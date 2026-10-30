@@ -96,7 +96,7 @@ import {
   isAggregatorAccount, isFallbackOnlyView, nativeQualifiedModels,
   hasHeadroom, crossAccountDominated, canonicalKey,
 } from './cross-account.mjs';
-import { normalizePaceGuard, DEFAULT_HOLD_AHEAD_PTS, paceGuardPools } from './paceguard.mjs';
+import { normalizePaceGuard, DEFAULT_HOLD_AHEAD_PTS, paceGuardPools, isWeeklyHeldModelRoute } from './paceguard.mjs';
 import {
   REVIEW_RESERVE_STATE_KEY, REVIEW_FOLDED_CAP, DEFAULT_REVIEW_RESERVE, normalizeReviewReserve,
   priceReviewBurn, priorProviderReserveState,
@@ -1298,7 +1298,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const p = poolOf(id);
       pools[p] = (pools[p] ?? 0) + n;
     }
-    return { pools, unattributed: census.unattributed };
+    return { pools, byAccount: census.byAccount, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
   // Failure-cluster single-flight: event ingestion and the per-minute tick
@@ -3050,6 +3050,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           qFleet: r.qFleet ?? null,
         })),
         provider: account.provider,
+        // Full feed inventory, before role/ladder filtering. Null is unknown,
+        // not an authoritative empty serving set for a shared model route.
+        ...(config.pacing.guard.enabled && config.pacing.holdAheadPts != null
+          ? { weeklyRouteModels: Array.isArray(account.models) ? [...account.models] : null } : {}),
         health: account.health,
         meter: account.meter ?? null,
         quality: account.quality,
@@ -4198,6 +4202,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // The pace guard's knobs, shared by the tick, the live view (hook and
     // event-time path) and the /capacity report.
     const paceOpts = { ...config.pacing.guard, holdAheadPts: config.pacing.holdAheadPts, meanRunDurationHours: config.concurrency.meanRunDurationHours };
+    const weeklyEnabled = paceOpts.enabled === true && paceOpts.holdAheadPts != null;
+    const weeklyFacts = weeklyRouteFacts(accountViews, paceOpts);
     // Fleet quality of the arm each account would run for this role (see
     // placementArm): the placement blend ranks accounts by it, so unspent
     // allowance breaks ties between similar arms instead of picking the
@@ -4265,7 +4271,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // pools the report narrates).
     const allocationOrder = (role, selfRunId = null, duplicates = true, opts = {}) => {
       const { pools, byAccount } = freshPressure();
-      const pacePools = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey }).pools;
+      const paceCensus = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
+      const pacePools = paceCensus.pools;
       const applyReserve = opts.applyReserve !== false && reviewReserveView.enabled === true;
       const suppress = opts.suppressAccountFallback === true || reviewAgentIdsFor(config).has(opts.run?.agentId);
       const routesRun = (v, dups) => {
@@ -4275,17 +4282,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             inputs.fallbackAdmission), breakers, v.accountId, nowMs, breakersCfg));
       };
       const universalPools = opts.universalPools === true;
-      const policyReview = opts.forReview === true && configuredTaskReviewer(config, opts.run?.agentId);
-      // Pool membership and empty-role safety use actual per-reviewer
-      // admission, including trial/price gates, not a weaker policy-record test.
-      const reviewLive = config.taskRanking.mode === 'enforce' ? tickReviewerView() : null;
+      const policyReview = opts.forReview === true && config.reviewerRouting?.agentIds.includes(opts.run?.agentId) === true;
+      // Pool membership uses actual per-reviewer admission in every mode.
+      const reviewLive = tickReviewerView();
       const reviewAccounts = new Map((reviewLive?.accounts ?? []).map(a => [a.accountId, a]));
       const admissionByAgent = new Map((reviewLive?.reviewerRouting?.agentIds ?? []).map(agentId => [agentId,
         reviewerArmAdmission(reviewLive, companyId, agentId, nowMs,
           { selfId: selfRunId, adapterType: agentId === opts.run?.agentId ? opts.run?.adapterType : null, consumer: 'pacing' })]));
       const policyArmIn = (v, agentId) => {
         const a = reviewAccounts.get(v.accountId), admit = admissionByAgent.get(agentId);
-        return a != null && admit != null && config.reviewerRouting.arms.some(arm =>
+        return a != null && reviewerServable(a) && admit != null && config.reviewerRouting.arms.some(arm =>
           arm.provider === String(a.pool ?? a.provider).toLowerCase() && admit(a, arm).ok === true);
       };
       const hasReadyPolicyArm = v => policyArmIn(v, opts.run?.agentId);
@@ -4338,6 +4344,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         })),
         {
           reservePct: 0.05, rateDeadbandRel: config.pacing.rateDeadbandRel, placement: config.placement, pacing: paceOpts,
+          burnAccounts: accountViews.filter(v => v.burnMode === true).map(v => ({ ...v,
+            burn: true, laneInFlight: paceCensus.byAccount[v.accountId] ?? 0,
+            paceInFlight: pacePools[v.pool] ?? 0, inFlight: pools[v.pool] ?? 0 })),
           reviewReserve: applyReserve
             ? { heldAccountIds: reviewReserveView.heldAccountIds, forReview: opts.forReview === true }
             : null,
@@ -4693,6 +4702,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       taskRanking: config.taskRanking,
       reviewerPolicyExclusions: config.roles.excludeFamilies,
       paceGuard: paceOpts,
+      weeklyRouteFacts: weeklyFacts,
       creditPriority: config.credits.priority,
       // Tick's review-reserve verdict: held accounts plus the agent ids
       // that run past the hold. The hook and event-time path read this.
@@ -4789,10 +4799,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (r?.status !== 'running' || r?.unverified === true) continue;
       if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
       let entry = agentRunningById.get(r.agentId);
-      if (!entry) { entry = { running: 0, overPace: false }; agentRunningById.set(r.agentId, entry); }
+      if (!entry) { entry = { running: 0, overPace: false, runningByAccount: {}, unattributedRunning: 0 }; agentRunningById.set(r.agentId, entry); }
       const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
       if (free) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
-      else entry.running += 1;
+      else {
+        entry.running += 1;
+        const actual = attributedAccount(r);
+        if (actual != null) Object.defineProperty(entry.runningByAccount, actual, { enumerable: true,
+          configurable: true, value: (Object.hasOwn(entry.runningByAccount, actual) ? entry.runningByAccount[actual] : 0) + 1 });
+        else entry.unattributedRunning += 1;
+      }
       const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
       if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
     }
@@ -4806,6 +4822,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // Use the real routing admission, not the configured default model's pool.
     // An empty list is meaningful: no helper may grant new review slots.
     const reviewerAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
+      const { admissionOf } = pickReviewerRoute(reviewerLive, companyId, agentId, null, nowMs, null, null, false);
+      return [agentId, (reviewerLive.accounts ?? []).filter(a => config.reviewerRouting.arms.some(arm =>
+        admissionOf.has(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`))).map(a => a.accountId)];
+    }));
+    const reviewerSafeAccountIdsByAgent = Object.fromEntries((config.reviewerRouting?.agentIds ?? []).map(agentId => {
       const { admissionOf } = pickReviewerRoute(reviewerLive, companyId, agentId, null, nowMs);
       return [agentId, (reviewerLive.accounts ?? []).filter(a => config.reviewerRouting.arms.some(arm =>
         admissionOf.has(`${a.accountId}|${arm.provider}|${arm.model}|${arm.effort ?? ''}`))).map(a => a.accountId)];
@@ -4816,9 +4837,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const role = roleOf({ roles: { thinkerAgentIds: reviewerLive.thinkerAgentIds, doerAgentIds: reviewerLive.doerAgentIds } }, agentId);
       const verdict = allocationOrderFromLive(reviewerLive, companyId, null, role,
         normalizeExcludedFamilies(reviewerLive.excludeFamilies?.[role] ?? []), true, true, { agentId });
-      const admitted = new Set(reviewerAccountIdsByAgent[agentId]);
-      return [agentId, { holdSuspendedAccountIds: verdict.holdSuspendedAccountIds.filter(id => admitted.has(id)),
-        pools: verdict.pools }];
+      return [agentId, { holdSuspendedAccountIds: [], pools: verdict.pools }];
     }));
     const reviewerView = computeReviewerCapacity({
       accounts: accountViews.map((v) => {
@@ -4999,13 +5018,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
     const rawPacePools = [...rawByPool.values()];
-    const paceRoleSafety = ROLES.flatMap(role => {
-      // Report the reserve-applied non-review admission: review-held pools
-      // are not spare capacity for ordinary roles.
-      const { holdSuspendedAccountIds } = allocationOrder(role, null, true, { applyReserve: true });
-      return holdSuspendedAccountIds.length > 0 ? [{ code: 'role-empty-hold-suspended', role,
-        accountIds: holdSuspendedAccountIds, message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' }] : [];
-    });
+    const paceRoleSafety = [];
     if (config.taskRanking.mode !== 'off') {
       const policyBucket = view => ({ funding: view?.creditFallback ? 'credit-fallback' : 'plan',
         burn: view?.burnMode === true, burnFirst: view?.burnMode === true && view?.burnFloor != null,
@@ -5087,8 +5100,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ? Math.min(config.concurrency.maxTotal, (concurrency.target ?? 0) + freeCapacity.target) : concurrency.target;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
       ...(newestVersion ? { newestVersion } : {}),
+      ...(weeklyEnabled ? { holdEvidenceVersion: 1, weeklyRouteFacts: weeklyFacts } : {}),
       reviewAdmissionGeneration: admissionGeneration,
-      ...(reviewAgentIdsFor(config).size > 0 ? { reviewAdmissionEpoch } : {}),
+      ...(weeklyEnabled || reviewAgentIdsFor(config).size > 0 ? { reviewAdmissionEpoch } : {}),
       atMs: nowMs,
       taskRanking,
       ...(freeCapacity ? { freeLanes: freeCapacity, paidTarget: concurrency.target,
@@ -5152,6 +5166,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
+      ...(weeklyEnabled ? { reviewerSafeAccountIdsByAgent } : {}),
       reviewerPaceByAgent,
       inFlightByAccount: liveCensus.byAccount,
       inFlightByPool: livePools,
@@ -5430,18 +5445,37 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return ladder?.taskRankingMode === 'enforce' ? ladder?.taskBurnPerRunPct ?? {} : ladder?.burnPerRunPct ?? {};
   }
 
+  // A selected account label does not bind the proxy credential. Keep the
+  // full serving inventory separate from role-qualified allowance membership.
+  function weeklyRouteFacts(accounts, pacing) {
+    const inventory = (accounts ?? []).map(a => ({ accountId: a.accountId, provider: a.provider,
+      pool: a.pool, models: Object.hasOwn(a, 'weeklyRouteModels') ? a.weeklyRouteModels : a.models,
+      burn: a.burnMode === true || a.burn === true, reactive: a.reactive,
+      meter: a.meter, quality: a.quality, planAhead: a.planAhead,
+    }));
+    const hardHeldAccountIds = paceGuardPools(inventory, { pacing,
+      poolKeyOf: a => a.pool != null ? `pool:${a.pool}` : `acct:${a.accountId}`,
+    }).flatMap(p => p.hardHeldAccountIds ?? []);
+    return { accounts: inventory, hardHeldAccountIds };
+  }
+
+  function weeklyRouteHeld(live, model) {
+    return isWeeklyHeldModelRoute({ ...(live.weeklyRouteFacts ?? weeklyRouteFacts(live.accounts, live.paceGuard)), model });
+  }
+
+  function weeklySafeGroups(groups, facts) {
+    if (!facts.hardHeldAccountIds.length) return groups;
+    // Empty rung shells carry the original role window and pointer indices.
+    return (groups ?? []).map(g => ({ ...g, arms: (g.arms ?? []).filter(arm =>
+      !isWeeklyHeldModelRoute({ ...facts, model: arm.model })) }));
+  }
+
   function withDuplicatePass(allocate) {
     const held = allocate(false);
     const full = allocate(true);
-    // The full frontier controls permission: a first-pass candidate that the
-    // full pass hard-holds (and does not suspend there) must not revive via
-    // the first pass's own role-empty safety. Allowed candidates keep their
-    // first-pass position so duplicate preference survives.
-    const suspended = new Set(full.holdSuspendedAccountIds ?? []);
+    // A first-pass candidate cannot revive a full-frontier hard hold.
     const hardHeld = new Set((full.pools ?? []).flatMap(p => p.hardHeldAccountIds ?? []));
-    const allowed = new Set((full.order ?? []).map(v => v.accountId));
-    const filtered = (held.order ?? []).filter(v =>
-      !hardHeld.has(v.accountId) || suspended.has(v.accountId) || allowed.has(v.accountId));
+    const filtered = (held.order ?? []).filter(v => !hardHeld.has(v.accountId));
     return {
       ...full,
       order: [...filtered, ...(full.order ?? [])],
@@ -5532,11 +5566,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // frozen pooled count plus pending decisions above drives ordering
     // only): executing runs, without the ones the hook deferred and without
     // the caller's own run.
-    const pacePools = live.paceGuard?.enabled === true && ledgers.has(companyId)
+    const paceCensus = live.paceGuard?.enabled === true && ledgers.has(companyId)
       ? paceInFlightByPool(companyId, ledgers.get(companyId), {
         nowMs: clock(), horizonMs: live.staleHorizonMs, selfRunId: excludeRunId, poolOf,
-      }).pools
-      : {};
+      })
+      : { pools: {}, byAccount: {} };
+    const pacePools = paceCensus.pools;
     const bstore = breakerStores.get(companyId) ?? createBreakerStore();
     const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
     const nowMs = clock();
@@ -5552,22 +5587,23 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       trialAdapters: live.trialAdapters ?? {}, trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
       taskRanking: live.taskRanking,
     });
+    const facts = live.weeklyRouteFacts ?? weeklyRouteFacts(live.accounts, live.paceGuard);
     const routesRun = (a, dups) => filterBreakerRungs(routableGroupsFor(a, dups, nowMs,
       credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg),
       accountInputs(a).fallbackAdmission), bstore, a.accountId, nowMs, bcfg);
     // Reserve privilege alone does not select a different agent's policy.
     // Configured reviewers share the exact admission used by their route,
     // including current-price and per-run trial gates for unscored arms.
-    const policyReview = forReview && configuredTaskReviewer(live, run.agentId);
+    const policyReview = forReview && live.reviewerRouting?.agentIds.includes(run.agentId) === true;
     const admitPolicy = policyReview ? reviewerArmAdmission(live, companyId, run.agentId, nowMs,
       { selfId: excludeRunId, adapterType: run.adapterType ?? null, consumer: 'pacing' }) : null;
-    const hasPolicyArm = a => live.reviewerRouting.arms.some(arm =>
+    const hasPolicyArm = a => reviewerServable(a) && (live.reviewerRouting.arms ?? []).some(arm =>
       arm.provider === String(a.pool ?? a.provider).toLowerCase() && admitPolicy(a, arm).ok === true);
     return orderAccountsWithPacing(
       (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (policyReview
         ? hasPolicyArm(a) : rungsHaveEligibleArms(routesRun(a, true)))).map(a => {
         const p = poolOf(a.accountId);
-        const ladderRungs = routesRun(a, duplicates);
+        const ladderRungs = weeklySafeGroups(routesRun(a, duplicates), facts);
         const preview = live.taskRanking?.mode === 'enforce' ? decide({ ...inputsFor(a), ladderRungs }) : null;
         // Membership above is the configured reviewer's structural admission;
         // an empty ordinary task ladder must not hide its safety exception.
@@ -5596,6 +5632,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }),
       {
         reservePct: 0.05, rateDeadbandRel: live.rateDeadbandRel ?? 0.15, placement: live.placement ?? null, pacing: live.paceGuard ?? null,
+        burnAccounts: (live.accounts ?? []).filter(a => a.burn === true).map(a => ({ ...a,
+          pool: poolOf(a.accountId), paceInFlight: pacePools[poolOf(a.accountId)] ?? 0,
+          laneInFlight: paceCensus.byAccount[a.accountId] ?? 0,
+        })),
         reviewReserve: live.reviewReserve?.enabled === true
           ? { heldAccountIds: live.reviewReserve.heldAccountIds ?? [], forReview }
           : null,
@@ -5795,7 +5835,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   /** Sync reviewer-route pick over a live view (hook and /capacity preview). */
-  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null, adapterType = null) {
+  function pickReviewerRoute(live, companyId, agentId, selfId = null, nowMs = clock(), excludeIds = null, adapterType = null, emissionSafety = true) {
     const cfg = live?.reviewerRouting;
     const pending = pendingByAccount(live, companyId, selfId);
     const self = ledgers.get(companyId)?.get(selfId);
@@ -5806,7 +5846,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const eligibleAccounts = (live.accounts ?? []).filter(a => !excludeIds?.has(a.accountId) && !managedFreeAccount(live, companyId, a));
     const capped = a => a.reactive && inFlightOf(a) >= liveTrialInflightCapFor(live, a);
     const accounts = eligibleAccounts.filter(a => !capped(a));
-    const admit = reviewerArmAdmission(live, companyId, agentId, nowMs, { selfId, adapterType });
+    const admission = reviewerArmAdmission(live, companyId, agentId, nowMs, { selfId, adapterType });
+    const admit = (account, arm) => emissionSafety && weeklyRouteHeld(live, arm.model)
+      ? { ok: 'weekly hold: emitted route can reach a held credential' } : admission(account, arm);
     // A hard credential cap still applies when another admission gate (for
     // example the family trial budget) also refuses the reviewer arm. Keep
     // that refusal independent so a legacy keep cannot start on a full lane.
@@ -5919,7 +5961,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
   function keptCapsAnswer(params, live, why) {
     const model = params?.agentDefaultModel;
-    if (defaultSupersededEverywhere(params, live)) return null;
+    if (weeklyRouteHeld(live, model) || defaultSupersededEverywhere(params, live)) return null;
     if (typeof model !== 'string' || model.trim().length === 0) return null;
     const match = liveArmForModel(live, model);
     const family = match?.family ?? inferFamily(canonicalModelName(model));
@@ -6110,6 +6152,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         skips.push(`${view.accountId} decide skipped (${d.reason})`);
         continue;
       }
+      if (weeklyRouteHeld(live, d.model)) {
+        skips.push(`${view.accountId} weekly hold: emitted route can reach a held credential`);
+        continue;
+      }
       if (!decisionCredentialReady(d, roleRungs, companyId)) {
         skips.push(`${view.accountId} arm ${d.armId ?? d.model} not credential-ready`);
         continue;
@@ -6165,6 +6211,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // An exhausted, held-only, excluded, or unmapped default keeps deferring:
     // strand the card rather than burn an exhausted pool or held quota.
     const defModel = params?.agentDefaultModel;
+    if (weeklyRouteHeld(live, defModel)) {
+      skips.push('weekly hold: bounded default emission can reach a held credential');
+      return fail();
+    }
     if (typeof defModel === 'string' && defModel.trim().length > 0) {
       const canon = String(canonicalModelName(defModel) ?? '').toLowerCase();
       if (defaultSupersededEverywhere(params, live)) {
@@ -6969,6 +7019,25 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionGeneration === generation)
           && (cap.reviewAdmissionGeneration == null || cap.reviewAdmissionEpoch === reviewAdmissionEpoch)
           && generation === configGenerationOf(companyId);
+        const weeklyEnabled = resolved?.pacing.guard.enabled === true && resolved.pacing.holdAheadPts != null;
+        const holdEvidenceFresh = !weeklyEnabled || (keptIds.size === 0 && reviewIds.size === 0)
+          || (reviewAdmissionFresh && cap.holdEvidenceVersion === 1
+          && cap.reviewAdmissionGeneration === generation && cap.reviewAdmissionEpoch === reviewAdmissionEpoch
+          && Array.isArray(cap.weeklyRouteFacts?.accounts) && Array.isArray(cap.weeklyRouteFacts?.hardHeldAccountIds));
+        const routeFacts = cap.weeklyRouteFacts ?? { accounts: [], hardHeldAccountIds: [] };
+        const unsafeEmission = model => weeklyEnabled && isWeeklyHeldModelRoute({ ...routeFacts, model });
+        const unsafeAccounts = (cap.accounts ?? []).filter(a => {
+          const models = Object.hasOwn(a, 'weeklyRouteModels') ? a.weeklyRouteModels : a.models;
+          return !Array.isArray(models) || models.length === 0
+            ? unsafeEmission(null) : models.every(unsafeEmission);
+        }).map(a => a.accountId);
+        const safePins = Object.fromEntries(Object.entries(cap.keptByAgent ?? {}).map(([id, binding]) => {
+          const account = (cap.accounts ?? []).find(a => a.accountId === binding.accountId);
+          const models = account?.weeklyRouteModels ?? account?.models;
+          const unsafe = binding.model != null ? unsafeEmission(binding.model)
+            : Array.isArray(models) && models.length > 0 ? models.some(unsafeEmission) : unsafeEmission(null);
+          return [id, unsafe ? { ...binding, accountId: null } : binding];
+        }));
         const reviewDemandConfig = reviewIds.size > 0 ? resolved?.reviewDemand : null;
         const reviewDemand = reviewDemandConfig && !reviewAdmissionFresh
           ? { status: 'unavailable', eligibleHeads: 0, reason: 'review-admission-stale' }
@@ -6982,6 +7051,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const baseInputs = [...agentIds].map(agentId => ({
           agentId,
           running: runningByAgent[agentId]?.running ?? 0,
+          ...(runningByAgent[agentId]?.runningByAccount ? {
+            runningByAccount: runningByAgent[agentId].runningByAccount,
+            unattributedRunning: runningByAgent[agentId].unattributedRunning ?? 0,
+          } : {}),
           queued: heartbeatIds.has(agentId)
             ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
             : (counts.get(agentId) ?? 0),
@@ -6994,14 +7067,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           maxTotal: cap.maxTotal ?? 75,
           demandFactor: cap.demandFactor ?? 1,
           keepAgentIds: [...keptIds],
-          keptByAgent: cap.keptByAgent ?? {},
+          keptByAgent: safePins,
           accounts: cap.accounts ?? [],
           perAccount: cap.perAccount ?? [],
           pacePools: cap.paceGuard?.rawPools ?? cap.paceGuard?.pools ?? [],
-          unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+          unavailableAccountIds: [...new Set([...(cap.breakerUnavailableAccountIds ?? []), ...unsafeAccounts])],
           reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
-            reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
-              ? cap.reviewerAccountIdsByAgent[id] : []])),
+            reviewAdmissionFresh && Array.isArray((cap.reviewerSafeAccountIdsByAgent ?? cap.reviewerAccountIdsByAgent)?.[id])
+              ? (cap.reviewerSafeAccountIdsByAgent ?? cap.reviewerAccountIdsByAgent)[id] : []])),
           reviewerPaceByAgent: reviewAdmissionFresh ? cap.reviewerPaceByAgent ?? {} : {},
         };
         // Probe the SAME account/pool/fleet guards without committing slots.
@@ -7116,17 +7189,19 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Reader invalidation alone cannot revoke a result already resolved
         // before hold-state I/O. Fence the entire publication: an old config
         // may preserve running work, but cannot authorize ANY new slots.
-        if (generation !== configGenerationOf(companyId)) {
+        if (generation !== configGenerationOf(companyId) || !holdEvidenceFresh) {
+          const evidenceReason = generation !== configGenerationOf(companyId)
+            ? 'configuration-changed' : 'weekly-hold-evidence-unavailable';
           const paidFloors = baseInputs.map(a => ({ ...a, allocated: a.running, maxConcurrentRuns: a.running }));
           const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
           const floors = (cap.freeLanes
             ? freeLaneCaps(paidFloors, freeRunning, 0, [], cap.maxTotal ?? 75) : paidFloors)
             .filter(a => a.running + a.queued > 0).map(a => ({ ...a,
-              demand: a.running + a.queued, reason: 'configuration-changed', reviewEligibleHeads: 0,
+              demand: a.running + a.queued, reason: evidenceReason, reviewEligibleHeads: 0,
             }));
           return { status: 200, body: { atMs, calibration, target: null, agents: floors,
-            capsError: 'configuration-changed',
-            reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
+            capsError: evidenceReason,
+            reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: evidenceReason },
             reservedFloors: {}, floorsSuspended: false } };
         }
         return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended,
@@ -7161,6 +7236,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // told before: it is no longer waiting, so the pace guard counts it.
       // A routed run proves the lane servable: the exhaustion streak resets.
       const keep = () => {
+        if (live?.enforce === true && enforceCompanies.has(params?.companyId)
+          && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)
+          && weeklyRouteHeld(live, params?.agentDefaultModel ?? live.keptByAgent?.[params?.agentId]?.model)) {
+          return { kind: 'defer', retryAfterMs: live.paceGuard?.retryAfterMs ?? 300000,
+            reason: 'weekly hold: default emission can reach a held credential' };
+        }
         if (live?.enforce === true && enforceCompanies.has(params?.companyId)
           && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)
           && defaultSupersededEverywhere(params, live)) {
@@ -7257,6 +7338,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Operator-pinned agents retain their configured model and context caps,
       // but keep must not bypass managed free-provider admission.
       if (Array.isArray(live.keepAgentIds) && live.keepAgentIds.includes(params?.agentId)) {
+        if (weeklyRouteHeld(live, params.agentDefaultModel ?? live.keptByAgent?.[params.agentId]?.model)) {
+          return deferred({ kind: 'defer', retryAfterMs: live.paceGuard?.retryAfterMs ?? 300000,
+            reason: 'weekly hold: pinned emission can reach a held credential' });
+        }
         const defaultKey = canonicalKey(params.agentDefaultModel);
         if (defaultKey && (live.accounts ?? []).some(a => managedFreeAccount(live, params.companyId, a)
           && (a.models ?? []).some(m => canonicalKey(m) === defaultKey))) {
@@ -7299,6 +7384,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         if (defaultSupersededEverywhere(params, live)) {
           return deferred({ kind: 'defer', retryAfterMs: 20000, reason: 'default model superseded-version' }, { countTowardExhaustion: false });
         }
+        if (weeklyRouteHeld(live, params.agentDefaultModel)) return deferred({ kind: 'defer',
+          retryAfterMs: live.paceGuard?.retryAfterMs ?? 300000,
+          reason: 'weekly hold: stale default emission can reach a held credential' }, { countTowardExhaustion: false });
         const staleAns = keptCapsAnswer(params, live, 'routing snapshot stale') ?? { kind: 'keep' };
         // Either answer executes the run, ending the chain: the streak
         // resets (a plain stale keep is a routed run like any other, not a

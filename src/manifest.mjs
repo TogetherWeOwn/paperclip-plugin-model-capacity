@@ -686,7 +686,7 @@ const CONFIG_SCHEMA = {
     pacing: {
       type: 'object', additionalProperties: false,
       properties: {
-        holdAheadPts: { type: ['number', 'null'], minimum: 0, maximum: 1, default: 0.10, description: 'Hold an account at zero new slots when weekly usage exceeds its floor-adjusted linear plan by more than this fraction (0.10 = 10 percentage points). Null disables. Burn and reactive lanes are exempt; suspend for a role with no other eligible account, retaining the ordinary pace cap. Requires pacing.guard.enabled.' },
+        holdAheadPts: { type: ['number', 'null'], minimum: 0, maximum: 1, default: 0.10, description: 'Hold an account at zero new slots when weekly usage exceeds its floor-adjusted linear plan by more than this fraction (0.10 = 10 percentage points). Null disables. Burn and reactive lanes are exempt; an empty role never suspends the hold. Ambiguous shared-model emissions fail closed. Requires pacing.guard.enabled.' },
         deadband: { type: 'number', minimum: 0, default: 0.02 },
         rungCooldownMs: { type: 'integer', minimum: 60000, default: 600000 },
         guardHighPct: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },
