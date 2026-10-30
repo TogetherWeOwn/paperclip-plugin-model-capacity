@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -35,6 +36,17 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
     const example = JSON.parse(await readFile(join(roots[p.variant],'config.example.json'),'utf8'));
     assert.equal(Object.hasOwn(example,'enforce'),p.variant==='transitional');
     const plugin = await readFile(join(roots[p.variant],'src/plugin.mjs'),'utf8');
+    // Execute unchanged U1-U17/router and native lifecycle assertions against
+    // EACH unpacked artifact, including the clean terminal-event cleanup path.
+    const childEnv = {...process.env}; delete childEnv.NODE_TEST_CONTEXT;
+    const smoke = execFileSync(process.execPath,['--test','--test-reporter=tap',
+      join(roots[p.variant],'test/router.test.mjs'),
+      join(roots[p.variant],'test/router-callback-lifecycle.test.mjs'),
+      join(roots[p.variant],'test/snapshot.test.mjs'),
+      join(roots[p.variant],'test/router-views.test.mjs'),
+    ],{encoding:'utf8',timeout:60000,env:childEnv});
+    assert.match(smoke,/# fail 0/);
+
     if (p.variant === 'clean') {
       for (const token of ['run.model.resolve','onResolveRunModel','model_decision_pending','usage-queue','enforceManifest','deferredRuns','exhaustionStreaks','invalidatedDefer']) {
         for (const path of await files(join(roots.clean,'src'))) {
@@ -46,6 +58,14 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
       const source = await readFile(new URL('../src/plugin.mjs',import.meta.url),'utf8');
       const hook = s => s.slice(s.indexOf('    async onResolveRunModel(params) {'),s.lastIndexOf('\n    },\n  };')+'\n    },'.length);
       assert.equal(hook(plugin),hook(source));
+      // Pin the approved branch handoff, NOT the differing 0.2.72 reference.
+      // The README/PR explicitly leave the deployed parity criterion open.
+      assert.equal(createHash('sha256').update(hook(plugin)).digest('hex'),
+        '18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d');
+      const expected = source.replace("if (!['transitional','clean'].includes(variant))", "if (variant !== 'transitional')")
+        .replace("  if (variant === 'clean') delete plugin.onResolveRunModel;\n", '');
+      assert.equal(plugin,expected,'transitional helpers changed beyond the build-time factory guard');
+
     }
   }
   const all = new Set([...await files(roots.clean),...await files(roots.transitional)]);

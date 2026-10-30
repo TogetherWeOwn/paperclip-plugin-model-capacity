@@ -25,37 +25,86 @@
         "harnessProfile": "codex",
         "connectionName": "cliproxy-codex-example",
         "pools": {
-          "builder": { "model": "gpt-6.1-terra", "effort": "high", "probeEligible": true },
-          "thinker": { "model": "gpt-6.1-sol", "effort": "high" },
-          "reviewer": { "model": "gpt-6.1-sol", "effort": "high" }
+          "builder": {
+            "model": "gpt-6.1-terra",
+            "effort": "high",
+            "probeEligible": true
+          },
+          "thinker": {
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "reviewer": {
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          }
+        }
+      },
+      {
+        "accountKey": "codex-secondary-example",
+        "prefix": "secondaryexample",
+        "provider": "openai",
+        "protocol": "responses",
+        "harnessProfile": "codex",
+        "connectionName": "cliproxy-secondary-example",
+        "pools": {
+          "builder": {
+            "model": "gpt-6.1-terra",
+            "effort": "high",
+            "probeEligible": false
+          },
+          "thinker": {
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "reviewer": {
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          }
         }
       }
     ],
     "pools": [
       {
-        "poolKey": "builder", "role": "doer",
+        "poolKey": "builder",
+        "role": "doer",
         "poolId": "00000000-0000-4000-8000-000000000010",
         "pluginKey": "togetherweown.model-capacity",
         "expectedRevision": 7,
-        "expectedMemberOrder": ["b5d8cdb2-c50c-51e1-a15d-151634e25857"],
-        "members": [{
-          "memberId": "b5d8cdb2-c50c-51e1-a15d-151634e25857",
-          "accountKey": "codex-example",
-          "connectionId": "00000000-0000-4000-8000-000000000011",
-          "grantId": "00000000-0000-4000-8000-000000000012"
-        }]
+        "expectedMemberOrder": [
+          "b5d8cdb2-c50c-51e1-a15d-151634e25857",
+          "1e4c9919-53ab-57aa-944a-4de4861323e9"
+        ],
+        "members": [
+          {
+            "memberId": "b5d8cdb2-c50c-51e1-a15d-151634e25857",
+            "accountKey": "codex-example",
+            "connectionId": "00000000-0000-4000-8000-000000000011",
+            "grantId": "00000000-0000-4000-8000-000000000012"
+          },
+          {
+            "memberId": "1e4c9919-53ab-57aa-944a-4de4861323e9",
+            "accountKey": "codex-secondary-example",
+            "connectionId": "00000000-0000-4000-8000-000000000021",
+            "grantId": "00000000-0000-4000-8000-000000000022"
+          }
+        ]
       },
-      { "poolKey": "thinker", "role": "thinker" },
-      { "poolKey": "reviewer", "role": "reviewer" }
+      {
+        "poolKey": "thinker",
+        "role": "thinker"
+      },
+      {
+        "poolKey": "reviewer",
+        "role": "reviewer"
+      }
     ]
   },
   "cliproxy": {
     "accountsPath": "/telemetry/cliproxy/live/accounts.json",
-    "laneKeySecretRef": null,
     "cacheTtlSec": 45
   },
   "aa": {
-    "apiKeySecretRef": null,
     "maxSnapshotAgeHours": 30
   },
   "armMap": [],
@@ -71,9 +120,9 @@
       "other": []
     },
     "minQuality": {
-      "doer": -1.0,
+      "doer": -1,
       "thinker": 0.4,
-      "other": -1.0
+      "other": -1
     },
     "outcomeGate": {
       "enabled": true,
@@ -124,24 +173,28 @@
   },
   "reviewReserve": {
     "enabled": true,
-    "providers": ["claude"],
+    "providers": [
+      "claude"
+    ],
     "agentIds": null,
     "windowH": 6,
     "envWindowH": 3,
     "envHalfLifeH": 3,
     "drainH": 8,
-    "rMin": 0.10,
+    "rMin": 0.1,
     "rMax": 0.95,
     "releaseWeeklyH": 24,
     "release5hMin": 45,
-    "marginW": 0.10,
+    "marginW": 0.1,
     "margin5h": 0.15,
     "exhaustedPct": 0.99,
     "minRunsPerH": 0.1,
     "runsHalfLifeH": 6
   },
   "reviewer": {
-    "providers": ["claude"],
+    "providers": [
+      "claude"
+    ],
     "supplyHeadroomPct": 0.3,
     "supplyHoursToReset": 120,
     "doerStarvationMarginRuns": 4,
@@ -156,7 +209,9 @@
   },
   "credits": {
     "priority": "fallback",
-    "freeTypes": ["codex-credits"],
+    "freeTypes": [
+      "codex-credits"
+    ],
     "paidTypes": []
   },
   "concurrency": {
@@ -168,7 +223,11 @@
   },
   "caps": {
     "reservedFloors": {
-      "agent-a": { "base": 4, "perQueued": 20, "max": 8 }
+      "agent-a": {
+        "base": 4,
+        "perQueued": 20,
+        "max": 8
+      }
     }
   },
   "contextCaps": {
@@ -197,7 +256,10 @@
     "minQuality": 0.4,
     "lowRiskAgentIds": [],
     "providers": {
-      "nvidia-nim": { "requestsPerMinute": 36, "requestsPerMinutePerSlot": 12 },
+      "nvidia-nim": {
+        "requestsPerMinute": 36,
+        "requestsPerMinutePerSlot": 12
+      },
       "openrouter": {
         "requestsPerMinute": 20,
         "requestsPerMinutePerSlot": 12,
@@ -205,7 +267,11 @@
         "requestsPerRun": 100
       }
     },
-    "demotion": { "lastRuns": 10, "minSuccessRate": 0.8, "windowHours": 24 }
+    "demotion": {
+      "lastRuns": 10,
+      "minSuccessRate": 0.8,
+      "windowHours": 24
+    }
   },
   "exhaustion": {
     "enabled": false,
@@ -217,8 +283,12 @@
     "minRuns": 10,
     "minSuccessRate": 0.8,
     "adapters": {
-      "claude_local": ["*"],
-      "claude-code": ["*"]
+      "claude_local": [
+        "*"
+      ],
+      "claude-code": [
+        "*"
+      ]
     }
   },
   "modelAaOverrides": {},
