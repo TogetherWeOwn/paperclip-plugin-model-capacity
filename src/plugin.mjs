@@ -26,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
 import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
 import { createRouterAdapter } from './router.mjs';
+import { createRunOverlay } from './overlay.mjs';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_ACCOUNTS_PATH,
@@ -101,7 +102,7 @@ import {
 } from './reviewreserve.mjs';
 import { SHADOW_CAPACITY } from './shadow.mjs';
 import {
-  createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
+  accountKeyForModel, createLedger, ledgerFromJSON, ledgerToJSON, recordStart, recordDecision,
   recordTerminal, calibrationAccount, decidedCount, isInflight, inflightByAccount, attributedAccount,
   trialInflight, reconcileLedger, startedOnCountWhere,
   terminalRecords, shadowEntries, trimLedger, mergeLedger, migrateLegacy,
@@ -918,6 +919,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   if (!['transitional','clean'].includes(variant)) throw new Error('invalid plugin variant');
   let ctx, quotaRefresh, routeConnection;
   const quotaJobs = new Map();
+  const nativeOverlay = createRunOverlay();
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
   const ledgerReady = new Set(); // companyIds whose memory ledger absorbed persisted state
@@ -6056,9 +6058,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx = context;
       routeConnection = createRouterAdapter({getConfig:routerConfigFor,getSnapshot:id=>quotaRefresh?.get(id),
         getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
+        getOverlay:(id,version)=>nativeOverlay.deltas(id,version),getOverlayStatus:id=>nativeOverlay.status(id),
         logger:ctx.logger,
       });
       quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
+        captureOverlay:id=>nativeOverlay.capture(id),onPublished:(id,snapshot,checkpoint)=>nativeOverlay.publish(id,snapshot.version,checkpoint),
         keyFor:companyId => scopeKey(companyId, 'router-quota-v1'),
         listAgents:async companyId => {
           const agents=[];
@@ -6140,6 +6144,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           recordTerminal(evtLedger, entry, status, entry.at);
           clearDeferred(companyId, entry.runId);
         }
+        // Only observed run models attribute native pressure. Never use a
+        // callback guess, agent default or a synthetic shadow decision. Current
+        // upstream lifecycle events omit account/model metadata; expose those
+        // runs as unattributed rather than fabricating an R2 guarantee.
+        const observed = evtLedger.get(entry.runId);
+        const model = entry.model ?? (observed?.actualModelSource === 'run-decision' ? observed.actualModel : null);
+        nativeOverlay.observe(companyId,{runId:entry.runId,status,
+          accountKey:accountKeyForModel(model,lastConfig.get(companyId)?.router?.accounts ?? []),
+        });
         const st = runEventStats.get(companyId) ?? { seen: 0, lastAtMs: null, lastRunId: null };
         st.seen += 1;
         st.lastAtMs = entry.at;
@@ -6260,7 +6273,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}) =>
             ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}));
         return { status: 200, body: lastConfig.get(companyId)?.router
-          ? {...body,nativeRouter:{...quotaRefresh.status(companyId),verifiedPools}} : body };
+          ? {...body,nativeRouter:{...quotaRefresh.status(companyId),...nativeOverlay.status(companyId),verifiedPools}} : body };
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:

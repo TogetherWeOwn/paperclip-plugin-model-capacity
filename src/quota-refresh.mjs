@@ -54,7 +54,7 @@ function driftMemberReasons(registry,drift) {
   return reasons;
 }
 
-export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPools=null,listAgents=async()=>[]}) {
+export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPools=null,listAgents=async()=>[],captureOverlay=()=>0,onPublished=()=>{}}) {
   const publisher=createSnapshotPublisher({state,keyFor}),failures=new Map(),lastFailure=new Map(),queues=new Map();
   function report(companyId,reason,details={},level='warn',message='model-capacity: native quota refresh') {
     const nowMs=clock(),key=JSON.stringify([companyId,reason,details.accountKey??details.poolId??details.poolKey??null]);
@@ -91,6 +91,7 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     }
     if(!isCurrent())return {status:'superseded'};
     let built;
+    const overlayCheckpoint=captureOverlay(companyId);
     try {built=buildQuotaSnapshot({registry,feed,nowMs:clock(),previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config});}
     catch {return failure(companyId,'quota-feed-invalid');}
     // M1 simulates registry members before native pools even exist. Preserve
@@ -129,7 +130,7 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     const shadowHistory=[...(previous?.shadow??[]),...shadow].slice(-SHADOW_CAP);
     const envelope={...built,shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
     try {
-      if(!await publisher.publish(companyId,envelope,{isCurrent}))return {status:'superseded'};
+      if(!await publisher.publish(companyId,envelope,{isCurrent,onPublish:()=>onPublished(companyId,built.snapshot,overlayCheckpoint)}))return {status:'superseded'};
     } catch {return failure(companyId,'quota-state-failed');}
     lastFailure.delete(companyId);
     return {status:'ok',snapshot:built.snapshot};

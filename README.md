@@ -5,13 +5,14 @@ should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 
-## Native router quota producer (callback integration pending)
+## Native router and quota producer (activation gates remain)
 
 The `router` block in `config.example.json` contains fictitious company/owner
 UUIDs and a worked example account; replace them before using the generator.
-`enabled` defaults to `false`, including when omitted. This branch does not yet
-register the native router callback. The operator CLI and pure registry, quality,
-and drift libraries are present (see the generator section). Pool
+`enabled` defaults to `false`, including when omitted. Both build variants
+register `onRouteAiConnection` and declare `ai.connections.route` plus router
+catalog metadata. The operator CLI and pure registry, quality, and drift
+libraries remain available (see the generator section). Pool
 `thresholdPercent` is ignored by this plugin; pacing is reset-relative.
 
 The native `quota-refresh` job (`* * * * *`) replaces `shadow-tick`. It is the
@@ -60,9 +61,41 @@ Any mismatch returns `unavailable`, including for pinned runs; diagnostics name
 the tripwire and pool/revisions, never connection/grant IDs. Snapshot contents
 cannot attest a pool. The company-scoped frozen fence moves synchronously ONLY
 on `onConfigChanged`, before a refresh starts, and clears even on a rejected
-notification. The slice-4 callback adapter MUST obtain config through
-`plugin.getRouterConfig(companyId)` at call time, not reuse a tick's config.
-This branch still does not register that adapter or its capability.
+notification. The native callback and `plugin.getRouterConfig(companyId)`
+share that synchronous call-time accessor; neither reuses a tick's attestation.
+The callback performs no SDK reads, network calls, state writes, reservations,
+or timer work. Every call emits sanitized R8 facts; R9 configuration failures
+and unambiguous dropped-member cases additionally emit error/warning evidence.
+
+Runtime quality/outcome policy reads the current role configuration and the
+legacy quota tick's in-memory scored fleet/outcome evidence. It checks the
+candidate's **effective runtime effort**, not generation's existential model
+verdict. An omitted effort is accepted only when every known variant passes;
+unknown/unscored evidence with a configured floor fails closed. Runtime floors
+are not suspended to rescue an empty role, and neither pins nor burn bypass them.
+
+**R2 activation blocker, verified against the target upstream source:**
+`server/src/services/heartbeat/run-lifecycle.ts:1342-1406` publishes
+`agent.run.*` events without model, account, or `contextSnapshot.aiRouterSelection`.
+A run-start event is a claim, not evidence of the subsequently selected account.
+The SDK agents/issues clients expose no run-selection reader. Therefore these
+native events alone cannot satisfy the promised between-tick account overlay.
+Model-attributed event fixtures prove the overlay mechanism, **not upstream
+availability of that metadata**. Account-less starts are counted visibly under
+`/capacity.nativeRouter.unattributedInFlight` and on R8 logs; they are never
+attributed from an agent default or a callback reservation. An upstream native
+run-account event/read contract (or an explicit revised acceptance contract) is
+required before R2/U21 can be claimed end-to-end or activation proceeds.
+
+For attributable events, run-ID sets deduplicate starts/terminal notifications
+across ticks. A successful quota publication replaces the base and rebases the
+overlay in one synchronous step. Sequence checkpoints retain events received
+while persistence is awaiting IO; failed/superseded ticks do not reset it.
+
+The transitional resolver body is byte-identical to branch handoff `52f4c97`.
+That handoff already differs from the supplied read-only 0.2.72 reference;
+this slice does not port or undo those unrelated differences. Deployed 0.2.73
+behavioral parity is a separate required proof, not established by that hash.
 
 Operator sequence (no deployment is authorized by this documentation):
 

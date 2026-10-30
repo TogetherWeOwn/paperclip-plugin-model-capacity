@@ -167,12 +167,13 @@ export function createSnapshotPublisher({state,keyFor}) {
   return {
     get: companyId => published.get(companyId)?.snapshot ?? null,
     envelope: companyId => published.get(companyId) ?? null,
-    async publish(companyId,tick,{isCurrent = () => true} = {}) {
+    async publish(companyId,tick,{isCurrent = () => true,onPublish = () => {}} = {}) {
       if (!isCurrent()) return false;
       const envelope = freezeSnapshot({...tick});
       await state.set(keyFor(companyId),envelope);
       if (!isCurrent()) return false;
       published.set(companyId,envelope);
+      onPublish(); // Synchronous with base replacement: no callback can see a stale overlay.
       return true;
     },
   };

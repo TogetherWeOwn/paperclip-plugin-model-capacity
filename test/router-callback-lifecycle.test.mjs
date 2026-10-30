@@ -1,0 +1,86 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createModelCapacityPlugin } from '../src/plugin.mjs';
+import { normalizeRegistry } from '../src/registry.mjs';
+import { syntheticRouterRequest } from '../src/quota-refresh.mjs';
+import { verifiedConfig } from './support/verified-pools.mjs';
+import { NOW, MINUTE, quotaFeed, stateHarness } from './support/quota.mjs';
+import { companyId } from './support/native-api.mjs';
+
+async function start() {
+  const h=stateHarness(),cfg=verifiedConfig(),jobs=new Map(),events=new Map();let now=NOW;
+  cfg.router.enabled=true;cfg.roles={minQuality:{doer:null,thinker:null,other:null}};
+  cfg.armMap=[{aaSlug:'terra-high',model:'terra',effort:'high',family:'terra',providers:['codex']},
+    {aaSlug:'claude-high',model:'claude',effort:'high',family:'haiku',providers:['claude']}];
+  h.store.set(JSON.stringify({...h.keyFor(companyId),stateKey:'aa-snapshot-v1'}),{fetchedAt:new Date(now).toISOString(),rows:[
+    {slug:'terra-high',intelligenceIndex:60,intelligenceIndexCostPerTask:5},
+    {slug:'claude-high',intelligenceIndex:55,intelligenceIndexCostPerTask:4},
+  ]});
+  const context={state:h.state,logger:h.logger,config:{get:async()=>cfg},secrets:{resolve:async()=> 'TEST_SECRET_NEVER_LOGGED'},
+    http:{fetch:async()=>({status:200,json:async()=>quotaFeed(now)})},jobs:{register:(key,fn)=>jobs.set(key,fn)},events:{on:(key,fn)=>events.set(key,fn)},
+    agents:{get:async()=>null,list:async()=>[]},issues:{get:async()=>null,list:async()=>[]}};
+  const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false});
+  await plugin.setup(context);await plugin.onConfigChanged(cfg,{companyId});
+  const tick=()=>jobs.get('quota-refresh')({});await tick();
+  const params=syntheticRouterRequest(normalizeRegistry(cfg.router),'builder',now),entry=cfg.router.pools[0];
+  params.pool.id=entry.poolId;params.pool.revision=entry.expectedRevision;
+  for(const {member,runtimeConfig} of params.candidates) {
+    const {connectionId,grantId}=entry.members.find(m=>m.memberId===member.id);
+    Object.assign(member.binding,{connectionId,grantId});runtimeConfig.modelReasoningEffort='high';
+  }
+  // model is supplemental observed metadata, NOT a claim that upstream's
+  // current lifecycle publisher provides it (the final test uses its real shape).
+  const fire=(runId,status,model)=>events.get(`agent.run.${status}`)({companyId,entityId:runId,occurredAt:new Date(now).toISOString(),payload:{runId,agentId:'agent',...(model?{model}:{})}});
+  return {...h,plugin,context,cfg,params,tick,fire,setNow:n=>{now=n;params.now=new Date(n).toISOString();},
+    route:()=>plugin.onRouteAiConnection(params),capacity:async()=> (await plugin.onApiRequest({companyId,routeKey:'capacity'})).body.nativeRouter};
+}
+
+test('native callback uses the real published snapshot and cannot touch SDK IO on repeated host retries',async()=>{
+  const s=await start(),first=s.route();assert.equal(first.kind,'selected');assert.equal(first.memberId,s.params.memberOrder[0]);
+  const priorWrites=s.writes.length;
+  for(const key of ['state','config','secrets','http','agents','issues'])s.context[key]=new Proxy({}, {get(){throw new Error(`callback-io-forbidden:${key}`);}});
+  for(let i=0;i<20;i++)assert.deepEqual(s.route(),first);
+  assert.equal(s.writes.length,priorWrites);
+  assert.equal(JSON.stringify(s.logs).includes('TEST_SECRET_NEVER_LOGGED'),false);
+});
+
+test('observed model-attributed run events spread selections without callback reservations and survive a quota tick',async()=>{
+  const s=await start(),[a,b]=s.params.memberOrder;
+  assert.equal(s.route().memberId,a);
+  await s.fire('one-run','started','one/terra');
+  assert.equal(s.route().memberId,b,'post-tick start pressure must reach the callback');
+  await s.fire('one-run','started','one/terra');assert.equal(s.route().memberId,b);
+  s.setNow(NOW+MINUTE);await s.tick();
+  assert.equal(s.route().memberId,b,'base count replaces the overlay exactly once');
+  await s.fire('one-run','finished');assert.equal(s.route().memberId,a);
+  await s.fire('one-run','finished');assert.equal(s.route().memberId,a);
+});
+
+test('events during persist are replayed over the new base, and failed ticks never clear the current overlay',async()=>{
+  const s=await start(),[a,b]=s.params.memberOrder;let release,entered;
+  const blocked=new Promise(r=>{release=r;}),started=new Promise(r=>{entered=r;}),original=s.context.state.set;
+  s.context.state.set=async(key,value)=>{if(key.stateKey==='router-quota-v1'){entered();await blocked;}return original(key,value);};
+  s.setNow(NOW+MINUTE);const ticking=s.tick();await started;
+  await s.fire('during-persist','started','one/terra');assert.equal(s.route().memberId,b);
+  release();await ticking;assert.equal(s.route().memberId,b,'a post-build event cannot vanish at publication');
+  s.context.state.set=original;s.setFail(true);s.setNow(NOW+2*MINUTE);await assert.rejects(s.tick());
+  assert.equal(s.route().memberId,b);s.setFail(false);
+  await s.fire('during-persist','cancelled');assert.equal(s.route().memberId,a);
+});
+
+test('validated config revocation affects the next callback even while its refresh is blocked',async()=>{
+  const s=await start();assert.equal(s.route().kind,'selected');
+  let release;s.context.http.fetch=async()=>{await new Promise(r=>{release=r;});throw new Error('PRIVATE_UPSTREAM_FAILURE');};
+  s.cfg.router.pools=s.cfg.router.pools.map(({poolKey,role})=>({poolKey,role}));
+  await s.plugin.onConfigChanged(s.cfg,{companyId});
+  assert.equal(s.route().kind,'unavailable');
+  await new Promise(setImmediate);release();await assert.rejects(s.tick());
+});
+
+test('current upstream account-less lifecycle payloads expose the R2 attribution gap instead of inventing accounts',async()=>{
+  const s=await start();
+  await s.fire('native-shape','started');
+  assert.equal((await s.capacity()).unattributedInFlight,1);
+  assert.equal(s.logs.filter(l=>l.message==='model-capacity: native route').at(-1)?.details.accountKey,undefined);
+  await s.fire('native-shape','failed');assert.equal((await s.capacity()).unattributedInFlight,0);
+});
