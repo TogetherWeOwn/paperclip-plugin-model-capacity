@@ -1907,7 +1907,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             ...(config.credentialReadiness.enforce && !readiness.eligible ? [readiness.reason] : []),
           ];
           const quotaCost = config.contextCaps?.tierAffectsQuota === false ? base : tier.costEffective ?? base;
+          const view = viewsByAccount?.get(keyOf(account, i));
+          const superseded = view && isSupersededArm(view, a);
+          const identity = view?.identities[canonicalModelName(a.model)];
+          const withoutKeeps = view && { ...view, overrides: { ...view.overrides, keep: [] } };
+          const kept = view && isSupersededArm(withoutKeeps, a) && !superseded;
           return { ...a, model, canonicalModel: a.model, effortVerified,
+            ...(view ? { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null,
+              newestVersionManaged: true, ...(kept ? { newestVersionKept: true } : {}),
+              ...(superseded ? { newestVersionSuperseded: true } : {}) } : {}),
             evidenceReason: effortVerified ? null : a.evidenceReason,
             credentialEvidence: evidence, operationalReasons,
             costBase: base, costMultiplier: tier.costMultiplier, costEffective: tier.costEffective,
@@ -1921,7 +1929,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           };
         })];
       }));
+      if (viewsByAccount) for (const [accountId, candidates] of Object.entries(candidatesByAccount)) {
+        viewsByAccount.get(accountId).supersededTaskArmIds = [...new Set(candidates
+          .filter(c => c.newestVersionSuperseded).map(c => c.armId))].sort();
+      }
       taskRanking = buildTaskRanking({ candidatesByAccount, config: config.taskRanking,
+        ...(viewsByAccount ? { supersededTaskArmIdsByAccount: new Map([...viewsByAccount]
+          .map(([key, view]) => [key, view.supersededTaskArmIds])) } : {}),
         minQuality: config.roles.minQuality, snapshotAt: aaSnapshot?.fetchedAt ?? null,
         previous: Object.fromEntries(Object.entries(previousLadders ?? {}).map(([key, l]) => [key, { roles: l.taskRoles ?? {} }])),
         eee: eeeLive ? { scores: eeeLive, blendDoer: config.eee.blendDoer, blendThinker: config.eee.blendThinker,
@@ -4756,7 +4770,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const candidates = live.taskRanking?.mode === 'enforce'
       ? account.taskRoles?.[role]?.candidates ?? [] : account.credentialRanking?.candidates ?? [];
     const manual = live.freeManualExclusions?.[role] ?? [];
+    if (report && account.newestVersion) for (const arm of account.newestVersion.rejectedCandidates ?? []) {
+      report.push({ accountId: account.accountId, provider, armId: arm.armId, model: arm.model,
+        eligible: false, reason: 'superseded-version' });
+    }
     const arms = candidates.filter(arm => {
+      if (isSupersededArm(account.newestVersion, arm)) {
+        if (report) report.push({ accountId: account.accountId, provider, armId: arm.armId, model: arm.model,
+          eligible: false, reason: 'superseded-version' });
+        return false;
+      }
       const verdict = freeArmVerdict(arm, provider, ledger.values(), cfg, nowMs);
       if (report) report.push({ accountId: account.accountId, provider, armId: arm.armId, model: arm.model, ...verdict });
       if (!verdict.eligible) return false;
@@ -4805,7 +4828,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         target: usable && (budget.dailyRemaining == null || budget.dailyRemaining >= cfg.providers[provider].requestsPerRun)
           ? budget.slots : 0 } });
     }
-    return { enabled: true, minQuality: cfg.minQuality, providers, arms,
+    const uniqueArms = live.newestVersion
+      ? [...new Map(arms.map(a => [JSON.stringify([a.accountId, a.armId]), a])).values()] : arms;
+    return { enabled: true, minQuality: cfg.minQuality, providers, arms: uniqueArms,
       target: Object.values(providers).reduce((sum, p) => sum + p.target, 0),
       outcomeSignal: 'failed-run-or-status-progress; not adjudicated review acceptance' };
   }
