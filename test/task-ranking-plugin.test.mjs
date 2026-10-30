@@ -379,3 +379,61 @@ test('approved reviewer config cannot bypass contributor-only Muse or Sol identi
     assert.equal((await d.hook({ agentId: 'reviewer' })).kind, 'defer', model);
   }
 });
+
+test('a disabled builder reserve ignores another reviewer policy and keeps Sol high on codex:s', async () => {
+  // Reserve membership is identity-scoped: another agent policy cannot move
+  // a reserve-only builder off its native Sol high route.
+  const makeReserve = () => ({ enabled: false, agentIds: ['builder'], providers: ['codex'] });
+  const makeOtherPolicy = () => ({ agentIds: ['other-reviewer'], arms: [
+    { provider: 'meta', model: 'muse-wonder-full-1.0-contributor', effort: 'max' },
+  ] });
+  const expectedReason = 'rung 0 on codex:s (doer); AA workload proxy 0.31914442375664703 USD (not calibrated accepted-task cost)';
+  const expectedEnv = { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '890000', CLAUDE_CODE_AUTO_COMPACT_WINDOW: '870000' };
+  for (const withOther of [false, true]) {
+    const config = withOther
+      ? { reviewReserve: makeReserve(), reviewerRouting: makeOtherPolicy() }
+      : { reviewReserve: makeReserve() };
+    const d = await drive({ config });
+    const pick = await d.hook();
+    assert.equal(pick.kind, 'decide');
+    assert.equal(pick.model, 'gpt-6.1-sol');
+    assert.equal(pick.effort, 'high');
+    assert.deepEqual(pick.env, expectedEnv);
+    assert.equal(pick.reason, expectedReason);
+    await d.fire('reserve-builder', 'builder');
+    await d.tick();
+    const entry = (await d.shadow()).entries.find(r => r.runId === 'hook');
+    assert.equal(entry.wouldModel, 'gpt-6.1-sol(high)');
+    assert.equal(entry.account, 'codex:s');
+    assert.equal(entry.accountId, 'codex:s');
+    assert.equal(entry.armId, 'gpt-6-1-sol@high');
+    assert.equal(entry.effort, 'high');
+    assert.equal(entry.rung, 0);
+    assert.equal(entry.family, 'sol');
+    assert.equal(entry.reason, expectedReason);
+    const sol = (await d.capacity()).taskRanking.candidates.find(c => c.aaSlug === 'gpt-6-1-sol-high' && c.role === 'doer');
+    assert.equal(sol.accountId, 'codex:s');
+    assert.equal(sol.eligible, true);
+    assert.deepEqual(sol.exclusionReasons, []);
+  }
+  // Control: the other policy is genuine once its own model is served/ready/admitted.
+  const d = await drive({ config: { reviewReserve: makeReserve(), reviewerRouting: makeOtherPolicy() } });
+  d.lane.accounts.push({ ...d.lane.accounts[0], provider: 'meta', lane: 'review', accountKey: 'review',
+    models: ['muse-wonder-full-1.0-contributor'] });
+  d.lane.servedModels.push('muse-wonder-full-1.0-contributor');
+  d.setNow(NOW + 61000);
+  d.lane.observedAt = new Date(NOW + 61000).toISOString();
+  await d.tick();
+  const builderAfter = await d.hook({ runId: 'builder-after' });
+  assert.equal(builderAfter.model, 'gpt-6.1-sol');
+  assert.equal(builderAfter.effort, 'high');
+  assert.equal(builderAfter.reason, expectedReason);
+  const reviewPick = await d.hook({ agentId: 'other-reviewer', runId: 'other-review' });
+  assert.equal(reviewPick.kind, 'decide');
+  assert.equal(reviewPick.model, 'muse-wonder-full-1.0-contributor');
+  assert.equal(reviewPick.effort, 'max');
+  assert.match(reviewPick.reason, /^reviewer routing: muse-wonder-full-1\.0-contributor\(max\) on meta:review/);
+  const incumbent = (await d.capacity()).taskRanking.candidates.find(c => c.model === 'muse-wonder-full-1.0-contributor' && c.role === 'reviewer');
+  assert.equal(incumbent.accountId, 'meta:review');
+  assert.equal(incumbent.evidenceTrust, 'policy-trusted-incumbent');
+});

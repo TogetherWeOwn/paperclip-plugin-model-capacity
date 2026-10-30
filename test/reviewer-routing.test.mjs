@@ -619,6 +619,64 @@ for (const refusal of ['unready', 'manual-exclusion']) {
   });
 }
 
+for (const includeDeniedAlternative of [false, true]) {
+  test(`policy reviewer safety: a denied trial alternative cannot remove local safety (configured=${includeDeniedAlternative})`, async t => {
+    const admissions = [];
+    const trialModel = 'devin/swe-2';
+    const d = drive({
+      config: { ...BASE, credentialReadiness: { enforce: false }, taskRanking: { mode: 'enforce' },
+        roles: { keepAgentIds: ['reviewer-1', 'other-pin'] },
+        trials: { roles: [], unscoredServedIds: [{ servedId: trialModel, reason: 'test' }] },
+        placement: { freeCostServedIds: { [trialModel]: { until: '2026-12-01T00:00:00Z', reason: 'test' } } },
+        reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1], ...(includeDeniedAlternative
+          ? [{ provider: 'devin', model: trialModel, effort: 'max' }] : [])] } },
+      accounts: [metaLane('review', 0.85, 120), { provider: 'devin', accountKey: 'd', models: [trialModel],
+        health: 'healthy', meter: 'reactive', quality: 'reactive' }],
+      heartbeats: [{ agentId: 'reviewer-1', queued: 1 }, { agentId: 'other-pin', queued: 1 }],
+      onReviewerAdmission: event => admissions.push(event),
+    });
+    await d.setup();
+    await d.tick();
+    const capacity = (await d.api('capacity')).body;
+    const policy = (await d.api('ladder')).body.ladders['devin:d'].policyReviewerArms;
+    assert.equal(policy.some(arm => arm.model === trialModel && arm.effort === 'max'), includeDeniedAlternative);
+    if (includeDeniedAlternative) {
+      // The observer reports structural checks before final trial gates; the
+      // published admission list below is the final verdict.
+      const checked = admissions.filter(event => event.arm.model === trialModel);
+      assert.ok(checked.some(event => event.result.ok === true && event.result.model === trialModel),
+        'the configured policy model passes structural servability, before final unscored/trial admission');
+    }
+    assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-1'], ['meta:review']);
+    const local = capacity.reviewerPaceByAgent['reviewer-1'];
+    const meta = local.pools.find(pool => pool.pool === 'meta');
+    const raw = capacity.paceGuard.rawPools.find(pool => pool.pool === 'meta');
+    assert.deepEqual({ cap: raw.cap, held: raw.hardHeldAccountIds }, { cap: 0, held: ['meta:review'] });
+    // Supply only sizing and a fixed binding; actual admissions and pace verdicts stay intact.
+    d.updateCapacity(cap => {
+      cap.target = 2; cap.calibration = 'measured';
+      cap.perAccount.find(account => account.accountId === 'meta:review').slots = 2;
+      cap.keptByAgent['other-pin'] = { accountId: 'meta:review' };
+    });
+    const caps = (await d.api('caps')).body;
+    const runIds = [`denied-trial-${includeDeniedAlternative}-first`, `denied-trial-${includeDeniedAlternative}-second`];
+    const decisions = [];
+    for (const runId of runIds) decisions.push(await d.hook(runId));
+    await d.tick();
+    const entries = (await d.api('shadow')).body.entries;
+    const selected = decisions.flatMap((decision, index) => decision.kind === 'decide' ? [{ model: decision.model,
+      effort: decision.effort, accountId: entries.find(entry => entry.runId === runIds[index])?.accountId }] : []);
+    const actual = { suspended: local.holdSuspendedAccountIds, cap: meta.cap,
+      reviewerGrant: caps.agents.find(agent => agent.agentId === 'reviewer-1')?.allocated,
+      fixedGrant: caps.agents.find(agent => agent.agentId === 'other-pin')?.allocated,
+      hooks: decisions.map(decision => decision.kind), selected };
+    t.diagnostic(JSON.stringify(actual));
+    assert.deepEqual(actual, { suspended: ['meta:review'], cap: 1, reviewerGrant: 1, fixedGrant: 0,
+      hooks: ['decide', 'defer'], selected: [{ model: WONDER, effort: 'max', accountId: 'meta:review' }] },
+    'a non-admitted unscored policy record is not a usable alternative to the sole admitted reviewer');
+  });
+}
+
 test('N-T16: kept default superseded on every serving account defers', async () => {
   const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
   const d = drive({ config: { ...BASE, roles: { ...BASE.roles, newestVersionOnly: { enabled: true } } },
