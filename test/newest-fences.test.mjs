@@ -36,14 +36,41 @@ test('N-T18/T18b: unmanaged tiebreak remains; managed keep survives ties but not
   assert.deepEqual(buildLadder([managedOld, { ...managedNew, Q: 51 }]).dominated, [older.armId]);
 });
 
+test('N-T18: a mixed managed/unmanaged pair retains the legacy newer tiebreak', () => {
+  const older = { ...flash, accountId: undefined };
+  const newer = { ...lite, accountId: undefined };
+  for (const [oldEntry, newEntry] of [
+    [{ ...older, newestVersionManaged: true }, newer],
+    [older, { ...newer, newestVersionManaged: true }],
+  ]) {
+    assert.equal(ladderDominates(newEntry, oldEntry), true);
+    assert.deepEqual(buildLadder([oldEntry, newEntry]).rungs.map(r => r.armId), [newer.armId]);
+  }
+});
+
 const nowMs = Date.parse('2026-10-29T12:00:00Z');
 const account = (key, models) => ({ lane: key, provider: 'fixture', accountKey: key, health: 'healthy', models, observedAt: new Date(nowMs).toISOString(), quality: 'live', weekly: { used: .2, resetsAt: '2026-11-05T12:00:00Z' }, fiveHour: { used: .1, resetsAt: '2026-10-29T17:00:00Z' } });
-async function tick(accounts, enabled, names = [flash.model, lite.model], families = ['gemini', 'gemini']) {
+async function tick(accounts, enabled, names = [flash.model, lite.model], families = ['gemini', 'gemini'], overrides = {}) {
   const lane = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts }, nowMs);
   const armMap = names.map((model, i) => ({ aaSlug: model, model, effort: 'high', family: families[i], providers: ['fixture'] }));
   const snapshot = { fetchedAt: new Date(nowMs).toISOString(), duplicateSlugs: [], rows: names.map(slug => ({ slug, intelligenceIndex: 50, intelligenceIndexCostPerTask: 1 })) };
-  return replayTick({ lane, snapshot, states: {}, nowMs, demand: { doer: 1 }, config: { armMap, roles: { newestVersionOnly: { enabled } } } });
+  return replayTick({ lane, snapshot, states: {}, nowMs, demand: { doer: 1 }, config: { armMap, roles: { newestVersionOnly: { enabled, overrides } } } });
 }
+
+test('N-T17 tick: enabled same-product dominance uses pinned versions across accounts', async () => {
+  const names = ['gemini-3-flash', 'gemini-3.5-flash'];
+  const accounts = [account('a', [names[0]]), account('b', [names[1]])];
+  // The pins deliberately reverse the order implied by the model names.
+  const overrides = { parsePins: {
+    'model:gemini-3-flash': { product: 'gemini-flash', version: [4] },
+    'model:gemini-3.5-flash': { product: 'gemini-flash', version: [3, 5] },
+  } };
+  const on = await tick(accounts, true, names, ['gemini', 'gemini'], overrides);
+  assert.deepEqual(on.ladders.ladders['fixture:b'].crossAccountDominated, [names[1]]);
+  assert.deepEqual(on.ladders.ladders['fixture:a'].crossAccountDominated ?? [], []);
+  assert.deepEqual(on.ladders.ladders['fixture:b'].rungs, []);
+  assert.equal(on.ladders.ladders['fixture:a'].rungs.length, 1);
+});
 
 test('N-T20b: enabled flash and flash-lite survive equal-cost ties on one or two accounts', async () => {
   const names = [flash.model, lite.model];
