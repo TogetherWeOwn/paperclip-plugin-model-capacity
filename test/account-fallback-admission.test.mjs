@@ -41,6 +41,24 @@ test('weak accounts admit the best finite arm at the floor; strong and unscored 
   assert.deepEqual(e.exclusions, buildEligibility(base).exclusions);
 });
 
+test('fallback does not lift a task-evidence failure with finite quality above the fallback floor', () => {
+  const untrusted = { ...arms[1], roleTrusted: { doer: false } };
+  const input = { arms: arms.map(a => a.armId === untrusted.armId ? untrusted : a), accountCandidates: { weak: [untrusted] } };
+  const e = build(input);
+  assert.equal(e.report.roles.doer.suspended, false);
+  assert.equal(e.report.arms.find(a => a.armId === 'old').eligible.doer.reasons.includes('task-evidence-admission'), true);
+  assert.equal(e.accountAdmissions.doer.weak, undefined);
+  assert.equal(e.report.accountFallback.admitted.some(a => a.role === 'doer' && a.accountId === 'weak'), false);
+  assert.equal(build({ accountCandidates: { weak: [arms[1]] } }).accountAdmissions.doer.weak.armId, 'old');
+});
+
+test('fallback rejects thinker even when an unnormalized roles list requests it', () => {
+  const e = build({ accountFallback: { ...cfg, roles: ['thinker', 'doer'] }, accountCandidates: { weak: [arms[1]] } });
+  assert.equal(e.accountAdmissions.doer.weak.armId, 'old');
+  assert.equal(Object.hasOwn(e.accountAdmissions, 'thinker'), false);
+  assert.equal(e.report.accountFallback.admitted.some(a => a.role === 'thinker'), false);
+});
+
 test('supersession removes candidates from both passing and fallback pools', () => {
   const updatedArms = arms.map(a => a.armId === 'old' ? { ...a, qFleet: 0.14 } : a);
   const candidates = { weak: [updatedArms[1], updatedArms[2]] };
