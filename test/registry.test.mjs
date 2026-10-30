@@ -96,3 +96,30 @@ test('feed join warns and marks missing non-exempt members stale without exempti
   assert.deepEqual(result.staleMemberIds,[memberIdFor('builder','missing'),memberIdFor('thinker','missing')]);
   assert.throws(()=>joinRegistryFeed(normalizeRegistry(raw),null),/feed/);
 });
+
+test('feed join rejects malformed and duplicate identities with named errors', async () => {
+  const {joinRegistryFeed}=await import('../src/registry.mjs');
+  const registry=normalizeRegistry(fixture());
+  for (const accounts of [[{accountKey:'  '}],[{accountKey:'codex-1'},{accountKey:'codex-1'}],[{accountKey:' codex-1'}]]) {
+    assert.throws(()=>joinRegistryFeed(registry,{accounts}),/invalid feed accounts/);
+  }
+  for (const bad of [undefined,null,{}, {accounts:[]}, {accounts:[null],memberIndex:{}}, {accounts:[],memberIndex:{x:null}}]) {
+    assert.throws(()=>joinRegistryFeed(bad,{accounts:[]}),/invalid registry/);
+  }
+});
+
+test('policy errors take precedence for misplaced probe flags and excluded pool members', () => {
+  const raw=fixture(); raw.accounts[0].probeEligible=true;
+  assert.throws(()=>normalizeRegistry(raw),/probeEligible belongs to pool membership/);
+  const member={binding:null,profile:{provider:'opencode',model:'codex1/model'}};
+  assert.throws(()=>validatePoolMember(member,fixture().accounts[0]),/lane-excluded-by-policy/);
+});
+
+test('feed join tolerates unrelated non-registry feed identities and rejects malformed registry entries', async () => {
+  const {joinRegistryFeed}=await import('../src/registry.mjs');
+  const registry=normalizeRegistry(fixture());
+  assert.deepEqual(joinRegistryFeed(registry,{accounts:[{accountKey:'codex-1'},{accountKey:'other@example.com'}]}).missingAccountKeys,[]);
+  for (const bad of [{accounts:[1],memberIndex:{}},{accounts:[{accountKey:'codex-1'}, {accountKey:'codex-1'}],memberIndex:{}},{accounts:[],memberIndex:{x:{accountKey:'ghost',poolKey:'builder'}}}]) {
+    assert.throws(()=>joinRegistryFeed(bad,{accounts:[]}),/invalid registry/);
+  }
+});

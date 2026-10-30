@@ -54,8 +54,6 @@ export function normalizeRegistry(raw) {
     key(a?.accountKey, 'accountKey'); key(a?.prefix, 'prefix'); text(a?.connectionName, 'connectionName');
     if (accountKeys.has(a.accountKey) || prefixes.has(a.prefix) || names.has(a.connectionName)) throw new Error('duplicate account identity');
     accountKeys.add(a.accountKey); prefixes.add(a.prefix); names.add(a.connectionName);
-    if (Object.hasOwn(a, 'probeEligible')) throw new Error('probeEligible belongs to pool membership');
-    if (a.harnessProfile === 'opencode' || a.harnessProfile === 'grok' || a.acpxAgent === 'grok') throw new Error('lane-excluded-by-policy');
     const valid = a.provider === 'openai' && a.protocol === 'responses' && a.harnessProfile === 'codex'
       || raw.allowMessages === true && a.provider === 'anthropic' && a.protocol === 'messages' && a.harnessProfile === 'acpx';
     if (!valid || (a.acpxAgent != null && (a.harnessProfile !== 'acpx' || a.acpxAgent !== 'claude'))) throw new Error('invalid protocol matrix');
@@ -78,8 +76,14 @@ export function normalizeRegistry(raw) {
 /** Join validated feed identities to registry members; callers must apply the
  * stale-member set to their snapshot, not treat an exemption as a reading. */
 export function joinRegistryFeed(registry, feed) {
-  if (!Array.isArray(feed?.accounts) || feed.accounts.some(a => !a || typeof a.accountKey !== 'string' || !a.accountKey)) throw new Error('invalid feed accounts');
+  const validKey = value => typeof value === 'string' && keyPattern.test(value);
+  if (!registry || !Array.isArray(registry.accounts) || !registry.memberIndex || typeof registry.memberIndex !== 'object' || Array.isArray(registry.memberIndex)
+      || registry.accounts.some(a => !a || typeof a !== 'object' || Array.isArray(a) || !validKey(a.accountKey) || ('feedExempt' in a && typeof a.feedExempt !== 'boolean'))) throw new Error('invalid registry');
+  const accountKeys = new Set(registry.accounts.map(a => a.accountKey));
+  if (accountKeys.size !== registry.accounts.length || Object.values(registry.memberIndex).some(m => !m || !validKey(m.accountKey) || !accountKeys.has(m.accountKey) || !validKey(m.poolKey))) throw new Error('invalid registry');
+  if (!Array.isArray(feed?.accounts) || feed.accounts.some(a => !a || typeof a.accountKey !== 'string' || !a.accountKey.trim() || a.accountKey !== a.accountKey.trim())) throw new Error('invalid feed accounts');
   const present = new Set(feed.accounts.map(a => a.accountKey));
+  if (present.size !== feed.accounts.length) throw new Error('invalid feed accounts: duplicate accountKey');
   const missingAccountKeys = registry.accounts.filter(a => !a.feedExempt && !present.has(a.accountKey)).map(a => a.accountKey);
   const missing = new Set(missingAccountKeys);
   return {
@@ -91,8 +95,8 @@ export function joinRegistryFeed(registry, feed) {
 
 export function validatePoolMember(member, account) {
   const binding = member?.binding, profile = member?.profile;
-  if (!binding || !['shared','delegated'].includes(binding.mode) || binding.provider !== account.provider || !['api_key','subscription'].includes(binding.method) || !uuidPattern.test(binding.connectionId ?? '') || !uuidPattern.test(binding.grantId ?? '')) throw new Error('invalid pool binding');
   if (profile?.provider === 'opencode' || profile?.acpxAgent === 'grok') throw new Error('lane-excluded-by-policy');
+  if (!binding || !['shared','delegated'].includes(binding.mode) || binding.provider !== account.provider || !['api_key','subscription'].includes(binding.method) || !uuidPattern.test(binding.connectionId ?? '') || !uuidPattern.test(binding.grantId ?? '')) throw new Error('invalid pool binding');
   if (!profile || profile.provider !== account.harnessProfile || typeof profile.model !== 'string' || !profile.model.startsWith(`${account.prefix}/`) || profile.model.length <= account.prefix.length + 1 || profile.model.length > 256) throw new Error('invalid pool profile');
   if (profile.provider === 'acpx' ? profile.acpxAgent !== 'claude' : Object.hasOwn(profile, 'acpxAgent')) throw new Error('invalid harness profile');
   return member;
@@ -119,6 +123,7 @@ function routerShapeErrors(raw) {
   }
   if (Array.isArray(raw.accounts)) for (const account of raw.accounts) {
     if (!account || typeof account !== 'object' || Array.isArray(account)) continue;
+    if (Object.hasOwn(account, 'probeEligible')) errors.push('probeEligible belongs to pool membership');
     checkKeys(account, ROUTER_CONFIG_KEYS.account, 'router.accounts[]');
     if (account.harnessProfile === 'opencode' || account.harnessProfile === 'grok' || account.acpxAgent === 'grok') errors.push('lane-excluded-by-policy');
     else if ('acpxAgent' in account && account.acpxAgent !== 'claude') errors.push('router account acpxAgent must be claude');
