@@ -14,10 +14,10 @@ import { parseUpstreamWrite } from './support/upstream-http-schema.mjs';
 const exec=promisify(execFile),script=new URL('../scripts/generate-pool.mjs',import.meta.url).pathname;
 const saveSchema=z.object({pluginKey:z.literal('togetherweown.model-capacity'),id:z.string().uuid().optional(),expectedRevision:z.number().int().positive().optional(),config:aiConnectionPoolConfigSchema}).strict();
 
-async function fixture(t) {
-  const api=new NativeApi(),requests=[],errors=[];
+async function fixture(t, owner=ownerUserId) {
+  const api=new NativeApi(owner),requests=[],errors=[];
   const dir=await mkdtemp(join(tmpdir(),'pool-cli-'));t.after(()=>rm(dir,{recursive:true,force:true}));
-  for(const [name,value] of Object.entries({registry,batch:{pools:batch,sessionPlans:{}},quality:{arms:['terra','sol','claude'].map(model=>({model,armId:model,family:model,qFleet:1,qFleetThinker:1})),records:[],roles:{}},refs:{one:{env:'LANE_ONE'},two:{env:'LANE_TWO'}}}))await writeFile(join(dir,`${name}.json`),JSON.stringify(value));
+  for(const [name,value] of Object.entries({registry:{...registry,ownerUserId:owner},batch:{pools:batch,sessionPlans:{}},quality:{arms:['terra','sol','claude'].map(model=>({model,armId:model,family:model,qFleet:1,qFleetThinker:1})),records:[],roles:{}},refs:{one:{env:'LANE_ONE'},two:{env:'LANE_TWO'}}}))await writeFile(join(dir,`${name}.json`),JSON.stringify(value));
   const server=createServer(async(req,res)=>{
     let body='';for await(const part of req)body+=part;
     try {
@@ -138,4 +138,37 @@ test('mapping caches reverify connection AND grant IDs; a deleted mapping is nev
   assert.deepEqual(result.mappingCache.stale,['one']);assert.deepEqual(result.mappingCache.verified,['two']);
   assert.equal(result.connections[0].action,'create');assert.notEqual(result.pools[0].config.members[0].binding.connectionId,gone);
   assert.deepEqual(f.api.writes,[]);
+});
+
+test('CLI plans, applies and rolls back using opaque native owner IDs',async t=>{
+  for (const owner of ['local-board','usr_01J9Z4Y7N65A8Q2R3T6V8W0X1Y']) {
+    const f=await fixture(t,owner),journal=join(f.dir,'opaque.jsonl');
+    assert.equal(JSON.parse((await f.run()).stdout).pools.length,2);
+    await f.run(['--apply','--keep-disabled','--secret-refs',join(f.dir,'refs.json'),'--journal',journal]);
+    assert.equal(f.api.connections.length,2);
+    assert.equal(JSON.parse((await f.run(['--rollback',journal])).stdout).ok,true);
+    assert.equal(f.api.connections.length,0);assert.equal(f.api.pools.length,0);assert.deepEqual(f.errors,[]);
+  }
+});
+
+test('CLI rejects invalid owner identities before any writes',async t=>{
+  for (const owner of ['', '  \t\n', null, 42]) {
+    const f=await fixture(t,owner);
+    await assert.rejects(f.run());
+    assert.deepEqual(f.api.writes,[]);
+  }
+});
+
+test('rollback rejects tampered or mismatched opaque owners before any writes',async t=>{
+  const f=await fixture(t,'local-board'),journal=join(f.dir,'owner.jsonl');
+  await f.run(['--apply','--keep-disabled','--secret-refs',join(f.dir,'refs.json'),'--journal',journal]);
+  const {readFile}=await import('node:fs/promises');
+  const lines=(await readFile(journal,'utf8')).trimEnd().split('\n');
+  const original=JSON.parse(lines[0]);
+  for (const owner of ['', '  \t\n', null, 42, 'another-user']) {
+    lines[0]=JSON.stringify({...original,ownerUserId:owner});
+    await writeFile(journal,lines.join('\n')+'\n');f.api.writes=[];
+    await assert.rejects(f.run(['--rollback',journal]));
+    assert.deepEqual(f.api.writes,[]);
+  }
 });

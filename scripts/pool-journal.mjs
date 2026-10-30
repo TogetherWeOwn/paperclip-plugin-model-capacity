@@ -5,7 +5,7 @@
 import { open, readFile, truncate } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { equal, poolConfig, connectionShape, orderedInstalls } from './generator-safety.mjs';
-import { PLUGIN_KEY } from '../src/registry.mjs';
+import { PLUGIN_KEY, isNativeUserId } from '../src/registry.mjs';
 const kinds=new Set(['connection-create','connection-patch','installs','pool-create','pool-save','binding','reset','wake']);
 const uuid=x=>typeof x==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
 export const temporaryName=(runId,label)=>`mc-${runId}-${label}`;
@@ -39,7 +39,7 @@ export async function perform(api,op) {
 }
 function validate(lines) {
   const h=lines[0];
-  if(h?.type!=='header' || h.version!==2 || h.pluginKey!==PLUGIN_KEY || !uuid(h.companyId) || !uuid(h.ownerUserId) || !uuid(h.runId)) throw new Error('invalid journal header');
+  if(h?.type!=='header' || h.version!==2 || h.pluginKey!==PLUGIN_KEY || !uuid(h.companyId) || !isNativeUserId(h.ownerUserId) || !uuid(h.runId)) throw new Error('invalid journal header');
   if(h.batchAgentIds!==undefined && (!Array.isArray(h.batchAgentIds)||h.batchAgentIds.some(id=>!uuid(id))))throw new Error('invalid journal batch agents');
   const intents=new Map(),done=new Map();
   const safe=x=>{if(Array.isArray(x)) return x.every(safe);if(x && typeof x==='object') return Object.entries(x).every(([k,v])=>!/(api.?key|password|authorization|token|credential(?!SecretRefs))/i.test(k) && safe(v));return true;};

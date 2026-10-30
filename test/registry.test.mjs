@@ -66,8 +66,8 @@ test('member validation rejects responsible-user bindings and harness mismatches
 });
 
 
-test('registry rejects non-UUID identities and explicit null membership flags', () => {
-  for (const mutate of [r=>r.companyId='bad',r=>r.ownerUserId='bad',r=>r.accounts[0].pools.builder.probeEligible=null]) {
+test('registry rejects invalid identities and explicit null membership flags', () => {
+  for (const mutate of [r=>r.companyId='bad',r=>r.ownerUserId='  ',r=>r.accounts[0].pools.builder.probeEligible=null]) {
     const r=fixture(); mutate(r); assert.throws(()=>normalizeRegistry(r));
   }
 });
@@ -137,5 +137,14 @@ test('feed join tolerates unrelated non-registry feed identities and rejects mal
   assert.deepEqual(joinRegistryFeed(registry,{accounts:[{accountKey:'codex-1'},{accountKey:'other@example.com'}]}).missingAccountKeys,[]);
   for (const bad of [{accounts:[1],memberIndex:{}},{accounts:[{accountKey:'codex-1'}, {accountKey:'codex-1'}],memberIndex:{}},{accounts:[],memberIndex:{x:{accountKey:'ghost',poolKey:'builder'}}}]) {
     assert.throws(()=>joinRegistryFeed(bad,{accounts:[]}),/invalid registry/);
+  }
+});
+
+test('registry accepts opaque native owner identities and rejects empty or non-string IDs', () => {
+  for (const id of ['local-board','usr_01J9Z4Y7N65A8Q2R3T6V8W0X1Y','  opaque id  ']) {
+    const r=fixture();r.ownerUserId=id;assert.equal(normalizeRegistry(r).ownerUserId,id);
+  }
+  for (const id of ['', '  \t\n', null, 42]) {
+    const r=fixture();r.ownerUserId=id;assert.throws(()=>normalizeRegistry(r));
   }
 });

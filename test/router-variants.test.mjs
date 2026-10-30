@@ -10,7 +10,7 @@ test('both build variants advertise the native router under the stable plugin id
     assert.equal(manifest.aiConnectionRouter.name, 'Model Capacity pool');
     assert.ok(manifest.aiConnectionRouter.description.length > 0);
     assert.equal(manifest.instanceConfigSchema.properties.router.properties.companyId.format, 'uuid');
-    assert.equal(manifest.instanceConfigSchema.properties.router.properties.ownerUserId.format, 'uuid');
+    assert.equal(manifest.instanceConfigSchema.properties.router.properties.ownerUserId.type, 'string');
   }
 });
 

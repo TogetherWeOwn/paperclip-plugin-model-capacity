@@ -438,7 +438,7 @@ const CONFIG_SCHEMA = {
         enabled: { type: 'boolean', default: false },
         allowMessages: { type: 'boolean', default: false },
         companyId: { type: 'string', format: 'uuid' },
-        ownerUserId: { type: 'string', format: 'uuid' },
+        ownerUserId: { type: 'string', pattern: '\\S' },
         staleSnapshotMs: { type: 'integer', minimum: 1, default: 180000 },
         accountStaleMs: { type: 'integer', minimum: 1, default: 900000 },
         recheckMs: { type: 'integer', minimum: 1, default: 300000 },

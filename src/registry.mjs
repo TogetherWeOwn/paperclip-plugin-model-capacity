@@ -30,6 +30,7 @@ export const ROUTER_CONFIG_KEYS = Object.freeze({
 });
 const DNS_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const isNativeUserId = v => typeof v === 'string' && v.trim().length > 0;
 const keyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const text = (v, name) => {
   if (typeof v !== 'string' || !v.trim() || v !== v.trim()) throw new Error(`invalid ${name}`);
@@ -81,8 +82,9 @@ export function normalizeRegistry(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid registry');
   const shapeErrors = routerShapeErrors(raw);
   if (shapeErrors.length) throw new Error(shapeErrors.join('; '));
-  text(raw.companyId, 'companyId'); text(raw.ownerUserId, 'ownerUserId');
-  if (!uuidPattern.test(raw.companyId) || !uuidPattern.test(raw.ownerUserId)) throw new Error('companyId and ownerUserId must be UUIDs');
+  text(raw.companyId, 'companyId');
+  if (!uuidPattern.test(raw.companyId)) throw new Error('companyId must be a UUID');
+  if (!isNativeUserId(raw.ownerUserId)) throw new Error('invalid ownerUserId');
   if (!Array.isArray(raw.accounts) || !Array.isArray(raw.pools)) throw new Error('accounts and pools must be arrays');
   const roles = new Map(), accountKeys = new Set(), prefixes = new Set(), names = new Set();
   for (const pool of raw.pools) {
@@ -167,7 +169,8 @@ function routerShapeErrors(raw) {
   };
   checkKeys(raw, ROUTER_CONFIG_KEYS.router, 'router');
   for (const k of ['enabled','allowMessages']) if (k in raw && typeof raw[k] !== 'boolean') errors.push(`router.${k} must be a boolean`);
-  for (const k of ['companyId','ownerUserId']) if (typeof raw[k] !== 'string' || !uuidPattern.test(raw[k])) errors.push(`router.${k} must be a UUID`);
+  if (typeof raw.companyId !== 'string' || !uuidPattern.test(raw.companyId)) errors.push('router.companyId must be a UUID');
+  if (!isNativeUserId(raw.ownerUserId)) errors.push('router.ownerUserId must be a non-empty string');
   for (const k of ['staleSnapshotMs','accountStaleMs','recheckMs']) if (k in raw && !(Number.isSafeInteger(raw[k]) && raw[k] > 0)) errors.push(`router.${k} must be a positive integer`);
   for (const k of ['hardCapWeekly','hardCapFiveHour']) if (k in raw && !(Number.isFinite(raw[k]) && raw[k] >= 0 && raw[k] <= 1)) errors.push(`router.${k} must be a number in [0, 1]`);
   if (Array.isArray(raw.pools)) for (const pool of raw.pools) {
