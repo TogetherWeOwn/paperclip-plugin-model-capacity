@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import * as generator from '../scripts/generate-pool.mjs';
 
 const companyId = '10000000-0000-4000-8000-000000000001';
-const registry = {companyId,ownerUserId:'owner',pools:[{poolKey:'builder',role:'doer'}],accounts:[{accountKey:'one',prefix:'one',provider:'openai',protocol:'responses',harnessProfile:'codex',connectionName:'One',pools:{builder:{model:'model'}}}]};
+const registry = {companyId,ownerUserId:'20000000-0000-4000-8000-000000000002',pools:[{poolKey:'builder',role:'doer'}],accounts:[{accountKey:'one',prefix:'one',provider:'openai',protocol:'responses',harnessProfile:'codex',connectionName:'One',pools:{builder:{model:'model'}}}]};
 const verdicts = {one:{builder:true}};
 const id = n => `10000000-0000-4000-8000-${String(n).padStart(12,'0')}`;
 class FakeApi {

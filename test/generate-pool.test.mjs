@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildPoolPlan } from '../scripts/generate-pool.mjs';
 
-const registry = () => ({companyId:'10000000-0000-4000-8000-000000000001',ownerUserId:'owner',allowMessages:true,pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[
+const registry = () => ({companyId:'10000000-0000-4000-8000-000000000001',ownerUserId:'20000000-0000-4000-8000-000000000002',allowMessages:true,pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[
   {accountKey:'codex-1',prefix:'codex1',provider:'openai',protocol:'responses',harnessProfile:'codex',connectionName:'Codex',pools:{builder:{model:'gpt-6.1-terra'},thinker:{model:'gpt-6.1-sol'}}},
   {accountKey:'claude-1',prefix:'claude1',provider:'anthropic',protocol:'messages',harnessProfile:'acpx',connectionName:'Claude',pools:{builder:{model:'model'}}}
 ]});
@@ -51,9 +51,19 @@ test('policy-backed pool planning computes and applies membership floors', async
   const result = buildPoolPlanFromPolicy(registry(), rows(), {
     arms:[{armId:'terra',model:'gpt-6.1-terra',family:'terra',qFleet:0.3,qFleetThinker:0.3},
       {armId:'sol',model:'gpt-6.1-sol',family:'sol',qFleet:1,qFleetThinker:1},
-      {armId:'weak',model:'model',family:'weak',qFleet:-2,qFleetThinker:-2}],
+      {armId:'weak',model:'model',family:'weak',qFleet:-2,qFleetThinker:-2},
+      ...Array.from({length:5},(_,i)=>({armId:`f${i}`,model:`f${i}`,family:`f${i}`,qFleet:1,qFleetThinker:1}))],
     roles:{minQuality:{doer:0,thinker:0.4}},records:[],nowMs:10000,roleOf:()=> 'doer',familyOf:r=>r.family,
   });
   assert.deepEqual(result.excluded,[{accountKey:'claude-1',poolKey:'builder',reason:'excluded-by-policy'}]);
   assert.equal(result.pools[0].config.members.length,1);
+});
+
+test('policy planner reports gates suspended to keep a pool serving', async () => {
+  const {buildPoolPlanFromPolicy}=await import('../scripts/generate-pool.mjs');
+  const r=registry(); r.pools=[{poolKey:'thinker',role:'thinker'}]; r.accounts=[r.accounts[0]]; r.accounts[0].pools={thinker:{model:'gpt-6.1-sol'}};
+  const arms=Array.from({length:8},(_,i)=>({armId:`arm${i}`,model:i===0?'gpt-6.1-sol':`other${i}`,family:i===0?'sol':`other${i}`,qFleet:0,qFleetThinker:0}));
+  const plan=buildPoolPlanFromPolicy(r,rows(),{arms,records:[],nowMs:1000,roleOf:()=> 'thinker',familyOf:x=>x.family});
+  assert.equal(plan.pools[0].config.members.length,1);
+  assert.ok(plan.policyReports.thinker.roles.thinker.suspendedGates.includes('quality'));
 });

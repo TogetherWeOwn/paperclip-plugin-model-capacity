@@ -21,8 +21,40 @@ test('router config validation rejects malformed identity, matrix, membership an
     c=>{c.router.staleSnapshotMs=0},
     c=>{c.router.allowMessages='true'},
     c=>{c.router.typo=true},
+    c=>{c.router.pools[0].poolKey='x'.repeat(161)},
+    c=>{c.router.accounts[0].connectionName='x'.repeat(161)},
     c=>{c.router.accounts[0].pools.builder.typo=true},
     c=>{c.router.accounts[0].pools.builder.probeEligible=null},
   ];
   for (const mutate of cases) { const c=good(); mutate(c); assert.notDeepEqual(validateConfigShape(c), [], JSON.stringify(c)); }
+});
+
+
+test('schema properties and validator key allowlists stay in parity at each router level', async () => {
+  const {manifest}=await import('../src/manifest.mjs');
+  const schema=manifest.instanceConfigSchema.properties.router;
+  const levels=[
+    [schema.properties,c=>c.router,'router'],
+    [schema.properties.pools.items.properties,c=>c.router.pools[0],'router.pools[]'],
+    [schema.properties.accounts.items.properties,c=>c.router.accounts[0],'router.accounts[]'],
+    [schema.properties.accounts.items.properties.pools.additionalProperties.properties,c=>c.router.accounts[0].pools.builder,'router membership'],
+  ];
+  for (const [properties,get,path] of levels) {
+    for (const key of Object.keys(properties)) {
+      const c=good(); get(c)[key]=undefined;
+      assert.ok(!validateConfigShape(c).includes(`${path}.${key} is not a known key`),`${path}.${key}`);
+    }
+    const c=good(); get(c).notInSchema=true;
+    assert.ok(validateConfigShape(c).includes(`${path}.notInSchema is not a known key`));
+  }
+});
+
+test('validator allowlists equal manifest schema keys in both directions', async () => {
+  const {ROUTER_CONFIG_KEYS}=await import('../src/registry.mjs');
+  const {manifest}=await import('../src/manifest.mjs');
+  const s=manifest.instanceConfigSchema.properties.router;
+  const schemas={router:s.properties,pool:s.properties.pools.items.properties,account:s.properties.accounts.items.properties,membership:s.properties.accounts.items.properties.pools.additionalProperties.properties};
+  for (const [level,properties] of Object.entries(schemas)) {
+    assert.deepEqual([...ROUTER_CONFIG_KEYS[level]].sort(),Object.keys(properties).sort(),level);
+  }
 });

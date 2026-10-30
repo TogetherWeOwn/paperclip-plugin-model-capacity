@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { planGatewayConnections, planSessionAdoption } from '../scripts/gateway-batch.mjs';
 
 const a='10000000-0000-4000-8000-000000000001', b='10000000-0000-4000-8000-000000000002';
-const registry={companyId:a,ownerUserId:'owner',pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[{accountKey:'one',prefix:'one',connectionName:'One',provider:'openai',protocol:'responses',harnessProfile:'codex',pools:{builder:{model:'terra'},thinker:{model:'sol'}}}]};
+const registry={companyId:a,ownerUserId:'20000000-0000-4000-8000-000000000002',pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[{accountKey:'one',prefix:'one',connectionName:'One',provider:'openai',protocol:'responses',harnessProfile:'codex',pools:{builder:{model:'terra'},thinker:{model:'sol'}}}]};
 
 test('gateway plan uses the upstream routing and install wire shape with the union of batch agents',()=>{
  const plan=planGatewayConnections({registry,baseUrl:'https://gateway.example/v1',batch:{builder:[a],thinker:[b,a]}});

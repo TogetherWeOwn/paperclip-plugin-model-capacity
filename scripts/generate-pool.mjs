@@ -7,7 +7,12 @@ import { computePoolQualityVerdicts } from '../src/pool-quality.mjs';
 
 /** Policy-backed planner: derive rather than trust per-membership verdicts. */
 export function buildPoolPlanFromPolicy(raw, connectionRows, evidence) {
-  return buildPoolPlan(raw, connectionRows, computePoolQualityVerdicts(raw, evidence));
+  const reports = [];
+  const verdicts = computePoolQualityVerdicts(raw, {...evidence, onReport: (poolKey, report) => {
+    reports.push([poolKey, report]);
+    evidence?.onReport?.(poolKey, report);
+  }});
+  return {...buildPoolPlan(raw, connectionRows, verdicts), policyReports: Object.fromEntries(reports)};
 }
 
 /** Build validated disabled pool SaveInputs using previously discovered grants.

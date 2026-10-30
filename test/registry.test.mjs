@@ -55,3 +55,16 @@ test('member validation rejects responsible-user bindings and harness mismatches
   assert.throws(() => validatePoolMember(acpx,anthropic),/harness/);
   assert.throws(() => validatePoolMember({...acpx,profile:{...acpx.profile,acpxAgent:'grok'}},anthropic),/harness/);
 });
+
+
+test('registry rejects non-UUID identities and explicit null membership flags', () => {
+  for (const mutate of [r=>r.companyId='bad',r=>r.ownerUserId='bad',r=>r.accounts[0].pools.builder.probeEligible=null]) {
+    const r=fixture(); mutate(r); assert.throws(()=>normalizeRegistry(r));
+  }
+});
+
+test('shared normalization rejects the same schema violations as plugin config', () => {
+  for (const mutate of [r=>r.pools[0].poolKey='x'.repeat(161),r=>r.accounts[0].connectionName='x'.repeat(161),r=>r.accounts[0].feedExempt=null,r=>r.extra=true,r=>r.hardCapWeekly=2]) {
+    const r=fixture(); mutate(r); assert.throws(()=>normalizeRegistry(r));
+  }
+});

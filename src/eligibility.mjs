@@ -340,9 +340,9 @@ function firstServingState({ attempts, tokensFor, manualList, order, serves }) {
  */
 export function buildEligibility({
   arms, records, nowMs, minQuality, outcomeGate, manual, roleOf, familyOf,
-  accountGroups = [], structuralGroups = null, roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
+  qualityArms = arms, accountGroups = [], structuralGroups = null, roleBands, trialRoles, minFleetArms = MIN_FLEET_ARMS,
 }) {
-  const quality = qualityVerdicts(arms, minQuality, { minFleetArms });
+  const quality = qualityVerdicts(qualityArms, minQuality, { minFleetArms });
   const manualByRole = {};
   for (const role of ELIGIBILITY_ROLES) manualByRole[role] = normalizeExcludedFamilies(manual?.[role]);
   // Benchmark skips: the operator's list plus every family with no usable
@@ -473,7 +473,7 @@ export function buildEligibility({
   }
 
   for (const role of ELIGIBILITY_ROLES) {
-    const scored = (arms ?? []).filter(a => armQuality(a, role) != null).length;
+    const scored = (qualityArms ?? []).filter(a => armQuality(a, role) != null).length;
     if (isFiniteNumber(minQuality?.[role]) && scored < minFleetArms) {
       warnings.push({
         code: 'fleet-too-small',

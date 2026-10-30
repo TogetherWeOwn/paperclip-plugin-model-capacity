@@ -4,6 +4,12 @@
 import { createHash } from 'node:crypto';
 
 export const PLUGIN_KEY = 'togetherweown.model-capacity';
+export const ROUTER_CONFIG_KEYS = Object.freeze({
+  router: Object.freeze(['enabled','allowMessages','companyId','ownerUserId','staleSnapshotMs','accountStaleMs','recheckMs','hardCapWeekly','hardCapFiveHour','accounts','pools']),
+  pool: Object.freeze(['poolKey','role']),
+  account: Object.freeze(['accountKey','prefix','provider','protocol','harnessProfile','acpxAgent','connectionName','feedExempt','pools']),
+  membership: Object.freeze(['model','probeEligible']),
+});
 const DNS_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const keyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -33,7 +39,10 @@ export function memberIdFor(poolKey, accountKey) {
 
 export function normalizeRegistry(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid registry');
+  const shapeErrors = routerShapeErrors(raw);
+  if (shapeErrors.length) throw new Error(shapeErrors.join('; '));
   text(raw.companyId, 'companyId'); text(raw.ownerUserId, 'ownerUserId');
+  if (!uuidPattern.test(raw.companyId) || !uuidPattern.test(raw.ownerUserId)) throw new Error('companyId and ownerUserId must be UUIDs');
   if (!Array.isArray(raw.accounts) || !Array.isArray(raw.pools)) throw new Error('accounts and pools must be arrays');
   const roles = new Map(), accountKeys = new Set(), prefixes = new Set(), names = new Set();
   for (const pool of raw.pools) {
@@ -55,7 +64,7 @@ export function normalizeRegistry(raw) {
       if (!roles.has(poolKey) || !membership || typeof membership !== 'object' || Array.isArray(membership)) throw new Error('invalid pool membership');
       const model = text(membership.model, 'model');
       if (model.includes('/') || `${a.prefix}/${model}`.length > 256) throw new Error('model must be unprefixed');
-      if (membership.probeEligible != null && typeof membership.probeEligible !== 'boolean') throw new Error('invalid probeEligible');
+      if (Object.hasOwn(membership, 'probeEligible') && typeof membership.probeEligible !== 'boolean') throw new Error('invalid probeEligible');
       index.push([memberIdFor(poolKey,a.accountKey), {accountKey:a.accountKey,poolKey}]);
       return [poolKey, {...membership, probeEligible: membership.probeEligible ?? false}];
     });
@@ -74,38 +83,46 @@ export function validatePoolMember(member, account) {
   return member;
 }
 
-/** Validate plugin router configuration without changing the deployed hook. */
-export function validateRouterConfig(raw) {
+/** Schema-shaped checks shared by generator and plugin validation. */
+function routerShapeErrors(raw) {
   if (raw === undefined) return [];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['router must be an object'];
   const errors = [];
   const checkKeys = (obj, allowed, path) => {
     for (const k of Object.keys(obj)) if (!allowed.includes(k)) errors.push(`${path}.${k} is not a known key`);
   };
-  checkKeys(raw, ['enabled','allowMessages','companyId','ownerUserId','staleSnapshotMs','accountStaleMs','recheckMs','hardCapWeekly','hardCapFiveHour','accounts','pools'], 'router');
+  checkKeys(raw, ROUTER_CONFIG_KEYS.router, 'router');
   for (const k of ['enabled','allowMessages']) if (k in raw && typeof raw[k] !== 'boolean') errors.push(`router.${k} must be a boolean`);
   for (const k of ['companyId','ownerUserId']) if (typeof raw[k] !== 'string' || !uuidPattern.test(raw[k])) errors.push(`router.${k} must be a UUID`);
   for (const k of ['staleSnapshotMs','accountStaleMs','recheckMs']) if (k in raw && !(Number.isSafeInteger(raw[k]) && raw[k] > 0)) errors.push(`router.${k} must be a positive integer`);
   for (const k of ['hardCapWeekly','hardCapFiveHour']) if (k in raw && !(Number.isFinite(raw[k]) && raw[k] >= 0 && raw[k] <= 1)) errors.push(`router.${k} must be a number in [0, 1]`);
   if (Array.isArray(raw.pools)) for (const pool of raw.pools) {
     if (pool && typeof pool === 'object' && !Array.isArray(pool)) {
-      checkKeys(pool, ['poolKey','role'], 'router.pools[]');
+      checkKeys(pool, ROUTER_CONFIG_KEYS.pool, 'router.pools[]');
       if (typeof pool.poolKey === 'string' && pool.poolKey.length > 160) errors.push('router poolKey exceeds 160 characters');
     }
   }
   if (Array.isArray(raw.accounts)) for (const account of raw.accounts) {
     if (!account || typeof account !== 'object' || Array.isArray(account)) continue;
-    checkKeys(account, ['accountKey','prefix','provider','protocol','harnessProfile','acpxAgent','connectionName','feedExempt','pools'], 'router.accounts[]');
+    checkKeys(account, ROUTER_CONFIG_KEYS.account, 'router.accounts[]');
     if ('acpxAgent' in account && account.acpxAgent !== 'claude') errors.push('router account acpxAgent must be claude');
     if ('feedExempt' in account && typeof account.feedExempt !== 'boolean') errors.push('router account feedExempt must be a boolean');
     if (typeof account.connectionName === 'string' && account.connectionName.length > 160) errors.push('router connectionName exceeds 160 characters');
     if (account.pools && typeof account.pools === 'object' && !Array.isArray(account.pools)) for (const member of Object.values(account.pools)) {
       if (member && typeof member === 'object' && !Array.isArray(member)) {
-        checkKeys(member, ['model','probeEligible'], 'router membership');
+        checkKeys(member, ROUTER_CONFIG_KEYS.membership, 'router membership');
         if ('probeEligible' in member && typeof member.probeEligible !== 'boolean') errors.push('router membership probeEligible must be a boolean');
       }
     }
   }
+  return errors;
+}
+
+/** Validate plugin router configuration without changing the deployed hook. */
+export function validateRouterConfig(raw) {
+  if (raw === undefined) return [];
+  const errors = routerShapeErrors(raw);
+  if (errors.length) return errors;
   try { normalizeRegistry(raw); } catch (error) { errors.push(`router registry: ${error.message}`); }
   return errors;
 }
