@@ -590,3 +590,31 @@ test('F-T30 caller: routing-only reviewer cannot spend held quota; reserve membe
     if (agentId === 'routed') assert.match(answer.reason, /review.reserve/i);
   }
 });
+
+test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account fallback', async () => {
+  for (const mode of ['off', 'shadow']) for (const exhaustion of [false, true]) {
+    const input = windowFixture();
+    input.config.taskRanking.mode = mode;
+    input.config.enforce = true;
+    input.config.exhaustion = { enabled: exhaustion, finalAnswerFromAttempt: 1 };
+    input.states['ledger-v1'] = [1, 2].map(i => ({ ...running(`busy-${i}`), decidedAccount: 'fixture:strong' }));
+    const { live, plugin } = await runTick(input);
+    const weak = live.accounts.find(a => a.accountId === 'fixture:weak');
+    const strong = live.accounts.find(a => a.accountId === 'fixture:strong');
+    assert.ok(live.accountAdmissions.doer['fixture:weak']);
+    // Only the strong account serves the configured review arm. It is ahead
+    // and its pool cap is occupied; the weak account is behind and can serve
+    // only the otherwise-excluded, seated fallback arm at exhaustion.
+    weak.planAhead = -0.1;
+    strong.planAhead = 0.5;
+    weak.targetShare = strong.targetShare = 0;
+    live.paceGuard = { enabled: true, marginPct: .02, meanRunDurationHours: 1, retryAfterMs: 300000 };
+    live.reviewerRouting = { agentIds: ['worker'], arms: [{ provider: 'fixture', model: names[7], effort: 'high' }] };
+    const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: `routed-${mode}-${exhaustion}`,
+      issueId: 'routed-issue', agentId: 'worker', adapterType: 'claude-code' });
+    assert.equal(answer.kind, 'defer', JSON.stringify(answer));
+    assert.match(answer.reason, /pace guard: reviewer lanes held/);
+    if (exhaustion) assert.match(answer.reason, /exhaustion scan:/);
+    else assert.doesNotMatch(answer.reason, /exhaustion scan:/);
+  }
+});
