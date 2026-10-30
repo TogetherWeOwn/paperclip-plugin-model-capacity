@@ -3,7 +3,7 @@
  * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
  * DEFAULT: the default export holds NO `run.model.resolve` capability and no
  * modelRouting; it observes and records only. The enforce-capable variant
- * (`enforceManifest` = `buildManifest({ modelResolve: true })`) is opt-in and
+ * (`enforceManifest` = `buildManifest({ variant: 'transitional' })`) is opt-in and
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
  *
@@ -971,13 +971,15 @@ const CONFIG_SCHEMA = {
 };
 
 /**
- * Build the manifest. Defaults to the shadow-only variant (no resolve
- * capability, no modelRouting). Pass `{ modelResolve: true }` for the
- * enforcement variant: it holds the `run.model.resolve` capability plus the
- * modelRouting envKeys declaration the host requires with it.
+ * Build-time variant, never a runtime setting. The clean manifest is upstream
+ * compatible. Only the dated fork-image transitional artifact declares the
+ * retained run.model.resolve hook and its env allowlist.
  */
-export function buildManifest({ modelResolve = false } = {}) {
+export function buildManifest({ variant = 'clean' } = {}) {
+  if (!['transitional', 'clean'].includes(variant)) throw new Error('invalid manifest variant');
+  const modelResolve = variant === 'transitional';
   const capabilities = [
+    'ai.connections.route',
     'jobs.schedule',
     'plugin.state.read',
     'plugin.state.write',
@@ -1008,15 +1010,16 @@ export function buildManifest({ modelResolve = false } = {}) {
     id: PLUGIN_ID,
     apiVersion: 1,
     version: PLUGIN_VERSION,
-    displayName: modelResolve ? 'Model Capacity' : 'Model Capacity (Shadow)',
+    displayName: modelResolve ? 'Model Capacity (Transitional)' : 'Model Capacity',
     description: modelResolve
-      ? 'Model-capacity routing: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Enforces run models only when the `enforce` config flag is true (default false: hook answers keep).'
-      : 'Shadow model-capacity decisions: paced per-account Pareto ladders from AA quality and CLIProxy burn data. Observes only; it changes no runs and holds no resolve capability.',
+      ? 'fork-image transitional dual-capability build, exit 2026-11-30. Native per-account pool pacing plus the unchanged opt-in fork hook.'
+      : 'Native AI connection pool routing with reset-relative per-account pacing. No fork model-resolution hook.',
+    aiConnectionRouter: { name: 'Model Capacity pool', description: 'Select host-authorized pool members using per-account quota, pacing and role policy.' },
     author: 'TogetherWeOwn',
     categories: ['automation'],
     capabilities,
     entrypoints: { worker: './src/worker.mjs' },
-    instanceConfigSchema: CONFIG_SCHEMA,
+    instanceConfigSchema: modelResolve ? CONFIG_SCHEMA : { ...CONFIG_SCHEMA, properties: Object.fromEntries(Object.entries(CONFIG_SCHEMA.properties).filter(([key]) => key !== 'enforce')) },
     jobs: [
       {
         jobKey: 'aa-refresh',
@@ -1072,15 +1075,14 @@ export function buildManifest({ modelResolve = false } = {}) {
   };
   if (modelResolve) {
     out.capabilities = [...capabilities, 'run.model.resolve'];
-    out.displayName = 'Model Capacity';
     out.modelRouting = { envKeys: [...MODEL_ROUTING_ENV_KEYS] };
   }
   return out;
 }
 
-/** Default (and installed-by-default) manifest: shadow only, no resolve capability. */
+/** Default clean manifest: native router only, no fork hook. */
 export const manifest = buildManifest();
 
-/** Opt-in enforce-capable manifest (runtime-gated by the `enforce: false` default). */
-export const enforceManifest = buildManifest({ modelResolve: true });
+/** Compatibility export for the dated transitional build. */
+export const enforceManifest = buildManifest({ variant: 'transitional' });
 export default manifest;

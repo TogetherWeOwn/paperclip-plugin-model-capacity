@@ -35,7 +35,7 @@ test('lane endpoint pinned to the allowlist in schema', () => {
   );
 });
 
-test('default manifest is shadow-only: no run.model.resolve, no modelRouting', () => {
+test('default clean manifest has no run.model.resolve or modelRouting', () => {
   assert.ok(!manifest.capabilities.includes('run.model.resolve'));
   assert.equal(manifest.modelRouting, undefined);
   assert.deepEqual(manifest, buildManifest({ modelResolve: false }));
@@ -59,7 +59,7 @@ test('opt-in enforceManifest holds run.model.resolve with the exact env keys', (
 });
 
 test('enforce kill switch defaults false in schema', () => {
-  assert.equal(manifest.instanceConfigSchema.properties.enforce.default, false);
+  assert.equal(enforceManifest.instanceConfigSchema.properties.enforce.default, false);
   assert.equal(
     manifest.instanceConfigSchema.properties.contextCaps.properties.autoCompactEnvKey.default,
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
