@@ -3703,6 +3703,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             armId: r.armId,
             family: r.family,
             model: r.model,
+            ...(viewsByAccount ? (() => {
+              const canonical = canonicalModelName(r.model)?.split('/').at(-1).toLowerCase();
+              const identity = viewsByAccount.get(key)?.identities?.[canonical];
+              return { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null };
+            })() : {}),
             Q: r.qFleet ?? null,
             C: r.costEffective ?? r.C ?? null,
             breaker,
@@ -3710,7 +3715,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           if (breaker === 'closed') allowedDominatorKeys.add(`${key}\u0000${r.armId}`);
         }
       }
-      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys });
+      const dominated = crossAccountDominated(fleetArms, qualifiedHeadroom, { allowedKeys: allowedDominatorKeys,
+        ...(viewsByAccount ? { requireSameProductForNewer: true } : {}) });
       const dominatedKeys = new Set(dominated.map(d => `${d.accountId}\u0000${d.armId}`));
       const dupKeys = new Set();
       for (const [key, ladder] of Object.entries(ladders ?? {})) {

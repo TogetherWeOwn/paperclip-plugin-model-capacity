@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.74
+### Added
+- Opt-in account-scoped newest-version filtering with scoped keeps, parser overrides, and auditable supersession views. Disabled by default. Strict Pareto and cross-account dominance remain in force.
+
 ## 0.2.73
 ### Fixed
 - Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.

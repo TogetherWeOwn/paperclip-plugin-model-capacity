@@ -78,3 +78,27 @@ test('enabled accounts with no task candidates still publish empty task exclusio
   for (const role of ['doer', 'thinker', 'other', 'reviewer'])
     assert.deepEqual(ladder.taskRoles[role].excludedArmIds, []);
 });
+
+test('N-T23: kept old model survives tied legacy and task frontiers and readiness rebuild; strict backups revive', async () => {
+  const runCase = async (stronger, unavailable) => {
+    const scores = structuredClone(snapshot);
+    scores.rows[1] = { ...scores.rows[1], ...metrics(stronger ? .8 : .6), intelligenceIndex: stronger ? 60 : 50, intelligenceIndexCostPerTask: 1 };
+    const feed = structuredClone(lane);
+    feed.accounts[0].meter = 'reactive';
+    if (unavailable) feed.accounts[0].credentialAvailability.models.find(row => row.model === models[1]).readyCredentials = 0;
+    return replayTick({ lane: feed, snapshot: scores, states: {}, nowMs, demand: { doer: 1 }, config: {
+      armMap, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
+      roles: { newestVersionOnly: { enabled: true, overrides: { keep: [`model:${models[0]}`] } }, minQuality: { doer: null, thinker: null, other: null } },
+    } });
+  };
+  const tied = (await runCase(false, false)).ladders.ladders['codex:one'];
+  assert.deepEqual(new Set(tied.rankingRungs.map(r => r.armId)), new Set(armMap.map(a => a.aaSlug)));
+  assert.deepEqual(new Set(tied.rungs.map(r => r.armId)), new Set(armMap.map(a => a.aaSlug)));
+  assert.deepEqual(new Set(tied.taskRoles.doer.rankingRungs.map(r => r.armId)), new Set(['gpt-6-luna@high', 'gpt-6-1-luna@high']));
+  const down = (await runCase(false, true)).ladders.ladders['codex:one'];
+  assert.deepEqual(down.rungs.map(r => r.model), [models[0]]);
+  const stronger = (await runCase(true, true)).ladders.ladders['codex:one'];
+  assert.deepEqual(stronger.rankingRungs.map(r => r.armId), [armMap[1].aaSlug]);
+  assert.deepEqual(stronger.rungs.map(r => r.model), [models[0]]);
+  assert.equal(stronger.rungs[0].rung, stronger.rankingRungs[0].rung);
+});

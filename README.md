@@ -19,6 +19,28 @@ sets) and is installed only after security sign-off. Even then the hook is
 gated by the `enforce` config flag (default `false`): with enforcement off
 it answers `keep` and nothing changes.
 
+## Newest version per account (opt-in)
+
+`roles.newestVersionOnly.enabled` defaults to `false`; absent or disabled leaves
+legacy routing unchanged. When enabled, each account's served model list (or
+inferred provider arms when the list is absent) defines its own universe. Older
+versions of the same parsed product line are structurally excluded even when the
+newest version is unscored or unavailable. Models with unknown identities or
+versions fail open. Distinct products, such as Flash and Flash Lite, do not
+supersede one another merely because they share a family.
+
+Overrides under `roles.newestVersionOnly.overrides` allow `keep` entries such as
+`arm:<armId>`, `model:<canonicalModel>`, or `product:<productKey>`; a bare arm
+or model ID is also accepted. An effort-scoped arm keep applies only to that
+representation. `productAliases` maps parsed product keys to a shared key, and
+`parsePins` assigns a `product` and numeric `version` to a model or arm when
+parsing needs correction. Inspect the account view under `/capacity.newestVersion`
+and ladder `supersededArmEvidence` before enabling: evidence includes retained
+keeps, while the published exclusion arrays contain only actual exclusions.
+A keep prevents version removal, not strict Pareto, cross-account dominance,
+quality, readiness, breaker, or manual exclusions. Roll back by disabling the
+flag; no model is automatically upgraded.
+
 ## Reviewer backlog demand (v0.2.69; opt-in, activation gated)
 
 A slot-metered review gate may enqueue only one review at a time even when many

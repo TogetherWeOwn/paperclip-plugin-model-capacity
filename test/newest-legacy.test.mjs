@@ -103,4 +103,8 @@ test('N3: cross-account dominance preserves superseded exclusions in the same la
   assert.deepEqual(l.crossAccountDominated, [names[1]]);
   assert.deepEqual(result.capacity.newestVersion.accounts['fixture:old'].supersededLegacyArmIds, [names[0]]);
   assert.deepEqual(new Set(l.credentialRanking.excludedArmIds), new Set(names.slice(0, 2)));
+  const reverse = structuredClone(twoAccounts);
+  reverse.accounts.reverse();
+  const reversed = await replayTick({ ...base, lane: reverse, snapshot: scores, config: { ...config(true), armMap } });
+  assert.deepEqual(new Set(reversed.ladders.ladders['fixture:old'].credentialRanking.excludedArmIds), new Set(names.slice(0, 2)));
 });
