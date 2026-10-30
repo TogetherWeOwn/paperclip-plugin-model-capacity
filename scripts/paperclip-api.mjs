@@ -61,6 +61,7 @@ export function createPaperclipApi({target,companyId,token,secretRefs={},env=pro
     async savePool({companyId:cid,id:poolId,expectedRevision,config}) {if(cid!==companyId)throw new Error('company mismatch');return request('POST',`${company}/ai-connection-pools`,{pluginKey:PLUGIN_KEY,...(poolId?{id:id(poolId),expectedRevision}:{}),config});},
     async deletePool(poolId,expectedRevision) {return request('DELETE',`${company}/ai-connection-pools/${id(poolId)}`,{expectedRevision});},
     async deleteConnection(connectionId) {return request('DELETE',`/tool-connections/${id(connectionId)}`);},
+    async listAgents(cid) {if(cid!==companyId)throw new Error('company mismatch');return request('GET',`${company}/agents`);},
     async getAgent(agentId) {return request('GET',`/agents/${id(agentId)}`);},
     async listSessions(agentId) {const rows=await request('GET',`/agents/${id(agentId)}/task-sessions`);if(!Array.isArray(rows))throw new Error('invalid session list');return rows.map(({taskKey})=>({taskKey}));},
     async resetSession(agentId,taskKey) {return request('POST',`/agents/${id(agentId)}/runtime-state/reset-session`,{taskKey});},

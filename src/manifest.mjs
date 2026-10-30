@@ -1027,7 +1027,7 @@ export function buildManifest({ variant = 'clean' } = {}) {
   const out = {
     id: PLUGIN_ID,
     apiVersion: 1,
-    version: modelResolve ? `${PLUGIN_VERSION}-transitional` : PLUGIN_VERSION,
+    version: `${PLUGIN_VERSION}-${variant}`,
     displayName: modelResolve ? 'Model Capacity (Transitional)' : 'Model Capacity',
     description: modelResolve
       ? 'fork-image transitional dual-capability build, exit 2026-11-30. Native per-account pool pacing plus the unchanged opt-in fork hook.'

@@ -45,7 +45,7 @@ test('G-1 actual tarballs preserve plugin identity and bake matching manifest/wo
     execFileSync('tar',['-xzf',artifact.tarball,'-C',unpack]);
     const directory=join(unpack,'package'),pkg=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));
     assert.equal(pkg.name,'@togetherweown/paperclip-plugin-model-capacity');
-    assert.equal(pkg.version,artifact.variant==='clean'?'0.3.0':'0.3.0-transitional');
+    assert.equal(pkg.version,`0.3.0-${artifact.variant}`);
     assert.notEqual(pkg.paperclipPlugin.manifest,'./src/manifest.enforce.mjs');
     const module=await import(pathToFileURL(resolve(directory,pkg.paperclipPlugin.manifest)));
     const manifest=module.default;

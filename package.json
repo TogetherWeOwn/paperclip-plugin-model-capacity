@@ -20,7 +20,8 @@
     "scripts/pool-journal.mjs",
     "README.md",
     "LICENSE",
-    "config.example.json"
+    "config.example.json",
+    "scripts/audit-env-pins.mjs"
   ],
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*"
@@ -31,7 +32,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "check:public-pin": "node scripts/check-public-pin.mjs",
-    "build:variants": "node scripts/build-variants.mjs"
+    "build:variants": "node scripts/build-variants.mjs",
+    "audit:env-pins": "node scripts/audit-env-pins.mjs"
   },
   "devDependencies": {
     "ajv": "^8.20.0",

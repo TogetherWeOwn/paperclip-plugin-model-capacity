@@ -8,7 +8,7 @@ import { LANE_BASE_URLS } from '../src/lane-host.mjs';
 test('plugin identity and version', () => {
   assert.equal(manifest.id, PLUGIN_ID);
   assert.equal(PLUGIN_ID, 'togetherweown.model-capacity');
-  assert.equal(manifest.version, '0.3.0');
+  assert.equal(manifest.version, '0.3.0-clean');
   assert.equal(PLUGIN_VERSION, '0.3.0');
 });
 
