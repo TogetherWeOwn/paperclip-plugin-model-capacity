@@ -89,3 +89,35 @@ test('resolver removes only the admitted arm token on a copy and fails closed', 
     assert.equal(none.fallbackAdmission, null);
   }
 });
+
+
+test('X-T02a: superseded weak candidate cannot re-enter the fallback pool', () => {
+  const e = build({ accountCandidates: { weak: [arms[1], arms[2]] }, supersededByAccount: { weak: ['old'] } });
+  assert.equal(e.accountAdmissions.doer.weak.armId, 'new');
+});
+
+test('equal quality candidates select lexical armId regardless of input order', () => {
+  const tied = [{ armId: 'tie-b', family: 'b', qFleet: -0.1 }, { armId: 'tie-a', family: 'a', qFleet: -0.1 }];
+  const e = build({ arms: [...arms, ...tied], accountCandidates: { weak: tied } });
+  assert.equal(e.accountAdmissions.doer.weak.armId, 'tie-a');
+});
+
+test('fallback reports and admission maps are sorted by role and account', () => {
+  const e = build({ accountFallback: { ...cfg, roles: ['other', 'doer'] }, accountCandidates: { 'z-acct': [arms[1]], 'a-acct': [arms[2]] } });
+  assert.deepEqual(e.report.accountFallback.admitted.map(({ role, accountId }) => [role, accountId]), [
+    ['doer', 'a-acct'], ['doer', 'z-acct'], ['other', 'a-acct'], ['other', 'z-acct'],
+  ]);
+  assert.deepEqual(Object.keys(e.accountAdmissions), ['doer', 'other']);
+  assert.deepEqual(Object.keys(e.accountAdmissions.doer), ['a-acct', 'z-acct']);
+});
+
+test('resolver uses doer band for other and the default doer band when missing', () => {
+  const admissions = { other: { weak: { armId: 'old' } }, doer: { weak: { armId: 'old' } } };
+  const resolve = decision.resolveAccountInputs;
+  assert.deepEqual(resolve([], admissions, bands, 'other', 'weak').fallbackAdmission.band, bands.doer);
+  for (const roleBands of [undefined, {}]) {
+    for (const role of ['doer', 'other']) {
+      assert.deepEqual(resolve([], admissions, roleBands, role, 'weak').fallbackAdmission.band, { floorRung: 0, ceilingRung: null });
+    }
+  }
+});

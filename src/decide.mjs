@@ -315,7 +315,7 @@ export function resolveAccountInputs(baseExclusions, admissions, roleBands, role
   }
   return {
     excludedFamilies: baseExclusions.filter(token => token !== armToken(admission.armId)),
-    fallbackAdmission: { armId: admission.armId, band: roleBands?.[role] ?? roleBands?.doer,
+    fallbackAdmission: { armId: admission.armId, band: roleBands?.[role] ?? roleBands?.doer ?? DEFAULT_ROLE_BANDS.doer,
       supersessionView, newestEnabled },
   };
 }

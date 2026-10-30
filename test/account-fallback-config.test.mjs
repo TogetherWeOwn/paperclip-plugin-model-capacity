@@ -32,3 +32,9 @@ test('fallback config schema and example expose default-off settings', async () 
   const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
   assert.deepEqual(resolveConfig(example).roles.accountFallback, { enabled: false, roles: ['doer', 'other'], minQuality: -0.5 });
 });
+
+
+test('duplicate fallback roles normalize to one entry each', () => {
+  const normalized = eligibility.normalizeAccountFallback({ enabled: true, roles: ['other', 'doer', 'other', 'doer'] });
+  assert.deepEqual(normalized.roles, ['other', 'doer']);
+});

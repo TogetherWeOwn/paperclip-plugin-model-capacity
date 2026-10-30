@@ -103,7 +103,7 @@ export function normalizeMinQuality(raw) {
 export function normalizeAccountFallback(raw) {
   return {
     enabled: raw?.enabled === true,
-    roles: Array.isArray(raw?.roles) ? raw.roles.filter(role => role === 'doer' || role === 'other') : ['doer', 'other'],
+    roles: Array.isArray(raw?.roles) ? [...new Set(raw.roles.filter(role => role === 'doer' || role === 'other'))] : ['doer', 'other'],
     minQuality: isFiniteNumber(raw?.minQuality) ? raw.minQuality : -0.5,
   };
 }
@@ -562,11 +562,11 @@ export function buildEligibility({
     accountAdmissions = {};
     const admitted = [];
     if (supported) {
-      for (const role of accountFallback.roles ?? []) {
+      for (const role of [...new Set(accountFallback.roles ?? [])].sort()) {
         if (role !== 'doer' && role !== 'other') continue;
         const entries = [];
         if (!roles[role].suspended) {
-          for (const [accountId, candidates] of Object.entries(accountCandidates)) {
+          for (const [accountId, candidates] of Object.entries(accountCandidates).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
             const superseded = new Set(supersededByAccount?.[accountId] ?? []);
             const survivors = (candidates ?? []).filter(c => !superseded.has(c.armId));
             if (survivors.some(c => quality[role][c.armId]?.ok === true)) continue;

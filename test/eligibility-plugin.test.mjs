@@ -433,3 +433,14 @@ test('fallback reporting does not change routing or ladder serialization', async
   assert.equal(JSON.stringify(await on.ladder()), JSON.stringify(await off.ladder()));
   assert.deepEqual(await on.hook('f2-run', 'eng-doer'), await off.hook('f2-run', 'eng-doer'));
 });
+
+
+test('fallback warning and report reflect newest-version configuration at tick', async () => {
+  for (const enabled of [false, true]) {
+    const d = drive({ config: { roles: { ...ROLES_CFG, accountFallback: { enabled: true }, newestVersionOnly: { enabled } } } });
+    await d.setup(); await d.tick();
+    const report = (await d.capacity()).eligibility;
+    assert.equal(report.accountFallback.newestVersionActive, enabled);
+    assert.equal(report.warnings.filter(w => w.code === 'account-fallback-without-newest-version').length, enabled ? 0 : 1);
+  }
+});
