@@ -1,5 +1,5 @@
 /** Account-scoped structural version comparisons. No routing or I/O lives here. */
-import { canonicalModelName, armsForAccount, taskArmId, EFFORT_ORDER } from './arms.mjs';
+import { canonicalModelName, armsForAccount, taskArmId, taskSlugBases, EFFORT_ORDER } from './arms.mjs';
 import { compareVersions } from './cross-account.mjs';
 
 export const CHANNEL_PRECEDENCE = Object.freeze(['contributor', 'free']);
@@ -139,6 +139,12 @@ export function isSupersededArm(view, armLike) {
     const efforts = [...EFFORT_ORDER.filter(e => e !== 'ultra'), ...(typeof arm.effort === 'string' ? [arm.effort.toLowerCase()] : [])];
     const suffix = efforts.find(e => rawModel.endsWith(`-${e}`));
     if (suffix && rawModel.length > suffix.length + 1) rawModel = rawModel.slice(0, -suffix.length - 1);
+  }
+  // Dotted and channel-decorated model names can share an arm slug. Only
+  // recover a canonical identity when the account's universe identifies it uniquely.
+  if (!model && rawModel && !Object.hasOwn(view.identities ?? {}, rawModel)) {
+    const matches = Object.keys(view.identities ?? {}).filter(key => taskSlugBases(key).includes(rawModel));
+    if (matches.length === 1) rawModel = matches[0];
   }
   let identity = model ? view.identities?.[model] : null;
   if (!model && id) {

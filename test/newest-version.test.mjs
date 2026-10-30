@@ -65,6 +65,7 @@ test('N-T05/T26: keep applies to the named scope, never to sibling efforts', () 
     assert.equal(isSupersededArm(v, high), false, keep);
     assert.equal(isSupersededModel(v, models[0]), false, keep);
     assert.equal(v.verdicts[0].kept, true);
+    assert.deepEqual(v.supersededCanonicalModels, [], keep);
   }
 });
 
@@ -259,6 +260,39 @@ test('N-T26: legacy arm-only effort suffix uses canonical model for keeps, alias
   const armKeep = view(['old-1','old-2'], {keep:['arm:old-1-max']});
   assert.equal(isSupersededArm(armKeep, 'old-1-max'), false);
   assert.equal(isSupersededArm(armKeep, 'old-1-high'), true);
+});
+
+test('N-T26: dotted canonical identities resolve from unique legacy and task slug forms', () => {
+  const models = ['gpt-5.6-terra', 'gpt-6.1-terra'];
+  const forms = ['gpt-5-6-terra-high', {armId:'gpt-5-6-terra-high'}, 'gpt-5-6-terra@high'];
+  for (const keep of ['gpt-5.6-terra', 'model:gpt-5.6-terra']) {
+    const v = view(models, {keep:[keep]});
+    for (const arm of forms) assert.equal(isSupersededArm(v, arm), false, `${keep}: ${JSON.stringify(arm)}`);
+  }
+  const armKeep = view(models, {keep:['arm:gpt-5-6-terra@max']});
+  assert.equal(isSupersededArm(armKeep, 'gpt-5-6-terra@max'), false);
+  assert.equal(isSupersededArm(armKeep, 'gpt-5-6-terra@high'), true);
+  for (const overrides of [{productAliases:{old:'new'}}, {parsePins:{'model:old-1.5':{product:'new',version:[1,5]}}}]) {
+    const v = view(['old-1.5','new-2'], overrides);
+    for (const arm of ['old-1-5-high', 'old-1-5@high']) assert.equal(isSupersededArm(v, arm), true, JSON.stringify(overrides));
+  }
+  const decorated = view(['muse-spark-1.2-contributor', 'muse-spark-1.3-contributor'], {keep:['model:muse-spark-1.2-contributor']});
+  assert.equal(isSupersededArm(decorated, 'muse-spark-1-2@high'), false);
+  assert.equal(isSupersededArm(decorated, 'muse-spark-1-2-high'), false);
+});
+
+test('N-T26: ambiguous slug identities fall back to parsing without applying a model keep', () => {
+  const v = view(['old-1.5', 'old-1-5', 'old-2'], {keep:['model:old-1.5']});
+  assert.equal(isSupersededArm(v, 'old-1-5@high'), true);
+  const ambiguous = view(['old-1.5-free', 'old-1.5-contributor', 'old-2'], {keep:['model:old-1.5-free']});
+  assert.equal(isSupersededArm(ambiguous, 'old-1-5@high'), true);
+});
+
+test('N-T26: aaSlug keep protects the represented arm but not a sibling', () => {
+  const v = view(['old-1', 'old-2'], {keep:['arm:scored-old-high']});
+  assert.equal(isSupersededArm(v, {model:'old-1',armId:'old-1@high',aaSlug:'scored-old-high',effort:'high'}), false);
+  assert.equal(isSupersededArm(v, {model:'old-1',armId:'old-1@max',aaSlug:'scored-old-max',effort:'max'}), true);
+  assert.deepEqual(v.supersededCanonicalModels, ['old-1']);
 });
 
 test('N-T02: ultra is a product word unless explicitly the arm effort', () => {
