@@ -114,7 +114,8 @@ test('fallback reports and admission maps are sorted by role and account', () =>
 test('resolver uses doer band for other and the default doer band when missing', () => {
   const admissions = { other: { weak: { armId: 'old' } }, doer: { weak: { armId: 'old' } } };
   const resolve = decision.resolveAccountInputs;
-  assert.deepEqual(resolve([], admissions, bands, 'other', 'weak').fallbackAdmission.band, bands.doer);
+  const customBands = { doer: { floorRung: 3, ceilingRung: 5 } };
+  assert.deepEqual(resolve([], admissions, customBands, 'other', 'weak').fallbackAdmission.band, customBands.doer);
   for (const roleBands of [undefined, {}]) {
     for (const role of ['doer', 'other']) {
       assert.deepEqual(resolve([], admissions, roleBands, role, 'weak').fallbackAdmission.band, { floorRung: 0, ceilingRung: null });
