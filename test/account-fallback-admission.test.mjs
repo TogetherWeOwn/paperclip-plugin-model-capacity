@@ -111,6 +111,12 @@ test('fallback reports and admission maps are sorted by role and account', () =>
   assert.deepEqual(Object.keys(e.accountAdmissions.doer), ['a-acct', 'z-acct']);
 });
 
+test('resolver uses the thinker band for a thinker admission', () => {
+  const admissions = { thinker: { weak: { armId: 'old' } } };
+  const roleBands = { doer: { floorRung: 1, ceilingRung: 2 }, thinker: { floorRung: 3, ceilingRung: 5 } };
+  assert.deepEqual(decision.resolveAccountInputs([], admissions, roleBands, 'thinker', 'weak').fallbackAdmission.band, roleBands.thinker);
+});
+
 test('resolver uses doer band for other and the default doer band when missing', () => {
   const admissions = { other: { weak: { armId: 'old' } }, doer: { weak: { armId: 'old' } } };
   const resolve = decision.resolveAccountInputs;
