@@ -25,7 +25,19 @@
       }
     ],
     "pools": [
-      { "poolKey": "builder", "role": "doer" },
+      {
+        "poolKey": "builder", "role": "doer",
+        "poolId": "00000000-0000-4000-8000-000000000010",
+        "pluginKey": "togetherweown.model-capacity",
+        "expectedRevision": 7,
+        "expectedMemberOrder": ["b5d8cdb2-c50c-51e1-a15d-151634e25857"],
+        "members": [{
+          "memberId": "b5d8cdb2-c50c-51e1-a15d-151634e25857",
+          "accountKey": "codex-example",
+          "connectionId": "00000000-0000-4000-8000-000000000011",
+          "grantId": "00000000-0000-4000-8000-000000000012"
+        }]
+      },
       { "poolKey": "thinker", "role": "thinker" },
       { "poolKey": "reviewer", "role": "reviewer" }
     ]

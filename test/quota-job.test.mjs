@@ -6,13 +6,17 @@ import { NativeApi, options, scratch, companyId } from './support/native-api.mjs
 import { applyPoolSaga } from '../scripts/pool-saga.mjs';
 import { config, quotaFeed, stateHarness, NOW, MINUTE } from './support/quota.mjs';
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH } from '../src/cliproxy.mjs';
+import { verifiedConfig } from './support/verified-pools.mjs';
+import { routeDecision } from '../src/router.mjs';
+import { syntheticRouterRequest } from '../src/quota-refresh.mjs';
+import { normalizeRegistry } from '../src/registry.mjs';
 
-async function start(t,{router=true,configure=true,withInspector=true,withPools=true}={}) {
+async function start(t,{router=true,configure=true,withInspector=true,withPools=true,initialConfig}={}) {
   const host=new NativeApi();
   if(withPools)await applyPoolSaga({...options(host),activate:false,journalPath:await scratch(t)});
   host.writes=[];
   const harness=stateHarness(),jobs=new Map(),events=new Map(),requests=[];let now=NOW,body=quotaFeed(),status=200,block=null;
-  const cfg=config();if(!router)delete cfg.router;
+  const cfg=initialConfig??config();if(!router)delete cfg.router;
   const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false,
     ...(withInspector?{inspectPools:async()=>({...options(host),expectedEnabled:false})}:{}),
   });
@@ -174,4 +178,102 @@ test('omitting router.enabled never silently enables the native callback policy'
   const request=syntheticRouterRequest(normalizeRegistry(s.cfg.router),'builder',NOW);
   const result=routeDecision(request,snapshot,resolveConfig(s.cfg));
   assert.equal(result.kind,'exhausted');assert.ok(Object.values(result.skipped).every(reason=>reason==='router-disabled'));
+});
+
+const attestation=p=>{const {role,...fields}=p;return fields;};
+function attestedRequest(cfg) {
+  const p=cfg.router.pools[0],request=syntheticRouterRequest(normalizeRegistry(cfg.router),'builder',NOW);
+  request.pool.id=p.poolId;request.pool.revision=p.expectedRevision;
+  request.memberOrder=[...p.expectedMemberOrder];
+  for(const {member} of request.candidates) {
+    const {connectionId,grantId}=p.members.find(m=>m.memberId===member.id);
+    Object.assign(member.binding,{connectionId,grantId});
+  }
+  return request;
+}
+async function startAttested(t) {
+  const cfg=verifiedConfig();cfg.router.enabled=true;
+  const s=await start(t,{initialConfig:cfg,withInspector:false,withPools:false});await s.tick();
+  return s;
+}
+const published=s=>s.store.get(JSON.stringify(s.keyFor(companyId))).snapshot;
+const echoed=async s=>(await s.capacity()).body.nativeRouter.verifiedPools;
+const revoke=s=>{s.cfg.router.pools[0]={poolKey:'builder',role:'doer'};};
+function revise(s) {
+  const p=s.cfg.router.pools[0];p.expectedRevision=8;p.expectedMemberOrder.reverse();
+  for(const [i,m] of p.members.entries()) {
+    m.connectionId=`50000000-0000-4000-8000-00000000000${i+3}`;
+    m.grantId=`60000000-0000-4000-8000-00000000000${i+3}`;
+  }
+}
+
+test('A2 verifiedPools echoes only the current frozen company fence, never quota status or caller-owned config',async t=>{
+  const s=await startAttested(t),expected=attestation(s.cfg.router.pools[0]);
+  assert.deepEqual(await echoed(s),[expected]);
+  assert.deepEqual(s.plugin.getRouterConfig(companyId).router.pools[0],s.cfg.router.pools[0]);
+  const pools=s.plugin.getRouterConfig(companyId).router.pools;
+  assert.ok(Object.isFrozen(pools)&&Object.isFrozen(pools[0])&&Object.isFrozen(pools[0].members[0]));
+  assert.deepEqual(s.plugin.getRouterConfig('another-company').router.pools,[]);
+  const old=structuredClone(expected);s.cfg.router.pools[0].expectedRevision=8;
+  assert.deepEqual(await echoed(s),[old],'mutating persisted config is not a delivered configChanged');
+});
+
+test('A2 removal closes the next call while fetch is blocked and old quota remains fresh',async t=>{
+  const s=await startAttested(t),snapshot=published(s),request=attestedRequest(s.cfg);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'selected');
+  let release;s.blockOn(new Promise(r=>{release=r;}));t.after(()=>release());
+  revoke(s);await s.plugin.onConfigChanged(s.cfg,{companyId});await new Promise(setImmediate);
+  assert.deepEqual(await echoed(s),[]);
+  assert.equal(published(s),snapshot,'no refresh completed');
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'unavailable');
+  release();await s.tick();assert.deepEqual(await echoed(s),[]);
+});
+
+test('A2 removal remains effective when the config-triggered quota fetch fails',async t=>{
+  const s=await startAttested(t),snapshot=published(s),request=attestedRequest(s.cfg);
+  s.setStatus(503);revoke(s);await s.plugin.onConfigChanged(s.cfg,{companyId});
+  assert.deepEqual(await echoed(s),[]);
+  await assert.rejects(s.tick());
+  assert.equal(published(s),snapshot);assert.deepEqual(await echoed(s),[]);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'unavailable');
+});
+
+test('A2 relationally invalid delivered config clears attestation before rejection and no later tick resurrects it',async t=>{
+  const s=await startAttested(t),snapshot=published(s),request=attestedRequest(s.cfg);
+  s.cfg.router.pools[0].members[0].accountKey='not-in-registry';
+  assert.equal((await s.plugin.onValidateConfig(s.cfg)).ok,false,'native config/test can reject before save');
+  await assert.rejects(s.plugin.onConfigChanged(s.cfg,{companyId}),/invalid-config/);
+  assert.deepEqual(await echoed(s),[]);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'unavailable');
+  await assert.rejects(s.tick());
+  assert.deepEqual(await echoed(s),[]);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'unavailable');
+  assert.equal((await s.capacity()).body.nativeRouter.lastFailure,'router-registry-invalid');
+});
+
+test('A2 same-poolKey revision update echoes NEW order and bindings before its quota refresh completes',async t=>{
+  const s=await startAttested(t),snapshot=published(s);
+  let release;s.blockOn(new Promise(r=>{release=r;}));t.after(()=>release());
+  revise(s);const expected=structuredClone(attestation(s.cfg.router.pools[0]));
+  await s.plugin.onConfigChanged(s.cfg,{companyId});await new Promise(setImmediate);
+  assert.deepEqual(await echoed(s),[expected]);assert.equal(published(s),snapshot);
+  const request=attestedRequest(s.cfg);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'selected');
+  release();await s.tick();assert.deepEqual(await echoed(s),[expected]);
+});
+
+test('A2 persisted-but-undelivered edit stays at echoed revision 7 across ticks; native re-delivery opens revision 8',async t=>{
+  const s=await startAttested(t),old=structuredClone(attestation(s.cfg.router.pools[0]));
+  revise(s);const expected=structuredClone(attestation(s.cfg.router.pools[0])),request=attestedRequest(s.cfg);
+  // ctx.config now returns revision 8, but configChanged delivery failed. A
+  // normal tick overwrites lastConfig: it MUST NOT overwrite the fence.
+  await s.tick();const snapshot=published(s);
+  assert.deepEqual(await echoed(s),[old]);assert.notDeepEqual(await echoed(s),[expected]);
+  assert.equal((await echoed(s))[0].poolKey,expected.poolKey,'presence alone cannot confirm an edit');
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'unavailable');
+  // Re-save or startup replay uses this same native lifecycle method.
+  await s.plugin.onConfigChanged(s.cfg,{companyId});
+  assert.deepEqual(await echoed(s),[expected]);
+  assert.equal(routeDecision(request,snapshot,s.plugin.getRouterConfig(companyId)).kind,'selected');
+  await s.tick();
 });

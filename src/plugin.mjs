@@ -23,7 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { validateRouterConfig } from './registry.mjs';
+import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
 import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
 import {
   DEFAULT_BASE_URL,
@@ -1179,6 +1179,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   // Config lifecycle owns this fence; a stale tick cannot re-enable a mode
   // after an operator changed it while the tick was awaiting telemetry.
   const taskRankingModes = new Map();
+  // Only onConfigChanged writes this fence. Ticks read unvalidated persisted
+  // config and may update lastConfig, but can never attest/reopen native pools.
+  const noAttestedPools = Object.freeze([]);
+  const attestedPools = new Map();
   const freeLaneConfigs = new Map(); // lifecycle fence; a stale tick cannot re-enable free routing
   const freeLaneUsage = new Map(); // company -> UTC-day request reservations, tick-persisted
   const taskModeCompatible = (live, companyId) => !taskRankingModes.has(companyId)
@@ -6030,6 +6034,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   return {
     multiCompanyConfig: true,
 
+    // Slice 4 must call this synchronously at decision time, never retain a
+    // tick's config as the authority for operator-verified pool metadata.
+    getRouterConfig(companyId) {
+      const config = lastConfig.get(companyId) ?? {};
+      return {...config,router:{...config.router,pools:attestedPools.get(companyId) ?? noAttestedPools}};
+    },
+
     async setup(context) {
       ctx = context;
       quotaRefresh = createQuotaRefresh({state:ctx.state,logger:ctx.logger,clock,inspectPools,
@@ -6158,6 +6169,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (typeof companyId !== 'string' || companyId.length === 0) throw new Error('company-context-required');
       const errors = validateConfigShape(raw);
       if (errors.length > 0) {
+        attestedPools.set(companyId, noAttestedPools);
         ctx.logger.error('model-capacity: config rejected', { companyId, errors });
         throw new Error('invalid-config');
       }
@@ -6175,6 +6187,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       freeLaneConfigs.set(companyId, config.freeLanes);
       // Enforcement switches retain their established immediate-disable /
       // next-compatible-tick-enable semantics, independent of policy identity.
+      attestedPools.set(companyId, config.router
+        ? Object.freeze(normalizeRegistry(config.router).pools.filter(p=>p.poolId)) : noAttestedPools);
       lastConfig.set(companyId, config);
       if (raw?.enforce === true) enforceCompanies.add(companyId);
       else enforceCompanies.delete(companyId);
@@ -6227,7 +6241,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (!configured.has(companyId)) return { status: 404, body: { error: 'company-not-configured' } };
       if (input.routeKey === 'capacity') {
         const body = (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null };
-        return { status: 200, body: lastConfig.get(companyId)?.router ? {...body,nativeRouter:quotaRefresh.status(companyId)} : body };
+        const verifiedPools = (attestedPools.get(companyId) ?? noAttestedPools).map(
+          ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}) =>
+            ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}));
+        return { status: 200, body: lastConfig.get(companyId)?.router
+          ? {...body,nativeRouter:{...quotaRefresh.status(companyId),verifiedPools}} : body };
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:

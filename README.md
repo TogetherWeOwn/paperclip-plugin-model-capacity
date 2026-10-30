@@ -31,33 +31,72 @@ missing non-exempt accounts produce warnings and `staleMemberIds`. An exemption
 suppresses only the join warning, never inventing a meter. Snapshot age remains
 independent of account observation age.
 
-**A1 runtime inspection is not implemented in the production worker; slice 3
-is not activation-ready.** There are two independent contract gaps:
+**A2: operator verification plus a per-call tripwire, not worker inspection.**
+Upstream `packages/plugins/sdk/src/types.ts:2205-2313` exposes no native AI pool
+inspection client. Full drift/ownership inspection therefore stays in the
+read-only generator `--check`, with operator board auth; the plugin never
+receives that token or generator batch. The default quota job publishes quota
+only, with `inspection: "operator-check"`, no attestation or drift overlay in
+its snapshot, and no fabricated `pool-inspection-unavailable` error. The injected
+`inspectPools` branch remains a test/operator seam for exercising the real
+`checkPoolDrift` library; it is not supplied by the production worker.
 
-- `packages/plugins/sdk/src/types.ts` in the upstream contract tree exposes no
-  pool/connection/grant/install inspection client; `scripts/pool-saga.mjs`'s
-  `checkPoolDrift` also requires a board-owner identity. Adding a pool list alone
-  would not supply its other reads or authorize them.
-- The injected `inspectPools({companyId, registry, config})` test/operator seam
-  returns generator options: `api`, `batch`, `baseUrl`, `qualityVerdicts`, and
-  `expectedEnabled`. `batch` comes from an operator migration file (and is
-  deliberately not plugin config per §7-I); the target gateway URL, planner
-  verdicts, and per-pool expected activation state are also operator inputs.
-  The worker has no producer or defined runtime source for this context. The
-  tests supply it explicitly from their generator fixture; that is not SDK or
-  production integration proof.
+Each `router.pools[]` entry may carry all five verified fields together:
+`poolId`, `pluginKey`, `expectedRevision`, `expectedMemberOrder`, and
+`members[{memberId,accountKey,connectionId,grantId}]`. These assert only what a
+clean operator `--check` verified at write time. They are not an inventory or
+live truth. Entries without those fields remain valid for M1 shadow, but never
+authorize a real call. The example config shows one fictitious verified pool
+and two unverified pools; replace the example identifiers with verified reads.
+Both manifests schema-validate types, UUIDs, unknown keys, and all-or-none
+fields. Worker validation additionally checks registry membership, deterministic
+member IDs, matching member sets, and unique pool/binding IDs.
 
-Given that externally supplied context, the coordinator consumes the real
-read-only drift checker each tick, marks drifted members `unmapped-member`, and
-logs wrong plugin ownership at ERROR before making that pool unavailable. The
-production worker supplies **no** adapter: it reports
-`pool-inspection-unavailable` and fails every native pool closed. It cannot
-claim per-tick native inspection or the native V0 startup ownership check.
-No board token, loopback HTTP, direct DB, host automation, or new config fields
-work around these gaps. Activation needs an upstream-native inspection surface
-**and** an approved runtime input contract, or a spec-owner amendment assigning
-runtime drift/ownership inspection to the existing R9 operator `--check` path.
-Neither is supplied by this branch.
+`routeDecision` compares the CURRENT validated config entry with the host call's
+pool UUID, plugin key, revision, FULL `memberOrder`, and each candidate's binding
+IDs. Host `pool.members` is candidate-narrowed, including for pins, so it is not
+compared to the full order (upstream `server/src/services/ai-connection-router.ts:263`).
+Any mismatch returns `unavailable`, including for pinned runs; diagnostics name
+the tripwire and pool/revisions, never connection/grant IDs. Snapshot contents
+cannot attest a pool. The company-scoped frozen fence moves synchronously ONLY
+on `onConfigChanged`, before a refresh starts, and clears even on a rejected
+notification. The slice-4 callback adapter MUST obtain config through
+`plugin.getRouterConfig(companyId)` at call time, not reuse a tick's config.
+This branch still does not register that adapter or its capability.
+
+Operator sequence (no deployment is authorized by this documentation):
+
+1. Generator `--apply`, then a CLEAN `--check`; copy the verified live pool read
+   and binding IDs into ordinary plugin config (account keys from memberIndex).
+2. POST `/api/plugins/:pluginId/config/test` with `{companyId,configJson}` and
+   require `{valid:true}`. `valid:false` or `supported:false` means do not save.
+3. POST `/api/plugins/:pluginId/config` with the same body, then CONFIRM through
+   `/capacity.nativeRouter.verifiedPools`: the entry must deep-equal ALL saved
+   verified fields plus poolKey, not merely be present by poolKey. This read-time
+   echo comes ONLY from the effective fence, never persisted config or quota state.
+   It contains IDs only, not credentials. For removal, confirm no entry for that
+   poolKey. Routing then uses this fence immediately, subject to a fresh quota snapshot.
+
+The save endpoint schema-validates but PERSISTS BEFORE notifying the worker;
+notification errors are non-fatal (`server/src/routes/plugins.ts:2402-2476`).
+Relational validation before save exists ONLY at `/config/test` (:2541-2559).
+A successful save is therefore not proof of delivery. If a revision-8 edit still
+echoes revision 7, the old state remains effective; a revision-8 call fails closed.
+Re-POST the same config or restart the plugin worker to re-deliver it, then
+re-confirm deep equality (startup replays configChanged in
+`server/src/services/plugin-loader.ts:2370-2392`). Never infer delivery from GET config.
+
+Run `--check` before and after every migration checkpoint and Paperclip/plugin
+upgrade, plus weekly through the existing native routine-assigned agent task,
+never a host timer. A failed check requires removing that pool's verified fields
+through the same test/save/confirm sequence, fixing drift, then re-verifying and
+reposting. Any pool save bumps its revision and self-closes routing until the
+new revision is attested. Between operator checks this design DOES NOT detect
+grant/install status changes, connection edits without pool saves, selectable
+verdict changes, foreign pools outside config, or a wrong but self-consistent
+operator attestation. Host authorization still narrows candidates. A persisted
+edit whose notification failed leaves the echoed OLD fence effective. These
+weaker between-check guarantees are explicit, not a claim of live inspection.
 
 For unbound pools, the job runs synthetic requests through the same pure
 `routeDecision` with `router.enabled` overridden to `true`. This is a registry
@@ -66,12 +105,15 @@ selectable. It uses the current tick's immutable quota view **before** the nativ
 inspection/drift overlay: M1 must record account selections or quota exhaustion
 before native pools are created at M3, including in the worker without an
 inspector. Quota freshness, missing feed members, and credential evidence still
-apply. The published real-routing snapshot retains every inspection/drift gate;
+apply. Only the job's local synthetic call explicitly bypasses the attestation
+tripwire via a JS-only option; neither config nor host payload can enable it.
+The test/operator inspector seam retains its real-routing drift overlay;
 shadow never authorizes a run or changes the real master switch. Both the
 snapshot and bounded shadow records commit in the same persist-before-publish
 envelope exposed through `/capacity.nativeRouter`. Known bound pools are excluded
-from synthetic shadow. If any live router binding cannot be mapped to an
-inspected pool ID, the job conservatively suppresses **all** synthetic records
+from synthetic shadow, mapped through verified tick config in production or the
+inspected pool list on the seam. If any live router binding cannot be mapped to a
+known pool ID, the job conservatively suppresses **all** synthetic records
 for that tick, publishes `shadowSuppressedReason: "pool-bindings-unmapped"`, and
 emits a rate-limited warning. It does not guess pool names from UUIDs or claim
 those missing records as M1 shadow evidence; quota publication still proceeds.
@@ -1816,9 +1858,10 @@ provenance. Tests parse every emitted mutation body with upstream Zod schemas:
 connection create/PATCH, pool save/DELETE, installs PUT, agent PATCH (including
 rollback restoration), reset-session and wake. Bodyless connection DELETE is
 also checked. The CLI test server rejects unverified mutation routes. Run `npm ci --ignore-scripts --legacy-peer-deps` then
-`npm test`; the runtime CLI has no Zod dependency. Per amendment A1, runtime quota
-job enforcement / U14 remains slice 3 and runtime effort-floor enforcement remains
-slice 4. U15 is now delivered in `test/lane-denylist.test.mjs`: the existing
+`npm test`; the runtime CLI has no Zod dependency. Slice 3 supplies the quota
+job / U14; amendment A2 assigns full drift inspection to operator `--check` and
+adds the effective config fence and per-call tripwire above. Runtime effort-floor
+enforcement and callback registration remain slice 4. U15 is now delivered in `test/lane-denylist.test.mjs`: the existing
 lane request builder enforces the pinned origin and exact accounts path even
 before config normalization. It cannot emit a direct queue/RESP request.
 

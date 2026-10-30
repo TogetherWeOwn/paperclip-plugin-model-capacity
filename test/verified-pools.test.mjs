@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 import { manifest, enforceManifest } from '../src/manifest.mjs';
-import { normalizeRegistry, memberIdFor, PLUGIN_KEY } from '../src/registry.mjs';
+import { normalizeRegistry, memberIdFor } from '../src/registry.mjs';
 import { validateConfigShape } from '../src/plugin.mjs';
 import { config } from './support/quota.mjs';
 
@@ -70,4 +70,13 @@ test('normalized verified entries are copied and frozen, without freezing caller
   for(const v of [p,p.members,p.members[0],p.expectedMemberOrder])assert.ok(Object.isFrozen(v));
   c.router.pools[0].members[0].connectionId='changed';
   assert.notEqual(p.members[0].connectionId,'changed');
+});
+
+test('example router has one shape-valid, registry-consistent fictitious attestation and unverified peers',async()=>{
+  const {readFile}=await import('node:fs/promises');
+  const c=JSON.parse(await readFile(new URL('../config.example.json',import.meta.url),'utf8'));
+  assert.deepEqual(validateConfigShape({router:c.router}),[]);
+  const pools=normalizeRegistry(c.router).pools;
+  assert.equal(pools.filter(p=>p.poolId).length,1);
+  assert.ok(pools.some(p=>!p.poolId));
 });
