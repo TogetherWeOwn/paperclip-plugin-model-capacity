@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Install pinned test dependencies
+        run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Run unit tests
         run: node --test test/*.test.mjs
       - name: Committed lane host pin is the placeholder

@@ -5,6 +5,7 @@
  * No imaginary grant-creation route and no reconnect with altered routing.
  */
 import { PLUGIN_KEY } from '../src/registry.mjs';
+import { equal, reversibleBinding } from './generator-safety.mjs';
 const uuid=id=>typeof id==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 function id(value) {if(!uuid(value))throw new Error('invalid host object ID');return value;}
 export function createPaperclipApi({target,companyId,token,secretRefs={},env=process.env,fetchImpl=globalThis.fetch}) {
@@ -63,12 +64,17 @@ export function createPaperclipApi({target,companyId,token,secretRefs={},env=pro
     async getAgent(agentId) {return request('GET',`/agents/${id(agentId)}`);},
     async listSessions(agentId) {const rows=await request('GET',`/agents/${id(agentId)}/task-sessions`);if(!Array.isArray(rows))throw new Error('invalid session list');return rows.map(({taskKey})=>({taskKey}));},
     async resetSession(agentId,taskKey) {return request('POST',`/agents/${id(agentId)}/runtime-state/reset-session`,{taskKey});},
-    async bindAgent(agentId,binding) {
+    async bindAgent(agentId,binding,expectedBinding) {
+      if(!reversibleBinding(binding))throw new Error('no reversible native binding update for an absent binding');
       const a=await request('GET',`/agents/${id(agentId)}`);
       if(a.companyId!==companyId)throw new Error('agent company mismatch');
-      const runtimeConfig={...a.runtimeConfig};
-      if(binding===null)delete runtimeConfig.aiConnection;else runtimeConfig.aiConnection=binding;
-      return request('PATCH',`/agents/${id(agentId)}`,{runtimeConfig});
+      if(expectedBinding!==undefined && !equal(a.runtimeConfig?.aiConnection??null,expectedBinding))throw new Error('agent binding changed before write');
+      if(typeof a.configurationRevision!=='string' || !/^[a-f0-9]{64}$/.test(a.configurationRevision))throw new Error('agent configuration revision required');
+      const runtimeConfig={...a.runtimeConfig,aiConnection:binding};
+      await request('PATCH',`/agents/${id(agentId)}`,{runtimeConfig,expectedConfigurationRevision:a.configurationRevision});
+      const saved=await request('GET',`/agents/${id(agentId)}`);
+      if(!equal(saved.runtimeConfig?.aiConnection,binding))throw new Error('host did not retain requested binding');
+      return {ok:true};
     },
     async wakeAgent(agentId,input) {return request('POST',`/agents/${id(agentId)}/wakeup`,input);},
   };

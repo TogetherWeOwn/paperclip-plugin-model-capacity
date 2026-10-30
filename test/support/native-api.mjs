@@ -5,6 +5,7 @@ import { join } from 'node:path';
 export const companyId='10000000-0000-4000-8000-000000000001';
 export const ownerUserId='20000000-0000-4000-8000-000000000002';
 export const agentId='30000000-0000-4000-8000-000000000003';
+export const originalBinding={mode:'responsible_user',provider:'openai'};
 export const secondAgent='30000000-0000-4000-8000-000000000004';
 export const registry={companyId,ownerUserId,allowMessages:true,pools:[{poolKey:'builder',role:'doer'},{poolKey:'thinker',role:'thinker'}],accounts:[
   {accountKey:'one',prefix:'one',connectionName:'One',provider:'openai',protocol:'responses',harnessProfile:'codex',pools:{builder:{model:'terra'},thinker:{model:'sol'}}},
@@ -22,7 +23,7 @@ const uuid=()=>`40000000-0000-4000-8000-${String(++next).padStart(12,'0')}`;
 // are replaced, and pool saves use optimistic revisions. No invented grant API.
 export class NativeApi {
   connections=[]; pools=[]; writes=[]; reads=[]; agents=new Map(); sessions=new Map(); fail; afterWrite;
-  constructor() { for(const id of [agentId,secondAgent]) { this.agents.set(id,{id,companyId,adapterType:'paperclip_runner',runtimeConfig:{unrelated:true}}); this.sessions.set(id,[]); } }
+  constructor() { for(const id of [agentId,secondAgent]) { this.agents.set(id,{id,companyId,adapterType:'paperclip_runner',status:'idle',configurationRevision:'a'.repeat(64),runtimeConfig:{unrelated:true,aiConnection:copy(originalBinding)}}); this.sessions.set(id,[]); } }
   async mutate(type,action,input) { this.writes.push({type,input:copy(input)}); if(this.fail?.(type,input)) throw new Error('PRIVATE_API_ERROR'); const result=action(); await this.afterWrite?.(type,input,result); return copy(result); }
   async listConnections() { this.reads.push('connections'); return {currentUserId:ownerUserId,canManageConnections:true,connections:this.connections.filter(c=>c.enabled && c.status!=='archived').map(c=>({id:c.id,grantId:c.grantId,companyId,name:c.name,provider:c.provider,method:'api_key',ownership:'shared',status:'connected',routing:c.routing}))}; }
   async getConnection(id) { this.reads.push('detail'); return copy(this.connections.find(c=>c.id===id)??null); }

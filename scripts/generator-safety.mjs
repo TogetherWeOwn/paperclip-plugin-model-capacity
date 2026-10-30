@@ -10,6 +10,14 @@ export const installsFor=(input,companyId)=>input.allAgents?[{targetType:'compan
 export const orderedInstalls=xs=>xs.map(({targetType,targetId})=>({targetType,targetId})).sort((a,b)=>`${a.targetType}:${a.targetId}`.localeCompare(`${b.targetType}:${b.targetId}`));
 export const poolConfig=p=>({name:p.name,enabled:p.enabled,mode:p.mode,thresholdPercent:p.thresholdPercent,members:p.members});
 export const connectionShape=c=>({name:c.name,enabled:c.enabled});
+export function reversibleBinding(b) {
+  const uuid=value=>typeof value==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  if(!b || typeof b!=='object' || Array.isArray(b))return false;
+  if(b.mode==='router')return uuid(b.connectionId) && Object.keys(b).every(k=>['mode','connectionId'].includes(k));
+  if(!['openai','anthropic','openrouter','xai','github','google'].includes(b.provider))return false;
+  if(b.mode==='responsible_user')return Object.keys(b).every(k=>['mode','provider'].includes(k));
+  return ['shared','delegated'].includes(b.mode) && ['api_key','subscription'].includes(b.method) && uuid(b.connectionId) && uuid(b.grantId) && Object.keys(b).every(k=>['mode','provider','method','connectionId','grantId'].includes(k));
+}
 export function batchAgents(batch) {
   const assignments=new Map();
   for(const [poolKey,ids] of Object.entries(batch)) for(const id of ids) {

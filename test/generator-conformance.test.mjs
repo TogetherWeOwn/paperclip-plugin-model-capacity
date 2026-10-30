@@ -15,6 +15,7 @@ test('U18 generator requests conform to upstream Zod schemas, including boundary
   const plan=await planPoolSaga(options(new NativeApi()));
   const sent=[];
   const api=generator.createPaperclipApi({target:'https://paperclip.example',companyId,token:'BOARD_DUMMY',secretRefs:{one:{env:'LANE_ONE'},two:{env:'LANE_TWO'}},env:{LANE_ONE:'DUMMY_ONE',LANE_TWO:'DUMMY_TWO'},fetchImpl:async(url,init)=>{
+    if(init.method==='GET' && url.endsWith('/grants'))return Response.json({grants:[]});
     const body=JSON.parse(init.body);sent.push({url,body,init});
     if(url.endsWith('/ai-connections'))createAiConnectionSchema.parse(body);
     else saveBody.parse(body);

@@ -6,7 +6,7 @@
 import { normalizeRegistry, memberIdFor, PLUGIN_KEY } from '../src/registry.mjs';
 import { buildPoolPlan } from './pool-plan.mjs';
 import { planGatewayConnections } from './gateway-batch.mjs';
-import { batchAgents, selectableVerdict, sessionEvidence, issueIdForTaskKey, poolConfig, equal, installsFor, orderedInstalls, connectionShape } from './generator-safety.mjs';
+import { batchAgents, selectableVerdict, sessionEvidence, issueIdForTaskKey, poolConfig, equal, installsFor, orderedInstalls, connectionShape, reversibleBinding } from './generator-safety.mjs';
 import { newJournal, temporaryName, rollbackJournal } from './pool-journal.mjs';
 
 async function discover(options) {
@@ -30,8 +30,8 @@ async function discover(options) {
     if(row) {
       entry.detail=await api.getConnection(row.id);
       const grants=await api.getGrants(row.id);
-      const matches=grants.grants.filter(g=>g.kind==='organization' && g.id===row.grantId);
-      if(matches.length!==1) throw new Error(`missing or ambiguous shared grant: ${account.accountKey}`);
+      const matches=grants.grants.filter(g=>g.kind==='organization');
+      if(matches.length!==1 || matches[0].id!==row.grantId) throw new Error(`missing or ambiguous shared grant: ${account.accountKey}`);
       entry.grant=matches[0];entry.installs=await api.getInstalls(row.id);
       if(!Array.isArray(entry.installs) || !entry.detail || entry.detail.companyId!==registry.companyId || entry.detail.createdByUserId!==registry.ownerUserId || entry.grant.createdByUserId!==registry.ownerUserId || row.ownership!=='shared' || row.provider!==account.provider || row.method!=='api_key') throw new Error(`connection ownership or provider mismatch: ${account.accountKey}`);
     } else entry.installs=[];
@@ -71,6 +71,7 @@ export async function planPoolSaga(options) {
   const state=await discover(options),plan=planFor(state,options.qualityVerdicts);
   const sessions=await sessionEvidence(options.api,[...state.assignments.keys()],options.sessionPlans);
   const errors=[];
+  if(options.activate!==false)for(const a of state.agents.values())if(!reversibleBinding(a.runtimeConfig?.aiConnection))errors.push({agentId:a.id,reason:'prior-binding-not-reversibly-configured'});
   for(const {poolKey} of state.registry.pools) {
     if(!plan.pools.some(p=>p.config.name===poolKey))errors.push({poolKey,reason:'no-eligible-members'});
     const existing=state.pools.find(p=>p.name===poolKey);
@@ -108,8 +109,16 @@ export async function applyPoolSaga(options) {
   }
   const fatal=verdictsFor(state,plan).filter(v=>!v.selectable && !['pending-connection','not-installed'].includes(v.reason));
   if(fatal.length)throw new Error('negative selectable verdict; repair connection, audience or harness before applying');
-  for(const a of state.agents.values()) if(a.status==='running')throw new Error('agent is running; drain batch before applying');
-  const journal=await newJournal(journalPath,{companyId:state.registry.companyId,ownerUserId:state.registry.ownerUserId,target:api.target??null});
+  for(const a of state.agents.values()) {
+    if(a.status==='running')throw new Error('agent is running; drain batch before applying');
+    // Upstream agents.ts preserves an omitted/null aiConnection once a pool is
+    // bound. A genuinely absent prior binding has no reversible native PATCH.
+    // Require the operator's explicit original native binding, never invent an
+    // invalid sentinel or silently leave a dangling router binding on rollback.
+    if(activate && !reversibleBinding(a.runtimeConfig?.aiConnection))throw new Error('a reversible prior native binding is required before binding migration');
+  }
+  api.assertSecretRefs?.(state.accounts.filter(e=>!e.row||!sameConnection(e)).map(e=>e.account.accountKey));
+  const journal=await newJournal(journalPath,{companyId:state.registry.companyId,ownerUserId:state.registry.ownerUserId,target:api.target??null,batchAgentIds:ids});
   const created=[],resets=[];
   try {
     for(const e of state.accounts) {

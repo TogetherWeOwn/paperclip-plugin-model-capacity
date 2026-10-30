@@ -1606,3 +1606,144 @@ events cannot be distinguished).
   check does not apply, so this bites only if a trial family graduates on
   a metered lane. If it does, the fix is patience (E calibrates from lane
   deltas) or a `calibration` anchor, not code.
+
+## Native pool operator generator (offline build; staging first)
+
+`node scripts/generate-pool.mjs --help` documents the four modes. The default
+`--dry-run` makes **only GET requests and zero filesystem writes**, even when
+live sessions block migration. It prints full pool **SaveInput** JSON, complete
+bindings, per-(agent,member) selectable verdicts, excluded memberships and session
+blockers. Unknown/ambiguous target identities fail closed. Provisional UUIDs on a
+fresh target are explicitly marked: they are only valid-schema plan placeholders,
+not claims that connections or grants already exist. Apply always discovers the
+real host-generated IDs; member UUIDv5 identities stay stable.
+
+Inputs are operator files, never plugin startup configuration:
+
+- `--registry registry.json`: the validated `router` block, including `companyId`
+  and `ownerUserId`. Do not put `agentIds` or credentials in this registry.
+- `--batch batch.json`: `{ "pools": { "builder": ["<agent UUID>"], "thinker":
+  ["<another agent UUID>"] }, "sessionPlans": { "<agent UUID>": "drained" } }`.
+  Every configured pool must occur. An agent cannot belong to two pool batches
+  simultaneously because it has only one runtime pool binding. The batch is the
+  authoritative install scope; include already-migrated agents that must retain
+  access. Accounts shared across pools receive the union of those pools' agents.
+- `--quality-evidence quality.json`: `{ "arms": [...], "roles": {...},
+  "records": [...] }` from the plugin's quality/outcome policy, with record
+  `role` and `family` fields. The CLI computes verdicts with the existing policy
+  library at the host clock; it does not accept a hand-written boolean bypass.
+- `--target https://paperclip.example`: a Paperclip origin (optional `/api`).
+  Board auth comes **only** from `PAPERCLIP_BOARD_TOKEN` in the environment.
+- `--gateway-base-url https://gateway.example/v1`: real gateway endpoint,
+  HTTPS or loopback HTTP, no URL credentials, query or fragment.
+- Apply only: `--secret-refs refs.json` containing
+  `{ "account-one": { "env": "LANE_ACCOUNT_ONE_KEY" } }`. Resolve secrets into
+  these environment variables with the operator's normal secret manager before
+  invocation. These are references, never literal key values. Keys are injected
+  into `apiKey` only inside the POST boundary, never plans, journals or errors.
+
+Example (paths are local evidence inputs; no credentials in argv):
+
+```sh
+node scripts/generate-pool.mjs --dry-run \
+  --target https://paperclip.example --gateway-base-url https://gateway.example/v1 \
+  --registry registry.json --batch batch.json --quality-evidence quality.json
+# After reviewing the dry plan, use the same arguments plus:
+#   --apply --secret-refs refs.json --journal evidence/batch-1.jsonl
+# Stage without activating/binding: add --keep-disabled.
+# Read-only R9 primary signal: --check (exit 2 for drift, 0 when converged).
+# For staged pools, --check --keep-disabled expects enabled:false.
+# Compensation: --target https://paperclip.example --rollback evidence/batch-1.jsonl
+```
+
+`allAgents:false` is the default. Fleet-wide installation requires **both**
+`--all-agents` and `"allAgentsApproved":true` in the batch's recorded migration
+approval. Otherwise the generator refuses it. Do not use fleet-wide installs as
+a shortcut around per-agent evidence.
+
+### Native HTTP facts and operational prerequisites
+
+The implementation is grounded in upstream checkout `e2cfdc7e`:
+
+- `server/src/routes/ai-connections.ts`: POST creates an API-key connection,
+  organization grant and installs **inline**. Summaries already contain grant
+  IDs; there is no separate AI `createGrant` request. Pool POST carries
+  `pluginKey` separately from `config`, omits companyId in the HTTP body, and
+  requires `expectedRevision` on updates.
+- `server/src/services/ai-connections.ts`: `list(..., _agentId)` does **not**
+  validate installs. The generator reads the same AI summaries plus generic
+  `grants`/`installs` and saved agent metadata and conservatively evaluates
+  `select()`/`poolMemberRuntimeConfig()` rules. Output labels this
+  `source:"host-read-evidence"`, **not** a native `select()` execution response.
+  Restricted or unknown grant audiences are refused, even when the operator
+  personally has access. No model prompts or credential reads are used as probes.
+- `server/src/services/ai-connections.ts` rejects reconnect with changed routing;
+  `server/src/services/tool-access.ts` rejects AI config PATCH. Therefore model
+  changes use a **blue/green replacement**, not an invented update endpoint.
+  Changed pools must be disabled natively before apply. The prior adopted
+  connection is retained, disabled and renamed with the run ID, so compensation
+  can restore it. The new connection takes the configured name and exact model
+  set. Retired prior connections require operator cleanup after the migration's
+  rollback window; they are never misreported as creations of this run.
+- `server/src/routes/agents.ts` preserves an existing router binding if an update
+  omits/nulls `aiConnection`. **An absent prior binding cannot be restored by
+  this upstream API.** Activating migration therefore requires an explicit,
+  valid, working prior native binding per agent, configured through the normal
+  native management flow. Unbound agents can still dry-run/stage; activation is
+  refused before any writes rather than leave an un-rollbackable binding.
+  Binding writes use the host's `configurationRevision` for optimistic checks,
+  retain unrelated settings and verify the saved binding afterwards.
+
+Keep the batch quiescent (no queued/running work or concurrent roster/connection
+edits) until it completes. Live sessions without an explicit per-agent `reset`
+plan are listed by dry-run and refused by apply. `drained` is not proof of drain:
+re-listing must actually be empty. An authorized `reset` plan executes the native
+per-task reset endpoint, re-lists after reset and immediately before binding,
+then re-wakes the exact issue through the native wake endpoint with an idempotency
+key. Only UUID / `issue:<UUID>` task keys are reset automatically; other task
+kinds require native operator disposition, not comment-to-wake. `--keep-disabled`
+never resets, binds or wakes agents. No paused agents are unpaused by the tool.
+
+### Journal, compensation and recovery
+
+Apply requires a **new** journal path (exclusive create, mode 0600), writes and
+fsyncs each intent **before** its API call, then fsyncs its receipt before the
+next step. Creations use unguessable temporary names so a lost create response
+can be rediscovered as this run's object, not any pre-existing same-name object.
+Final names are promoted with name-only PATCH or revision-checked pool save.
+Pools are built disabled and `--check`-verified before separate activation saves.
+Failures stop immediately and report the journal, known creations and unresolved
+intents. An unresolved intent is not silently claimed to be unapplied.
+
+The journal itself is the non-secret identity/mapping evidence file. Optional
+`--mapping-journal prior.jsonl` reads the prior mapping as a cache, verifies every
+connection/grant against the live host, reports stale IDs, and still rediscovers
+before writing. Never reuse a journal path for another apply.
+
+`--rollback` validates the entire journal and live inverse plan before mutation,
+reauthorizes the named owner and exact target, recovers pending writes by read-only
+inspection, and compensates in reverse order. Adopted pool configs/installation
+scopes/names and prior agent bindings are restored; only journal-created pools
+and connections are archived via their real native endpoints. Grant revocation
+is inline in connection removal. Secret **IDs** are reported for separate cleanup
+through the native secrets API, never read back or deleted blindly. Compensation
+has its own durable intents and can resume after a lost deletion/restore response;
+a torn last journal append is recovered from the preceding durable intent.
+
+A completed active journal is **not** a delete script: drain its agents and disable
+its pools natively before rollback. Any live session, changed binding, ownership
+mismatch, target mismatch or unexpected pool revision stops compensation before
+it starts. Retained task pins and credential/secret cleanup are native lifecycle
+boundaries, not direct database work. Serialize operator batches; this is a saga,
+not a cross-object transaction.
+
+Tests include HTTP end-to-end CLI requests, lost responses/partial compensation,
+registry growth and a two-protocol U18 golden. Portable fixtures in
+`test/fixtures/upstream-schemas/` are unmodified upstream emitted schema modules
+with source checkout and SHA256 provenance. Tests parse real emitted POST bodies
+with those Zod schemas. Run `npm ci --ignore-scripts --legacy-peer-deps` then
+`npm test`; the runtime CLI has no Zod dependency. Per amendment A1, runtime quota
+job enforcement / U14 remains slice 3 and runtime effort-floor enforcement remains
+slice 4. The spec's U15 lane-job and U16 scorecard tests are not generator tests
+and are not delivered here; they still need ownership in the remaining port work. This CLI does not wire the deployed hook,
+install a host timer, or authorize any deployment.
