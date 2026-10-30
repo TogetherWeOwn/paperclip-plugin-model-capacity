@@ -7,11 +7,15 @@ import { applyPoolSaga } from '../scripts/pool-saga.mjs';
 import { config, quotaFeed, stateHarness, NOW, MINUTE } from './support/quota.mjs';
 import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH } from '../src/cliproxy.mjs';
 
-async function start(t,{router=true,configure=true}={}) {
-  const host=new NativeApi();await applyPoolSaga({...options(host),activate:false,journalPath:await scratch(t)});host.writes=[];
+async function start(t,{router=true,configure=true,withInspector=true,withPools=true}={}) {
+  const host=new NativeApi();
+  if(withPools)await applyPoolSaga({...options(host),activate:false,journalPath:await scratch(t)});
+  host.writes=[];
   const harness=stateHarness(),jobs=new Map(),events=new Map(),requests=[];let now=NOW,body=quotaFeed(),status=200,block=null;
   const cfg=config();if(!router)delete cfg.router;
-  const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false,inspectPools:async()=>({...options(host),expectedEnabled:false})});
+  const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false,
+    ...(withInspector?{inspectPools:async()=>({...options(host),expectedEnabled:false})}:{}),
+  });
   const context={
     state:harness.state,logger:harness.logger,config:{get:async()=>cfg},secrets:{resolve:async()=> 'TEST_LANE_KEY'},
     http:{fetch:async(url,init)=>{requests.push({url,init});if(block)await block;return {status,json:async()=>body};}},
@@ -44,6 +48,53 @@ test('quota job fetches one pinned GET with a ten-second timeout and publishes s
   assert.equal(capacity.nativeRouter.shadow.length,2);
   assert.equal(capacity.nativeRouter.inspection,'ready');
   assert.deepEqual(s.host.writes,[]);
+});
+
+test('U27 M1 worker without an inspector or native pools records quota selections, not configuration unavailability',async t=>{
+  // Match worker.mjs: no inspectPools injection, and M1 precedes pool creation.
+  const s=await start(t,{withInspector:false,withPools:false});await s.tick();
+  const native=(await s.capacity()).body.nativeRouter;
+  assert.equal(native.inspection,'unavailable');
+  assert.deepEqual(native.unavailablePoolKeys,['builder','thinker'],'real routing remains fail-closed');
+  assert.deepEqual(native.shadow.map(r=>r.poolKey),['builder','thinker']);
+  for(const r of native.shadow) {
+    assert.equal(r.decision.kind,'selected');
+    assert.ok(['one','two'].includes(r.wouldSelect));
+    assert.equal(s.cfg.router.enabled,false,'shadow override never mutates real config');
+  }
+  s.setNow(NOW+MINUTE);s.setBody(quotaFeed(NOW+MINUTE,{used:1}));await s.tick();
+  const exhausted=(await s.capacity()).body.nativeRouter.shadow;
+  assert.ok(exhausted.every(r=>r.wouldSelect==='exhausted'));
+  assert.ok(exhausted.every(r=>Object.values(r.decision.skipped).every(reason=>reason==='weekly-exhausted')));
+  const envelope=s.store.get(JSON.stringify(s.keyFor(companyId)));
+  assert.equal(envelope.shadow.length,4);
+  assert.deepEqual(envelope.currentShadow,exhausted);
+  assert.deepEqual(s.host.pools,[]);assert.deepEqual(s.host.writes,[]);
+});
+
+test('U27 M1 missing-pool drift cannot poison the quota-only synthetic candidate set',async t=>{
+  const s=await start(t,{withPools:false});await s.tick();
+  const envelope=s.store.get(JSON.stringify(s.keyFor(companyId)));
+  assert.ok(envelope.snapshot.drift.drift.some(d=>d.type==='missing-pool'));
+  assert.ok(Object.values(envelope.snapshot.memberSkipReasons).every(reason=>reason==='unmapped-member'));
+  assert.ok(envelope.currentShadow.every(r=>r.decision.kind==='selected'));
+  assert.ok(envelope.currentShadow.every(r=>['one','two'].includes(r.wouldSelect)));
+  assert.deepEqual(s.host.writes,[]);
+});
+
+test('M1 quota-only shadow still rejects missing feed members and unusable credentials',async t=>{
+  const s=await start(t,{configure:false,withInspector:false,withPools:false});
+  const feed=quotaFeed(NOW,{missing:['two']});
+  for(const evidence of feed.accounts[0].credentialAvailability.models)evidence.readyCredentials=0;
+  s.setBody(feed);await s.plugin.onConfigChanged(s.cfg,{companyId});await s.tick();
+  const envelope=s.store.get(JSON.stringify(s.keyFor(companyId)));
+  assert.equal(envelope.snapshot.staleMemberIds.length,1);
+  assert.ok(envelope.currentShadow.every(r=>r.decision.kind==='exhausted'));
+  const reasons=envelope.currentShadow.flatMap(r=>Object.values(r.decision.skipped));
+  assert.ok(reasons.every(reason=>reason==='credential-unavailable'),'credential absence takes precedence for missing feed members too');
+  assert.equal(envelope.snapshot.accounts.two.skipReason,'account-reading-stale');
+  assert.equal(envelope.snapshot.accounts.two.staleSinceMs,NOW);
+  assert.equal(reasons.includes('unmapped-member'),false,'remove only deployment poisoning, not quota gates');
 });
 
 test('first router config launches an async immediate refresh without waiting for HTTP or readiness',async t=>{

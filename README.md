@@ -45,10 +45,17 @@ or host automation workaround is included. An upstream-native inspection
 surface or an explicitly revised contract is required before activation.
 
 For unbound pools, the job runs synthetic requests through the same pure
-`routeDecision` with `router.enabled` overridden to `true`. It records selections,
-quota exhaustion, or explicit configuration unavailability to bounded plugin
-state and `/capacity.nativeRouter`. The real callback policy continues to see
-the actual master switch. Bound pools are excluded from synthetic shadow.
+`routeDecision` with `router.enabled` overridden to `true`. This is a registry
+and quota simulation, not proof that native connections/pools are installed or
+selectable. It uses the current tick's immutable quota view **before** the native
+inspection/drift overlay: M1 must record account selections or quota exhaustion
+before native pools are created at M3, including in the worker without an
+inspector. Quota freshness, missing feed members, and credential evidence still
+apply. The published real-routing snapshot retains every inspection/drift gate;
+shadow never authorizes a run or changes the real master switch. Both the
+snapshot and bounded shadow records commit in the same persist-before-publish
+envelope exposed through `/capacity.nativeRouter`. Bound pools are excluded
+from synthetic shadow when their native identity can be inspected.
 
 The policy-backed planner uses the existing `roles.other` floor/outcome gate for
 reviewer pools; it fails closed on unknown models and requires scored arm and

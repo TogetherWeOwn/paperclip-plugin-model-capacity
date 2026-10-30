@@ -5,7 +5,7 @@
  */
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
 import { checkPoolDrift } from '../scripts/pool-saga.mjs';
-import { buildQuotaSnapshot, createSnapshotPublisher } from './snapshot.mjs';
+import { buildQuotaSnapshot, createSnapshotPublisher, freezeSnapshot } from './snapshot.mjs';
 import { routeDecision } from './router.mjs';
 
 const WARNING_INTERVAL_MS = 10 * 60_000;
@@ -95,9 +95,15 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     const unavailablePoolIds=wrongPools.map(p=>p.id);
     const unavailablePoolKeys=inspection==='unavailable'?registry.pools.map(p=>p.poolKey):wrongPools.map(p=>p.name);
     let built;
-    try {built=buildQuotaSnapshot({registry,feed,nowMs:clock(),previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config,
-      unavailablePoolIds,unavailablePoolKeys,memberSkipReasons:driftMemberReasons(registry,drift.drift),drift});}
+    try {built=buildQuotaSnapshot({registry,feed,nowMs:clock(),previous:previous?.snapshot,histories:previous?.histories,controllers:previous?.controllers,ledger,config});}
     catch {return failure(companyId,'quota-feed-invalid');}
+    // M1 simulates registry members before native pools even exist. Preserve
+    // all quota/feed/credential gates, but do not treat deployment drift as a
+    // quota decision. Only the published, real-routing snapshot gets that
+    // enforcement overlay; neither this view nor shadow can authorize a run.
+    const shadowSnapshot=built.snapshot;
+    built={...built,snapshot:freezeSnapshot({...shadowSnapshot,unavailablePoolIds,unavailablePoolKeys,drift,
+      memberSkipReasons:{...shadowSnapshot.memberSkipReasons,...driftMemberReasons(registry,drift.drift)}})};
     for(const warning of built.warnings)report(companyId,warning.reason,{accountKey:warning.accountKey});
     for(const row of drift.drift)report(companyId,'pool-drift',{type:row.type,...(row.accountKey?{accountKey:row.accountKey}:{}),...(row.poolKey?{poolKey:row.poolKey}:{}),...(row.memberId?{memberId:row.memberId}:{})});
     let agents;
@@ -108,8 +114,8 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
     for(const {poolKey} of registry.pools) {
       if(boundKeys.has(poolKey))continue;
       const params=syntheticRouterRequest(registry,poolKey,atMs);
-      const decision=routeDecision(params,built.snapshot,{...config,router:{...config.router,enabled:true}});
-      shadow.push({poolKey,wouldSelect:decision.kind==='selected'?built.snapshot.memberIndex[decision.memberId].accountKey:decision.kind,atMs,decision});
+      const decision=routeDecision(params,shadowSnapshot,{...config,router:{...config.router,enabled:true}});
+      shadow.push({poolKey,wouldSelect:decision.kind==='selected'?shadowSnapshot.memberIndex[decision.memberId].accountKey:decision.kind,atMs,decision});
     }
     const shadowHistory=[...(previous?.shadow??[]),...shadow].slice(-SHADOW_CAP);
     const envelope={...built,shadow:shadowHistory,currentShadow:shadow,inspection};
