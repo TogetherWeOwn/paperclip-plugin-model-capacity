@@ -84,3 +84,23 @@ test('N-T21 legacy: captured fleet has exact per-account supersession sets and r
     }
   }
 });
+
+test('N3: cross-account dominance preserves superseded exclusions in the same ladder', async () => {
+  const names = ['gpt-5-sol', 'gpt-6-sol', 'gpt-6.1-sol'];
+  const account = (key, served) => ({ lane: key, provider: 'fixture', accountKey: key, health: 'healthy', models: served,
+    observedAt: new Date(nowMs).toISOString(), quality: 'live',
+    weekly: { used: 0.2, resetsAt: '2026-11-05T12:00:00Z' },
+    fiveHour: { used: 0.1, resetsAt: '2026-10-29T17:00:00Z' } });
+  const twoAccounts = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: [
+    account('old', names.slice(0, 2)), account('new', names.slice(2)),
+  ] }, nowMs);
+  const armMap = names.map(model => ({ aaSlug: model, model, effort: 'max', family: 'sol', providers: ['fixture'] }));
+  const scores = { fetchedAt: new Date(nowMs).toISOString(), duplicateSlugs: [], rows: names.map((slug, i) => ({
+    slug, intelligenceIndex: 50 + i * 10, intelligenceIndexCostPerTask: 3 - i,
+  })) };
+  const result = await replayTick({ ...base, lane: twoAccounts, snapshot: scores, config: { ...config(true), armMap } });
+  const l = result.ladders.ladders['fixture:old'];
+  assert.deepEqual(l.crossAccountDominated, [names[1]]);
+  assert.deepEqual(result.capacity.newestVersion.accounts['fixture:old'].supersededLegacyArmIds, [names[0]]);
+  assert.deepEqual(new Set(l.credentialRanking.excludedArmIds), new Set(names.slice(0, 2)));
+});

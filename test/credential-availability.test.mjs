@@ -40,7 +40,8 @@ async function start(accounts, rows = null, configure = () => {}) {
     roles: { minQuality: { doer: null, thinker: null, other: null }, outcomeGate: { enabled: false } },
   };
   configure(config);
-  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
+  const liveViews = new Map();
+  const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false, liveViews });
   await plugin.setup({
     config: { get: async () => config },
     state: { get: async k => store.get(key(k)) ?? null, set: async (k, v) => { store.set(key(k), v); } },
@@ -59,7 +60,7 @@ async function start(accounts, rows = null, configure = () => {}) {
   });
   await plugin.onConfigChanged(config, { companyId: 'acme' });
   return {
-    lane, warnings,
+    lane, warnings, liveViews,
     seedState: (stateKey, value) => store.set(key({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey }), value),
     setNow: value => { now = value; },
     setFetchStatus: value => { fetchStatus = value; },
@@ -693,4 +694,21 @@ test('N-T10: newest legacy arm cannot revive after its credential loses readines
   const l = (await d.api('ladder')).body.ladders['codex:newest'];
   assert.ok(l.credentialRanking.excludedArmIds.includes(older));
   assert.ok(l.rungs.every(r => r.model !== older));
+});
+
+
+test('N3: live newest-version views match the published capacity account views', async () => {
+  const old = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  const a = account(old, 'codex', 'first', 1);
+  a.models.push(newer);
+  a.credentialAvailability.models.push({ ...a.credentialAvailability.models[0], model: newer });
+  const b = account(newer, 'codex', 'second', 1);
+  const d = await start([a, b], null, cfg => { cfg.roles.newestVersionOnly = { enabled: true }; });
+  await d.tick();
+  const capacity = (await d.api('capacity')).body.newestVersion;
+  const live = d.liveViews.get('acme');
+  assert.deepEqual(live.newestVersion, capacity);
+  assert.deepEqual(new Set(live.accounts.map(a => a.accountId)), new Set(['codex:first', 'codex:second']));
+  for (const a of live.accounts) assert.deepEqual(a.newestVersion, capacity.accounts[a.accountId], a.accountId);
+  assert.deepEqual(capacity.accounts['codex:first'].supersededCanonicalModels, [old]);
 });

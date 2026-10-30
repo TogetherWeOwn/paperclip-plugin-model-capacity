@@ -912,7 +912,7 @@ function windowStartMs(resetsAtMs) {
 // read against the public placeholder pin with a fake http client. The
 // worker entry never passes it, so every deployed plugin refuses to read
 // the lane key unless the build pinned a real host.
-export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true } = {}) {
+export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneHost = true, liveViews = new Map() } = {}) {
   let ctx;
   const configured = new Set();
   const ledgers = new Map(); // companyId -> Map(runId -> ledger record), the single run-accounting truth
@@ -1173,7 +1173,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   //   excludeFamilies, roleBands, contextCaps,
   //   accounts: [{ accountId, pointer, headroomPct, remainingKnown,
   //   ladderRungs, burnPerRunPct }] } in reset order.
-  const liveViews = new Map();
+  // The optional map is a test seam; the worker uses a fresh private map.
   // Config lifecycle owns this fence; a stale tick cannot re-enable a mode
   // after an operator changed it while the tick was awaiting telemetry.
   const taskRankingModes = new Map();
