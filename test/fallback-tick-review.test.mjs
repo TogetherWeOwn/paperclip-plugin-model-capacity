@@ -133,6 +133,7 @@ async function runTick({ lane, snapshot, config, states = {}, demand = { doer: 4
   adapterType = 'claude-code', createPlugin = createModelCapacityPlugin }) {
   const store = new Map(Object.entries(structuredClone(states)));
   const jobs = new Map();
+  const handlers = new Map();
   const raw = structuredClone(config);
   const doer = raw.roles?.doerAgentIds?.[0] ?? 'worker';
   raw.roles = { ...raw.roles, doerAgentIds: [doer] };
@@ -147,7 +148,7 @@ async function runTick({ lane, snapshot, config, states = {}, demand = { doer: 4
     http: { fetch: async () => ({ status: 200, json: async () => structuredClone(lane) }) },
     agents: { get: async () => ({ adapterType }) },
     issues: { list: async ({ status }) => status === 'todo' ? structuredClone(issues) : [], get: async () => null },
-    jobs: { register: (name, fn) => jobs.set(name, fn) }, events: { on() {} },
+    jobs: { register: (name, fn) => jobs.set(name, fn) }, events: { on: (name, fn) => handlers.set(name, fn) },
     logger: { info() {}, warn() {}, error() {} },
   };
   const liveViews = new Map();
@@ -158,7 +159,7 @@ async function runTick({ lane, snapshot, config, states = {}, demand = { doer: 4
   await jobs.get('shadow-tick')({});
   const capacity = store.get('capacity-v1');
   assert.equal(capacity?.atMs, nowMs, 'real tick published capacity');
-  return { capacity, ladders: store.get('ladder-v1'), ledger: store.get('ledger-v1'), live: liveViews.get('offline-test') };
+  return { capacity, ladders: store.get('ladder-v1'), ledger: store.get('ledger-v1'), live: liveViews.get('offline-test'), plugin, handlers, store };
 }
 
 const running = (runId, agentId = 'worker') => ({ runId, agentId, status: 'running',
@@ -330,12 +331,12 @@ async function withLiveInternals(fn) {
     let code = await readFile(path, 'utf8');
     const marker = '  return {\n    multiCompanyConfig: true,';
     assert.equal(code.split(marker).length, 2);
-    code = code.replace(marker, `  return {\n    internals: { allocationOrderFromLive, reviewerArmAdmission, reviewerArmCheck, pickReviewerRoute, breakerStores, credentialEnforceCompanies,\n      recognized: typeof liveIsRecognizedReviewAgent === 'function' ? liveIsRecognizedReviewAgent : null,\n      liveAccountInputs: typeof liveAccountInputs === 'function' ? liveAccountInputs : null },\n    multiCompanyConfig: true,`);
+    code = code.replace(marker, `  return {\n    internals: { exhaustionAnswer, allocationOrderFromLive, reviewerArmAdmission, reviewerArmCheck, pickReviewerRoute, breakerStores, credentialEnforceCompanies,\n      recognized: typeof liveIsRecognizedReviewAgent === 'function' ? liveIsRecognizedReviewAgent : null,\n      liveAccountInputs: typeof liveAccountInputs === 'function' ? liveAccountInputs : null },\n    multiCompanyConfig: true,`);
     await writeFile(path, code);
     const module = await import(pathToFileURL(path));
     const liveViews = new Map();
     const plugin = module.createModelCapacityPlugin({ clock: () => nowMs, liveViews });
-    await fn(plugin.internals, liveViews);
+    await fn(plugin.internals, liveViews, module.createModelCapacityPlugin);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -476,4 +477,116 @@ test('X-T01 F5: production live resolver derives the descriptor from the serving
     assert.ok(!missing.ids.includes(kept.armId));
     assert.equal(liveAccountInputs(live, 'doer', live.excludeFamilies.doer, account, true).fallbackAdmission, null);
   });
+});
+
+
+test('F-T21/T22: ordinary hook and event route weak fallback only for non-reviewers', async () => {
+  for (const mode of ['off', 'shadow']) for (const path of ['hook', 'event']) for (const reviewer of [false, true]) {
+    const input = windowFixture();
+    input.config.taskRanking.mode = mode;
+    input.config.enforce = true;
+    const result = await runTick(input);
+    const { live, plugin, handlers } = result;
+    live.accounts = live.accounts.filter(a => a.accountId === 'fixture:weak');
+    live.reviewerRouting = { ...live.reviewerRouting, agentIds: ['worker'] };
+    if (!reviewer) live.reviewerRouting.agentIds = [];
+    assert.ok(live.accountAdmissions.doer['fixture:weak']);
+    if (path === 'hook') {
+      const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: 'hook', agentId: 'worker', adapterType: 'claude-code' });
+      assert.equal(answer.kind, reviewer ? 'defer' : 'decide', JSON.stringify(answer));
+      if (!reviewer) assert.match(answer.model, /a-best/);
+    } else {
+      await handlers.get('agent.run.started')({ type: 'agent.run.started', companyId: 'offline-test', entityId: 'event', payload: { agentId: 'worker', adapterType: 'claude-code' } });
+      result.store.delete('ledger-v1');
+      const entries = (await plugin.onApiRequest({ companyId: 'offline-test', routeKey: 'shadow' })).body.entries;
+      const row = entries.find(e => e.runId === 'event');
+      if (reviewer) assert.equal(row, undefined);
+      else { assert.ok(row, JSON.stringify(entries)); assert.match(row.wouldModel, /a-best/); }
+    }
+  }
+});
+
+
+test('F-T13: exhaustion scans seat non-reviewer fallback and suppress recognized reviewers', async () => {
+  await withLiveInternals(async (_internals, _views, createPlugin) => {
+    for (const mode of ['off', 'shadow']) for (const scan of ['ordinary', 'bounded-default']) for (const suppress of [false, true]) {
+      const input = windowFixture();
+      input.config.taskRanking.mode = mode;
+      const { live, plugin } = await runTick({ ...input, createPlugin });
+      live.accounts = live.accounts.filter(a => a.accountId === 'fixture:weak');
+      const weak = live.accounts[0];
+      if (scan === 'bounded-default') {
+        weak.headroomPct = 0;
+        weak.burnPerRunPct = { 'a-best': .2 };
+      }
+      const { answer, skips } = await plugin.internals.exhaustionAnswer({ live,
+        params: { companyId: 'offline-test', runId: `ex-${scan}-${suppress}`, agentId: 'worker', adapterType: 'claude-code', agentDefaultModel: 'a-best' },
+        role: 'doer', selfId: null, priorReason: 'test', forReview: false,
+        suppressAccountFallback: suppress, hookLedger: new Map(), nowMs });
+      if (suppress) assert.equal(answer, null, JSON.stringify({ answer, skips }));
+      else {
+        assert.ok(answer, JSON.stringify(skips));
+        assert.equal(answer.kind, scan === 'ordinary' ? 'decide' : 'keep');
+        if (scan === 'ordinary') assert.match(answer.model, /a-best/);
+      }
+    }
+  });
+});
+
+test('F-T30: routing-only reviewer keeps reserve hold with fallback enabled or disabled', async () => {
+  await withLiveInternals(async (_internals, _views, createPlugin) => {
+    for (const enabled of [false, true]) {
+      const input = windowFixture();
+      input.config.roles.minQuality.doer = -2;
+      input.config.roles.accountFallback.enabled = enabled;
+      const { live, plugin } = await runTick({ ...input, createPlugin });
+      live.accounts = live.accounts.filter(a => a.accountId === 'fixture:weak');
+      live.reviewReserve = { enabled: true, heldAccountIds: ['fixture:weak'], agentIds: ['reserve'] };
+      live.reviewerRouting = { agentIds: ['routed'] };
+      const base = live.excludeFamilies.doer;
+      const resolver = a => plugin.internals.liveAccountInputs(live, 'doer', base, a, true);
+      const held = plugin.internals.allocationOrderFromLive(live, 'offline-test', null, 'doer', resolver, true, false, { agentId: 'routed' });
+      const reserve = plugin.internals.allocationOrderFromLive(live, 'offline-test', null, 'doer', resolver, true, true, { agentId: 'reserve' });
+      assert.deepEqual(held.order, []);
+      assert.ok(held.reserveHeld.some(a => (a.accountId ?? a) === 'fixture:weak'), JSON.stringify(held.reserveHeld));
+      assert.equal(reserve.order[0].accountId, 'fixture:weak');
+      const { answer, skips } = await plugin.internals.exhaustionAnswer({ live, params: { companyId: 'offline-test', runId: 'held', agentId: 'routed' }, role: 'doer', selfId: null, priorReason: 'test', forReview: false, suppressAccountFallback: true, hookLedger: new Map(), nowMs });
+      assert.equal(answer, null);
+      assert.ok(skips.some(s => s.includes('review-reserve held')), JSON.stringify(skips));
+    }
+  });
+});
+
+test('F-T13 caller: ordinary hook exhaustion suppresses routing-only reviewers', async () => {
+  for (const reviewer of [false, true]) {
+    const input = windowFixture();
+    input.config.enforce = true;
+    input.config.exhaustion = { enabled: true, finalAnswerFromAttempt: 1 };
+    const { live, plugin } = await runTick(input);
+    live.accounts = live.accounts.filter(a => a.accountId === 'fixture:weak');
+    live.accounts[0].health = 'degraded'; // normal order skips it; exhaustion can use it
+    live.reviewerRouting = { ...live.reviewerRouting, agentIds: reviewer ? ['worker'] : [] };
+    const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: 'exhaust', issueId: 'i', agentId: 'worker', adapterType: 'claude-code', agentDefaultModel: 'a-best' });
+    assert.equal(answer.kind, reviewer ? 'defer' : 'decide', JSON.stringify(answer));
+    if (!reviewer) assert.match(answer.reason, /deferral-exhausted/);
+  }
+});
+
+
+test('F-T30 caller: routing-only reviewer cannot spend held quota; reserve member can', async () => {
+  for (const enabled of [false, true]) for (const agentId of ['routed', 'reserve']) {
+    const input = windowFixture();
+    input.config.enforce = true;
+    input.config.roles.minQuality.doer = -2;
+    input.config.roles.accountFallback.enabled = enabled;
+    input.config.roles.doerAgentIds = ['routed', 'reserve'];
+    const { live, plugin } = await runTick(input);
+    live.accounts = live.accounts.filter(a => a.accountId === 'fixture:weak');
+    live.doerAgentIds = ['routed', 'reserve'];
+    live.reviewReserve = { enabled: true, heldAccountIds: ['fixture:weak'], agentIds: ['reserve'] };
+    live.reviewerRouting = { agentIds: ['routed'] };
+    const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: 'reserve-test', agentId, adapterType: 'claude-code' });
+    assert.equal(answer.kind, agentId === 'routed' ? 'defer' : 'decide', JSON.stringify(answer));
+    if (agentId === 'routed') assert.match(answer.reason, /review.reserve/i);
+  }
 });

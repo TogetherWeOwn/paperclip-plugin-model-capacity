@@ -5535,7 +5535,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * diagnosability. Never throws for a malformed view: bad accounts are
    * skipped, never selected.
    */
-  async function exhaustionAnswer({ live, params, role, selfId, priorReason, forReview, hookLedger, nowMs }) {
+  async function exhaustionAnswer({ live, params, role, selfId, priorReason, forReview, suppressAccountFallback = false, hookLedger, nowMs }) {
     const skips = [];
     const fail = () => ({ answer: null, skips });
     const companyId = params?.companyId;
@@ -5544,6 +5544,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return fail();
     }
     const roleExcluded = normalizeExcludedFamilies(live?.excludeFamilies?.[role] ?? []);
+    const accountInputs = view => liveAccountInputs(live, role, roleExcluded, view, suppressAccountFallback);
     const adapter = params?.adapterType ?? liveAdapterFor(live, params?.agentId) ?? null;
     const bstore = breakerStores.get(companyId) ?? createBreakerStore();
     const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
@@ -5572,7 +5573,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       return Infinity;
     };
     const inputsFor = view => ({ runId: params.runId, agentId: params.agentId, role,
-      excludedFamilies: roleExcluded, pointer: view.pointer ?? 0,
+      excludedFamilies: accountInputs(view).excludedFamilies, pointer: view.pointer ?? 0,
       retryCount: 0, failureClass: 'none', contextTokens: null,
       // Exhaustion relaxes only the legacy reserve, not actual headroom or
       // any capability/trial/credential/adapter/breaker requirement.
@@ -5610,17 +5611,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
       // Breaker-filtered like the tick loop, so the hook never picks an arm
       // the tick would skip; then the role exclusions, same as the main loop.
+      const inputs = accountInputs(view);
       const roleRungs = filterRungsByExcludedFamilies(
         filterBreakerRungs(credentialGroupsFor(view, nowMs, credentialReadinessEnforced(companyId), role, null,
-          taskRunAdmission(inputsFor(view), bstore, nowMs, bcfg)), bstore, accountId, nowMs, bcfg),
-        roleExcluded,
+          taskRunAdmission(inputsFor(view), bstore, nowMs, bcfg), inputs.fallbackAdmission), bstore, accountId, nowMs, bcfg),
+        inputs.excludedFamilies,
       );
       if (!rungsHaveEligibleArms(roleRungs)) {
         skips.push(`${accountId} no eligible arm (breaker/readiness/exclusions)`);
         continue;
       }
       if (roleLadderAccess(roleRungs, {
-        role, roleBands: live.roleBands, excludedFamilies: roleExcluded, trialRoles,
+        role, roleBands: live.roleBands, excludedFamilies: inputs.excludedFamilies, trialRoles,
       }).eligible !== true) {
         skips.push(`${accountId} no arm reachable for role ${role}`);
         continue;
@@ -5750,14 +5752,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             || (!a.reactive && a.headroomSource === 'weekly')) continue;
           if (a.reactive
             && (capBase.get(accountId) ?? 0) + (acctPending.get(accountId) ?? 0) >= liveTrialInflightCapFor(live, a)) continue;
+          const inputs = accountInputs(a);
           const roleRungs = filterRungsByExcludedFamilies(
             filterBreakerRungs(credentialGroupsFor(a, nowMs, credentialReadinessEnforced(companyId), role, null,
-              taskRunAdmission({ ...inputsFor(a), fiveHourHeadroomPct: null }, bstore, nowMs, bcfg)), bstore, accountId, nowMs, bcfg),
-            roleExcluded,
+              taskRunAdmission({ ...inputsFor(a), fiveHourHeadroomPct: null }, bstore, nowMs, bcfg), inputs.fallbackAdmission), bstore, accountId, nowMs, bcfg),
+            inputs.excludedFamilies,
           );
           if (!rungsHaveEligibleArms(roleRungs)
             || !roleLadderAccess(roleRungs, {
-              role, roleBands: live.roleBands, excludedFamilies: roleExcluded, trialRoles,
+              role, roleBands: live.roleBands, excludedFamilies: inputs.excludedFamilies, trialRoles,
             }).eligible) continue;
           const defaultRungs = roleRungs.map(group => ({
             ...group,
@@ -5770,7 +5773,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             agentId: params.agentId,
             role,
             ladderRungs: defaultRungs,
-            excludedFamilies: roleExcluded,
+            excludedFamilies: inputs.excludedFamilies,
             pointer: a.pointer ?? 0,
             retryCount: 0,
             failureClass: 'none',
@@ -5970,8 +5973,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     if (!liveIsCurrent(companyId, live)) return null;
     const role = roleOf(config, run.agentId);
     const roleExcluded = normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []);
+    const accountInputs = view => liveAccountInputs(live, role, roleExcluded, view, liveIsRecognizedReviewAgent(live, run.agentId));
     const { order } = withDuplicatePass(duplicates => allocationOrderFromLive(
-      live, companyId, null, role, roleExcluded, duplicates, liveIsReviewAgent(live, run.agentId), run,
+      live, companyId, null, role, accountInputs, duplicates, liveIsReviewAgent(live, run.agentId), run,
     ));
     // Per-account cap inputs: the live view's per-account in-flight plus
     // queued decisions per account. The pooled inFlight on the ordered
@@ -5985,14 +5989,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (!view.reactive && !view.remainingKnown) continue;
       // Provider-scoped reactive cap (nvidia-nim 1, others on the global).
       if (view.reactive && (capBase.get(view.accountId) ?? 0) + (acctPending.get(view.accountId) ?? 0) >= liveTrialInflightCapFor(live, view)) continue;
-      const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
+      const inputs = accountInputs(view);
+      const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, inputs.excludedFamilies);
       if (!rungsHaveEligibleArms(roleRungs)) continue;
       const d = decide({
         runId: run.runId,
         agentId: run.agentId,
         role,
         ladderRungs: roleRungs,
-        excludedFamilies: roleExcluded,
+        excludedFamilies: inputs.excludedFamilies,
         pointer: view.pointer ?? 0,
         retryCount: 0,
         failureClass: 'none',
@@ -6709,6 +6714,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
                 selfId: params?.runId != null ? String(params.runId) : null,
                 priorReason: reviewRoute.reason,
                 forReview: liveIsReviewAgent(live, params.agentId),
+                suppressAccountFallback: true,
                 hookLedger,
                 nowMs: clock(),
               });
@@ -6828,8 +6834,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // them); other work defers while its only account is held, and the
       // reason says so -- not a generic no-headroom.
       const forReview = liveIsReviewAgent(live, params.agentId);
+      const suppressAccountFallback = liveIsRecognizedReviewAgent(live, params.agentId);
+      const accountInputs = view => liveAccountInputs(live, role, roleExcluded, view, suppressAccountFallback);
       const { order, paced, reserveHeld } = withDuplicatePass(duplicates => allocationOrderFromLive(
-        live, params.companyId, selfId, role, roleExcluded, duplicates, forReview, params,
+        live, params.companyId, selfId, role, accountInputs, duplicates, forReview, params,
       ));
       const capBase = new Map((live.accounts ?? []).map(a => [a.accountId, a.inFlight ?? 0]));
       const acctPending = pendingByAccount(live, params.companyId, selfId);
@@ -6848,14 +6856,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Role-based family exclusions use the tick-frozen live view (the
         // hook performs zero I/O): ineligible accounts are skipped, never
         // deferred on.
-        const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, roleExcluded);
+        const inputs = accountInputs(view);
+        const roleRungs = filterRungsByExcludedFamilies(view.ladderRungs, inputs.excludedFamilies);
         if (!rungsHaveEligibleArms(roleRungs)) continue;
         const d = decide({
           runId: params.runId,
           agentId: params.agentId,
           role,
           ladderRungs: filterBreakerRungs(roleRungs, bstore, view.accountId, bnow, bcfg),
-          excludedFamilies: roleExcluded,
+          excludedFamilies: inputs.excludedFamilies,
           pointer: view.pointer,
           retryCount: 0,
           failureClass: 'none',
@@ -6973,6 +6982,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const { answer, skips } = await exhaustionAnswer({
             live, params, role, selfId,
             priorReason: terminal.reason, forReview, hookLedger, nowMs: clock(),
+            suppressAccountFallback,
           });
           if (answer) return answer;
           return deferred({
