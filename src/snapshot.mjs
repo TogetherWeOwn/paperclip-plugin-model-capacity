@@ -161,7 +161,7 @@ export function buildQuotaSnapshot({registry, feed, nowMs, previous = null, hist
     a.view.targetShare = a.targetShare;
   }
   const burnState = burn ? {status:nowMs >= Date.parse(burn.expiresAt) ? 'expired' : 'active',...burn,expiresAtMs:Date.parse(burn.expiresAt),
-    warning:nowMs >= Date.parse(burn.expiresAt) ? 'burn: inactive (expiresAt in past)' : burn.mode === 'exclusive' ? 'burn: exclusive drain enabled' : null} : null;
+    warning:nowMs >= Date.parse(burn.expiresAt) ? `burn: expired ${burn.expiresAt}; inactive (expiresAt in past)` : burn.mode === 'exclusive' ? 'burn: exclusive drain enabled' : null} : null;
   if (burnState?.warning) joined.warnings.push({reason:burnState.status === 'expired' ? 'burn-expired' : 'burn-exclusive',message:burnState.warning});
   const snapshot = freezeSnapshot({burn:burnState,version:(previous?.version ?? 0) + 1,atMs:nowMs,accounts,
     inFlightRunAccounts,memberIndex:structuredClone(registry.memberIndex),poolRoles:{...registry.poolRoles},staleMemberIds:joined.staleMemberIds,

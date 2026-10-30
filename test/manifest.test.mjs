@@ -83,7 +83,7 @@ test('jobs and API routes are declared', () => {
   assert.equal(jobs.get('aa-refresh'), '17 4 * * *');
   assert.equal(jobs.get('quota-refresh'), '* * * * *');
   const routes = new Map(manifest.apiRoutes.map(r => [r.routeKey, r.path]));
-  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'shadow']);
+  assert.deepEqual([...routes.keys()].sort(), ['capacity', 'caps', 'ladder', 'scorecard', 'shadow']);
   assert.equal(routes.get('caps'), '/caps');
 });
 

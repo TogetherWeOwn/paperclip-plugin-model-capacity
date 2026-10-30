@@ -242,3 +242,9 @@ export function scorecardRows(state) {
     return copy(out);
   });
 }
+
+/** Same durable view for the dedicated route and folded capacity response. */
+export function scorecardView(envelope) {
+  return {atMs:envelope?.scorecard?.atMs ?? null,rows:scorecardRows(envelope?.scorecard),
+    burn:copy(envelope?.snapshot?.burn ?? null),warnings:copy(envelope?.scorecard?.warnings ?? [])};
+}

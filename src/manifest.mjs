@@ -1054,6 +1054,15 @@ export function buildManifest({ variant = 'clean' } = {}) {
     ],
     apiRoutes: [
       {
+        routeKey: 'scorecard',
+        method: 'GET',
+        path: '/scorecard',
+        auth: 'board-or-agent',
+        capability: 'api.routes.register',
+        checkoutPolicy: 'none',
+        companyResolution: { from: 'query', key: 'companyId' },
+      },
+      {
         routeKey: 'capacity',
         method: 'GET',
         path: '/capacity',

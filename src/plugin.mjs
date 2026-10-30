@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { scorecardView } from './scorecard.mjs';
 import { normalizeNativeBurn, validateNativeBurn } from './burnmode.mjs';
 import { validateRouterConfig, normalizeRegistry } from './registry.mjs';
 import { createQuotaRefresh, withQuotaTimeout } from './quota-refresh.mjs';
@@ -6276,13 +6277,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     async onApiRequest(input) {
       const companyId = input.companyId;
       if (!configured.has(companyId)) return { status: 404, body: { error: 'company-not-configured' } };
+      if (input.routeKey === 'scorecard') {
+        return {status:200,body:scorecardView(await ctx.state.get(scopeKey(companyId, 'router-quota-v1')))};
+      }
       if (input.routeKey === 'capacity') {
         const body = (await ctx.state.get(scopeKey(companyId, CAPACITY_KEY))) ?? { target: null };
         const verifiedPools = (attestedPools.get(companyId) ?? noAttestedPools).map(
           ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}) =>
             ({poolKey,poolId,pluginKey,expectedRevision,expectedMemberOrder,members}));
         return { status: 200, body: lastConfig.get(companyId)?.router
-          ? {...body,nativeRouter:{...quotaRefresh.status(companyId),...nativeOverlay.status(companyId),verifiedPools}} : body };
+          ? {...body,scorecard:scorecardView(await ctx.state.get(scopeKey(companyId, 'router-quota-v1'))),nativeRouter:{...quotaRefresh.status(companyId),...nativeOverlay.status(companyId),verifiedPools}} : body };
       }
       if (input.routeKey === 'shadow') {
         // The shadow log is an append-only view over the ledger records:

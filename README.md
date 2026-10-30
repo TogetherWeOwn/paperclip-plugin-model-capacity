@@ -1975,23 +1975,66 @@ enforcement and callback registration remain slice 4. U15 is now delivered in `t
 lane request builder enforces the pinned origin and exact accounts path even
 before config normalization. It cannot emit a direct queue/RESP request.
 
-U16 (and the U23 counter boundaries) is delivered as the **job-side accounting
-library** `src/scorecard.mjs`, tested in `test/scorecard.test.mjs`. Its pure
-`tickScorecard(saved, {nowMs, periodMs, accounts, ...})` returns serializable
-state; `scorecardRows(state)` returns isolated public rows. The future quota
-job must supply joined account evidence (including `inScope:false` policy
-exclusions), computed eligibility/floor/pacing verdicts and Keeper counters;
-the reducer does not assume an idle account is eligible. Public usage/unused
-figures are percentages; input quota readings are ratios. It latches each
-reset window, caps interval accounting at two job periods, retains eight
-windows per account, and distinguishes proved eligible-unpicked time from
-unexplained/held/feed-gap leftovers. Keeper deltas are window/epoch scoped;
-ledger totals stay separate and discrepancies emit warning facts. Wait
-attribution remains honestly null pending the staging G3 event-shape proof.
+### Native expiring burn and per-account scorecards (slice 5)
 
-These are library-level acceptance tests, **not a claim of runtime rollout**:
-this generator change does not register the quota job, persist its scorecard
-state, expose `GET /scorecard`, or fold rows into `/capacity`. Those runtime
-integration requirements remain part of the port; no spec ownership has been
-silently amended. This CLI does not wire the deployed hook, install a host
-timer, or authorize any deployment.
+The native quota job now persists `src/scorecard.mjs` accounting in the same
+`router-quota-v1` envelope as its immutable quota snapshot. Every minute it joins
+registry + lane meter/Keeper usage + observed ledger model evidence, including
+feed accounts excluded from the registry. Eligibility minutes require the same
+runtime quality/outcome policy and quota/credential gates, evaluated job-side;
+callback retries never increment counters or write state. A cold policy cache is
+not evidence of eligibility. Inputs are quota ratios; public used/unused values
+are percentages. API routes use the upstream declared plugin-local GET shape
+(`packages/shared/src/types/plugin.ts`, `PluginApiRouteDeclaration`), not custom
+board routes or a host producer.
+
+`GET /api/plugins/<plugin-id>/api/scorecard?companyId=<company-id>` returns
+`{atMs, rows, burn, warnings}`; the identical object is folded into `/capacity`
+as `scorecard`. Durable state is readable after worker restart before the first
+successful feed refresh; an uninitialized scorecard has `atMs:null, rows:[]`.
+Each account retains eight reset windows, with two-period-capped incremental
+minutes and immutable final unused readings latched at reset. Window and rolling
+24h rates use their own bounded history rather than the short pacing history.
+Keeper counter deltas are epoch/window-scoped. Ledger served counts are a
+separate incremental cross-check over observed prefixed models (shadow decisions
+are not runs); a >2% mismatch emits a sanitized warning and shows both counts.
+Missing meters/counters or downtime remain `feed-gap`, never fabricated no-demand.
+
+`waitsCaused` intentionally stays **null**, with a per-row `waitsNote` explaining
+that the host does not expose per-account wait attribution. `poolWaitsObserved`
+remains empty pending staging G3's event-shape proof; neither callback logs nor
+invented event payloads substitute for that gate. Unit and fake-host integration
+tests are not G3 evidence, nor evidence of production rollout.
+
+Native burn uses **`burn`**, separate from the transitional hook's unchanged
+`burnMode`. For example, replace the intentionally expired/empty example config
+block with a deliberate short-lived drain:
+
+```json
+{
+  "burn": {
+    "accountKeys": ["codex-example"],
+    "providers": [],
+    "expiresAt": "2026-11-02T00:00:00Z",
+    "endAtUsedPct": 0.995,
+    "mode": "prefer"
+  }
+}
+```
+
+A parseable explicit-timezone `expiresAt` is required. A past expiry is valid
+config but inactive, with a standing `burn: expired <timestamp>; inactive
+(expiresAt in past)` warning in the job and capacity/scorecard views. The job
+copies per-account expiry, scope and early-end thresholds into the snapshot;
+selection independently checks expiry between ticks. Burn bypasses only pace
+holds and ranks eligible targets first. It never alters fixed model profiles,
+quality floors, hard caps, credentials, pins, or heartbeat/lifecycle selection.
+`prefer` falls back normally; `exclusive` loudly warns, skips non-targets, and
+waits for the earliest target eligibility or burn expiry (subject to the host's
+60-second minimum). Config writes are the only control surface and may trigger
+a worker rebuild/native-wait wave; batch toggles in low-demand windows.
+
+These are source and test deliverables only: router activation stays off by
+default. G-1/G-T staging, G3 event evidence and every production migration gate
+remain outstanding. No deployment, host timer, direct database write or change
+to the transitional hook's legacy burn semantics is authorized by these tests.

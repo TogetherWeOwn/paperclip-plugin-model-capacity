@@ -8,7 +8,7 @@
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
 import { checkPoolDrift } from '../scripts/pool-saga.mjs';
 import { buildQuotaSnapshot, createSnapshotPublisher, freezeSnapshot } from './snapshot.mjs';
-import { tickScorecard, scorecardRows, scorecardAccounts } from './scorecard.mjs';
+import { tickScorecard, scorecardView, scorecardAccounts } from './scorecard.mjs';
 import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { routeDecision } from './router.mjs';
 
@@ -152,8 +152,7 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
   return {
     get:publisher.get,
     scorecard(companyId) {
-      const e=publisher.envelope(companyId);
-      return {atMs:e?.scorecard?.atMs ?? null,rows:scorecardRows(e?.scorecard),burn:e?.snapshot?.burn ?? null};
+      return scorecardView(publisher.envelope(companyId));
     },
     status(companyId) {
       const e=publisher.envelope(companyId);
