@@ -146,6 +146,7 @@ test('X-R4(c,d): enabled producer judges itself; its inputs still support disabl
   const producer = await replayTick(input);
   const replay = await replayTick(input);
   assert.ok(producer.capacity.newestVersion);
+  assert.ok(Object.keys(producer.ladders.ladders).length > 0, 'enabled producer must publish a ladder');
   assert.ok(Object.values(producer.ladders.ladders).every(ladder => Array.isArray(ladder.supersededArmEvidence)));
   assertReplayProvenance({ implementationRevision: 'producer', newestVersionOnlyEnabled: true, accountFallbackEnabled: false, capturedAt: '2026-10-30T00:00:00Z' }, { replayRevision: 'producer', replayFeatureState: { newestVersionOnlyEnabled: true, accountFallbackEnabled: false } });
   assertFidelity(producer, replay);

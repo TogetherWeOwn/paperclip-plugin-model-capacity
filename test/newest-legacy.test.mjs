@@ -108,3 +108,67 @@ test('N3: cross-account dominance preserves superseded exclusions in the same la
   const reversed = await replayTick({ ...base, lane: reverse, snapshot: scores, config: { ...config(true), armMap } });
   assert.deepEqual(new Set(reversed.ladders.ladders['fixture:old'].credentialRanking.excludedArmIds), new Set(names.slice(0, 2)));
 });
+
+test('X-T03: full-fleet newest and fallback flag matrix preserves supersession boundaries', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { accounts } = JSON.parse(await readFile(new URL('./fixtures/newest-served-20261029.json', import.meta.url)));
+  const arms = JSON.parse(await readFile(new URL('./fixtures/newest-scored-20261029.json', import.meta.url)));
+  const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';
+  const served = [...accounts, { id: 'matrix-weak', models: [old, newer] }];
+  const fleet = withSyntheticReadiness({ observedAt: new Date(nowMs).toISOString(), accounts: served.map(a => ({
+    provider: 'fixture', accountKey: a.id, health: 'healthy', meter: 'reactive', models: a.models,
+    observedAt: new Date(nowMs).toISOString(), quality: 'live',
+  })) }, nowMs);
+  const armMap = arms.map(a => ({ aaSlug: a.armId, model: a.model, effort: a.effort, family: a.model === old || a.model === newer ? 'sonnet' : a.armId, providers: ['fixture'] }));
+  const scored = { fetchedAt: new Date(nowMs).toISOString(), duplicateSlugs: [], rows: arms.map((a, i) => ({ slug: a.armId, intelligenceIndex: 40 + i, intelligenceIndexCostPerTask: 1 + i })) };
+  const results = new Map();
+  let disabledConfig;
+  for (const newest of [false, true]) for (const fallback of [false, true]) {
+    const settings = { armMap, roles: { doerAgentIds: ['doer'], thinkerAgentIds: ['thinker'], minQuality: { doer: 0.12, thinker: null, other: null },
+      outcomeGate: { enabled: false }, newestVersionOnly: { enabled: newest }, accountFallback: { enabled: fallback, roles: ['doer'], minQuality: -3 } } };
+    const result = await replayTick({ ...base, lane: fleet, snapshot: scored, config: settings });
+    if (!newest && !fallback) disabledConfig = settings;
+    results.set(`${newest}:${fallback}`, result);
+    assert.equal(Object.hasOwn(result.capacity.eligibility, 'accountFallback'), fallback);
+    if (newest) {
+      const view = result.capacity.newestVersion.accounts['fixture:matrix-weak'];
+      assert.deepEqual(view.supersededCanonicalModels, [old]);
+      const rows = result.capacity.eligibility.accountFallback?.admitted ?? [];
+      assert.ok(rows.every(row => row.accountId !== 'fixture:matrix-weak' || row.armId !== old));
+      assert.ok(rows.every(row => row.accountId !== 'fixture:matrix-weak' || !view.rejectedCandidates.some(candidate => candidate.armId === row.armId)));
+    }
+  }
+  const both = results.get('true:true');
+  const weak = both.capacity.eligibility.accountFallback.admitted.find(row => row.accountId === 'fixture:matrix-weak' && row.role === 'doer');
+  assert.equal(weak?.armId, 'claude-sonnet-5-5-xhigh');
+  const newestOnly = results.get('true:false');
+  const expected = [
+    ...Array(4).fill(['claude-haiku-4-5-20251001', 'claude-sonnet-5']),
+    ['gpt-5.6-terra', 'gpt-6-sol'], ['gpt-5.6-terra'], ['gpt-5.6-terra', 'gpt-6-sol'], ['gpt-5.6-terra', 'gpt-6-sol'],
+    ['gemini-3-flash', 'gemini-3.1-flash-lite'], ['gemini-3-flash', 'gemini-3.1-flash-lite'], [],
+    ...Array(3).fill(['muse-spark-1.1', 'muse-spark-1.2']), [], ['glm-4.7-flash'], [],
+    ['deepseek-v4-flash-free', 'muse-spark-1.2-contributor-free'], [old],
+  ];
+  for (const [index, account] of served.entries()) {
+    const key = `fixture:${account.id}`;
+    assert.deepEqual(both.capacity.newestVersion.accounts[key], newestOnly.capacity.newestVersion.accounts[key], key);
+    assert.deepEqual(newestOnly.capacity.newestVersion.accounts[key].supersededCanonicalModels, expected[index], key);
+  }
+  assert.ok(results.get('false:true').capacity.eligibility.accountFallback.admitted.some(row => row.accountId === 'fixture:matrix-weak'));
+  assert.equal(Object.hasOwn(results.get('false:false').capacity, 'newestVersion'), false);
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { pathToFileURL, fileURLToPath } = await import('node:url');
+  const { projectForParity } = await import('../scripts/aa-replay.mjs');
+  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-matrix-'));
+  try {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
+    execFileSync('tar', ['-x', '-C', dir], { input: archive });
+    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
+    const unmodified = await baseline.replayTick({ ...base, lane: fleet, snapshot: scored, config: disabledConfig });
+    assert.deepEqual(projectForParity(results.get('false:false')), projectForParity(unmodified));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

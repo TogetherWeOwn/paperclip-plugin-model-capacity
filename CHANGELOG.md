@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.75
+### Added
+- Opt-in per-account fallback for `doer` and `other` roles, preserving reviewer and other safety fences. Inspect admitted and suppressed rows in `/capacity.eligibility.accountFallback`; dashboard exclusions remain global. The fallback quality floor is a fleet-relative z-score, not an absolute benchmark.
+- Offline replay provenance and parity checks for staged newest/fallback rollout. Retain pre-newest capture-time provenance and pass historical fidelity before enabling newest; judge a newest-enabled capture only with its matching producer and flags, then check parity before enabling fallback.
+
 ## 0.2.74
 ### Added
 - Opt-in account-scoped newest-version filtering with scoped keeps, parser overrides, and auditable supersession views. Disabled by default. Strict Pareto and cross-account dominance remain in force.

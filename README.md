@@ -41,6 +41,33 @@ A keep prevents version removal, not strict Pareto, cross-account dominance,
 quality, readiness, breaker, or manual exclusions. Roll back by disabling the
 flag; no model is automatically upgraded.
 
+## Account fallback (opt-in)
+
+`roles.accountFallback` defaults to disabled. When enabled, an account without
+an eligible arm for a configured `doer` or `other` role can admit its best
+eligible fallback candidate for that account and role only. The default roles
+are `['doer', 'other']` and the default `minQuality` is `-0.5`; thinkers and
+recognized reviewers do not receive this fallback. Existing manual, outcome,
+version, readiness, breaker, trial and other safety fences remain in force;
+finalization can suppress a provisional admission. Task-ranking enforce mode
+is not supported. Inspect `/capacity.eligibility.accountFallback` for admitted
+and suppressed rows and warnings. The dashboard reads global exclusions, so a
+fallback admission does not remove the corresponding global exclusion there.
+
+The quality floor is a **fleet-relative z-score**, not an absolute model score:
+it can change as the scored fleet changes. Examine current quality scores and
+floors before choosing a threshold.
+
+For a staged rollout, retain a genuine pre-newest capture and its capture-time
+provenance (producer revision, both resolved feature flags and host timestamp)
+and pass its historical fidelity gate before enabling newest. Deploy fallback
+with the flag disabled and verify the fallback report is absent; only after the
+newest-enabled capture and its producer-matched fidelity and parity gates pass
+should fallback be enabled. Monitor admitted and suppressed rows for 24 hours.
+A `superseded-version` suppression is an integration alarm; persistent
+`cross-account-excluded` suppression on a dead account warrants review.
+A capture without provenance cannot establish historical fidelity.
+
 ## Reviewer backlog demand (v0.2.69; opt-in, activation gated)
 
 A slot-metered review gate may enqueue only one review at a time even when many
