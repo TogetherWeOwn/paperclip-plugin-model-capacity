@@ -36,6 +36,7 @@
     "audit:env-pins": "node scripts/audit-env-pins.mjs"
   },
   "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "zod": "4.6.7"
