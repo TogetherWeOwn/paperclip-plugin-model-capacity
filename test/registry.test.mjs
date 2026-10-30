@@ -53,7 +53,7 @@ test('member validation rejects responsible-user bindings and harness mismatches
   const anthropic = {...a,provider:'anthropic',harnessProfile:'acpx'};
   const acpx = {binding:{...binding,provider:'anthropic'},profile:{provider:'acpx',model:'codex1/model'}};
   assert.throws(() => validatePoolMember(acpx,anthropic),/harness/);
-  assert.throws(() => validatePoolMember({...acpx,profile:{...acpx.profile,acpxAgent:'grok'}},anthropic),/harness/);
+  assert.throws(() => validatePoolMember({...acpx,profile:{...acpx.profile,acpxAgent:'grok'}},anthropic),/lane-excluded-by-policy/);
 });
 
 
@@ -67,4 +67,32 @@ test('shared normalization rejects the same schema violations as plugin config',
   for (const mutate of [r=>r.pools[0].poolKey='x'.repeat(161),r=>r.accounts[0].connectionName='x'.repeat(161),r=>r.accounts[0].feedExempt=null,r=>r.extra=true,r=>r.hardCapWeekly=2]) {
     const r=fixture(); mutate(r); assert.throws(()=>normalizeRegistry(r));
   }
+});
+
+test('excluded grok lane has the named policy error before shape validation', () => {
+  const r=fixture();
+  Object.assign(r.accounts[0],{provider:'anthropic',protocol:'messages',harnessProfile:'acpx',acpxAgent:'grok'});
+  r.allowMessages=true;
+  assert.throws(()=>normalizeRegistry(r),/lane-excluded-by-policy/);
+});
+
+test('pool member inspection names excluded opencode and grok lanes', () => {
+  const account=fixture().accounts[0];
+  const member={binding:{mode:'shared',provider:'openai',method:'api_key',connectionId:'10000000-0000-4000-8000-000000000001',grantId:'20000000-0000-4000-8000-000000000002'},profile:{provider:'opencode',model:'codex1/model'}};
+  assert.throws(()=>validatePoolMember(member,account),/lane-excluded-by-policy/);
+  member.profile={provider:'acpx',acpxAgent:'grok',model:'codex1/model'};
+  assert.throws(()=>validatePoolMember(member,account),/lane-excluded-by-policy/);
+});
+
+test('feed join warns and marks missing non-exempt members stale without exempting present peers', async () => {
+  const { joinRegistryFeed } = await import('../src/registry.mjs');
+  assert.equal(typeof joinRegistryFeed, 'function');
+  const raw=fixture();
+  raw.accounts.push({...structuredClone(raw.accounts[0]),accountKey:'missing',prefix:'missing',connectionName:'missing'});
+  raw.accounts.push({...structuredClone(raw.accounts[0]),accountKey:'free',prefix:'free',connectionName:'free',feedExempt:true});
+  const result=joinRegistryFeed(normalizeRegistry(raw),{accounts:[{accountKey:'codex-1'}]});
+  assert.deepEqual(result.missingAccountKeys,['missing']);
+  assert.deepEqual(result.warnings,[{accountKey:'missing',reason:'account-missing-from-feed'}]);
+  assert.deepEqual(result.staleMemberIds,[memberIdFor('builder','missing'),memberIdFor('thinker','missing')]);
+  assert.throws(()=>joinRegistryFeed(normalizeRegistry(raw),null),/feed/);
 });

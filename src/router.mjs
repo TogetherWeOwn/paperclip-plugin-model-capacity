@@ -4,8 +4,7 @@
 import { orderAccountsWithPacing, DEFAULT_PLACEMENT } from './select.mjs';
 import { applyInFlightOverlay } from './views.mjs';
 import { accountKeyForModel } from './ledger.mjs';
-
-const PLUGIN_KEY = 'togetherweown.model-capacity';
+import { PLUGIN_KEY } from './registry.mjs';
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
@@ -104,6 +103,7 @@ export function routeDecision(params, snapshot, config = {}) {
   const recheck = Number.isFinite(router.recheckMs) && router.recheckMs > 0 ? router.recheckMs : 5 * MINUTE;
   const hardCap = Number.isFinite(router.hardCapWeekly) ? router.hardCapWeekly : .995;
   const skipped = {}, retries = [], eligible = [];
+  const feedStaleMembers = new Set(snapshot.staleMemberIds ?? []);
   const burnConfig = config.burn ?? router.burn ?? {};
   const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
   const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && infos.some(i => burnActive(i.account));
@@ -111,7 +111,7 @@ export function routeDecision(params, snapshot, config = {}) {
     const a = i.account;
     let reason = null;
     if (!poolKey || !snapshot.poolRoles?.[poolKey] || !i.key || !a) reason = 'unmapped-member';
-    else if (!['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE) || [a.weeklyUsed, a.fiveHourUsed].some(u => u != null && (!Number.isFinite(u) || u < 0 || u > 1))) reason = 'account-reading-stale';
+    else if (feedStaleMembers.has(i.id) || !['passive', 'live', 'cached'].includes(a.quality) || !freshAt(a.observedAtMs, now, router.accountStaleMs ?? 15 * MINUTE) || [a.weeklyUsed, a.fiveHourUsed].some(u => u != null && (!Number.isFinite(u) || u < 0 || u > 1))) reason = 'account-reading-stale';
     else if (a.credentialReady === false) reason = 'credential-unavailable';
     else if (Number.isFinite(a.weeklyUsed) && a.weeklyUsed >= hardCap) reason = 'weekly-exhausted';
     else if (Number.isFinite(a.fiveHourUsed) && a.fiveHourUsed >= (router.hardCapFiveHour ?? .99)) reason = 'five-hour-exhausted';

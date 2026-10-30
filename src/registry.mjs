@@ -75,9 +75,24 @@ export function normalizeRegistry(raw) {
     accountByPrefix:Object.fromEntries(accounts.map(a => [a.prefix, a.accountKey]))};
 }
 
+/** Join validated feed identities to registry members; callers must apply the
+ * stale-member set to their snapshot, not treat an exemption as a reading. */
+export function joinRegistryFeed(registry, feed) {
+  if (!Array.isArray(feed?.accounts) || feed.accounts.some(a => !a || typeof a.accountKey !== 'string' || !a.accountKey)) throw new Error('invalid feed accounts');
+  const present = new Set(feed.accounts.map(a => a.accountKey));
+  const missingAccountKeys = registry.accounts.filter(a => !a.feedExempt && !present.has(a.accountKey)).map(a => a.accountKey);
+  const missing = new Set(missingAccountKeys);
+  return {
+    missingAccountKeys,
+    warnings: missingAccountKeys.map(accountKey => ({accountKey, reason:'account-missing-from-feed'})),
+    staleMemberIds: Object.entries(registry.memberIndex).filter(([, member]) => missing.has(member.accountKey)).map(([id]) => id),
+  };
+}
+
 export function validatePoolMember(member, account) {
   const binding = member?.binding, profile = member?.profile;
   if (!binding || !['shared','delegated'].includes(binding.mode) || binding.provider !== account.provider || !['api_key','subscription'].includes(binding.method) || !uuidPattern.test(binding.connectionId ?? '') || !uuidPattern.test(binding.grantId ?? '')) throw new Error('invalid pool binding');
+  if (profile?.provider === 'opencode' || profile?.acpxAgent === 'grok') throw new Error('lane-excluded-by-policy');
   if (!profile || profile.provider !== account.harnessProfile || typeof profile.model !== 'string' || !profile.model.startsWith(`${account.prefix}/`) || profile.model.length <= account.prefix.length + 1 || profile.model.length > 256) throw new Error('invalid pool profile');
   if (profile.provider === 'acpx' ? profile.acpxAgent !== 'claude' : Object.hasOwn(profile, 'acpxAgent')) throw new Error('invalid harness profile');
   return member;
@@ -105,7 +120,8 @@ function routerShapeErrors(raw) {
   if (Array.isArray(raw.accounts)) for (const account of raw.accounts) {
     if (!account || typeof account !== 'object' || Array.isArray(account)) continue;
     checkKeys(account, ROUTER_CONFIG_KEYS.account, 'router.accounts[]');
-    if ('acpxAgent' in account && account.acpxAgent !== 'claude') errors.push('router account acpxAgent must be claude');
+    if (account.harnessProfile === 'opencode' || account.harnessProfile === 'grok' || account.acpxAgent === 'grok') errors.push('lane-excluded-by-policy');
+    else if ('acpxAgent' in account && account.acpxAgent !== 'claude') errors.push('router account acpxAgent must be claude');
     if ('feedExempt' in account && typeof account.feedExempt !== 'boolean') errors.push('router account feedExempt must be a boolean');
     if (typeof account.connectionName === 'string' && account.connectionName.length > 160) errors.push('router connectionName exceeds 160 characters');
     if (account.pools && typeof account.pools === 'object' && !Array.isArray(account.pools)) for (const member of Object.values(account.pools)) {

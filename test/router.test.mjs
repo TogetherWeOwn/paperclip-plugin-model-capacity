@@ -226,3 +226,10 @@ test('pace-held retry waits for both windows to catch up', () => {
   f.config.pacing={deadband:.096};
   assert.deepEqual(route(f),{kind:'exhausted',retryAt:new Date(now+24*60000).toISOString(),skipped:{a:'pace-held'}});
 });
+
+test('feed-join stale member overrides an otherwise fresh account snapshot', () => {
+  const f=mk(); f.snapshot.staleMemberIds=['a'];
+  assert.equal(route(f).memberId,'b');
+  f.params.candidates=f.params.candidates.slice(0,1);
+  assert.equal(route(f).skipped.a,'account-reading-stale');
+});
