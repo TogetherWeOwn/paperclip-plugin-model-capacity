@@ -90,7 +90,7 @@ export async function buildVariantPackages({outputDir}) {
       +'export default manifest;\n';
     await writeFile(join(directory,'src/manifest.mjs'),baked);
     await writeFile(join(directory,manifestEntry),`export * from './manifest.mjs?build=${variantStamp}';\nexport { default } from './manifest.mjs?build=${variantStamp}';\n`);
-    await writeFile(join(directory,manifest.entrypoints.worker),`export { default } from './worker.mjs?build=${variantStamp}';\n`);
+    await writeFile(join(directory,manifest.entrypoints.worker),`import { runWorker } from '@paperclipai/plugin-sdk';\nimport plugin from './worker.mjs?build=${variantStamp}';\nexport default plugin;\nrunWorker(plugin, import.meta.url);\n`);
     await writeFile(join(directory,'src/build-variant.mjs'),`export const BUILD_VARIANT = '${variant}';\n`);
     await writeFile(join(directory,'src/plugin.mjs'),bakePlugin(source,variant));
     const example=JSON.parse(await readFile(join(directory,'config.example.json'),'utf8'));
