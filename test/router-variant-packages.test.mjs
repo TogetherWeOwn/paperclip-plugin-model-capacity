@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { pluginManifestV1Schema } from './fixtures/upstream-schemas/plugin-manifest.js';
 import { buildManifest } from '../src/manifest.mjs';
+import { stateHarness } from './support/quota.mjs';
 
 const buildTool=new URL('../scripts/build-variants.mjs',import.meta.url);
 async function build(t) {
@@ -62,6 +63,22 @@ test('G-1 actual tarballs preserve plugin identity and bake matching manifest/wo
     assert.equal(typeof worker.default.onResolveRunModel,artifact.variant==='transitional'?'function':'undefined');
     const {createModelCapacityPlugin}=await import(pathToFileURL(join(directory,'src/plugin.mjs')));
     assert.throws(()=>createModelCapacityPlugin({variant:artifact.variant==='clean'?'transitional':'clean'}),/variant/);
+    await t.test(`${artifact.variant} packed worker logs its baked variant at WARN on every boot`,async()=>{
+      const expected=artifact.variant==='transitional'
+        ? {variant:'transitional',exitDate:'2026-11-30'} : {variant:'clean'};
+      // First exercise the packed worker, then a fresh default factory instance:
+      // no runtime variant argument, config, or quota job may be needed to warn.
+      for(const plugin of [worker.default,createModelCapacityPlugin()]) {
+        const h=stateHarness();
+        await plugin.setup({state:h.state,logger:h.logger,jobs:{register(){}},events:{on(){}}});
+        const warnings=h.logs.filter(log=>log.level==='warn');
+        assert.equal(warnings.length,1,'every boot must emit a visible variant self-check before configuration');
+        assert.deepEqual(warnings[0].details,expected);
+        assert.match(warnings[0].message,new RegExp(`variant=${expected.variant}\\b`));
+        if(artifact.variant==='transitional')assert.match(warnings[0].message,/2026-11-30/);
+        else assert.doesNotMatch(JSON.stringify(warnings[0]),/exit|2026-11-30/);
+      }
+    });
     for(const path of ['src/router.mjs','src/overlay.mjs','src/pool-quality.mjs','scripts/pool-saga.mjs','test/fixtures/upstream-schemas/ai-connection-router.js'])
       assert.equal(existsSync(join(directory,path)),true,`tarball missing ${path}`);
   }

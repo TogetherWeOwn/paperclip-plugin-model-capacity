@@ -222,6 +222,8 @@ test('emergency override still applies, warns while non-empty, and logs at most 
   const cfg = { enforce: true, roles: { ...ROLES_CFG, ...NO_GATES, excludeFamilies: { doer: ['muse'] } } };
   const d = drive({ config: cfg, warnings });
   await d.setup();
+  assert.deepEqual(warnings.map(w => w.meta), [{ variant: 'transitional', exitDate: '2026-11-30' }]);
+  warnings.length = 0; // Measure eligibility warnings separately from the boot self-check.
   await d.tick();
   assert.match((await d.hook('run-1', 'eng-doer')).model, /claude/);
   const cap = await d.capacity();
@@ -282,12 +284,12 @@ test('off mode still lifts the operator ban onto an all-cooling lane: the doer d
   assert.deepEqual((await on.capacity()).eligibility.roles.doer.suspendedManual, [], 'the muse ban holds');
 });
 
-test('an empty operator list logs nothing', async () => {
+test('an empty operator list adds no warnings beyond the boot self-check', async () => {
   const warnings = [];
   const d = drive({ config: { enforce: true, roles: ROLES_CFG }, warnings });
   await d.setup();
   await d.tick();
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(warnings.map(w => w.meta), [{ variant: 'transitional', exitDate: '2026-11-30' }]);
 });
 
 test('a logger without warn falls back to info instead of throwing', async () => {

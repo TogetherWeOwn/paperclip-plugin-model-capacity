@@ -6056,6 +6056,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
 
     async setup(context) {
       ctx = context;
+      // The package builder bakes and guards this variant; config cannot hide
+      // the transitional residual or change its exit date at worker startup.
+      ctx.logger.warn?.(`model-capacity: startup self-check variant=${variant}${variant === 'transitional' ? '; exit=2026-11-30' : ''}`, {
+        variant,
+        ...(variant === 'transitional' ? {exitDate:'2026-11-30'} : {}),
+      });
       routeConnection = createRouterAdapter({getConfig:routerConfigFor,getSnapshot:id=>quotaRefresh?.get(id),
         getPolicy:id=>{const live=liveViews.get(id);return liveIsCurrent(id,live) ? live?.routerPolicy : null;},
         getOverlay:(id,version)=>nativeOverlay.deltas(id,version),getOverlayStatus:id=>nativeOverlay.status(id),
