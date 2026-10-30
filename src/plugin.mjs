@@ -4339,6 +4339,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     if (superseded()) return { status: 'superseded' };
     liveViews.set(companyId, {
       ...(newestVersion ? { newestVersion } : {}),
+      ...(legacyEligibility.accountAdmissions ? { accountAdmissions: legacyEligibility.accountAdmissions } : {}),
       policyGeneration: configRevisions.get(companyId)?.policyGeneration,
       atMs: nowMs,
       enforce: config.enforce === true,
@@ -5176,8 +5177,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const bstore = breakerStores.get(companyId) ?? createBreakerStore();
     const bcfg = lastConfig.get(companyId)?.breakers ?? DEFAULT_BREAKERS;
     const nowMs = clock();
+    const accountInputs = a => typeof roleExcluded === 'function'
+      ? roleExcluded(a) : { excludedFamilies: roleExcluded, fallbackAdmission: null };
     const inputsFor = a => ({ runId: run.runId ?? 'preview', agentId: run.agentId ?? 'preview', role,
-      excludedFamilies: roleExcluded, pointer: a.pointer ?? 0,
+      excludedFamilies: accountInputs(a).excludedFamilies, pointer: a.pointer ?? 0,
       retryCount: 0, failureClass: 'none', contextTokens: null,
       fiveHourHeadroomPct: a.headroomPct, burnPerRunPct: a.burnPerRunPct ?? {}, reservePct: .05,
       accountId: a.accountId, roleBands: live.roleBands, contextCaps: live.contextCaps,
@@ -5187,8 +5190,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       taskRanking: live.taskRanking,
     });
     const routesRun = (a, dups) => filterBreakerRungs(routableGroupsFor(a, dups, nowMs,
-      credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg)),
-    bstore, a.accountId, nowMs, bcfg);
+      credentialReadinessEnforced(companyId), role, null, taskRunAdmission(inputsFor(a), bstore, nowMs, bcfg),
+      accountInputs(a).fallbackAdmission), bstore, a.accountId, nowMs, bcfg);
     return orderAccountsWithPacing(
       (live.accounts ?? []).filter(a => !managedFreeAccount(live, companyId, a) && (rungsHaveEligibleArms(routesRun(a, true))
         || (forReview && live.taskRanking?.mode === 'enforce' && (a.policyReviewerArms?.length ?? 0) > 0))).map(a => {
@@ -5202,7 +5205,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           ...a,
           ladderRungs,
           roleEligible: roleLadderAccess(ladderRungs, {
-            role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
+            role, roleBands: live.roleBands, excludedFamilies: accountInputs(a).excludedFamilies,
             trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles,
           }).eligible,
           held: !duplicates && !rungsHaveEligibleArms(ladderRungs),
@@ -5212,7 +5215,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           pool: p,
           laneInFlight: (a.inFlight ?? 0) + (lanePending.get(a.accountId) ?? 0),
           placementQ: placementArm(ladderRungs, {
-            role, roleBands: live.roleBands, excludedFamilies: roleExcluded,
+            role, roleBands: live.roleBands, excludedFamilies: accountInputs(a).excludedFamilies,
             trialRoles: live.trialRoles ?? DEFAULT_TRIALS.roles, pointer: a.pointer ?? 0,
           })?.quality ?? null,
           ...taskView,
@@ -5245,6 +5248,21 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   /** True when the run's agent serves reviews past the reserve hold. */
   function liveIsReviewAgent(live, agentId) {
     return Array.isArray(live?.reviewReserve?.agentIds) && live.reviewReserve.agentIds.includes(agentId);
+  }
+
+  /** Recognition suppresses fallback, not the separate reserve privilege. */
+  function liveIsRecognizedReviewAgent(live, agentId) {
+    return liveIsReviewAgent(live, agentId)
+      || (Array.isArray(live?.reviewerRouting?.agentIds) && live.reviewerRouting.agentIds.includes(agentId));
+  }
+
+  /** Build the relaxation from the serving account's own live view. */
+  function liveAccountInputs(live, role, baseExclusions, account, suppressAccountFallback = false) {
+    return resolveAccountInputs(baseExclusions, live.accountAdmissions, live.roleBands, role, account.accountId, {
+      suppressAccountFallback,
+      supersessionView: account.newestVersion ?? null,
+      newestEnabled: live.newestVersion?.enabled === true,
+    });
   }
 
   /**
