@@ -673,3 +673,24 @@ test('readiness off keeps the all-cooling arm in the served ladder rungs', async
   assert.ok(rungs.length > 0, 'off mode serves the arm on-mode refuses');
   assert.equal((await d.hook('off-mode-ladder-hook')).kind, 'decide');
 });
+
+test('N-T10: newest legacy arm cannot revive after its credential loses readiness', async () => {
+  const older = 'gpt-6-sol', newer = 'gpt-6.1-sol';
+  const raw = account(older, 'codex', 'newest', 1);
+  raw.models.push(newer);
+  raw.credentialAvailability.models.push({ ...raw.credentialAvailability.models[0], model: newer, expiresAt: new Date(NOW + 1000).toISOString() });
+  const d = await start([raw], null, cfg => {
+    cfg.roles.newestVersionOnly = { enabled: true };
+  });
+  await d.tick();
+  const before = await d.hook('newest-ready');
+  assert.equal(before.kind, 'decide');
+  assert.equal(before.model, newer);
+  d.setNow(NOW + 1000);
+  assert.equal((await d.hook('newest-unavailable')).kind, 'defer');
+  await d.tick();
+  assert.equal((await d.hook('newest-unavailable-after-tick')).kind, 'defer');
+  const l = (await d.api('ladder')).body.ladders['codex:newest'];
+  assert.ok(l.credentialRanking.excludedArmIds.includes(older));
+  assert.ok(l.rungs.every(r => r.model !== older));
+});

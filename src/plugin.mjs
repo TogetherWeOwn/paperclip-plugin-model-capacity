@@ -41,6 +41,7 @@ import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
   canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId,
 } from './arms.mjs';
+import { buildAccountSupersession, isSupersededArm } from './newest-version.mjs';
 import { computeComposite, DEFAULT_WEIGHTS, METRIC_SOURCES } from './quality.mjs';
 import {
   computeEeeComposite, blendQ, blendAlphaForRole, eeeUsable, eeeFamilyPrior,
@@ -1535,18 +1536,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return (trialState?.graduated ?? []).includes(family);
   }
 
-  function buildAccountLadders({ accounts, servedModels = null, aaSnapshot, eeeSnapshot = null, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null, nowMs = null }) {
-    // EEE prior: usable only when the artifact is fresh; otherwise every
-    // arm keeps its AA-only score (bit-for-bit identical to today).
-    const tickNow = nowMs ?? clock();
-    const credentialNow = clock();
-    const eeeLive = eeeUsable(eeeSnapshot, { nowMs: tickNow, maxAgeDays: config.eee.maxAgeDays })
-      ? eeeSnapshot.scores : null;
-    const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
+  function resolveAccountArms(accounts, aaSnapshot, config) {
     const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
-    // Dynamic arms from the models the feed reports served, minus ids the
-    // classic table already binds. No provider list involved: the feed is
-    // the only coverage source.
     const accountModels = new Set();
     for (const account of accounts ?? []) {
       for (const m of account?.models ?? []) {
@@ -1557,7 +1548,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const classicModels = new Set(classic.arms.map(a => a.model));
     const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides });
     const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings);
-    const arms = [...classic.arms, ...dynamic.arms];
+    return { classic, dynamic, accountModels, arms: [...classic.arms, ...dynamic.arms] };
+  }
+
+  function buildAccountLadders({ accounts, servedModels = null, aaSnapshot, eeeSnapshot = null, config, previousLadders, stateKeys = null, trialState = null, tierFeed = null, nowMs = null, resolved, viewsByAccount }) {
+    // EEE prior: usable only when the artifact is fresh; otherwise every
+    // arm keeps its AA-only score (bit-for-bit identical to today).
+    const tickNow = nowMs ?? clock();
+    const credentialNow = clock();
+    const eeeLive = eeeUsable(eeeSnapshot, { nowMs: tickNow, maxAgeDays: config.eee.maxAgeDays })
+      ? eeeSnapshot.scores : null;
+    const keyOf = (account, i) => stateKeys?.[i] ?? accountKey(account);
+    const { classic, dynamic, accountModels, arms } = resolved ?? resolveAccountArms(accounts, aaSnapshot, config);
     const skipped = [...classic.skipped, ...dynamic.unscored.map(u => ({ model: u.model, reason: u.reason }))];
     const byArm = new Map(arms.map(a => [a.armId, a]));
     // Unscored models (no AA match, non-chat ids): unrankable, listed for
@@ -1707,7 +1709,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // quota/burn accounting and climbForSpend are unchanged; only C and
       // costEffective read 0 (costBase keeps the measured AA cost for audit).
       const freeCost = isFreeCostAccount(account, config.placement.freeCostProviders);
-      const eligible = served.map(a => {
+      const view = viewsByAccount?.get(keyOf(account, i));
+      const unfiltered = served.map(a => {
         const base = costs.get(a.armId)?.C ?? null;
         const tier = tierCostOf(a, base);
         const qAa = scored.get(a.armId)?.Q ?? null;
@@ -1720,6 +1723,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         });
         return {
           armId: a.armId,
+          ...(view ? (() => {
+            const identity = view.identities[canonicalModelName(a.model)];
+            const withoutKeeps = { ...view, overrides: { ...view.overrides, keep: [] } };
+            const kept = isSupersededArm(withoutKeeps, a) && !isSupersededArm(view, a);
+            return { productLine: identity?.product ?? null, parsedVersion: identity?.version ?? null,
+              newestVersionManaged: true, ...(kept ? { newestVersionKept: true } : {}) };
+          })() : {}),
           // Family + model ride along for same-family newer-version dominance
           // (see ladder.mjs): entries without them keep strict-only behavior.
           family: a.family ?? null,
@@ -1742,6 +1752,30 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           statsRequests: tier.statsRequests,
         };
       });
+      let eligible = unfiltered;
+      let supersededArmEvidence;
+      if (view) {
+        const originalById = new Map(served.map(a => [a.armId, a]));
+        const withoutKeeps = { ...view, overrides: { ...view.overrides, keep: [] } };
+        supersededArmEvidence = [];
+        eligible = unfiltered.filter(candidate => {
+          const arm = originalById.get(candidate.armId);
+          const older = isSupersededArm(withoutKeeps, arm);
+          const superseded = isSupersededArm(view, arm);
+          if (older) {
+            const identity = view.identities[canonicalModelName(arm.model)];
+            const group = view.byProduct[identity?.product];
+            const supersededBy = group ? { version: group.maxVersion, canonicalModels: group.membersAtMax } : null;
+            supersededArmEvidence.push({ armId: arm.armId, model: arm.model, kept: !superseded,
+              supersededBy, reason: 'superseded-version' });
+            if (superseded) view.rejectedCandidates.push({ armId: arm.armId, model: arm.model, supersededBy });
+          }
+          return !superseded;
+        });
+        view.supersededLegacyArmIds = [...new Set(served.filter(arm => isSupersededArm(view, arm)).map(arm => arm.armId))].sort();
+        view.rejectedCandidates.sort((a, b) => a.armId.localeCompare(b.armId));
+        supersededArmEvidence.sort((a, b) => a.armId.localeCompare(b.armId));
+      }
       const eligibleByArm = new Map(eligible.map(e => [e.armId, e]));
       // Rung-level CI gate (§5): newcomer displacements blocked within noise
       // need the comparison-metric datum per arm. Null map (no fresh EEE
@@ -1796,6 +1830,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const credentialRanking = {
         candidates, rankingRungs: ranking.rungs, previousRungs,
         gateByArm: gateByArm ? Object.fromEntries(gateByArm) : null, heldPairs,
+        ...(view ? { excludedArmIds: [...view.supersededLegacyArmIds] } : {}),
       };
       const admitted = credentialLadderFor(credentialRanking, credentialNow, config.credentialReadiness.enforce);
       // Quota burn prices the tier multiplier while tierAffectsQuota holds:
@@ -1819,6 +1854,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         rankingRungs: ranking.rungs,
         rankingWithinNoise: ranking.withinNoise,
         credentialRanking,
+        ...(view ? { supersededArmEvidence } : {}),
         burnPerRunPct: Object.fromEntries(eligible.map(e => [e.armId, burnFor(burnCostOf(e))])),
       };
     }
@@ -2302,9 +2338,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // One state key per snapshot entry (never a merged series): see
     // uniqueAccountKeys. `keyOf` keeps ladders aligned with the same keys.
     const stateKeys = uniqueAccountKeys(snapshot.accounts);
+    const resolved = config.roles.newestVersionOnly.enabled
+      ? resolveAccountArms(snapshot.accounts, aaSnapshot, config) : null;
+    const viewsByAccount = config.roles.newestVersionOnly.enabled
+      ? new Map(snapshot.accounts.map((account, i) => [stateKeys[i],
+        buildAccountSupersession(account, resolved.arms, config.roles.newestVersionOnly)]))
+      : null;
+    const newestVersion = viewsByAccount ? { enabled: true, accounts: Object.fromEntries(viewsByAccount) } : null;
     const { ladders, fleet: fleetArmScores, taskFleet, taskRanking, skipped, unscored, unservable, credentialAdmission, modelInventory, tierCaps, tierBaseline, withinNoise } = buildAccountLadders({
       accounts: snapshot.accounts, servedModels: snapshot.servedModels, aaSnapshot, eeeSnapshot: snapshot.eeeSnapshot ?? null, config, previousLadders: prevLadders, stateKeys, trialState,
-      tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs,
+      tierFeed: { modelStats: snapshot.modelStats, pricingTiers: snapshot.pricingTiers }, nowMs, resolved, viewsByAccount,
     });
     const credentialReadinessEnforced = config.credentialReadiness.enforce;
     const credentialAlarm = credentialAdmission.length > 0 && !credentialAdmission.some(row => row.eligible);
@@ -3676,9 +3719,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // arms that only the dominated arm had pushed off the ladder.
           const ranking = ladder?.credentialRanking;
           if (ranking) {
-            ranking.excludedArmIds = [...dropKeys]
+            const dominatedIds = [...dropKeys]
               .filter(k => k.startsWith(`${key}\u0000`))
               .map(k => k.split('\u0000')[1]);
+            ranking.excludedArmIds = viewsByAccount
+              ? [...new Set([...(ranking.excludedArmIds ?? []), ...dominatedIds])]
+              : dominatedIds;
           }
           const before = (ladder?.rungs ?? []).length;
           if (before === 0) continue;
@@ -4106,6 +4152,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     if (superseded()) return { status: 'superseded' };
     liveViews.set(companyId, {
+      ...(newestVersion ? { newestVersion } : {}),
       policyGeneration: configRevisions.get(companyId)?.policyGeneration,
       atMs: nowMs,
       enforce: config.enforce === true,
@@ -4149,6 +4196,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const ladder = ladders[a.accountId];
         return {
           accountId: a.accountId,
+          ...(viewsByAccount ? { newestVersion: viewsByAccount.get(a.accountId) } : {}),
           provider: view?.pool ?? poolOfKey(a.accountId),
           pool: view?.pool ?? poolOfKey(a.accountId),
           laneProvider: view?.provider ?? null,
@@ -4543,6 +4591,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const publishedTarget = freeCapacity?.target > 0
       ? Math.min(config.concurrency.maxTotal, (concurrency.target ?? 0) + freeCapacity.target) : concurrency.target;
     await ctx.state.set(scopeKey(companyId, CAPACITY_KEY), {
+      ...(newestVersion ? { newestVersion } : {}),
       reviewAdmissionGeneration: admissionGeneration,
       ...(reviewAgentIdsFor(config).size > 0 ? { reviewAdmissionEpoch } : {}),
       atMs: nowMs,
