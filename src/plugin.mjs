@@ -3813,22 +3813,26 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const routesRun = (v, dups) => rungsHaveEligibleArms(filterBreakerRungs(
         routableGroupsFor(ladders[v.accountId], dups, nowMs, config.credentialReadiness.enforce, role, opts.taskMode), breakers, v.accountId, nowMs, breakersCfg));
       const universalPools = opts.universalPools === true;
-      // A configured policy model is not an admission. Raw pool membership
-      // must apply the same reviewer credential-readiness, breaker and
-      // role-exclusion gate as reviewerArmCheck, or an unready, breaker-open
-      // or excluded sibling resizes a qualified cap. Policy records are their
-      // own admission family: they only exist when task ranking is enabled,
-      // so a shadow-mode record must not size enforced raw capacity either.
-      // The exclusion list is the operator's manual policy fence, the same
-      // one reviewerArmAdmission reads in enforce mode.
-      const hasReadyPolicyArm = v => config.taskRanking.mode !== 'off'
+      // A configured policy model is not an admission. Both policy memberships
+      // apply the credential-readiness and closed-breaker gates reviewerArmCheck
+      // demands of a routed pick, and both require enforce mode: a policy
+      // record is a routing family only while task ranking enforces, so a
+      // shadow-mode record must not size capacity the hook refuses.
+      //
+      // They differ on exclusions, deliberately. universalPools computes the
+      // global, role-agnostic pool facts (its own comment: hold facts must
+      // survive routing exclusions), so one role's fence must not narrow a
+      // cap every role shares. forReview is this reviewer role's own pool, so
+      // the fence reviewerArmAdmission reads applies there too.
+      const policyArmIn = (v, roleExcluded) => config.taskRanking.mode === 'enforce'
         && policyArmQualifies(ladders[v.accountId]?.policyReviewerArms, v.accountId,
-          breakers, breakersCfg, nowMs, config.credentialReadiness.enforce,
-          config.roles.excludeFamilies?.[role] ?? []);
+          breakers, breakersCfg, nowMs, config.credentialReadiness.enforce, roleExcluded);
+      const hasReadyPolicyArm = v => policyArmIn(v, config.roles.excludeFamilies?.[role] ?? []);
+      const hasUniversalPolicyArm = v => policyArmIn(v, []);
       return orderAccountsWithPacing(
         accountViews.filter(v => freeProvider(v, config.freeLanes) == null && (routesRun(v, true)
-          || (opts.forReview === true && config.taskRanking.mode === 'enforce' && hasReadyPolicyArm(v))
-          || (universalPools && hasReadyPolicyArm(v)))).map(v => ({
+          || (opts.forReview === true && hasReadyPolicyArm(v))
+          || (universalPools && hasUniversalPolicyArm(v)))).map(v => ({
           accountId: v.accountId,
           resetAtMs: v.resetAtMs,
           headroomPct: v.headroomPct,
