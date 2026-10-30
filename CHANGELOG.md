@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 / 0.3.0-transitional (unreleased; activation gates outstanding)
+### Added
+- Native `ai.connections.route` manifest metadata and memory-only `onRouteAiConnection` callback, current operator-attestation tripwire, effective-effort quality/outcome checks, sanitized per-call diagnostics, and event-owned in-flight overlays rebased atomically with quota publication.
+- Variant-locked clean/transitional npm packages with source-stamped entrypoints and actual-tarball upstream manifest conformance tests. Transitional retains the fork resolver unchanged from the approved branch handoff; clean omits its handler, capability, env declaration and enforce field.
+### Activation limits
+- Target upstream lifecycle events do not publish selected run model/account metadata; unattributed in-flight starts are reported, not guessed. End-to-end R2 anti-herding, deployed-hook parity, and native staging install/reinstall proofs remain activation gates. No deployment or publish is part of this source change.
+
 ## 0.2.73
 ### Fixed
 - Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.

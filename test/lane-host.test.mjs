@@ -100,7 +100,7 @@ test('the lane secret is read only after the pin check, by default', async () =>
 
 test('the worker entry never disables the pin guard', () => {
   const worker = readFileSync(join(ROOT, 'src', 'worker.mjs'), 'utf8');
-  assert.match(worker, /createModelCapacityPlugin\(\)/);
+  assert.match(worker, /createModelCapacityPlugin\(\{variant:BUILD_VARIANT\}\)/);
   assert.doesNotMatch(worker, /requirePinnedLaneHost/);
 });
 

@@ -1,9 +1,34 @@
-# Model Capacity plugin (v0.2.48, all-providers)
+# Model Capacity plugin (0.3.0 native-router source; not activated)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
 resets. Two inputs: CLIProxy burn telemetry and Artificial Analysis
 free-API quality data. Purely deterministic -- no classifiers, no vetoes.
+
+## Build-time variants (no deployment)
+
+Run `npm run build:variants -- --out-dir <new-output-directory>` to produce two
+separately named npm tarballs, retaining plugin ID `togetherweown.model-capacity`:
+
+- **0.3.0-transitional**: fork-image transitional dual-capability build, exit
+  2026-11-30. Keeps the resolver body and `enforce` switch; native routing is
+  governed independently by `router.enabled`. Never install on pristine upstream.
+- **0.3.0 clean**: `ai.connections.route` only; no resolver handler, hook
+  capability, `modelRouting` declaration, `MODEL_ROUTING_ENV_KEYS` export, or
+  `enforce` config field. It is the source worker's default variant.
+
+Artifacts contain baked manifest data and variant-locked factories, not a runtime
+capability switch. Thin per-variant manifest/worker entry shims include a source
+content stamp so changed manifests can bypass the ESM cache on same-version
+reinstalls. Unit tests unpack the actual tarballs, import both worker exports,
+and exercise the real committed upstream manifest validator: clean is accepted,
+transitional is rejected at the fork-only capability. A same-path/same-version
+ESM characterization test proves the shim dependency is cache-busted. These are
+**local package proofs**, not staging install/reinstall or G-T runtime evidence;
+those native staging gates remain required before any activation.
+
+Historical hook/ladder sections below describe the retained transitional path,
+not the clean build's routing mechanism.
 
 ## Native router and quota producer (activation gates remain)
 

@@ -1,8 +1,8 @@
 /**
  * Plugin manifest. v0.2.2 = ALL-PROVIDERS (data-driven arms, trial lanes,
  * reactive-account eligibility, event-time shadow). v0.2.9 = SHADOW BY
- * DEFAULT: the default export holds NO `run.model.resolve` capability and no
- * modelRouting; it observes and records only. The enforce-capable variant
+ * DEFAULT: the clean export holds ai.connections.route, never the fork hook.
+ * The dated transitional variant
  * (`enforceManifest` = `buildManifest({ variant: 'transitional' })`) is opt-in and
  * ships only after security sign-off; even then the `enforce` config flag
  * (default false) keeps the hook answering `keep` until the operator flips it.
@@ -385,7 +385,7 @@ import { LANE_BASE_URLS } from './lane-host.mjs';
 import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.2.73';
+export const PLUGIN_VERSION = '0.3.0';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -1009,7 +1009,7 @@ export function buildManifest({ variant = 'clean' } = {}) {
   const out = {
     id: PLUGIN_ID,
     apiVersion: 1,
-    version: PLUGIN_VERSION,
+    version: modelResolve ? `${PLUGIN_VERSION}-transitional` : PLUGIN_VERSION,
     displayName: modelResolve ? 'Model Capacity (Transitional)' : 'Model Capacity',
     description: modelResolve
       ? 'fork-image transitional dual-capability build, exit 2026-11-30. Native per-account pool pacing plus the unchanged opt-in fork hook.'
