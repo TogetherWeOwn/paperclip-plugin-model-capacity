@@ -484,15 +484,32 @@ for (const blockingPriority of [false, true]) {
   });
 }
 
-test('ready policy-only reviewers remain raw pool members with credential readiness enforced', async () => {
+async function occupiedReviewerAlternative({ enforceReadiness = false } = {}) {
+  // The alternative is configured and admitted, but its ordinary soft-cap slot is occupied.
   const d = drive({
-    config: { ...BASE, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
-      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1]] } },
-    accounts: [metaLane('review', 0.85, 120), claudeLane(0.1, 120)],
-    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }],
+    config: { ...BASE, credentialReadiness: { enforce: enforceReadiness }, taskRanking: { mode: 'enforce' },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 0.2 },
+      roles: { keepAgentIds: ['reviewer-1', 'busy-pin'] },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1], ARMS[0]] } },
+    accounts: [metaLane('review', 0.85, 120), claudeLane(0.58, 84)],
+    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }, { agentId: 'busy-pin', running: 1, queued: 0 }],
   });
   await d.setup();
   await d.tick();
+  await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'occupied-review-alternative',
+    payload: { run: { agentId: 'busy-pin', provider: 'claude', model: 'claude-opus-5-5' } },
+    occurredAt: new Date(TICK).toISOString() });
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  assert.deepEqual([...capacity.reviewerAccountIdsByAgent['reviewer-1']].sort(), ['claude:a1', 'meta:review']);
+  const pool = capacity.reviewerPaceByAgent['reviewer-1'].pools.find(p => p.pool === 'claude');
+  assert.deepEqual({ cap: pool.cap, inFlight: pool.inFlight }, { cap: 1, inFlight: 1 });
+  d.updateCapacity(cap => { cap.keptByAgent['busy-pin'] = { accountId: 'claude:a1' }; });
+  return d;
+}
+
+test('ready policy-only reviewers remain raw pool members with credential readiness enforced', async () => {
+  const d = await occupiedReviewerAlternative({ enforceReadiness: true });
   const capacity = (await d.api('capacity')).body;
   const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'meta');
   assert.deepEqual({ lanes: raw?.lanes, cap: raw?.cap, hardHeld: raw?.hardHeldAccountIds },
@@ -504,14 +521,7 @@ test('ready policy-only reviewers remain raw pool members with credential readin
 });
 
 test('policy-only reviewer hard hold is retained in global pools and denies queued caps', async () => {
-  const d = drive({
-    config: { ...BASE, taskRanking: { mode: 'enforce' },
-      reviewerRouting: { agentIds: ['reviewer-1'], arms: [ARMS[1]] } },
-    accounts: [metaLane('review', 0.85, 120), claudeLane(0.1, 120)],
-    heartbeats: [{ agentId: 'reviewer-1', queued: 1 }],
-  });
-  await d.setup();
-  await d.tick();
+  const d = await occupiedReviewerAlternative();
   const capacity = (await d.api('capacity')).body;
   const reviewerPace = capacity.reviewerPaceByAgent['reviewer-1'];
   assert.deepEqual(reviewerPace.holdSuspendedAccountIds, []);
@@ -525,6 +535,89 @@ test('policy-only reviewer hard hold is retained in global pools and denies queu
   assert.equal(caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated, 0, JSON.stringify(caps));
   assert.deepEqual(capacity.paceGuard.rawPools.find(p => p.pool === 'meta')?.hardHeldAccountIds, ['meta:review']);
 });
+
+async function policyReviewerSafetyFixture({ accounts = [metaLane('review', 0.85, 120)], arms = [ARMS[1]], excludeFamilies = {} } = {}) {
+  const d = drive({
+    config: { ...BASE, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
+      roles: { keepAgentIds: ['reviewer-1', 'other-pin'], excludeFamilies },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms } },
+    accounts, heartbeats: [{ agentId: 'reviewer-1', queued: 1 }, { agentId: 'other-pin', queued: 1 }],
+  });
+  await d.setup();
+  await d.tick();
+  return d;
+}
+
+for (const ordinaryAlternative of [false, true]) {
+  test(`policy reviewer safety: admitted policy-only lane keeps its local soft-cap slot (ordinaryAlternative=${ordinaryAlternative})`, async t => {
+    const d = await policyReviewerSafetyFixture({ accounts: [metaLane('review', 0.85, 120),
+      ...(ordinaryAlternative ? [claudeLane(0.1, 120)] : [])] });
+    const capacity = (await d.api('capacity')).body;
+    const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'meta');
+    const local = capacity.reviewerPaceByAgent['reviewer-1'];
+    const pool = local.pools.find(p => p.pool === 'meta');
+    const ladder = (await d.api('ladder')).body.ladders['meta:review'];
+    assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-1'], ['meta:review']);
+    assert.equal(ladder.rungs.length, 0, 'the reviewer is served by an approved policy arm, not an ordinary ladder');
+    assert.ok(ladder.policyReviewerArms.some(a => a.model === WONDER && a.effort === 'max'
+      && a.credentialEvidence?.readyCredentials === 1));
+    assert.ok(Math.abs(capacity.accounts.find(a => a.accountId === 'meta:review').planAhead - 0.5642857142857143) < 1e-10);
+    assert.deepEqual({ cap: raw.cap, held: raw.hardHeldAccountIds }, { cap: 0, held: ['meta:review'] });
+    assert.equal(capacity.inFlightByPool.meta ?? 0, 0);
+    // Calibrate only quota sizing and the exact fixed binding, never admission or pace facts.
+    d.updateCapacity(cap => {
+      cap.target = 2; cap.calibration = 'measured';
+      cap.perAccount.find(a => a.accountId === 'meta:review').slots = 2;
+      cap.keptByAgent['other-pin'] = { accountId: 'meta:review' };
+    });
+    const caps = (await d.api('caps')).body;
+    const runIds = [`policy-safety-${ordinaryAlternative}-first`, `policy-safety-${ordinaryAlternative}-second`];
+    const decisions = [];
+    for (const runId of runIds) decisions.push(await d.hook(runId));
+    await d.tick();
+    const entries = (await d.api('shadow')).body.entries;
+    const admittedAccounts = runIds.flatMap((runId, i) => decisions[i].kind === 'decide'
+      ? [entries.find(e => e.runId === runId)?.accountId] : []);
+    const actual = { suspended: local.holdSuspendedAccountIds, cap: pool?.cap,
+      reviewerGrant: caps.agents.find(a => a.agentId === 'reviewer-1')?.allocated,
+      fixedGrant: caps.agents.find(a => a.agentId === 'other-pin')?.allocated,
+      hooks: decisions.map(d => d.kind), admittedAccounts };
+    t.diagnostic(JSON.stringify(actual));
+    assert.deepEqual(actual, { suspended: ['meta:review'], cap: 1, reviewerGrant: 1, fixedGrant: 0,
+      hooks: ['decide', 'defer'], admittedAccounts: ['meta:review'] },
+    'an actually admitted policy-only reviewer has role-empty safety, not an unrestricted grant or a global hold release');
+  });
+}
+
+test('policy reviewer safety: a behind-plan admitted configured alternative retains the Meta hold', async () => {
+  const d = await policyReviewerSafetyFixture({ accounts: [metaLane('review', 0.85, 120), claudeLane(0.1, 120)],
+    arms: [ARMS[1], ARMS[0]] });
+  const capacity = (await d.api('capacity')).body;
+  assert.deepEqual([...capacity.reviewerAccountIdsByAgent['reviewer-1']].sort(), ['claude:a1', 'meta:review']);
+  const local = capacity.reviewerPaceByAgent['reviewer-1'];
+  assert.deepEqual(local.holdSuspendedAccountIds, []);
+  assert.equal(local.pools.find(p => p.pool === 'meta').cap, 0);
+  assert.deepEqual(capacity.paceGuard.rawPools.find(p => p.pool === 'meta').hardHeldAccountIds, ['meta:review']);
+  assert.ok(capacity.accounts.find(a => a.accountId === 'claude:a1').planAhead < 0);
+  const route = await d.hook('approved-review-alternative');
+  assert.deepEqual({ kind: route.kind, model: route.model }, { kind: 'decide', model: 'claude-opus-5-5' });
+  await d.tick();
+  assert.equal((await d.api('shadow')).body.entries.find(e => e.runId === 'approved-review-alternative')?.accountId, 'claude:a1');
+});
+
+for (const refusal of ['unready', 'manual-exclusion']) {
+  test(`policy reviewer safety: role-empty safety cannot revive ${refusal} policy arms`, async () => {
+    const d = await policyReviewerSafetyFixture({
+      accounts: [metaLane('review', 0.85, 120, refusal === 'unready'
+        ? { credentialAvailability: { version: 1, models: [] } } : {})],
+      excludeFamilies: refusal === 'manual-exclusion' ? { doer: ['muse'] } : {},
+    });
+    const capacity = (await d.api('capacity')).body;
+    assert.deepEqual(capacity.reviewerAccountIdsByAgent['reviewer-1'], []);
+    assert.deepEqual(capacity.reviewerPaceByAgent['reviewer-1'].holdSuspendedAccountIds, []);
+    assert.equal((await d.hook(`refused-policy-${refusal}`)).kind, 'defer');
+  });
+}
 
 test('N-T16: kept default superseded on every serving account defers', async () => {
   const old = 'claude-sonnet-5', newer = 'claude-sonnet-5-5';

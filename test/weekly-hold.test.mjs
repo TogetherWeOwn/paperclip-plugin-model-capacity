@@ -296,3 +296,70 @@ for (const blockingPriority of [false, true]) {
     });
   }
 }
+
+// Held running fixed charge occupies the shared pool cap: the cap is total pooled
+// in-flight, not additional starts. Fixed keeps its running floor; the reviewer
+// only spends remaining slack.
+for (const blockingPriority of [false, true]) {
+  const cases = [
+    { cap: 2, reviewer: 0, total: 2 },
+    { cap: 3, reviewer: 1, total: 3 },
+    { cap: 4, reviewer: 2, total: 4 },
+  ];
+  for (const { cap, reviewer: expectedReviewer, total: expectedTotal } of cases) {
+    test(`held fixed running charge counts toward pool cap (cap=${cap}, priority=${blockingPriority})`, async t => {
+      const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+      const out = allocateKeptAndRoutedCaps({ target: 8, blockingPriority,
+        agents: [{ agentId: 'fixed', running: 2, queued: 0 }, { agentId: 'reviewer', running: 0, queued: 2 }],
+        keepAgentIds: ['fixed'], keptByAgent: { fixed: { accountId: 'held' } },
+        reviewerAccountIdsByAgent: { reviewer: ['unheld'] },
+        accounts: [{ accountId: 'held', pool: 'shared' }, { accountId: 'unheld', pool: 'shared' }],
+        perAccount: [{ accountId: 'held', slots: 2 }, { accountId: 'unheld', slots: 2 }],
+        pacePools: [{ pool: 'shared', cap, hardHeldAccountIds: ['held'] }],
+      });
+      const rows = [...out.kept, ...out.routed];
+      const row = id => rows.find(a => a.agentId === id);
+      t.diagnostic(JSON.stringify({ cap, blockingPriority, fixed: row('fixed').allocated,
+        reviewer: row('reviewer').allocated, total: rows.reduce((s, r) => s + r.allocated, 0) }));
+      assert.equal(row('fixed').allocated, 2);
+      assert.equal(row('reviewer').allocated, expectedReviewer);
+      assert.equal(rows.reduce((s, r) => s + r.allocated, 0), expectedTotal);
+    });
+  }
+}
+
+for (const blockingPriority of [false, true]) {
+  test(`zero-running fixed leaves pool slack for reviewer (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const out = allocateKeptAndRoutedCaps({ target: 8, blockingPriority,
+      agents: [{ agentId: 'fixed', running: 0, queued: 1 }, { agentId: 'reviewer', running: 0, queued: 2 }],
+      keepAgentIds: ['fixed'], keptByAgent: { fixed: { accountId: 'held' } },
+      reviewerAccountIdsByAgent: { reviewer: ['unheld'] },
+      accounts: [{ accountId: 'held', pool: 'shared' }, { accountId: 'unheld', pool: 'shared' }],
+      perAccount: [{ accountId: 'held', slots: 2 }, { accountId: 'unheld', slots: 2 }],
+      pacePools: [{ pool: 'shared', cap: 2, hardHeldAccountIds: ['held'] }],
+    });
+    const rows = [...out.kept, ...out.routed];
+    const row = id => rows.find(a => a.agentId === id);
+    assert.equal(row('fixed').allocated, 0);
+    assert.equal(row('reviewer').allocated, 2);
+    assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 2);
+  });
+
+  test(`unheld fixed running charge counts toward pool cap (priority=${blockingPriority})`, async () => {
+    const { allocateKeptAndRoutedCaps } = await import('../src/concurrency.mjs');
+    const out = allocateKeptAndRoutedCaps({ target: 8, blockingPriority,
+      agents: [{ agentId: 'fixed', running: 2, queued: 0 }, { agentId: 'reviewer', running: 0, queued: 2 }],
+      keepAgentIds: ['fixed'], keptByAgent: { fixed: { accountId: 'unheld' } },
+      reviewerAccountIdsByAgent: { reviewer: ['unheld'] },
+      accounts: [{ accountId: 'held', pool: 'shared' }, { accountId: 'unheld', pool: 'shared' }],
+      perAccount: [{ accountId: 'held', slots: 2 }, { accountId: 'unheld', slots: 4 }],
+      pacePools: [{ pool: 'shared', cap: 2, hardHeldAccountIds: ['held'] }],
+    });
+    const rows = [...out.kept, ...out.routed];
+    const row = id => rows.find(a => a.agentId === id);
+    assert.equal(row('fixed').allocated, 2);
+    assert.equal(row('reviewer').allocated, 0);
+    assert.equal(rows.reduce((s, r) => s + r.allocated, 0), 2);
+  });
+}

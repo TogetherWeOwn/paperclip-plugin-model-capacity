@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { loadWeeklyReference } from './weekly-reference.mjs';
 
 test('offline replay executes the real shadow tick with supplied AA snapshots', async () => {
   const path = new URL('../scripts/aa-replay.mjs', import.meta.url);
@@ -98,38 +99,8 @@ function replayInputs() {
   };
 }
 
-// Weekly-compatible reference: synthetic assembly, never a live capture.
-// Implementation is src+package from the pinned weekly revision; harness is the
-// unchanged current offline replay script copied into the assembly. The replay
-// script did not exist on the pinned revision.
-const WEEKLY_IMPLEMENTATION_REVISION = '77d8049bb50b3a8bf15be66873580add9040c66b';
-const WEEKLY_IMPLEMENTATION_TREE = '6d7d8c7895e2db20fa4d1a627ad9a947c1dca37b';
-const REPLAY_HARNESS_SHA256 = 'adf0d02c908057342e47efdaf985a71f37868807ab130cac69b6f3ebd0063b14';
-async function loadWeeklyReference() {
-  const { mkdtemp, rm, mkdir, copyFile, readFile } = await import('node:fs/promises');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { execFileSync } = await import('node:child_process');
-  const { pathToFileURL, fileURLToPath } = await import('node:url');
-  const { createHash } = await import('node:crypto');
-  const root = fileURLToPath(new URL('..', import.meta.url));
-  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-weekly-'));
-  try {
-    const tree = execFileSync('git', ['-C', root, 'rev-parse', `${WEEKLY_IMPLEMENTATION_REVISION}^{tree}`], { encoding: 'utf8' }).trim();
-    assert.equal(tree, WEEKLY_IMPLEMENTATION_TREE);
-    const archive = execFileSync('git', ['-C', root, 'archive', WEEKLY_IMPLEMENTATION_REVISION, 'src', 'package.json']);
-    execFileSync('tar', ['-x', '-C', dir], { input: archive });
-    await mkdir(join(dir, 'scripts'), { recursive: true });
-    await copyFile(fileURLToPath(new URL('../scripts/aa-replay.mjs', import.meta.url)), join(dir, 'scripts/aa-replay.mjs'));
-    const harnessBytes = await readFile(join(dir, 'scripts/aa-replay.mjs'));
-    assert.equal(createHash('sha256').update(harnessBytes).digest('hex'), REPLAY_HARNESS_SHA256);
-    const mod = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
-    return { mod, cleanup: () => rm(dir, { recursive: true, force: true }) };
-  } catch (e) {
-    await rm(dir, { recursive: true, force: true });
-    throw e;
-  }
-}
+// Weekly-compatible reference loads from the portable fixture.
+// See weekly-reference.mjs: synthetic assembly, never a live capture.
 
 test('X-R1: lifecycle generation differs in historical fidelity but not identical replays', async () => {
   const { replayTick, assertFidelity, projectForParity } = await import('../scripts/aa-replay.mjs');
