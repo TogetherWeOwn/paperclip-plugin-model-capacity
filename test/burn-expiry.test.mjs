@@ -80,6 +80,14 @@ test('exclusive burn still fences non-targets when the host prefilters every tar
   assert.equal(Date.parse(d.retryAt),NOW+10*MINUTE);
 });
 
+test('exclusive burn never fences a pool that has no target membership',()=>{
+  const cfg={...config(),burn:burn({accountKeys:['two'],mode:'exclusive'})};
+  const snapshot=build(cfg).snapshot;
+  const params=syntheticRouterRequest(normalizeRegistry(cfg.router),'thinker',NOW);
+  const d=routeDecision(params,snapshot,{...cfg,router:{...cfg.router,enabled:true}},{syntheticShadow:true});
+  assert.deepEqual(d,{kind:'selected',memberId:memberIdFor('thinker','one')});
+});
+
 test('expiry without a new job tick restores the independently built never-burned ranking exactly',()=>{
   const cfg={...config(),burn:burn({accountKeys:['two']})};
   const active=structuredClone(build(cfg).snapshot),never=structuredClone(build(config()).snapshot);

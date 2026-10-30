@@ -131,6 +131,7 @@ export function scorecardAccounts({registry,snapshot,feed,previous,ledger,member
   const rawByKey=new Map(feed.accounts.map(a=>[a.accountKey,a]));
   const registered=new Map(registry.accounts.map(a=>[a.accountKey,a]));
   const bodyAt=resetAtMsOf(feed.observedAt);
+  const burnPoolKeys=new Set(Object.values(snapshot.memberIndex).filter(m=>snapshot.accounts[m.accountKey]?.burn?.active===true).map(m=>m.poolKey));
   const runs=new Map();
   for (const r of ledger.values()) {
     const key=accountKeyForModel(r.actualModel ?? r.eventModel,registry.accounts);
@@ -145,13 +146,15 @@ export function scorecardAccounts({registry,snapshot,feed,previous,ledger,member
     const entryAt=raw && Object.hasOwn(raw,'observedAt') ? resetAtMsOf(raw.observedAt) : bodyAt;
     const observedAtMs=Number.isFinite(bodyAt)&&Number.isFinite(entryAt) ? Math.min(bodyAt,entryAt) : null;
     const members=Object.entries(snapshot.memberIndex).filter(([,m])=>m.accountKey===accountKey);
-    const policyReady=members.some(([id,m])=>!memberPolicySkips[id]&&!snapshot.memberSkipReasons?.[id]
+    const policyMembers=members.filter(([id,m])=>!memberPolicySkips[id]&&!snapshot.memberSkipReasons?.[id]
       &&!snapshot.staleMemberIds?.includes(id)&&!snapshot.unavailablePoolKeys?.includes(m.poolKey));
+    const policyReady=policyMembers.length>0;
     const burn=quota?.burn;
     const paceHeld=quota?.skipReason==='pace-held'&&burn?.active!==true;
     const underCaps=Number.isFinite(quota?.view.projectedUsed)&&quota.view.projectedUsed<hardCapWeekly
       &&(quota.view.projectedFiveHourUsed==null||quota.view.projectedFiveHourUsed<hardCapFiveHour);
-    const burnExcluded=snapshot.burn?.mode==='exclusive' && Object.values(snapshot.accounts).some(a=>a.burn?.active===true) && burn?.active!==true;
+    // One policy-ready membership outside the fenced pools is enough to serve.
+    const burnExcluded=snapshot.burn?.mode==='exclusive' && burn?.active!==true && policyMembers.every(([,m])=>burnPoolKeys.has(m.poolKey));
     const eligible=!burnExcluded && policyReady && underCaps && (quota?.eligible===true || (quota?.skipReason==='pace-held'&&burn?.active===true));
     return {accountKey,prefix:reg?.prefix ?? null,inScope:Boolean(reg),weeklyResetsAtMs:reset,
       weeklyUsed:a?.weekly?.utilization ?? null,projectedUsed:quota?.view.projectedUsed ?? a?.weekly?.utilization ?? null,

@@ -143,7 +143,10 @@ export function routeDecision(params, snapshot, config = {}, options = {}) {
   const feedStaleMembers = new Set(snapshot.staleMemberIds ?? []);
   const burnConfig = snapshot.burn ?? config.burn ?? router.burn ?? {};
   const burnActive = a => a?.burn?.active === true && Number.isFinite(a.burn.expiresAtMs) && now < a.burn.expiresAtMs && (!Number.isFinite(a.weeklyResetsAtMs) || now < a.weeklyResetsAtMs) && (!Number.isFinite(a.weeklyUsed) || a.weeklyUsed < (Number.isFinite(a.burn.endAtUsedPct) ? a.burn.endAtUsedPct : Number.isFinite(burnConfig.endAtUsedPct) ? burnConfig.endAtUsedPct : hardCap));
-  const burnTargets = Object.values(snapshot.accounts ?? {}).filter(burnActive);
+  // Saved pool membership survives host candidate filtering; unrelated pools
+  // must not be fenced by a target that can never serve them.
+  const poolAccountKeys = new Set(Object.values(snapshot.memberIndex ?? {}).filter(m => m.poolKey === poolKey).map(m => m.accountKey));
+  const burnTargets = [...poolAccountKeys].map(key => snapshot.accounts?.[key]).filter(burnActive);
   const exclusive = !pin && !probe && burnConfig.mode === 'exclusive' && burnTargets.length > 0;
   for (const i of infos) {
     const a = i.account;

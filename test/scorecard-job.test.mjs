@@ -80,6 +80,26 @@ test('native burn expiry is visible in job diagnostics and persisted scorecard b
   assert.ok(s.logs.some(l=>l.details.reason==='burn-expired'));
 });
 
+for (const shared of [false,true]) test(`exclusive burn preserves eligibility in a non-fenced pool (${shared?'shared':'disjoint'} membership)`,async()=>{
+  const s=start();s.cfg.burn={accountKeys:['two'],mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()};
+  if (!shared) delete s.cfg.router.accounts[0].pools.builder;
+  await s.tick();s.setNow(NOW+MINUTE);await s.tick();
+  const row=s.rows().find(r=>r.accountKey==='one');
+  assert.equal(row.minutesEligible,2);
+  assert.equal(row.minutesEligibleUnpicked,1);
+  assert.equal(row.leftoverReason,'no-demand');
+});
+
+test('an unfenced but policy-blocked membership cannot make a burn-fenced account eligible',async()=>{
+  const s=start();s.cfg.burn={accountKeys:['two'],mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()};
+  s.cfg.roles.excludeFamilies={thinker:['sol']};
+  await s.tick();s.setNow(NOW+MINUTE);await s.tick();
+  const row=s.rows().find(r=>r.accountKey==='one');
+  assert.equal(row.minutesEligible,0);
+  assert.equal(row.minutesEligibleUnpicked,0);
+  assert.notEqual(row.leftoverReason,'no-demand');
+});
+
 test('exclusive burn non-targets cannot accumulate eligible-unpicked minutes or a no-demand explanation',async()=>{
   const s=start();s.cfg.burn={accountKeys:['one'],mode:'exclusive',expiresAt:new Date(NOW+10*MINUTE).toISOString()};
   await s.tick();s.setNow(NOW+MINUTE);await s.tick();
