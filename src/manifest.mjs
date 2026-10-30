@@ -475,6 +475,24 @@ const CONFIG_SCHEMA = {
             other: { type: 'array', default: [], items: { type: 'string' } },
           },
         },
+        newestVersionOnly: {
+          type: 'object', additionalProperties: false,
+          description: 'Prefer newest model versions per account and product line. Disabled by default. Overrides can retain specific arms, models or products, alias products, or pin parsed identities.',
+          properties: {
+            enabled: { type: 'boolean', default: false },
+            overrides: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                keep: { type: 'array', default: [], items: { type: 'string', minLength: 1 }, description: 'Arm IDs, model:<canonicalModel>, product:<productKey>, or arm:<armId> to retain.' },
+                productAliases: { type: 'object', default: {}, additionalProperties: { type: 'string', minLength: 1 } },
+                parsePins: { type: 'object', default: {}, additionalProperties: {
+                  type: 'object', additionalProperties: false, required: ['product', 'version'],
+                  properties: { product: { type: 'string', minLength: 1 }, version: { type: 'array', minItems: 1, items: { type: 'integer', minimum: 0 } } },
+                } },
+              },
+            },
+          },
+        },
         minQuality: {
           type: 'object', additionalProperties: false,
           description: 'Per-role minimum on the fleet-scored quality Q (AA plus the EEE prior, the ladder\'s weights and blend). An arm below the minimum is ineligible for that role on every account. null turns the minimum off for the role. Defaults: doer -1.0, thinker 0.4, other -1.0.',

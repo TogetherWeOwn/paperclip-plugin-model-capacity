@@ -99,6 +99,22 @@ export function normalizeMinQuality(raw) {
   return out;
 }
 
+/** Normalize structural supersession settings; only the literal boolean enables it. */
+export function normalizeNewestVersionOnly(raw) {
+  const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+  const validKey = value => nonempty(value) && !/^(?:arm|model|product):$/.test(value);
+  const overrides = object(object(raw).overrides);
+  const keep = Array.isArray(overrides.keep) ? overrides.keep.filter(validKey) : [];
+  const productAliases = Object.fromEntries(Object.entries(object(overrides.productAliases))
+    .filter(([key, value]) => nonempty(key) && nonempty(value)));
+  const parsePins = Object.fromEntries(Object.entries(object(overrides.parsePins))
+    .filter(([key, pin]) => validKey(key) && nonempty(pin?.product) && Array.isArray(pin?.version)
+      && pin.version.length > 0 && pin.version.every(n => Number.isSafeInteger(n) && n >= 0))
+    .map(([key, pin]) => [key, { product: pin.product, version: [...pin.version] }]));
+  return { enabled: object(raw).enabled === true, overrides: { keep, productAliases, parsePins } };
+}
+
 export function normalizeOutcomeGate(raw) {
   const d = DEFAULT_OUTCOME_GATE;
   const int1 = (v, dflt) => (Number.isInteger(v) && v >= 1 ? v : dflt);

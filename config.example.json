@@ -20,6 +20,14 @@
       "thinker": [],
       "other": []
     },
+    "newestVersionOnly": {
+      "enabled": false,
+      "overrides": {
+        "keep": [],
+        "productAliases": {},
+        "parsePins": {}
+      }
+    },
     "minQuality": {
       "doer": -1.0,
       "thinker": 0.4,
