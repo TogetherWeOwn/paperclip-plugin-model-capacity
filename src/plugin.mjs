@@ -191,6 +191,7 @@ export function validateConfigShape(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return ['config must be an object'];
   const { cliproxy, aa, weights, pacing, concurrency, roles, armMap } = raw;
   errors.push(...validateTaskRanking(raw.taskRanking), ...validateFreeLanes(raw.freeLanes));
+  if (raw.bannedModels != null && (!Array.isArray(raw.bannedModels) || raw.bannedModels.some(m => typeof m !== 'string' || !m.trim() || m.includes('/')))) errors.push('bannedModels must be an array of bare model ids (no provider prefix)');
   if (raw.allocation != null) {
     const allocation = raw.allocation;
     if (typeof allocation !== 'object' || Array.isArray(allocation)) errors.push('allocation must be an object');
@@ -607,6 +608,7 @@ export function resolveConfig(raw = {}) {
       apiKeySecretRef: raw.aa?.apiKeySecretRef ?? null,
       maxSnapshotAgeHours: raw.aa?.maxSnapshotAgeHours ?? 30,
     },
+    bannedModels: [...new Set((Array.isArray(raw.bannedModels) ? raw.bannedModels : []).filter(m => typeof m === 'string' && m.trim() && !m.includes('/')).map(m => m.trim()))],
     armMap: Array.isArray(raw.armMap) && raw.armMap.length > 0 ? raw.armMap : DEFAULT_ARM_MAP,
     roles: {
       thinkerAgentIds: raw.roles?.thinkerAgentIds ?? [],
@@ -1634,7 +1636,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   }
 
   function resolveAccountArms(accounts, aaSnapshot, config) {
-    const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap);
+    const classic = resolveArms(aaSnapshot?.rows ?? [], config.armMap, { bannedModels: config.bannedModels });
     const accountModels = new Set();
     for (const account of accounts ?? []) {
       for (const m of account?.models ?? []) {
@@ -1643,7 +1645,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
     const classicModels = new Set(classic.arms.map(a => a.model));
-    const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides });
+    const { bindings } = buildDynamicBindings([...accountModels], { coveredModels: [...classicModels], overrides: config.modelAaOverrides, bannedModels: config.bannedModels });
     const dynamic = resolveDynamicArms(aaSnapshot?.rows ?? [], bindings);
     return { classic, dynamic, accountModels, arms: [...classic.arms, ...dynamic.arms] };
   }
@@ -1980,7 +1982,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const models = new Set(accountModels);
       for (const list of accountArms) for (const a of list) models.add(a.model);
       const discovered = discoverTaskArms(aaSnapshot?.rows ?? [], models, {
-        armMap: config.armMap, overrides: config.modelAaOverrides,
+        armMap: config.armMap, overrides: config.modelAaOverrides, bannedModels: config.bannedModels,
       });
       const pool = discovered.arms.map(a => ({ armId: a.armId, family: a.family,
         cost: a.row.intelligenceIndexCostPerTask }));
@@ -2062,7 +2064,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const policyArms = (config.reviewerRouting?.arms ?? []).flatMap(approved => {
           if (approved.provider !== String(account.pool ?? account.provider ?? '').toLowerCase()) return [];
           const canon = canonicalModelName(approved.model);
-          const allowed = discoverTaskArms([], [canon]).unscored.every(u => u.reason !== 'identity-policy' && u.reason !== 'non-chat-model');
+          const allowed = discoverTaskArms([], [canon], { bannedModels: config.bannedModels }).unscored.every(u => u.reason !== 'identity-policy' && u.reason !== 'non-chat-model' && u.reason !== 'banned-model');
           if (!allowed || !(account.models ?? []).map(canonicalModelName).includes(canon)) return [];
           const model = servedIdForArm(account.models, canon, account.provider, servedIds);
           if (servedIds && !servedIds.has(model)) return [];

@@ -79,6 +79,18 @@ export function canonicalModelName(model) {
   return bare.length > 0 ? bare : null;
 }
 
+/** Identity for ban checks and opt-in duplicate comparisons, never emission. */
+export function aliasKey(model) {
+  const canon = canonicalModelName(model);
+  return canon ? canon.toLowerCase().replace(/(\d)\.(?=\d)/g, '$1-') : null;
+}
+
+export const MANDATORY_BANNED_MODELS = Object.freeze(['gpt-6-sol', 'gpt-5.6-terra']);
+export function isBannedModel(model, additionalBans = []) {
+  const key = aliasKey(model);
+  return !!key && [...MANDATORY_BANNED_MODELS, ...(additionalBans ?? [])].some(b => aliasKey(b) === key);
+}
+
 /**
  * Providers whose lanes serve ONLY under the provider-prefixed id (never the
  * bare id). A `devin/<id>` lane 400s the bare id as unknown provider, so the
@@ -250,7 +262,7 @@ export function dynamicEffort(canonical) {
  * { aaSlug, model, effort, family, providers: null, dynamic: true };
  * unscored are { model, reason, tried } for the capacity report.
  */
-export function buildDynamicBindings(servedModels, { coveredModels = [], overrides = {} } = {}) {
+export function buildDynamicBindings(servedModels, { coveredModels = [], overrides = {}, bannedModels = [] } = {}) {
   const covered = new Set(coveredModels);
   const seen = new Set();
   const bindings = [];
@@ -259,6 +271,7 @@ export function buildDynamicBindings(servedModels, { coveredModels = [], overrid
     const model = canonicalModelName(raw);
     if (!model || seen.has(model)) continue;
     seen.add(model);
+    if (isBannedModel(model, bannedModels)) { unscored.push({ model, reason: 'banned-model', tried: [] }); continue; }
     if (covered.has(model)) continue;
     if (NON_CHAT_MODEL_RE.test(model)) {
       unscored.push({ model, reason: 'non-chat-model', tried: [] });
@@ -370,7 +383,7 @@ export function effortAllowed(family, effort) {
  * the shadow log can say why an arm is missing instead of silently
  * dropping it.
  */
-export function resolveArms(aaRows, armMap = DEFAULT_ARM_MAP) {
+export function resolveArms(aaRows, armMap = DEFAULT_ARM_MAP, { bannedModels = [] } = {}) {
   const bySlug = new Map();
   const counts = new Map();
   for (const row of aaRows ?? []) {
@@ -380,6 +393,7 @@ export function resolveArms(aaRows, armMap = DEFAULT_ARM_MAP) {
   const arms = [];
   const skipped = [];
   for (const binding of armMap) {
+    if (isBannedModel(binding.model, bannedModels)) { skipped.push({ aaSlug: binding.aaSlug, reason: 'banned-model' }); continue; }
     if ((counts.get(binding.aaSlug) ?? 0) > 1) {
       skipped.push({ aaSlug: binding.aaSlug, reason: 'slug-ambiguous' });
       continue;
@@ -441,13 +455,14 @@ export const taskArmId = (model, effort) => `${taskSlugBases(model).at(-1) ?? mo
  * variants require an explicit endpoint effortSupport declaration. A family
  * ceiling proves rejection above it, never acceptance below it. Unknown and
  * borrowed observations stay in the report, not normal benchmark admission. */
-export function discoverTaskArms(aaRows, servedModels, { armMap = DEFAULT_ARM_MAP, overrides = {}, effortSupport = {} } = {}) {
+export function discoverTaskArms(aaRows, servedModels, { armMap = DEFAULT_ARM_MAP, overrides = {}, effortSupport = {}, bannedModels = [] } = {}) {
   const counts = new Map();
   for (const r of aaRows ?? []) if (typeof r?.slug === 'string') counts.set(r.slug, (counts.get(r.slug) ?? 0) + 1);
   const rows = (aaRows ?? []).filter(r => r?.slug && counts.get(r.slug) === 1);
   const arms = [], unscored = [];
   for (const model of new Set([...(servedModels ?? [])].map(canonicalModelName).filter(Boolean))) {
     const bases = taskSlugBases(model);
+    if (isBannedModel(model, bannedModels)) { unscored.push({ model, reason: 'banned-model', tried: [] }); continue; }
     const family = inferFamily(model);
     if (NON_CHAT_MODEL_RE.test(model)) { unscored.push({ model, reason: 'non-chat-model', tried: bases }); continue; }
     if ((family === 'muse' && !/-contributor(?:-free|:free|-1m)*$/.test(model))

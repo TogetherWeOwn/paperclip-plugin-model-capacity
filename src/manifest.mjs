@@ -843,6 +843,7 @@ const CONFIG_SCHEMA = {
         },
       },
     },
+    bannedModels: { type: 'array', default: [], items: { type: 'string', minLength: 1 }, description: 'Additional bare model ids; this list only widens the mandatory bans on gpt-6-sol and gpt-5.6-terra, which cannot be removed.' },
     modelAaOverrides: {
       type: 'object', default: {},
       description: 'Operator extensions to the AA-slug override table: CLIProxy model id to AA slug (or { slug, effort }). Merged over the built-in table.',
