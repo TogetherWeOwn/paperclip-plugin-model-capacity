@@ -795,8 +795,10 @@ empty (`paceGuard.roleSafety` and `holdSuspendedAccountIds`).
 **Shared model routes:** selecting an account label does not bind the proxy's
 credential. If an emitted model can reach any known weekly-held non-burn
 credential, the plugin refuses that emission and chooses an already-approved
-safe alternative or returns a bounded defer. Unknown serving inventory is not
-proof of safety. Defaults, effort changes, policy arms, duplicate passes and
+safe alternative or returns a bounded defer. Reviewer safety checks the actual
+admitted served ID, including its provider prefix and existing decorations,
+not just the configured policy's bare model name. Unknown serving inventory is
+not proof of safety. Defaults, effort changes, policy arms, duplicate passes and
 exhaustion fallback cannot reopen the same route. A burn credential sharing an
 indistinguishable route can therefore wait too; it remains burn-exempt, but does
 not authorize use of the held non-burn credential. Distinct safe emissions and
@@ -811,13 +813,28 @@ the doer-role admission view. Every running run continues charging its recorded
 account and pool, even after its route becomes held or ineligible; it is never
 rematched to a new candidate. Reviewer-local ordinary caps include other agents'
 ordinary pool pressure. Burn identity and running pressure survive role filters.
+Missing, empty or `unknown` agent metadata does not erase verified in-scope
+occupancy or create a synthetic demand recipient. Its known account charges are
+carried separately as `externalRunningByPool` (ordinary/burn totals and account
+counts); `unknownExternalRunning` refuses extra paid allocation when its charge
+cannot be established. Independent pool totals overlap this census and are not
+added again. An observed run-model charge outranks a non-enforced shadow guess
+for physical reporting, without rewriting the ledger, claiming credential
+affinity, or changing simulated water-filling reservations.
 
 When this layer is enabled, new fixed/reviewer grants require a feature-compatible
 snapshot from the current producer instance and configuration/admission generation,
 no older than 120 seconds and not future-dated. A failed refresh, old-policy,
 pre-feature or incompatible snapshot preserves running floors but grants no
-affected new slots, reporting `weekly-hold-evidence-unavailable`. Opting out of
-the weekly layer retains the existing disabled-hold freshness behavior.
+affected new slots, reporting `weekly-hold-evidence-unavailable`. Under the
+existing enabled-hold/relevant-fixed-or-reviewer-identity trigger, this final
+fence conservatively floors the whole publication, including ordinary, burn
+and free headroom. Those credentials are not relabelled weekly-held. Smoothing,
+reserved floors and review-demand credits cannot restore new slots; a successful
+compatible refresh restores eligibility. Opting out of the weekly layer, or
+having no relevant constrained identities, retains the existing freshness
+behavior. Configuration-generation changes still fence every new slot
+independently of the weekly-hold setting.
 
 **Plan endpoint:** the linear target is `elapsedFraction * (1 - configuredFloor)`,
 reaching **100% minus the explicit floor at reset**, with no additional pacing

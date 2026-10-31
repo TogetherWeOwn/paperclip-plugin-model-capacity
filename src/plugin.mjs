@@ -1289,7 +1289,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       }
     }
     const self = selfRunId != null ? String(selfRunId) : null;
-    const census = inflightByAccount(ledger, {
+    const census = physicalCensus(ledger, {
       nowMs, horizonMs,
       skip: r => r?.runId === self || waiting?.has(r?.runId) === true,
     });
@@ -1301,6 +1301,22 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     return { pools, byAccount: census.byAccount, unattributed: census.unattributed };
   };
   const runEventStats = new Map(); // companyId -> { seen, lastAtMs, lastRunId } (persisted each tick)
+  // Physical pressure follows an observed run model, not a prior shadow guess.
+  // Config/issue model guesses still lose to decisions; ledger records stay intact.
+  function physicalAccountOf(record) {
+    const observed = record?.actualModelSource === 'run-event' || record?.actualModelSource === 'run-decision'
+      || (record?.actualModel == null && record?.eventModel != null);
+    return record?.enforced !== true && observed && record?.actualAccount != null
+      ? record.actualAccount : attributedAccount(record);
+  }
+  function physicalCensus(ledger, options) {
+    return inflightByAccount({ *values() {
+      for (const record of ledger?.values() ?? []) {
+        const account = physicalAccountOf(record);
+        yield account !== attributedAccount(record) ? { ...record, decidedAccount: account } : record;
+      }
+    } }, options);
+  }
   // Failure-cluster single-flight: event ingestion and the per-minute tick
   // share one chain per company so persisted counters, transition
   // signatures and singleton writes serialize (duplicate/out-of-order
@@ -4190,8 +4206,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // decisions spread across accounts instead of herding onto one static
     // argmax winner. Same order the hook and the event-time path use (via
     // the live view below).
-    const freshPressure = () => {
-      const cur = inflightByAccount(ledger, { nowMs, horizonMs: staleHorizonMs });
+    const freshPressure = (physical = false) => {
+      // Keep simulated water-filling reservations; only the final physical
+      // publication may replace a shadow guess with observed run evidence.
+      const cur = (physical ? physicalCensus : inflightByAccount)(ledger, { nowMs, horizonMs: staleHorizonMs });
       const pools = {};
       for (const [id, n] of Object.entries(cur.byAccount)) {
         const p = poolOfKey(id);
@@ -4270,7 +4288,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // report complete (held pools are not candidates, but they are still
     // pools the report narrates).
     const allocationOrder = (role, selfRunId = null, duplicates = true, opts = {}) => {
-      const { pools, byAccount } = freshPressure();
+      const { pools, byAccount } = freshPressure(opts.physicalPressure === true);
       const paceCensus = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, selfRunId, poolOf: poolOfKey });
       const pacePools = paceCensus.pools;
       const applyReserve = opts.applyReserve !== false && reviewReserveView.enabled === true;
@@ -4586,7 +4604,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       adapterByAgentEntries.set(k.slice(sep + 1), { adapterType: v.adapterType, atMs: v.atMs });
     }
     const adapterByAgent = Object.fromEntries(adapterByAgentEntries);
-    const liveCensus = inflightByAccount(ledger, { nowMs, horizonMs: staleHorizonMs });
+    const liveCensus = physicalCensus(ledger, { nowMs, horizonMs: staleHorizonMs });
     const livePools = {};
     for (const [id, n] of Object.entries(liveCensus.byAccount)) {
       const p = poolOfKey(id);
@@ -4794,23 +4812,34 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // plain object with '__proto__' would write Object.prototype worker-wide
     // (and read it back as NaN counts). fromEntries below defines own data
     // properties even for '__proto__', so the snapshot reads back safely.
-    const agentRunningById = new Map();
+    const agentRunningById = new Map(), externalRunningByPool = new Map();
+    let unknownExternalRunning = false;
     for (const r of ledger.values()) {
       if (r?.status !== 'running' || r?.unverified === true) continue;
-      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
+      const actual = physicalAccountOf(r);
+      const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
+      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') {
+        // Occupancy without a demand recipient still spends its real pool.
+        if (free || !isInflight(r, nowMs, staleHorizonMs)) continue;
+        const account = viewById.get(actual), pool = account?.pool ?? account?.provider;
+        if (actual == null || typeof pool !== 'string') { unknownExternalRunning = true; continue; }
+        let entry = externalRunningByPool.get(pool);
+        if (!entry) { entry = { ordinary: 0, burn: 0, byAccount: {} }; externalRunningByPool.set(pool, entry); }
+        entry[account.burnMode === true ? 'burn' : 'ordinary'] += 1;
+        Object.defineProperty(entry.byAccount, actual, { enumerable: true, configurable: true,
+          value: (Object.hasOwn(entry.byAccount, actual) ? entry.byAccount[actual] : 0) + 1 });
+        continue;
+      }
       let entry = agentRunningById.get(r.agentId);
       if (!entry) { entry = { running: 0, overPace: false, runningByAccount: {}, unattributedRunning: 0 }; agentRunningById.set(r.agentId, entry); }
-      const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
       if (free) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
       else {
         entry.running += 1;
-        const actual = attributedAccount(r);
         if (actual != null) Object.defineProperty(entry.runningByAccount, actual, { enumerable: true,
           configurable: true, value: (Object.hasOwn(entry.runningByAccount, actual) ? entry.runningByAccount[actual] : 0) + 1 });
         else entry.unattributedRunning += 1;
       }
-      const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
-      if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
+      if (actual != null && overPaceAccounts.has(actual)) entry.overPace = true;
     }
     const agentRunning = Object.fromEntries(agentRunningById);
     // With routing enabled, capacity must pass the same admission as a
@@ -4990,13 +5019,13 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
     // Pace guard verdict per pool with the tick's final in-flight counts
     // (the role only affects placement quality, never the guard).
-    const paceReportOrder = allocationOrder('doer', null, true, { applyReserve: false });
+    const paceReportOrder = allocationOrder('doer', null, true, { applyReserve: false, physicalPressure: true });
     const paceReport = paceReportOrder.pools;
     // Keep spendable soft-cap membership qualified, including policy-only
     // reviewers. Universal weekly hold facts must survive routing exclusions,
     // but an unservable or low-headroom ordinary lane must not resize this cap.
-    const qualifiedRaw = allocationOrder('doer', null, true, { applyReserve: false, universalPools: true }).rawPools;
-    const pressure = freshPressure();
+    const qualifiedRaw = allocationOrder('doer', null, true, { applyReserve: false, universalPools: true, physicalPressure: true }).rawPools;
+    const pressure = freshPressure(true);
     const globalPace = paceInFlightByPool(companyId, ledger, { nowMs, horizonMs: staleHorizonMs, poolOf: poolOfKey }).pools;
     const globalViews = accountViews.filter(v => v.health === 'healthy' && freeProvider(v, config.freeLanes) == null)
       .map(v => ({ ...v, burn: v.burnMode === true,
@@ -5163,6 +5192,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
+      ...(externalRunningByPool.size > 0 ? { externalRunningByPool: Object.fromEntries(externalRunningByPool) } : {}),
+      ...(unknownExternalRunning ? { unknownExternalRunning: true } : {}),
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
@@ -5847,8 +5878,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const capped = a => a.reactive && inFlightOf(a) >= liveTrialInflightCapFor(live, a);
     const accounts = eligibleAccounts.filter(a => !capped(a));
     const admission = reviewerArmAdmission(live, companyId, agentId, nowMs, { selfId, adapterType });
-    const admit = (account, arm) => emissionSafety && weeklyRouteHeld(live, arm.model)
-      ? { ok: 'weekly hold: emitted route can reach a held credential' } : admission(account, arm);
+    let weeklyRefused = false;
+    const admit = (account, arm) => {
+      const result = admission(account, arm);
+      if (emissionSafety && result.ok === true && weeklyRouteHeld(live, result.model ?? arm.model)) {
+        weeklyRefused = true;
+        return { ok: 'weekly hold: emitted route can reach a held credential' };
+      }
+      return result;
+    };
     // A hard credential cap still applies when another admission gate (for
     // example the family trial budget) also refuses the reviewer arm. Keep
     // that refusal independent so a legacy keep cannot start on a full lane.
@@ -5881,7 +5919,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return r.ok;
       },
     });
-    return { pick, admissionOf, capHeld };
+    return { pick, admissionOf, capHeld, weeklyRefused };
   }
 
   function configuredTaskReviewer(live, agentId) {
@@ -6353,7 +6391,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         normalizeExcludedFamilies(live.excludeFamilies?.[role] ?? []), true, true, params).paced ?? [])
       : [];
     const pacedIds = new Set(paced.flatMap(p => p.pacedAccountIds ?? []));
-    const { pick, admissionOf, capHeld } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds, params.adapterType);
+    const { pick, admissionOf, capHeld, weeklyRefused } = pickReviewerRoute(live, companyId, params.agentId, selfId, nowMs, pacedIds, params.adapterType);
     if (pick.none) {
       // A legacy keep fallback still starts provider work. It cannot escape
       // the shared credential cap when an approved reviewer route is full.
@@ -6372,7 +6410,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         return { kind: 'defer', retryAfterMs, reason };
       }
       if (live.taskRanking?.mode === 'enforce') {
-        const reason = `no approved reviewer arm available: ${pick.reason}`;
+        const reason = weeklyRefused ? `weekly hold: emitted route can reach a held credential; ${pick.reason}`
+          : `no approved reviewer arm available: ${pick.reason}`;
         note({ routed: false, deferred: true, reason });
         return { kind: 'defer', retryAfterMs: 20000, reason };
       }
@@ -7070,6 +7109,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           keptByAgent: safePins,
           accounts: cap.accounts ?? [],
           perAccount: cap.perAccount ?? [],
+          externalRunningByPool: cap.externalRunningByPool ?? {},
+          unknownExternalRunning: cap.unknownExternalRunning === true,
           pacePools: cap.paceGuard?.rawPools ?? cap.paceGuard?.pools ?? [],
           unavailableAccountIds: [...new Set([...(cap.breakerUnavailableAccountIds ?? []), ...unsafeAccounts])],
           reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,

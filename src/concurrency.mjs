@@ -438,9 +438,11 @@ export function allocateKeptAndRoutedCaps({
   // A physical census can describe runs on accounts other than a fixed pin.
   // Use the account-aware path even when reviewer routing is disabled.
   if (Object.keys(reviewerAccountIdsByAgent).length > 0 || actualRunningByAgent != null
+    || Object.keys(externalRunningByPool).length > 0 || unknownExternalRunning
     || agents.some(a => a.runningByAccount != null || a.unattributedRunning != null)) {
     return allocateMultiPoolReviewers({ target, maxTotal, demandFactor, agents, keepAgentIds,
-      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority, actualRunningByAgent });
+      keptByAgent, accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent, reviewerPaceByAgent, blockingPriority,
+      actualRunningByAgent, externalRunningByPool, unknownExternalRunning });
   }
   const keptIds = new Set(keepAgentIds);
   const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
@@ -592,17 +594,36 @@ export function allocateKeptAndRoutedCaps({
 function allocateMultiPoolReviewers(input) {
   const { target, maxTotal, demandFactor, agents, keepAgentIds, keptByAgent,
     accounts, perAccount, pacePools, unavailableAccountIds, reviewerAccountIdsByAgent,
-    reviewerPaceByAgent, blockingPriority, actualRunningByAgent } = input;
+    reviewerPaceByAgent, blockingPriority, actualRunningByAgent, externalRunningByPool, unknownExternalRunning } = input;
   const reviewIds = new Set(Object.keys(reviewerAccountIdsByAgent));
   const fixedIds = new Set(keepAgentIds.filter(id => !reviewIds.has(id)));
   const constrainedIds = new Set([...fixedIds, ...reviewIds]);
   const accountPool = new Map(accounts.map(a => [a.accountId, a.pool]));
   const hardHeld = new Set(pacePools.flatMap(p => p.hardHeldAccountIds ?? []));
   const unavailable = new Set([...unavailableAccountIds, ...hardHeld]);
-  const burn = new Set(pacePools.flatMap(p => p.burnAccountIds ?? []));
+  const burn = new Set([...pacePools.flatMap(p => p.burnAccountIds ?? []),
+    ...accounts.filter(a => a.burnMode === true).map(a => a.accountId)]);
   const accountLeft = new Map(), poolLeft = new Map(), pacedLeft = new Map();
-  const ordinaryPressure = new Map();
-  let unknownPressure = false;
+  const ordinaryPressure = new Map(), externalAccounts = new Map(), externalRemainder = new Map();
+  let unknownPressure = unknownExternalRunning, externalTotal = 0;
+  // These runs have no demand recipient. Seed their pressure once, separately
+  // from agent floors; independent pool totals below are maxima, not additions.
+  for (const [pool, pressure] of Object.entries(externalRunningByPool)) {
+    const ordinary = Math.max(0, Math.floor(Number(pressure.ordinary) || 0));
+    const burning = Math.max(0, Math.floor(Number(pressure.burn) || 0));
+    externalTotal += ordinary + burning;
+    ordinaryPressure.set(pool, ordinary);
+    const remaining = { ordinary, burn: burning };
+    for (const [id, value] of Object.entries(pressure.byAccount ?? {})) {
+      const n = Math.max(0, Math.floor(Number(value) || 0));
+      if (!n) continue;
+      if (accountPool.get(id) !== pool) { unknownPressure = true; continue; }
+      remaining[burn.has(id) ? 'burn' : 'ordinary'] -= n;
+      externalAccounts.set(id, (externalAccounts.get(id) ?? 0) + n);
+    }
+    if (remaining.ordinary < 0 || remaining.burn < 0) unknownPressure = true;
+    externalRemainder.set(pool, remaining);
+  }
 
   // A census, when supplied, is authoritative: its per-agent account counts
   // must cover every running run. Otherwise retain the legacy kept-account
@@ -646,10 +667,7 @@ function allocateMultiPoolReviewers(input) {
   // Physical occupancy stays on its actual account, including if admission
   // changed. Held accounts have no spendable slots, but still consume the
   // ordinary cap of their original pool. Burn never consumes that cap.
-  for (const agent of agents) {
-    const running = Math.max(0, Math.floor(agent.running ?? 0));
-    if (!running || (!censusProvided && !constrainedIds.has(agent.agentId))) continue;
-    const charges = chargesOf(agent, running);
+  const chargeRunning = charges => {
     for (const [id, value] of Object.entries(charges)) {
       const n = Math.max(0, Math.floor(Number(value) || 0));
       if (!accountLeft.has(id) || !n) continue;
@@ -659,6 +677,20 @@ function allocateMultiPoolReviewers(input) {
       poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - used));
       if (!burn.has(id)) pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - used));
     }
+  };
+  for (const agent of agents) {
+    const running = Math.max(0, Math.floor(agent.running ?? 0));
+    if (!running || (!censusProvided && !constrainedIds.has(agent.agentId))) continue;
+    chargeRunning(chargesOf(agent, running));
+  }
+  chargeRunning(Object.fromEntries(externalAccounts));
+  // Older callers supply pool-only pressure. Spend that residual without
+  // charging ordinary work to burn allowance, or the same account twice.
+  for (const [pool, pressure] of externalRemainder) {
+    const ordinary = Math.min(pressure.ordinary, pacedLeft.get(pool) ?? 0);
+    const burning = Math.min(pressure.burn, Math.max(0, (poolLeft.get(pool) ?? 0) - (pacedLeft.get(pool) ?? 0)));
+    pacedLeft.set(pool, Math.max(0, (pacedLeft.get(pool) ?? 0) - ordinary));
+    poolLeft.set(pool, Math.max(0, (poolLeft.get(pool) ?? 0) - ordinary - burning));
   }
   // Every reviewer's local cap measures all ordinary pressure in the pool,
   // not just that reviewer's own runs. The minimum applicable cap is a
@@ -704,7 +736,8 @@ function allocateMultiPoolReviewers(input) {
       ? Math.min(404, agent.allocationWeight) : 1 };
   });
   const totalCeiling = Math.max(0, Math.min(maxTotal, Math.round(target ?? maxTotal)));
-  let left = Math.max(0, totalCeiling - rows.reduce((sum, row) => sum + row.running, 0));
+  let left = unknownExternalRunning ? 0
+    : Math.max(0, totalCeiling - externalTotal - rows.reduce((sum, row) => sum + row.running, 0));
   let resourceStatus;
   if (blockingPriority) {
     // Matching is only for new slots; running charges above are never moved.
@@ -752,17 +785,18 @@ function allocateMultiPoolReviewers(input) {
     reason: row.allocated === row.running ? 'floor-running' : blockingPriority ? 'proportional' : 'reviewer-headroom',
   }));
   const keptTotal = kept.reduce((sum, row) => sum + row.allocated, 0);
-  // A physical running census alone must not turn the ordinary soft target
-  // into a hard ceiling. Constrained grants still consume the fleet remainder.
-  const routedTarget = keptTotal === 0
-    ? target
-    : (target == null ? null : Math.max(0, totalCeiling - keptTotal));
+  // Preserve ordinary soft-target headroom, but identity-less occupancy and
+  // constrained grants both consume the fleet remainder without extra demand.
+  const occupied = keptTotal + externalTotal;
+  const routedTarget = target == null ? null : Math.max(0,
+    (keptTotal === 0 ? target : totalCeiling) - occupied);
   const routedCeiling = Math.max(1, Math.floor(keptTotal === 0
-    ? maxTotal
-    : Math.min(maxTotal - keptTotal, totalCeiling - keptTotal)));
+    ? maxTotal - externalTotal
+    : Math.min(maxTotal - occupied, totalCeiling - occupied)));
   const routed = blockingPriority ? rows.filter(row => !constrainedIds.has(row.agentId)).map(({ allocationWeight, ...row }) => ({
     ...row, maxConcurrentRuns: row.allocated, reason: row.allocated === row.running ? 'floor-running' : 'proportional',
-  })) : allocateDemandCaps(routedTarget, agents.filter(a => !constrainedIds.has(a.agentId)), routedCeiling);
+  })) : allocateDemandCaps(unknownExternalRunning || externalTotal >= maxTotal ? 0 : routedTarget,
+    agents.filter(a => !constrainedIds.has(a.agentId)), routedCeiling);
   return { kept, keptCeilings: new Map(kept.map(row => [row.agentId, row.allocated])), routed,
     routedTarget, routedCeiling, ...(resourceStatus ? { resourceStatus } : {}) };
 }
