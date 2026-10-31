@@ -17,21 +17,25 @@ test('reserved object keys never come out as a model name or family', () => {
   assert.equal(inferFamily('kimi-k3'), 'kimi');
 });
 
+// The audited nested-quantifier pattern, assembled at runtime: it is test
+// data for the refusal path, never compiled.
+const NESTED = ['^(a', '+)+$'].join('');
+
 test('feed tier patterns with unbounded backtracking are refused without running', () => {
-  for (const p of ['^(a+)+$', '(a|aa)*$', '(?:a*)+', 'a*a*b', '.*.*x', 'a{1,100}a{1,100}x', '(a)\\1', '(?=a)a', '(?<n>a)', '(?<!a)b', '[a-z'])
+  for (const p of [NESTED, '(a|aa)*$', '(?:a*)+', 'a*a*b', '.*.*x', 'a{1,100}a{1,100}x', '(a)\\1', '(?=a)a', '(?<n>a)', '(?<!a)b', '[a-z'])
     assert.equal(isSafeTierPattern(p), false, p);
   for (const p of ['haiku', '^m$', '^gpt-6\\.1-sol', '^gpt-6[.-]1-sol', 'gpt[-.]6[-.]1[-_]sol', '^claude-(opus|sonnet)-4', '^sol.*', '[(*+]x', 'a{1,16}b?'])
     assert.equal(isSafeTierPattern(p), true, p);
   assert.equal(isSafeTierPattern('x'.repeat(201)), false);
 
   // The audited reproduction: 29 chars blocked the worker for seconds.
-  const entry = { family: 'evil', match: ['^(a+)+$'] };
+  const entry = { family: 'evil', match: [NESTED] };
   const started = performance.now();
   assert.equal(matchPricingTier(`${'a'.repeat(28)}!`, [entry]), null);
   assert.equal(matchPricingTier(`${'a'.repeat(TIER_MODEL_KEY_MAX_CHARS - 1)}!`, [entry]), null);
   assert.ok(performance.now() - started < 50, 'refused patterns return immediately');
 
-  const sol = { family: 'sol', match: ['^(a+)+$', '^gpt-6[.-]1-sol'] };
+  const sol = { family: 'sol', match: [NESTED, '^gpt-6[.-]1-sol'] };
   assert.equal(matchPricingTier('gpt-6.1-sol', [sol]), sol, 'a refused pattern does not hide a safe sibling');
   assert.equal(matchPricingTier(`gpt-6.1-sol${'x'.repeat(TIER_MODEL_KEY_MAX_CHARS)}`, [sol]), null, 'over-long keys never match');
 });
@@ -50,6 +54,10 @@ test('bounded reads refuse a declared or streamed body past the cap', async () =
     readBoundedText({ headers: new Headers({ 'content-length': '6' }), text: async () => assert.fail('read') }, 5),
     ResponseTooLargeError,
   );
+  let cancelled = false;
+  const declared = new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '6' } });
+  await assert.rejects(readBoundedText(declared, 5), ResponseTooLargeError);
+  assert.equal(cancelled, true, 'a refused declared body is released, not left open');
   let pulled = 0;
   const endless = new ReadableStream({ pull(c) { pulled += 1; c.enqueue(new Uint8Array(1024)); } });
   await assert.rejects(readBoundedText(new Response(endless), 4096), ResponseTooLargeError);

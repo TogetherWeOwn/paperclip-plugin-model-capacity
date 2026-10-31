@@ -26,8 +26,12 @@ function declaredLength(response) {
  */
 export async function readBoundedText(response, maxBytes, code = 'response-too-large') {
   const declared = declaredLength(response);
-  if (declared != null && declared > maxBytes) throw new ResponseTooLargeError(code);
   const body = response?.body;
+  if (declared != null && declared > maxBytes) {
+    // Release the unread stream so the connection is not held open.
+    if (body && typeof body.cancel === 'function') await body.cancel().catch(() => {});
+    throw new ResponseTooLargeError(code);
+  }
   if (body && typeof body.getReader === 'function') {
     const reader = body.getReader();
     const decoder = new TextDecoder();
