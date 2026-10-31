@@ -2,7 +2,7 @@
  * Pure JOB-SIDE reducer: no callback accounting, HTTP, timers, or IO. The quota
  * job persists the returned JSON and publishes scorecardRows() on its views.
  *
- * accounts is the job's joined account evidence, including excluded feed rows:
+ * accounts is the job's joined account evidence for registered accounts:
  * {accountKey,prefix,inScope,weeklyResetsAtMs,weeklyUsed,projectedUsed,
  *  quality,observedAtMs,eligible,paceHeld,requiredRatePerHour,
  *  measuredRatePerHour,measuredRate24h,usage:{epoch,requests,observedAtMs},
@@ -139,7 +139,9 @@ export function scorecardAccounts({registry,snapshot,feed,previous,ledger,member
     if (!runs.has(key)) runs.set(key,[]);
     runs.get(key).push({runId:r.runId,startedAt:r.startedAt});
   }
-  return [...new Set([...registered.keys(),...byKey.keys()])].map(accountKey=>{
+  // Only this company's registered accounts: the pinned lane feed is shared by
+  // every company on the instance, so other feed accounts are counted, never shown.
+  return [...registered.keys()].map(accountKey=>{
     const reg=registered.get(accountKey),a=byKey.get(accountKey),raw=rawByKey.get(accountKey),quota=snapshot.accounts[accountKey];
     const prior=(previous?.windows ?? []).find(r=>r.accountKey===accountKey&&!r.closed&&r._resetMs>nowMs);
     const reset=a?.weekly?.resetsAtMs ?? prior?._resetMs ?? null;
@@ -156,13 +158,26 @@ export function scorecardAccounts({registry,snapshot,feed,previous,ledger,member
     // One policy-ready membership outside the fenced pools is enough to serve.
     const burnExcluded=snapshot.burn?.mode==='exclusive' && burn?.active!==true && policyMembers.every(([,m])=>burnPoolKeys.has(m.poolKey));
     const eligible=!burnExcluded && policyReady && underCaps && (quota?.eligible===true || (quota?.skipReason==='pace-held'&&burn?.active===true));
-    return {accountKey,prefix:reg?.prefix ?? null,inScope:Boolean(reg),weeklyResetsAtMs:reset,
+    return {accountKey,prefix:reg.prefix ?? null,inScope:true,weeklyResetsAtMs:reset,
       weeklyUsed:a?.weekly?.utilization ?? null,projectedUsed:quota?.view.projectedUsed ?? a?.weekly?.utilization ?? null,
       quality:a?.quality ?? 'unknown',observedAtMs,eligible,paceHeld:!burnExcluded&&policyReady&&paceHeld,
       requiredRatePerHour:quota?.view.requiredRatePerHour ?? null,
       measuredRatePerHour:quota?.view.weeklyMeasuredRatePerHour ?? null,
-      usage:a?.usage ?? null,ledgerRuns:reg ? runs.get(accountKey) ?? [] : undefined,burn};
+      usage:a?.usage ?? null,ledgerRuns:runs.get(accountKey) ?? [],burn};
   });
+}
+
+/** Feed accounts outside the company's registry: published as a count only. */
+export function unregisteredFeedAccountCount(registry,feed) {
+  const registered=new Set(registry.accounts.map(a=>a.accountKey));
+  return new Set((feed?.accounts ?? []).map(a=>a?.accountKey).filter(k=>typeof k==='string'&&!registered.has(k))).size;
+}
+
+/** Keep only rows for the company's registered accounts. Earlier builds
+ * persisted rows for other feed accounts, and a feed gap could have moved
+ * them to feed-unknown, so membership (not status) decides. */
+export function scopeScorecard(state,accountKeys) {
+  return state?.windows ? {...state,windows:state.windows.filter(r=>accountKeys.has(r.accountKey))} : state;
 }
 
 /** Advance one quota tick. Replayed/out-of-order ticks cannot add time or runs.
@@ -249,6 +264,7 @@ export function scorecardRows(state) {
 
 /** Same durable view for the dedicated route and folded capacity response. */
 export function scorecardView(envelope) {
-  return {atMs:envelope?.scorecard?.atMs ?? null,rows:scorecardRows(envelope?.scorecard),
+  return {atMs:envelope?.scorecard?.atMs ?? null,rows:scorecardRows(scopeScorecard(envelope?.scorecard,new Set(Object.keys(envelope?.snapshot?.accounts ?? {})))),
+    unregisteredFeedAccounts:envelope?.unregisteredFeedAccounts ?? null,
     burn:copy(envelope?.snapshot?.burn ?? null),warnings:copy(envelope?.scorecard?.warnings ?? [])};
 }

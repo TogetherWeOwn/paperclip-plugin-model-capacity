@@ -63,8 +63,9 @@ test('release tarballs identify BOTH variants and differ only on the U19 build a
       assert.equal(hook(plugin),hook(source));
       // §17 pins the read-only 0.2.72 reference and main dc86ae4, not the
       // stale port handoff. Mainline integration must not regress that hook.
+      // Re-pinned once for the no-live-view credential-readiness defer (TWO-355).
       assert.equal(createHash('sha256').update(hook(plugin)).digest('hex'),
-        'a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2');
+        '4bcadf4d3129122063aa5e830c205212f4310211854486329b9ecb2449ec7b8d');
       const expected = source.replace("if (!['transitional','clean'].includes(variant))", "if (variant !== 'transitional')")
         .replace("  if (variant === 'clean') delete plugin.onResolveRunModel;\n", '');
       assert.equal(plugin,expected,'transitional helpers changed beyond the build-time factory guard');

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createQuotaRefresh } from '../src/quota-refresh.mjs';
+import { scorecardView } from '../src/scorecard.mjs';
 import { companyId } from './support/native-api.mjs';
 import { config, quotaFeed, stateHarness, NOW, MINUTE, HOUR } from './support/quota.mjs';
 const policy=now=>({atMs:now,records:[],arms:[
@@ -22,13 +23,15 @@ function start({h=stateHarness(),now=NOW,deny=false}={}) {
     rows:()=>quota.scorecard(companyId).rows};
 }
 
-test('native quota job persists incremental per-account rows, usage deltas, excluded accounts and honest wait nulls',async()=>{
+test('native quota job persists incremental per-account rows, usage deltas, honest wait nulls and only a count of unregistered feed accounts',async()=>{
   const s=start();let f=s.feed();
-  f.accounts.push({...structuredClone(f.accounts[0]),accountKey:'excluded'});
+  f.accounts.push({...structuredClone(f.accounts[0]),accountKey:'other-company'});
   await s.tick(f);
   assert.equal(typeof s.quota.scorecard,'function','scorecard is exposed by the native quota coordinator');
   assert.equal(s.rows().find(r=>r.accountKey==='one').minutesEligible,1);
-  assert.equal(s.rows().find(r=>r.accountKey==='excluded').leftoverReason,'excluded');
+  assert.equal(s.rows().some(r=>r.accountKey==='other-company'),false,'unregistered feed accounts are not published');
+  assert.equal(s.quota.scorecard(companyId).unregisteredFeedAccounts,1);
+  assert.doesNotMatch(JSON.stringify(s.store.get(JSON.stringify(s.keyFor(companyId))).scorecard),/other-company/,'nor persisted');
   s.setNow(NOW+MINUTE);f=s.feed();f.accounts[0].usage.requests=105;
   const ledger=new Map([['r1',{runId:'r1',startedAt:NOW+1000,actualModel:'one/terra'}],['shadow',{runId:'shadow',startedAt:NOW+1000,wouldModel:'one/terra'}]]);
   await s.tick(f,ledger);
@@ -107,4 +110,18 @@ test('exclusive burn non-targets cannot accumulate eligible-unpicked minutes or 
   assert.equal(row.minutesEligible,0);assert.equal(row.minutesEligibleUnpicked,0);assert.notEqual(row.leftoverReason,'no-demand');
   s.setNow(NOW+10*MINUTE);await s.tick();
   assert.equal(s.rows().find(r=>r.accountKey==='two').minutesEligible,2,'after expiry the gap-capped ordinary eligibility returns');
+});
+
+test('unregistered rows persisted by an earlier build are dropped from the view and the next tick, whatever their status',async()=>{
+  const s=start();await s.tick();
+  const key=JSON.stringify(s.keyFor(companyId)),saved=s.store.get(key);
+  // An earlier build's excluded row turns feed-unknown once the account leaves the feed.
+  for (const [accountKey,status] of [['other-company','excluded-by-policy'],['gone-company','feed-unknown']])
+    saved.scorecard.windows.push({...structuredClone(saved.scorecard.windows[0]),accountKey,prefix:accountKey,status,pctUsedNow:40});
+  s.store.set(key,saved);
+  const restarted=createQuotaRefresh({state:s.state,logger:s.logger,keyFor:s.keyFor,clock:()=>NOW+MINUTE,getPolicy:()=>policy(NOW+MINUTE)});
+  assert.equal(scorecardView(saved).rows.some(r=>r.accountKey.endsWith('-company')),false,'legacy rows hidden before the next tick');
+  await restarted.refresh(companyId,s.cfg,{feed:s.feed(),ledger:new Map()});
+  assert.equal(s.store.get(key).scorecard.windows.some(r=>r.accountKey.endsWith('-company')),false,'legacy rows pruned on the next tick');
+  assert.ok(restarted.scorecard(companyId).rows.some(r=>r.accountKey==='one'));
 });

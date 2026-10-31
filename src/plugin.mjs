@@ -7060,6 +7060,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)) {
         return { kind: 'defer', retryAfterMs: 20000, reason: 'awaiting native free-lane evidence snapshot' };
       }
+      // Readiness enforcement must not fail open before the first good tick
+      // (restart, secret or lane outage): no view means no readiness evidence.
+      if (!live && enforceCompanies.has(params?.companyId) && credentialEnforceCompanies.has(params.companyId)
+        && !(typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0)) {
+        return { kind: 'defer', retryAfterMs: 20000, reason: 'awaiting native credential-readiness evidence snapshot' };
+      }
       if (!live || live.enforce !== true || !enforceCompanies.has(params.companyId)) return keep();
       if (typeof params?.issueOverrideModel === 'string' && params.issueOverrideModel.length > 0) {
         return keep();

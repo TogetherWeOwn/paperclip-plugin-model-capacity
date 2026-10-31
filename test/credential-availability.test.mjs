@@ -74,7 +74,7 @@ async function start(accounts, rows = null, configure = () => {}) {
     },
     tick: () => jobs.get('quota-refresh')({}),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
-    hook: runId => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500 }),
+    hook: (runId, extra = {}) => plugin.onResolveRunModel({ runId, companyId: 'acme', agentId: 'agent-9', adapterType: 'claude-code', deadlineMs: 1500, ...extra }),
     startRun: runId => events.get('agent.run.started')({
       type: 'agent.run.started', companyId: 'acme', entityId: runId,
       payload: { run: { agentId: 'agent-9', adapterType: 'claude-code' } }, occurredAt: new Date(now).toISOString(),
@@ -711,4 +711,16 @@ test('N3: live newest-version views match the published capacity account views',
   assert.deepEqual(new Set(live.accounts.map(a => a.accountId)), new Set(['codex:first', 'codex:second']));
   for (const a of live.accounts) assert.deepEqual(a.newestVersion, capacity.accounts[a.accountId], a.accountId);
   assert.deepEqual(capacity.accounts['codex:first'].supersededCanonicalModels, [old]);
+});
+
+test('readiness enforcement defers before the first good tick instead of failing open', async () => {
+  const d = await start([account(MODEL, 'antigravity', 'a', 1)]);
+  d.setFetchStatus(503);
+  await assert.rejects(d.tick(), /quota-refresh-failed/);
+  const hook = await d.hook('no-live-view');
+  assert.equal(hook.kind, 'defer');
+  assert.match(hook.reason, /credential-readiness evidence/);
+  assert.deepEqual(await d.hook('no-live-view-override', { issueOverrideModel: MODEL }), { kind: 'keep' }, 'issue overrides stay the bypass');
+  await d.setCredentialEnforce(false);
+  assert.deepEqual(await d.hook('no-live-view-readiness-off'), { kind: 'keep' });
 });

@@ -8,7 +8,7 @@
 import { normalizeRegistry, memberIdFor, poolHasExpectedPluginKey, PLUGIN_KEY } from './registry.mjs';
 import { checkPoolDrift } from '../scripts/pool-saga.mjs';
 import { buildQuotaSnapshot, createSnapshotPublisher, freezeSnapshot } from './snapshot.mjs';
-import { tickScorecard, scorecardView, scorecardAccounts } from './scorecard.mjs';
+import { tickScorecard, scorecardView, scorecardAccounts, unregisteredFeedAccountCount, scopeScorecard } from './scorecard.mjs';
 import { computeRuntimePolicySkips } from './pool-quality.mjs';
 import { routeDecision } from './router.mjs';
 import { MIN_ATTRIBUTED_RUNS } from './calibration.mjs';
@@ -158,13 +158,13 @@ export function createQuotaRefresh({state,logger,clock=Date.now,keyFor,inspectPo
       const evidence=getPolicy(companyId);
       for (const {poolKey} of registry.pools) Object.assign(memberPolicySkips,
         computeRuntimePolicySkips(syntheticRouterRequest(registry,poolKey,atMs),built.snapshot,config,evidence));
-      scorecard=tickScorecard(previous?.scorecard ?? null,{nowMs:atMs,
+      scorecard=tickScorecard(scopeScorecard(previous?.scorecard,new Set(registry.accounts.map(a=>a.accountKey))) ?? null,{nowMs:atMs,
         hardCapWeekly:config.router.hardCapWeekly ?? .995,accountStaleMs:config.router.accountStaleMs ?? 900_000,
         accounts:scorecardAccounts({registry,snapshot:built.snapshot,feed,previous:previous?.scorecard,ledger,memberPolicySkips,nowMs:atMs,
           hardCapWeekly:config.router.hardCapWeekly ?? .995,hardCapFiveHour:config.router.hardCapFiveHour ?? .99})});
     } catch {return failure(companyId,'scorecard-invalid');}
     for (const warning of scorecard.warnings) report(companyId,warning.reason,{accountKey:warning.accountKey,windowResetsAt:warning.windowResetsAt});
-    const envelope={...built,scorecard,shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
+    const envelope={...built,scorecard,unregisteredFeedAccounts:unregisteredFeedAccountCount(registry,feed),shadow:shadowHistory,currentShadow:shadow,inspection,shadowSuppressedReason};
     try {
       if(!await publisher.publish(companyId,envelope,{isCurrent,onPublish:()=>onPublished(companyId,built.snapshot,overlayCheckpoint)}))return {status:'superseded'};
     } catch {return failure(companyId,'quota-state-failed');}
