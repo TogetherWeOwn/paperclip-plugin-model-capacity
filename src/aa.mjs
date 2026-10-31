@@ -10,6 +10,7 @@
  * The free list returns one row per model x effort. The base slug (no
  * effort suffix) is the max effort row.
  */
+import { readBoundedText, ResponseTooLargeError } from './bounded-body.mjs';
 
 export const AA_FREE_LIST_URL = 'https://artificialanalysis.ai/api/v2/language/models/free';
 
@@ -182,12 +183,10 @@ async function fetchAaFreePage({ http, apiKey, url = AA_FREE_LIST_URL, timeoutMs
   }
   let text;
   try {
-    text = await response.text();
-  } catch {
+    text = await readBoundedText(response, maxResponseBytes);
+  } catch (error) {
+    if (error instanceof ResponseTooLargeError) return { ok: false, error: 'aa-response-too-large', retryable: false };
     return { ok: false, error: 'aa-request-failed', retryable: true };
-  }
-  if (new TextEncoder().encode(text).length > maxResponseBytes) {
-    return { ok: false, error: 'aa-response-too-large', retryable: false };
   }
   return { ok: true, text };
 }
@@ -321,12 +320,10 @@ export async function fetchAaLeaderboard({ http, url = AA_LEADERBOARD_URL, timeo
   }
   let html;
   try {
-    html = await response.text();
-  } catch {
+    html = await readBoundedText(response, maxResponseBytes);
+  } catch (error) {
+    if (error instanceof ResponseTooLargeError) return { ok: false, error: 'aa-response-too-large', retryable: false };
     return { ok: false, error: 'aa-request-failed', retryable: true };
-  }
-  if (new TextEncoder().encode(html).length > maxResponseBytes) {
-    return { ok: false, error: 'aa-response-too-large', retryable: false };
   }
   return { ok: true, html };
 }

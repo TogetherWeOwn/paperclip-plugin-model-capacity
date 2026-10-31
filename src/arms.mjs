@@ -71,12 +71,21 @@ export const NON_CHAT_MODEL_RE = /(image|video|private|^test([_-]|$))/i;
  * serves the bare id. No served id or AA slug carries parens or brackets,
  * so the strip only ever turns a miss into a hit.
  */
+/**
+ * Names that would resolve to Object.prototype members when used as plain
+ * object keys (counters, maps keyed by model or family). Never a model.
+ */
+const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+export function isReservedKey(name) {
+  return typeof name === 'string' && RESERVED_KEYS.has(name.toLowerCase());
+}
+
 export function canonicalModelName(model) {
   if (typeof model !== 'string') return null;
   let bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
   if (bare.endsWith('[1m]')) bare = bare.slice(0, -4);
   if (bare.endsWith(')') && bare.includes('(')) bare = bare.slice(0, bare.lastIndexOf('('));
-  return bare.length > 0 ? bare : null;
+  return bare.length > 0 && !isReservedKey(bare) ? bare : null;
 }
 
 /** Identity for ban checks and opt-in duplicate comparisons, never emission. */
@@ -171,7 +180,7 @@ export function servedIdForArm(accountModels, armModel, provider = null, servedI
  * share a trial budget or success history.
  */
 export function inferFamily(canonical) {
-  if (typeof canonical !== 'string' || canonical.length === 0) return null;
+  if (typeof canonical !== 'string' || canonical.length === 0 || isReservedKey(canonical)) return null;
   const lower = canonical.toLowerCase();
   if (/^claude-(opus|sonnet)-4-6/.test(lower)) return 'claude-4-6';
   if (lower.includes('claude-opus')) return 'opus';
@@ -205,7 +214,8 @@ export function inferFamily(canonical) {
     }
     return 'legacy-devin';
   }
-  return lower.split('-')[0] || null;
+  const head = lower.split('-')[0];
+  return head && !isReservedKey(head) ? head : null;
 }
 
 /**

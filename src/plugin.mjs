@@ -34,6 +34,7 @@ import {
   DEFAULT_ACCOUNTS_PATH,
   LANE_ACCOUNTS_PATH_ALLOWLIST,
   LANE_KEY_HEADER,
+  LANE_MAX_RESPONSE_BYTES,
   isPlaceholderLaneHost,
   assertLaneHostPinned,
   buildLaneRequest,
@@ -42,10 +43,11 @@ import {
   isReactiveAccount,
   CliproxyCache,
 } from './cliproxy.mjs';
+import { readBoundedText } from './bounded-body.mjs';
 import { fetchAaFreeList, parseAaFreeList, fetchAaLeaderboard, parseAaLeaderboardHtml, mergeAaRows, mergeAaRowsGapFill, carryForwardCosts, carryForwardBenchmarks, markStaleBenchmarks, BENCHMARK_FIELDS, stampAaObservations } from './aa.mjs';
 import {
   DEFAULT_ARM_MAP, resolveArms, armsForAccount, buildDynamicBindings, resolveDynamicArms,
-  canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId, isBannedModel, aliasKey,
+  canonicalModelName, servedIdForArm, inferFamily, familyOfModelName, PROVEN_FAMILIES, discoverTaskArms, taskArmId, isBannedModel, aliasKey, isReservedKey,
 } from './arms.mjs';
 import { buildAccountSupersession, isSupersededArm } from './newest-version.mjs';
 import { computeComposite, DEFAULT_WEIGHTS, METRIC_SOURCES } from './quality.mjs';
@@ -1463,10 +1465,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     assertLaneRequest({ method: req.method, url: req.url, body: null },
       { baseUrl: config.cliproxy.baseUrl, accountsPath: config.cliproxy.accountsPath });
     return withQuotaTimeout(async signal => {
-      const res = await ctx.http.fetch(req.url, { method: 'GET', headers: { [LANE_KEY_HEADER]: laneKey }, signal });
+      // redirect: 'manual' -- a followed redirect would carry the lane key
+      // to a URL the allowlist never saw; any 3xx is refused unread.
+      const res = await ctx.http.fetch(req.url, { method: 'GET', headers: { [LANE_KEY_HEADER]: laneKey }, redirect: 'manual', signal });
+      if (res.redirected || (res.status >= 300 && res.status < 400)) throw new Error('cliproxy-redirect-refused');
       if (res.status === 401 || res.status === 403) throw new Error('cliproxy-access-denied');
       if (res.status < 200 || res.status >= 300) throw new Error(`cliproxy-http-${res.status}`);
-      return res.json();
+      // Response-like doubles without a body or text() keep their json().
+      if (!res.body && typeof res.text !== 'function') return res.json();
+      return JSON.parse(await readBoundedText(res, LANE_MAX_RESPONSE_BYTES, 'cliproxy-response-too-large'));
     });
   }
 
@@ -1747,11 +1754,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
    * every other family earns it through these counters.
    */
   function emptyTrialState() {
-    return { counters: {}, graduated: [], seenTerminal: [] };
+    return { counters: Object.create(null), graduated: [], seenTerminal: [] };
+  }
+
+  /**
+   * Persisted trial state rebuilt with prototype-free counters: a family key
+   * such as `__proto__` must land as an own entry, never on Object.prototype.
+   */
+  function loadTrialState(raw) {
+    const state = emptyTrialState();
+    if (!raw || typeof raw !== 'object') return state;
+    const counters = raw.counters && typeof raw.counters === 'object' ? raw.counters : {};
+    for (const [family, c] of Object.entries(counters)) {
+      if (isReservedKey(family) || !c || typeof c !== 'object') continue;
+      state.counters[family] = { finished: Number(c.finished) || 0, failed: Number(c.failed) || 0 };
+    }
+    if (Array.isArray(raw.graduated)) state.graduated = raw.graduated.filter(f => typeof f === 'string');
+    if (Array.isArray(raw.seenTerminal)) state.seenTerminal = raw.seenTerminal;
+    return { ...raw, ...state };
   }
 
   function trialFamilyStats(trialState, family) {
-    const c = trialState?.counters?.[family] ?? { finished: 0, failed: 0 };
+    const counters = trialState?.counters;
+    const c = (counters && Object.hasOwn(counters, family) ? counters[family] : null) ?? { finished: 0, failed: 0 };
     const finished = Number(c.finished) || 0;
     const failed = Number(c.failed) || 0;
     const total = finished + failed;
@@ -2545,7 +2570,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       try {
         feed = await readAccounts(companyId, config, clock(), generation);
       } catch (error) {
-        const code = /^(cliproxy-http-[0-9]{3}|cliproxy-access-denied|cliproxy-lane-host-unpinned|cliproxy-lane-parse-failed|cliproxy-timeout)$/.test(error?.message ?? '')
+        const code = /^(cliproxy-http-[0-9]{3}|cliproxy-access-denied|cliproxy-lane-host-unpinned|cliproxy-lane-parse-failed|cliproxy-timeout|cliproxy-redirect-refused|cliproxy-response-too-large)$/.test(error?.message ?? '')
           ? error.message : 'quota-fetch-failed';
         quotaRefresh.failure(companyId, code);
         throw new Error(code);
@@ -2613,7 +2638,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     const prevLadders = (await ctx.state.get(scopeKey(companyId, LADDER_KEY)))?.ladders ?? {};
     // Trial family counters drive which families route as trials; the fresh
     // resolved config feeds the memory-only event-time path (see setup).
-    const trialState = (await ctx.state.get(scopeKey(companyId, TRIAL_KEY))) ?? emptyTrialState();
+    const trialState = loadTrialState(await ctx.state.get(scopeKey(companyId, TRIAL_KEY)));
     if (superseded()) return { status: 'superseded' };
     if (admissionGeneration !== configGenerationOf(companyId)) return { status: 'configuration-changed' };
     lastConfig.set(companyId, config);
@@ -3729,8 +3754,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       const canon = canonicalModelName(rec.actualModel);
       if (!canon) continue;
       const family = inferFamily(canon);
-      if (!family) continue;
-      const c = trialState.counters[family] ?? { finished: 0, failed: 0 };
+      if (!family || isReservedKey(family)) continue;
+      const c = Object.hasOwn(trialState.counters, family) ? trialState.counters[family] : { finished: 0, failed: 0 };
       if (rec.status === 'finished') c.finished += 1; else c.failed += 1;
       trialState.counters[family] = c;
       seenTerminal.add(rec.runId);
