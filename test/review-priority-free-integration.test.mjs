@@ -215,7 +215,7 @@ async function drive({ cap = capacity(), raw = config(), issues = [], heads = 0,
           barrier.entered.resolve();
           await barrier.release.promise;
         }
-        return { status: 200, json: async () => ({ data: { repository: { pullRequests: {
+        return { status: 200, text: async () => JSON.stringify({ data: { repository: { pullRequests: {
           nodes: Array.from({ length: heads }, (_, i) => pull(i + 1)), pageInfo: { hasNextPage: false, endCursor: null },
         } } } }) };
       }
