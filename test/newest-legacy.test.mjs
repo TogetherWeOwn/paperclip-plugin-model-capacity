@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { replayTick } from '../scripts/aa-replay.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { loadWeeklyReference } from './weekly-reference.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 
 // Routing fixtures use allowed synthetic versions, retaining the captured
 // product ordering and cohort size without bypassing mandatory model bans.
@@ -17,6 +19,9 @@ const base = { lane, snapshot, states: {}, demand: { doer: 2, thinker: 1, other:
 const config = enabled => ({ roles: { doerAgentIds: ['doer'], thinkerAgentIds: ['thinker'], newestVersionOnly: { enabled } } });
 const ladder = result => Object.values(result.ladders.ladders)[0];
 const accountView = result => Object.values(result.capacity.newestVersion.accounts)[0];
+
+// Weekly-compatible reference loads from the portable fixture.
+// See weekly-reference.mjs: synthetic assembly, never a live capture.
 
 test('N-T09/T10: older scored arm is excluded even when the newer credential is unavailable', async () => {
   const result = await replayTick({ ...base, config: config(true) });
@@ -209,13 +214,50 @@ test('X-T03: full-fleet newest and fallback flag matrix preserves supersession b
   const { execFileSync } = await import('node:child_process');
   const { pathToFileURL, fileURLToPath } = await import('node:url');
   const { projectForParity } = await import('../scripts/aa-replay.mjs');
-  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-matrix-'));
+  // Both-disabled fleet must match the weekly reference.
+  const { mod: weekly, cleanup: weeklyCleanup } = await loadWeeklyReference();
+  const histDir = await mkdtemp(join(tmpdir(), 'aa-replay-matrix-'));
   try {
     const root = fileURLToPath(new URL('..', import.meta.url));
     const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
-    execFileSync('tar', ['-x', '-C', dir], { input: archive });
-    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
+    execFileSync('tar', ['-x', '-C', histDir], { input: archive });
+    const baseline = await import(pathToFileURL(join(histDir, 'scripts/aa-replay.mjs')).href);
+    const ref = await weekly.replayTick({ ...base, lane: fleet, snapshot: scored, config: disabledConfig });
+    const parityReference = projectForParity(ref);
+    assert.equal(Object.hasOwn(parityReference.capacity, 'reviewAdmissionEpoch'), false);
+    // This old no-reviewer capture predates the now-mandatory process marker.
+    // Only the expected comparison gets a placeholder; current real evidence is validated separately.
+    parityReference.capacity.reviewAdmissionEpoch = '<epoch>';
+    assert.deepEqual(projectCompatibilityEvidence(results.get('false:false')), parityReference);
+    // Historical-to-weekly migration: 19 reactive accounts lack weekly readings,
+    // so spendable stays null while the plan endpoint is still published.
     const unmodified = await baseline.replayTick({ ...base, lane: fleet, snapshot: scored, config: disabledConfig });
-    assert.deepEqual(projectForParity(results.get('false:false')), projectForParity(unmodified));
-  } finally { await rm(dir, { recursive: true, force: true }); }
+    const oldProj = projectForParity(unmodified);
+    const refProj = projectForParity(ref);
+    const expected = [];
+    for (let i = 0; i < 19; i++) expected.push(`capacity.accounts.${i}.planTargetUsedPct`, `capacity.accounts.${i}.spendableRemaining`);
+    expected.push('capacity.paceGuard.holdAheadPts', 'capacity.paceGuard.roleSafety', 'capacity.paceGuard.rawPools', 'capacity.reviewerPaceByAgent');
+    // 42 intended paths only; undeclared changes add more.
+    assert.deepEqual([...diffPaths(oldProj, refProj)].sort(), [...expected].sort());
+    // Explicit migration literals for the unmeasured fleet.
+    for (let i = 0; i < 19; i++) {
+      assert.equal(refProj.capacity.accounts[i].planTargetUsedPct, 1);
+      assert.equal(oldProj.capacity.accounts[i].planTargetUsedPct, undefined);
+    }
+    for (let i = 0; i < 19; i++) {
+      assert.equal(refProj.capacity.accounts[i].spendableRemaining, null);
+      assert.equal(oldProj.capacity.accounts[i].spendableRemaining, undefined);
+    }
+    assert.equal(refProj.capacity.paceGuard.holdAheadPts, 0.1);
+    assert.equal(oldProj.capacity.paceGuard.holdAheadPts, undefined);
+    assert.deepEqual(refProj.capacity.paceGuard.roleSafety, []);
+    assert.equal(oldProj.capacity.paceGuard.roleSafety, undefined);
+    assert.deepEqual(refProj.capacity.paceGuard.rawPools, [{ pool: 'fixture', lanes: 19, planAhead: null, pacedSlots: null, cap: null, inFlight: 0, ahead: false, paced: false, state: 'not-measured', pacedAccountIds: [] }]);
+    assert.equal(oldProj.capacity.paceGuard.rawPools, undefined);
+    assert.deepEqual(refProj.capacity.reviewerPaceByAgent, {});
+    assert.equal(oldProj.capacity.reviewerPaceByAgent, undefined);
+  } finally {
+    await weeklyCleanup();
+    await rm(histDir, { recursive: true, force: true });
+  }
 });

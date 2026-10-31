@@ -263,14 +263,14 @@ function drive({ config = {} } = {}) {
 }
 
 test('the hook places on the stronger arm even though the weaker account has the most room', async () => {
-  const d = drive({ config: { enforce: true } });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } } });
   await d.setup();
   await d.tick();
   const h = await d.hook('run-1');
   assert.equal(h.kind, 'decide');
   assert.match(h.model, /haiku/, `placed on ${h.model}`);
   // Switching the blend off restores the old pick (Meta: most unspent allowance).
-  const off = drive({ config: { enforce: true, placement: { qualityWeight: 0 } } });
+  const off = drive({ config: { enforce: true, pacing: { holdAheadPts: null }, placement: { qualityWeight: 0 } } });
   await off.setup();
   await off.tick();
   const h0 = await off.hook('run-1');
@@ -287,4 +287,15 @@ test('/capacity carries the fleet quality of each rung arm', async () => {
   const muse = arms.find(a => a.model.startsWith('muse-spark'));
   assert.ok(Number.isFinite(haiku.qFleet) && Number.isFinite(muse.qFleet));
   assert.ok(haiku.qFleet > muse.qFleet);
+});
+
+test('weekly hard hold outranks surplus placement quality by default', async () => {
+  const d = drive({ config: { enforce: true } });
+  await d.setup();
+  await d.tick();
+  const h = await d.hook('held-quality');
+  assert.equal(h.kind, 'decide');
+  assert.match(h.model, /muse-spark/);
+  const cap = (await d.capacity()).body;
+  assert.deepEqual(cap.paceGuard.pools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
 });

@@ -394,7 +394,7 @@ import { REVIEW_REPOSITORY_PATTERN } from './review-demand.mjs';
 import { PREFIXED_PROFILE_EFFORTS } from './registry.mjs';
 
 export const PLUGIN_ID = 'togetherweown.model-capacity';
-export const PLUGIN_VERSION = '0.3.0';
+export const PLUGIN_VERSION = '0.3.1';
 
 /**
  * Lane endpoint allowlist: the ONLY host `cliproxy.baseUrl` may name.
@@ -686,6 +686,7 @@ const CONFIG_SCHEMA = {
     pacing: {
       type: 'object', additionalProperties: false,
       properties: {
+        holdAheadPts: { type: ['number', 'null'], minimum: 0, maximum: 1, default: 0.10, description: 'Hold an account at zero new slots when weekly usage exceeds its floor-adjusted linear plan by more than this fraction (0.10 = 10 percentage points). Null disables. Burn and reactive lanes are exempt; an empty role never suspends the hold. Ambiguous shared-model emissions fail closed. Requires pacing.guard.enabled.' },
         deadband: { type: 'number', minimum: 0, default: 0.02 },
         rungCooldownMs: { type: 'integer', minimum: 60000, default: 600000 },
         guardHighPct: { type: 'number', minimum: 0, maximum: 1, default: 0.8 },

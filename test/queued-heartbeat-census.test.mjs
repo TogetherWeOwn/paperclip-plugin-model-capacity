@@ -49,7 +49,8 @@ async function drive({ rows = [], now = NOW } = {}) {
   };
   const plugin = createModelCapacityPlugin({ clock: () => box.now, requirePinnedLaneHost: false });
   await plugin.setup(io);
-  await plugin.onConfigChanged({ roles: { keepAgentIds: [REVIEWER] } }, { companyId: COMPANY });
+  await plugin.onConfigChanged({ pacing: { holdAheadPts: null },
+    roles: { keepAgentIds: [REVIEWER] } }, { companyId: COMPANY });
   return {
     box, queuedCalls, errors,
     caps: async () => {

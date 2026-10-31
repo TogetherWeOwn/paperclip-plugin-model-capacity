@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { replayTick } from '../scripts/aa-replay.mjs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 import * as eligibility from '../src/eligibility.mjs';
 import { resolveConfig } from '../src/plugin.mjs';
 import { manifest } from '../src/manifest.mjs';
@@ -14,19 +15,27 @@ const snapshot = { fetchedAt: new Date(nowMs).toISOString(), rows: [{ slug: 'mus
 const inputs = { lane, snapshot, states: {}, demand: { doer: 2, thinker: 1, other: 0 }, nowMs };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function project(result) {
-  const copy = structuredClone({ capacity: result.capacity, ladders: result.ladders });
-  assert.match(copy.capacity.reviewAdmissionEpoch, uuid);
-  copy.capacity.reviewAdmissionEpoch = '<epoch>';
-  return copy;
+  assert.match(result.capacity.reviewAdmissionEpoch, uuid);
+  return projectCompatibilityEvidence({ capacity: result.capacity, ladders: result.ladders });
 }
 
 // The checked-in golden was captured from a368f5c's behavior before N2.
+// Weekly-compatible golden is a synthetic reference assembly, never a live capture:
+// implementation src+package from 77d8049bb50b3a8bf15be66873580add9040c66b
+// (tree 6d7d8c7895e2db20fa4d1a627ad9a947c1dca37b) with the frozen pre-native offline
+// replay harness (SHA-256 adf0d02c908057342e47efdaf985a71f37868807ab130cac69b6f3ebd0063b14)
+// copied in. The replay script did not exist on the pinned revision.
 test('N-T19 Gate S: off, false and malformed configurations preserve full published state', async () => {
-  const golden = JSON.parse(await readFile(new URL('./fixtures/newest-config-off-golden.json', import.meta.url), 'utf8'));
+  const golden = JSON.parse(await readFile(new URL('./fixtures/newest-config-off-weekly-golden.json', import.meta.url), 'utf8'));
+  // The archived capture remains immutable. Only the two expressly removed
+  // rescue outputs differ under the conservative contract; every other field stays pinned.
+  golden.capacity.paceGuard.roleSafety = [];
+  golden.capacity.paceGuard.pools = structuredClone(golden.capacity.paceGuard.rawPools);
   const baseline = await replayTick({ ...inputs, config: baseConfig });
   const again = await replayTick({ ...inputs, config: baseConfig });
   assert.notEqual(baseline.capacity.reviewAdmissionEpoch, again.capacity.reviewAdmissionEpoch);
   assert.deepEqual(project(baseline), project(again));
+  // Disabled newest must match the weekly golden.
   assert.deepEqual(JSON.parse(JSON.stringify(project(baseline))), golden);
   for (const newestVersionOnly of [undefined, { enabled: false }, { enabled: 'true', overrides: { keep: 42, parsePins: [] } }, null, 'true']) {
     const config = { ...baseConfig, roles: { ...baseConfig.roles, ...(newestVersionOnly === undefined ? {} : { newestVersionOnly }) } };
@@ -34,6 +43,46 @@ test('N-T19 Gate S: off, false and malformed configurations preserve full publis
     assert.deepEqual(project(result), project(baseline));
     assert.deepEqual(JSON.parse(JSON.stringify(project(result))), golden);
   }
+});
+
+test('Historical-to-weekly migration pins six intended paths for Meta fixture', async () => {
+  const hist = JSON.parse(await readFile(new URL('./fixtures/newest-config-off-golden.json', import.meta.url), 'utf8'));
+  const weekly = JSON.parse(await readFile(new URL('./fixtures/newest-config-off-weekly-golden.json', import.meta.url), 'utf8'));
+  const diff = (x, y, prefix = '') => {
+    if (Object.is(x, y)) return [];
+    if (x && y && typeof x === 'object' && typeof y === 'object' && Array.isArray(x) === Array.isArray(y)) {
+      return [...new Set([...Object.keys(x), ...Object.keys(y)])].flatMap(k => diff(x[k], y[k], prefix ? `${prefix}.${k}` : k));
+    }
+    return [prefix];
+  };
+  const paths = diff(hist, weekly);
+  // Six intended paths only; undeclared golden changes add more.
+  assert.deepEqual([...paths].sort(), [
+    'capacity.accounts.0.planTargetUsedPct',
+    'capacity.accounts.0.spendableRemaining',
+    'capacity.paceGuard.holdAheadPts',
+    'capacity.paceGuard.rawPools',
+    'capacity.paceGuard.roleSafety',
+    'capacity.reviewerPaceByAgent',
+  ]);
+  // Explicit migration literals for this floor=0 fixture (raw and spendable
+  // both read 0.8 here; floor-sensitive spendable math is covered elsewhere).
+  assert.equal(weekly.capacity.accounts[0].planTargetUsedPct, 1);
+  assert.equal(hist.capacity.accounts[0].planTargetUsedPct, undefined);
+  assert.equal(weekly.capacity.accounts[0].spendableRemaining, 0.8);
+  assert.equal(hist.capacity.accounts[0].spendableRemaining, undefined);
+  assert.equal(weekly.capacity.paceGuard.holdAheadPts, 0.1);
+  assert.equal(hist.capacity.paceGuard.holdAheadPts, undefined);
+  assert.deepEqual(weekly.capacity.paceGuard.roleSafety, [
+    { code: 'role-empty-hold-suspended', role: 'doer', accountIds: ['meta:sample'], message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' },
+    { code: 'role-empty-hold-suspended', role: 'thinker', accountIds: ['meta:sample'], message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' },
+    { code: 'role-empty-hold-suspended', role: 'other', accountIds: ['meta:sample'], message: 'weekly ahead hold suspended: no other account can serve this role; ordinary pace cap still applies' },
+  ]);
+  assert.equal(hist.capacity.paceGuard.roleSafety, undefined);
+  assert.deepEqual(weekly.capacity.paceGuard.rawPools, [{ pool: 'meta', lanes: 1, planAhead: 0.2, pacedSlots: 0, cap: 0, inFlight: 0, ahead: true, paced: true, state: 'hard-held', pacedAccountIds: ['meta:sample'], hardHeldAccountIds: ['meta:sample'] }]);
+  assert.equal(hist.capacity.paceGuard.rawPools, undefined);
+  assert.deepEqual(weekly.capacity.reviewerPaceByAgent, {});
+  assert.equal(hist.capacity.reviewerPaceByAgent, undefined);
 });
 
 test('newest normalizer defaults off and drops malformed overrides', () => {

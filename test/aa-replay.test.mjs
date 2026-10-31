@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { withSyntheticReadiness } from './synthetic-readiness.mjs';
+import { loadWeeklyReference } from './weekly-reference.mjs';
+import { projectForParity } from '../scripts/aa-replay.mjs';
+import { projectCompatibilityEvidence } from './producer-evidence.mjs';
 
 test('offline replay executes the real shadow tick with supplied AA snapshots', async () => {
   const path = new URL('../scripts/aa-replay.mjs', import.meta.url);
@@ -98,6 +101,24 @@ function replayInputs() {
   };
 }
 
+// Weekly-compatible reference loads from the portable fixture.
+// See weekly-reference.mjs: synthetic assembly, never a live capture.
+function conservativeCodexReference(reference) {
+  const expected = projectForParity(reference), capacity = expected.capacity;
+  assert.deepEqual(capacity.accounts.map(account => account.accountId), ['codex:a']);
+  assert.deepEqual(capacity.paceGuard.rawPools[0].hardHeldAccountIds, ['codex:a']);
+  assert.equal(capacity.paceGuard.rawPools[0].cap, 0);
+  assert.equal(capacity.reviewer.routing.preview.routed, true);
+  assert.equal(capacity.reviewer.routing.accountId, 'codex:a');
+  // This one archived fixture advertised a globally held policy-only review
+  // route. The cut replaces only that unsafe positive and its missing local hold.
+  const reason = 'no servable account serves a configured reviewer arm (1 refused)';
+  capacity.reviewer.routing = { ...capacity.reviewer.routing, accountId: null, provider: null, arm: null,
+    reason, preview: { routed: false, fallback: 'keep', reason } };
+  capacity.reviewerPaceByAgent.review.pools = structuredClone(capacity.paceGuard.rawPools);
+  return expected;
+}
+
 test('X-R1: lifecycle generation differs in historical fidelity but not identical replays', async () => {
   const { replayTick, assertFidelity, projectForParity } = await import('../scripts/aa-replay.mjs');
   const input = replayInputs();
@@ -148,11 +169,6 @@ test('X-R4(b): fidelity rejects even an empty enabled-newest ladder evidence key
 });
 
 test('X-R4(c,d): enabled producer judges itself; its inputs still support disabled baseline parity', async () => {
-  const { mkdtemp, rm } = await import('node:fs/promises');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { execFileSync } = await import('node:child_process');
-  const { pathToFileURL, fileURLToPath } = await import('node:url');
   const { replayTick, assertFidelity, assertReplayProvenance, projectForParity } = await import('../scripts/aa-replay.mjs');
   const input = replayInputs();
   input.config.roles.newestVersionOnly = { enabled: true };
@@ -163,17 +179,14 @@ test('X-R4(c,d): enabled producer judges itself; its inputs still support disabl
   assert.ok(Object.values(producer.ladders.ladders).every(ladder => Array.isArray(ladder.supersededArmEvidence)));
   assertReplayProvenance({ implementationRevision: 'producer', newestVersionOnlyEnabled: true, accountFallbackEnabled: false, capturedAt: '2026-10-30T00:00:00Z' }, { replayRevision: 'producer', replayFeatureState: { newestVersionOnlyEnabled: true, accountFallbackEnabled: false } });
   assertFidelity(producer, replay);
-  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-baseline-'));
+  // Disabled newest must match the weekly reference.
+  const { mod: weekly, cleanup } = await loadWeeklyReference();
   try {
-    const root = fileURLToPath(new URL('..', import.meta.url));
-    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
-    execFileSync('tar', ['-x', '-C', dir], { input: archive });
-    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
     input.config.roles.newestVersionOnly = { enabled: false };
-    const old = await baseline.replayTick(structuredClone(input));
+    const ref = await weekly.replayTick(structuredClone(input));
     const patched = await replayTick(structuredClone(input));
-    assert.deepEqual(projectForParity(old), projectForParity(patched));
-  } finally { await rm(dir, { recursive: true, force: true }); }
+    assert.deepEqual(conservativeCodexReference(ref), projectCompatibilityEvidence(patched));
+  } finally { await cleanup(); }
 });
 
 test('X-R2: post-state replay advances capacity change while fidelity holds', async () => {
@@ -186,20 +199,12 @@ test('X-R2: post-state replay advances capacity change while fidelity holds', as
   const post = await replayTick(postInput);
   assert.ok(!post.capacity.capacityChange.added.includes('codex:a'));
   assertFidelity(transition, post);
-  const { mkdtemp, rm } = await import('node:fs/promises');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { execFileSync } = await import('node:child_process');
-  const { pathToFileURL, fileURLToPath } = await import('node:url');
-  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-baseline-'));
+  // Post-state must match the weekly reference for the same stored state.
+  const { mod: weekly, cleanup } = await loadWeeklyReference();
   try {
-    const root = fileURLToPath(new URL('..', import.meta.url));
-    const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
-    execFileSync('tar', ['-x', '-C', dir], { input: archive });
-    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
-    const old = await baseline.replayTick(structuredClone(postInput));
-    assert.deepEqual(projectForParity(post), projectForParity(old));
-  } finally { await rm(dir, { recursive: true, force: true }); }
+    const ref = await weekly.replayTick(structuredClone(postInput));
+    assert.deepEqual(projectCompatibilityEvidence(post), conservativeCodexReference(ref));
+  } finally { await cleanup(); }
 });
 
 test('X-R4(a): replay CLI rejects inadmissible captures before loading fidelity fixtures', async () => {
@@ -224,29 +229,77 @@ test('X-R4(a): replay CLI rejects inadmissible captures before loading fidelity 
 });
 
 test('synthetic Gate S compares baseline and patched for absent, false and malformed flags', async () => {
+  const { replayTick, projectForParity } = await import('../scripts/aa-replay.mjs');
+  // Absent/false/malformed flags must match the weekly reference.
+  const { mod: weekly, cleanup } = await loadWeeklyReference();
+  try {
+    for (const features of [{}, { newestVersionOnly: { enabled: false }, accountFallback: { enabled: false } },
+      { newestVersionOnly: { enabled: 'true' }, accountFallback: { enabled: 'true' } }]) {
+      const input = replayInputs();
+      Object.assign(input.config.roles, features);
+      const ref = await weekly.replayTick(structuredClone(input));
+      const patched = await replayTick(structuredClone(input));
+      assert.equal(Object.hasOwn(ref.capacity, 'reviewAdmissionEpoch'), Object.hasOwn(patched.capacity, 'reviewAdmissionEpoch'));
+      for (const output of [ref, patched]) assert.match(output.capacity.reviewAdmissionEpoch, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      assert.deepEqual(conservativeCodexReference(ref), projectCompatibilityEvidence(patched));
+    }
+  } finally { await cleanup(); }
+});
+
+test('Historical-to-weekly migration pins six intended paths for reviewer fixture', async () => {
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { execFileSync } = await import('node:child_process');
   const { pathToFileURL, fileURLToPath } = await import('node:url');
-  const { replayTick, projectForParity } = await import('../scripts/aa-replay.mjs');
-  const dir = await mkdtemp(join(tmpdir(), 'aa-replay-parity-'));
+  const { projectForParity } = await import('../scripts/aa-replay.mjs');
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const histDir = await mkdtemp(join(tmpdir(), 'aa-replay-hist-'));
+  const { mod: weekly, cleanup: weeklyCleanup } = await loadWeeklyReference();
   try {
-    const root = fileURLToPath(new URL('..', import.meta.url));
     const archive = execFileSync('git', ['-C', root, 'archive', 'a368f5c', 'src', 'scripts/aa-replay.mjs', 'package.json']);
-    execFileSync('tar', ['-x', '-C', dir], { input: archive });
-    const baseline = await import(pathToFileURL(join(dir, 'scripts/aa-replay.mjs')).href);
-    for (const features of [{}, { newestVersionOnly: { enabled: false }, accountFallback: { enabled: false } },
-      { newestVersionOnly: { enabled: 'true' }, accountFallback: { enabled: 'true' } }]) {
-      const input = replayInputs();
-      Object.assign(input.config.roles, features);
-      const old = await baseline.replayTick(structuredClone(input));
-      const patched = await replayTick(structuredClone(input));
-      assert.equal(Object.hasOwn(old.capacity, 'reviewAdmissionEpoch'), Object.hasOwn(patched.capacity, 'reviewAdmissionEpoch'));
-      for (const output of [old, patched]) assert.match(output.capacity.reviewAdmissionEpoch, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
-      assert.deepEqual(projectForParity(old), projectForParity(patched));
-    }
-  } finally { await rm(dir, { recursive: true, force: true }); }
+    execFileSync('tar', ['-x', '-C', histDir], { input: archive });
+    const hist = await import(pathToFileURL(join(histDir, 'scripts/aa-replay.mjs')).href);
+    const input = replayInputs();
+    const old = await hist.replayTick(structuredClone(input));
+    const ref = await weekly.replayTick(structuredClone(input));
+    const oldProj = projectForParity(old);
+    const refProj = projectForParity(ref);
+    const diff = (x, y, prefix = '') => {
+      if (Object.is(x, y)) return [];
+      if (x && y && typeof x === 'object' && typeof y === 'object' && Array.isArray(x) === Array.isArray(y)) {
+        return [...new Set([...Object.keys(x), ...Object.keys(y)])].flatMap(k => diff(x[k], y[k], prefix ? `${prefix}.${k}` : k));
+      }
+      return [prefix];
+    };
+    const paths = diff(oldProj, refProj);
+    // Six intended paths only; undeclared routing/ladder/capacity changes add more.
+    assert.deepEqual([...paths].sort(), [
+      'capacity.accounts.0.planTargetUsedPct',
+      'capacity.accounts.0.spendableRemaining',
+      'capacity.paceGuard.holdAheadPts',
+      'capacity.paceGuard.rawPools',
+      'capacity.paceGuard.roleSafety',
+      'capacity.reviewerPaceByAgent',
+    ]);
+    // Explicit migration literals for this floor=0 fixture (raw and spendable
+    // both read 0.8 here; floor-sensitive spendable math is covered elsewhere).
+    assert.equal(refProj.capacity.accounts[0].planTargetUsedPct, 1);
+    assert.equal(oldProj.capacity.accounts[0].planTargetUsedPct, undefined);
+    assert.equal(refProj.capacity.accounts[0].spendableRemaining, 0.8);
+    assert.equal(oldProj.capacity.accounts[0].spendableRemaining, undefined);
+    assert.equal(refProj.capacity.paceGuard.holdAheadPts, 0.1);
+    assert.equal(oldProj.capacity.paceGuard.holdAheadPts, undefined);
+    assert.deepEqual(refProj.capacity.paceGuard.roleSafety, []);
+    assert.equal(oldProj.capacity.paceGuard.roleSafety, undefined);
+    assert.deepEqual(refProj.capacity.paceGuard.rawPools, [{ pool: 'codex', lanes: 1, planAhead: 0.2, pacedSlots: 0, cap: 0, inFlight: 0, ahead: true, paced: true, state: 'hard-held', pacedAccountIds: ['codex:a'], hardHeldAccountIds: ['codex:a'] }]);
+    assert.equal(oldProj.capacity.paceGuard.rawPools, undefined);
+    assert.deepEqual(refProj.capacity.reviewerPaceByAgent, { review: { holdSuspendedAccountIds: [], pools: [] } });
+    assert.equal(oldProj.capacity.reviewerPaceByAgent, undefined);
+  } finally {
+    await weeklyCleanup();
+    await rm(histDir, { recursive: true, force: true });
+  }
 });
 
 // A widened projection could hide a routing or lifecycle regression even when

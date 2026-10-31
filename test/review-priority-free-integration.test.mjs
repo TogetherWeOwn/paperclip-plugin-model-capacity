@@ -165,6 +165,7 @@ const issue = (id, assigneeAgentId, priority = 'medium') => ({
 });
 const source = () => ({ repositories: ['example/product'], tokenSecretRef: REF, requiredChecks: ['ci-ok', 'pr-lint'] });
 const config = () => ({
+  pacing: { holdAheadPts: null }, // manual paid/free snapshots, not current weekly evidence
   roles: { keepAgentIds: ['review'], doerAgentIds: ['worker'], minQuality: { doer: null, thinker: null, other: null } },
   allocation: { blockingPriority: true }, reviewReserve: { enabled: false },
   reviewerRouting: { agentIds: ['review'], arms: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },

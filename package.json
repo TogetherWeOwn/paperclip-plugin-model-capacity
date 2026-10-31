@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-model-capacity",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Native AI connection pool routing with reset-relative per-account pacing. Build-time clean and fork-image transitional variants; no runtime capability toggle.",
   "license": "MIT",
   "type": "module",

@@ -193,6 +193,7 @@ function windowFixture() {
 
 test('F-T26: preview threads both exclusion subtraction and out-of-window seating', async () => {
   const input = windowFixture();
+  input.config.pacing = { holdAheadPts: null }; // seating-only control, not weekly rescue
   const on = await runTick(input);
   input.config.roles.accountFallback.enabled = false;
   const off = await runTick(input);
@@ -209,19 +210,26 @@ test('F-T26: preview threads both exclusion subtraction and out-of-window seatin
   assert.equal(preview(on).armId, 'a-best', 'the preview itself must seat and unbar the admitted arm');
 });
 
-test('F-T8: fallback preserves trial role, adapter, and in-flight budget gates', async t => {
+function trialGateFixture(scenario) {
+  const input = windowFixture();
+  input.states['trial-families-v1'].graduated = names.slice(2).map((_, i) => `family${i + 2}`);
+  input.states['ledger-v1'] = [running('trial-candidate')];
+  input.config.trials = { roles: scenario === 'role-blocked' ? ['other'] : ['doer', 'other'],
+    adapters: { 'claude-code': scenario === 'adapter-blocked' ? [] : ['*'] }, maxInFlightPerFamily: 1 };
+  // An absent account's running trial consumes the fleet family budget, not the weak lane's slot.
+  if (scenario === 'budget-exhausted') input.states['ledger-v1'].push({ ...running('occupied', 'misc'),
+    trial: true, family: 'family1', decidedAccount: 'fixture:elsewhere', armId: 'a-best', wouldModel: 'a-best(high)' });
+  return input;
+}
+
+test('F-T8 trial-only: fallback preserves role, adapter, and in-flight budget gates with the hard hold opted out', async t => {
   for (const scenario of ['allowed', 'role-blocked', 'adapter-blocked', 'budget-exhausted']) {
     await t.test(scenario, async () => {
-      const input = windowFixture();
-      input.states['trial-families-v1'].graduated = names.slice(2).map((_, i) => `family${i + 2}`);
-      input.states['ledger-v1'] = [running('trial-candidate')];
-      input.config.trials = { roles: scenario === 'role-blocked' ? ['other'] : ['doer', 'other'],
-        adapters: { 'claude-code': scenario === 'adapter-blocked' ? [] : ['*'] }, maxInFlightPerFamily: 1 };
-      // A still-running trial on a now-absent account consumes the FLEET
-      // family budget without independently filling the weak account's lane.
-      if (scenario === 'budget-exhausted') input.states['ledger-v1'].push({ ...running('occupied', 'misc'),
-        trial: true, family: 'family1', decidedAccount: 'fixture:elsewhere', armId: 'a-best', wouldModel: 'a-best(high)' });
+      const input = trialGateFixture(scenario);
+      input.config.pacing = { ...input.config.pacing, holdAheadPts: null };
       const result = await runTick(input);
+      assert.equal(result.capacity.paceGuard.enabled, true, 'ordinary pacing remains enabled');
+      assert.equal(result.capacity.paceGuard.holdAheadPts, null);
       assert.ok(result.capacity.eligibility.accountFallback.admitted.some(row => row.role === 'doer'
         && row.accountId === 'fixture:weak' && row.armId === 'a-best'), 'quality admission is present in every case');
       const candidate = result.ladders.ladders['fixture:weak'].credentialRanking.candidates.find(a => a.armId === 'a-best');
@@ -229,6 +237,37 @@ test('F-T8: fallback preserves trial role, adapter, and in-flight budget gates',
       const decision = result.ledger.find(row => row.runId === 'trial-candidate');
       assert.equal(decision.decidedAccount, scenario === 'allowed' ? 'fixture:weak' : 'fixture:strong');
       if (scenario === 'allowed') { assert.equal(decision.armId, 'a-best'); assert.equal(decision.trial, true); }
+      if (scenario === 'budget-exhausted') assert.equal(result.capacity.trialFamilies.family1.budget, 0);
+    });
+  }
+});
+
+test('F-T8 default hard hold: per-run trial denial cannot reopen the held strong lane', async t => {
+  for (const scenario of ['allowed', 'role-blocked', 'adapter-blocked', 'budget-exhausted']) {
+    await t.test(scenario, async () => {
+      const result = await runTick(trialGateFixture(scenario));
+      assert.equal(result.capacity.paceGuard.enabled, true);
+      assert.equal(result.capacity.paceGuard.holdAheadPts, 0.1);
+      const strong = result.capacity.accounts.find(a => a.accountId === 'fixture:strong');
+      assert.ok(Math.abs(strong.planAhead - 0.95) < 1e-10, 'the original deeply-ahead reading is retained');
+      const pool = result.capacity.paceGuard.rawPools.find(p => p.pool === 'fixture');
+      assert.deepEqual(pool.hardHeldAccountIds, ['fixture:strong'], 'universal hold facts survive role safety');
+      assert.ok(result.capacity.eligibility.accountFallback.admitted.some(row => row.role === 'doer'
+        && row.accountId === 'fixture:weak' && row.armId === 'a-best'), 'trial denial is not a missing quality admission');
+      const candidate = result.ladders.ladders['fixture:weak'].credentialRanking.candidates.find(a => a.armId === 'a-best');
+      assert.equal(candidate.trial, true);
+      const suspendedForDoer = result.capacity.paceGuard.roleSafety.some(row => row.role === 'doer'
+        && row.accountIds.includes('fixture:strong'));
+      assert.equal(suspendedForDoer, false, 'even true role emptiness never suspends the weekly hold');
+      const decision = result.ledger.find(row => row.runId === 'trial-candidate');
+      if (scenario === 'allowed') {
+        assert.equal(decision.decidedAccount, 'fixture:weak');
+        assert.equal(decision.armId, 'a-best');
+        assert.equal(decision.trial, true);
+      } else {
+        assert.equal(decision.decidedAccount, undefined, 'neither the denied weak trial nor the held strong lane may run');
+        assert.equal(decision.armId, undefined);
+      }
       if (scenario === 'budget-exhausted') assert.equal(result.capacity.trialFamilies.family1.budget, 0);
     });
   }
@@ -596,6 +635,7 @@ test('F-T30 caller: routing-only reviewer cannot spend held quota; reserve membe
 test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account fallback', async () => {
   for (const mode of ['off', 'shadow']) for (const exhaustion of [false, true]) {
     const input = windowFixture();
+    input.config.pacing = { holdAheadPts: null }; // ordinary pace exhaustion, not weekly rescue
     input.config.taskRanking.mode = mode;
     input.config.enforce = true;
     input.config.exhaustion = { enabled: exhaustion, finalAnswerFromAttempt: 1 };
@@ -610,7 +650,7 @@ test('F-T13 routed caller: pace-held reviewer exhaustion cannot select account f
     weak.planAhead = -0.1;
     strong.planAhead = 0.5;
     weak.targetShare = strong.targetShare = 0;
-    live.paceGuard = { enabled: true, marginPct: .02, meanRunDurationHours: 1, retryAfterMs: 300000 };
+    live.paceGuard = { enabled: true, holdAheadPts: null, marginPct: .02, meanRunDurationHours: 1, retryAfterMs: 300000 };
     live.reviewerRouting = { agentIds: ['worker'], arms: [{ provider: 'fixture', model: names[7], effort: 'high' }] };
     const answer = await plugin.onResolveRunModel({ companyId: 'offline-test', runId: `routed-${mode}-${exhaustion}`,
       issueId: 'routed-issue', agentId: 'worker', adapterType: 'claude-code' });

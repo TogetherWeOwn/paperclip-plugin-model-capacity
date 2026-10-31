@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+### Weekly pacing
+- Add a default ten-percentage-point weekly ahead hold (`pacing.holdAheadPts`; `null` opts out): idle ahead accounts receive zero new slots instead of immediately reopening the one-job minimum. Burn and reactive accounts remain exempt. Weekly holds never suspend for an empty role or a temporarily full peer; suspension diagnostics remain empty. Shared-model compatibility emissions and fixed/reviewer new grants fail closed when they can reach a known held non-burn credential, without introducing credential-binding infrastructure. Protection does not extend to native or unrelated proxy traffic.
+- Price the weekly linear endpoint, required rate and concurrency need at 100% minus the existing explicit account floor (`burnMode.floors`) only when it governs the weekly meter, with no extra pacing remainder; regenerating-meter floors retain their own exhaustion gate without reducing the weekly target. Report target and spendable quota without changing raw remaining readings. No new capabilities, jobs, egress, host automation or production changes.
+
+### Fixed
+- Require actual servable reviewer admission in off, shadow and enforce modes before counting policy-only allowance: readiness, role exclusions, current price, trials and breakers remain gates. A guarded or denied sibling cannot erase a finite cap. Reserve privilege alone never adopts another agent's reviewer policy.
+- Preserve held fixed/reviewer running work on its recorded physical account and pool instead of dropping its charge or rematching it to a newly admitted candidate. Every applicable reviewer-local ordinary cap accounts for cross-agent pressure. Full burn identities and burn pressure survive raw and reviewer-scoped filtering independently of usable new allowance.
+- Enabled weekly holds require versioned current-policy admission evidence from the current producing instance, at most 120 seconds old and not future-dated. Incompatible, pre-feature or stale evidence after a failed refresh preserves running floors and refuses affected extra allocation; disabled-hold behavior is retained.
+
 ## 0.3.0-clean / 0.3.0-transitional (unreleased; activation gates outstanding)
 ### Added
 - Support the pinned native no-revision binding shape using unrestricted detail and post-write revision/full-config checks, with journal recovery reporting. This is detect-and-report only, not CAS; controlled single-writer cutovers remain required.
@@ -8,7 +18,7 @@
 - Native `ai.connections.route` manifest metadata and memory-only `onRouteAiConnection` callback, current operator-attestation tripwire, effective-effort quality/outcome checks, sanitized per-call diagnostics, and event-owned in-flight overlays rebased atomically with quota publication.
 - Variant-locked clean/transitional npm packages with source-stamped entrypoints and actual-tarball upstream manifest conformance tests. Transitional retains the fork resolver byte-identical to mainline dc86ae4 and the read-only 0.2.72 reference; clean omits its handler, capability, env declaration and enforce field.
 ### Release packaging and migration
-- Both installable versions and filenames now name the variant explicitly (`0.3.0-clean`, `0.3.0-transitional`). The source version remains the base `0.3.0` release line. Every boot emits a WARN naming the baked variant; transitional additionally names its hard 2026-11-30 exit.
+- Both installable versions and filenames name the variant explicitly (`<release>-clean`, `<release>-transitional`); the 0.3.0 entry below records that packaging change. The source version remains the base release line. Every boot emits a WARN naming the baked variant; transitional additionally names its hard 2026-11-30 exit.
 - Retire the old `manifest.enforce.mjs` package entrypoint, but keep per-variant `?build=` manifest shims. A loader-mtime negative control reproduces stale ESM dependencies; a changed dependency stamp observes the same-version replacement. Actual staging reinstall proof is still a rollout gate.
 - Clean artifacts remove legacy deferred-run/exhaustion maps and hook-only helpers, and omit the transitional-only `enforce` field from the shipped example. The transitional resolver body is unchanged by release packaging.
 - Add `scripts/audit-env-pins.mjs`: one native GET, read-only S1 checklist, exact pin keys and model-family-only output. Redacted values remain `redacted`; secret references are never resolved. Env inventory is a named MCP gap, not an agent-update route.
@@ -34,6 +44,7 @@
 - Preserve missing benchmark and cost observations with their original timestamps, while publishing a new intelligence-index major as a fresh generation without carrying prior-major data. Report pages, static arm coverage and previous snapshot age.
 
 ## Unreleased
+
 ### Added
 - Alert-only failure-cluster detector (default off): failed-run events feed per-account counters in plugin state; >= 3 allowlisted failures (`claude_auth_required`, `claude_transient_upstream`, `adapter_failed`) for one account inside a 15-minute event-time window creates or updates exactly one stable-origin managed alert issue and reports `error` through plugin health until the cluster clears. Writes happen on cluster enter/exit/count-band transitions only, never per run; `timed_out` runs are excluded and the account keeps the legacy ` on provider:account` extraction. Opt in with `failureClusterAlert: { enabled: true, assigneeAgentId }`; disabled or unassigned performs zero issue writes. Adds exactly `issues.create` + `issues.update` with create/update field allowlists and per-write ownership checks; no comment, checkout, wakeup, interaction, document or relation writes, no routing or enforce-flag change, no new job, egress, secret or env key.
 - Read-only `modelInventory` on `/capacity`: raw, canonical and emitted spellings of every reported model id side by side, per-account served present/absent/unknown (an absent served list reads unknown, fail-open as routing does), linked unscored/unservable/readiness evidence, and explicit unknown markers for protocol/tool/reasoning compatibility and configured-model coverage (other-agent adapter configuration is restricted). Pure reporting; routing reads nothing from it. No new capability, egress, secret or env key.

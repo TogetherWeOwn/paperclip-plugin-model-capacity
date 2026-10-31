@@ -43,10 +43,10 @@ export const RATE_HISTORY_KEEP_MS = 90 * 60 * 1000;
 export const RATE_HISTORY_CAP = 120;
 
 /** Linear-target schedule error: +ahead (overspent) / -behind. */
-export function scheduleError({ usedPct, nowMs, periodStartMs, periodEndMs }) {
+export function scheduleError({ usedPct, nowMs, periodStartMs, periodEndMs, targetUsedPct = 1 }) {
   if (!(periodEndMs > periodStartMs)) return 0;
   const elapsed = Math.min(Math.max(nowMs - periodStartMs, 0), periodEndMs - periodStartMs);
-  return usedPct - elapsed / (periodEndMs - periodStartMs);
+  return usedPct - targetUsedPct * elapsed / (periodEndMs - periodStartMs);
 }
 
 /**

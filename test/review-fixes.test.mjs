@@ -53,6 +53,8 @@ const runEvent = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
 });
 
 function drive({ nowMs, config = {}, laneAccounts = [], agentGets = {} }) {
+  // Trial consumption is independent of the weekly hard-hold overlay.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

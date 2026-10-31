@@ -38,13 +38,13 @@ function bakePlugin(source,variant) {
     const census=`  // Clean build: all non-terminal ledger runs count; no hook retry marks.
   const paceInFlightByPool = (companyId, ledger, { nowMs, horizonMs, selfRunId = null, poolOf }) => {
     const self = selfRunId != null ? String(selfRunId) : null;
-    const census = inflightByAccount(ledger, { nowMs, horizonMs, skip: r => r?.runId === self });
+    const census = physicalCensus(ledger, { nowMs, horizonMs, skip: r => r?.runId === self });
     const pools = {};
     for (const [id, n] of Object.entries(census.byAccount)) {
       const p = poolOf(id);
       pools[p] = (pools[p] ?? 0) + n;
     }
-    return { pools, unattributed: census.unattributed };
+    return { pools, byAccount: census.byAccount, unattributed: census.unattributed };
   };
 `;
     source=source.replace('  const runEventStats =',census+'  const runEventStats =');

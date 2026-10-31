@@ -36,12 +36,17 @@ const lane = (laneName, provider, key, weeklyUsed, fiveHourUsed = 0.1) => ({
   observedAt: new Date(TICK).toISOString(), quality: 'live',
 });
 
-function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, coolingMeta = false, metaOnly = false, agentModels = {} } = {}) {
+function drive({ config = {}, ledger = null, warnings = null, unhealthyClaude = false, spentClaude = false, coolingClaude = false, coolingMeta = false, metaOnly = false, agentModels = {}, accountModels = {} } = {}) {
+  // Quality/outcome/manual/fallback gates retain their own safety semantics;
+  // their positive fixtures must not borrow the removed weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const metaLane = lane('meta-1', 'meta', 'm1', 0.05, 0.05);
+  if (Object.hasOwn(accountModels, 'meta:m1')) metaLane.models = [...accountModels['meta:m1']];
   if (coolingMeta) metaLane.credentialAvailability = syntheticAvailability(metaLane, TICK, { serving: 1, ready: 0 });
   const claudeLane = spentClaude
     ? lane('claude-1', 'claude', 'a1', 1, 0)
     : lane('claude-1', 'claude', 'a1', 0.95);
+  if (Object.hasOwn(accountModels, 'claude:a1')) claudeLane.models = [...accountModels['claude:a1']];
   if (unhealthyClaude) claudeLane.health = 'unhealthy';
   // All-cooling evidence (readyCredentials 0): transient lane state, not a
   // health flag. The lane stays healthy so placement still sees it; only
@@ -394,7 +399,7 @@ test('pinned runs count against their serving account at once, before the next t
   // otherwise take. Pinned hooks between ticks must add pressure on m1 so
   // water-filling sends the doer elsewhere; without the kept decision the
   // doer still lands on m1.
-  const cfg = { enforce: true, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
+  const cfg = { enforce: true, pacing: { holdAheadPts: null }, placement: FLAT_PLACEMENT, roles: { ...ROLES_CFG, ...NO_GATES, keepAgentIds: ['planner'] } };
   const control = drive({ config: cfg, agentModels: { planner: 'muse-spark-1.3-contributor' } });
   await control.setup();
   await control.tick();
@@ -422,19 +427,49 @@ test('the published family outcomes and the gate attribute a run to the same fam
   assert.equal(cap.eligibility.roles.doer.outcome.families.muse.judged, 1);
 });
 
-test('fallback reporting does not change routing or ladder serialization', async () => {
-  const common = { enforce: true, roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
-  const off = drive({ config: common });
-  const on = drive({ config: { ...common, roles: { ...common.roles, accountFallback: { enabled: true, minQuality: -3 } } } });
+test('active fallback selects its finalized account without changing global exclusions or serialized ladders', async t => {
+  const common = { enforce: true, pacing: { holdAheadPts: 0.10 },
+    roles: { ...ROLES_CFG, minQuality: { doer: 0.12, other: 0.17 }, outcomeGate: { enabled: false } } };
+  const accountModels = { 'meta:m1': ['muse-spark-1.3-contributor'],
+    'claude:a1': ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'] };
+  const active = { ...common, roles: { ...common.roles, accountFallback: { enabled: true, minQuality: -3 } } };
+  const off = drive({ config: common, accountModels });
+  const on = drive({ config: active, accountModels });
   await off.setup(); await on.setup();
   await off.tick(); await on.tick();
   const a = await off.capacity(); const b = await on.capacity();
   assert.equal('accountFallback' in a.eligibility, false);
   assert.equal(b.eligibility.accountFallback.supported, true);
   assert.ok(b.eligibility.accountFallback.admitted.length > 0);
+  assert.ok(b.eligibility.accountFallback.admitted.some(row => row.role === 'doer' && row.accountId === 'meta:m1'));
+  for (const fact of b.weeklyRouteFacts.accounts) assert.deepEqual(fact.models, accountModels[fact.accountId]);
   assert.deepEqual(b.roleExclusionsEffective, a.roleExclusionsEffective);
   assert.equal(JSON.stringify(await on.ladder()), JSON.stringify(await off.ladder()));
-  assert.deepEqual(await on.hook('f2-run', 'eng-doer'), await off.hook('f2-run', 'eng-doer'));
+  const onPick = await on.hook('f2-run', 'eng-doer');
+  const offPick = await off.hook('f2-run', 'eng-doer');
+  t.diagnostic(JSON.stringify({ onPick, offPick, facts: b.weeklyRouteFacts,
+    admissions: b.eligibility.accountFallback.admitted }));
+  assert.deepEqual({ kind: onPick.kind, model: onPick.model, effort: onPick.effort },
+    { kind: 'decide', model: 'muse-spark-1.3-contributor', effort: 'xhigh' });
+  assert.deepEqual({ kind: offPick.kind, model: offPick.model, effort: offPick.effort },
+    { kind: 'defer', model: undefined, effort: undefined });
+  await on.tick(); await off.tick();
+  const selected = on.ledger().find(row => row.runId === 'f2-run');
+  const control = off.ledger().find(row => row.runId === 'f2-run');
+  assert.deepEqual({ accountId: selected.decidedAccount, armId: selected.armId, rung: selected.rung, agentId: selected.agentId },
+    { accountId: 'meta:m1', armId: 'muse-spark-1-3-xhigh', rung: 0, agentId: 'eng-doer' });
+  assert.deepEqual({ accountId: control?.decidedAccount, rung: control?.rung },
+    { accountId: undefined, rung: undefined }, 'the control cannot rescue its sole weekly-held account');
+  assert.equal(b.eligibility.accountFallback.admitted.filter(row => row.accountId === selected.decidedAccount
+    && row.armId === selected.armId && row.role === 'doer').length, 1,
+  'the selected doer arm belongs to a finalized admission, not a global exclusion rewrite');
+  const unknown = drive({ config: active });
+  await unknown.setup(); await unknown.tick();
+  const unknownCapacity = await unknown.capacity();
+  assert.equal(unknownCapacity.weeklyRouteFacts.accounts.find(row => row.accountId === 'claude:a1').models, null);
+  const unavailable = await unknown.hook('f2-unknown-route', 'eng-doer');
+  assert.equal(unavailable.kind, 'defer', 'missing discovery cannot prove the held credential cannot serve the fallback emission');
+  assert.equal(unavailable.model, undefined);
 });
 
 

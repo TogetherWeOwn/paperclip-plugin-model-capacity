@@ -47,7 +47,7 @@ const runEvent = (runId, atMs, type = 'agent.run.started', agentId = 'agent-9') 
   occurredAt: new Date(atMs).toISOString(),
 });
 
-function drive({ config = {}, accounts, agentGets = {} }) {
+function drive({ config = {}, accounts, agentGets = {}, heartbeats = [], snapshotRows = aaRows() }) {
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();
@@ -59,7 +59,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     state: { get: async k => store.get(skey(k)) ?? null, set: async (k, v) => { store.set(skey(k), v); } },
     secrets: { resolve: async () => 'lane-key' },
     http: { fetch: async () => ({ status: 200, json: async () => withSyntheticReadiness({ observedAt: new Date(now).toISOString(), accounts: lane }, now) }) },
-    agents: { get: async (id) => agentGets[id] ?? null },
+    agents: { get: async (id) => agentGets[id] ?? null, getQueuedRunCounts: async () => heartbeats },
     issues: { get: async () => null, list: async () => [] },
     jobs: { register: (n, fn) => { jobs.set(n, fn); } },
     events: { on: (n, fn) => { handlers.set(n, fn); } },
@@ -72,7 +72,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
     setAccounts: a => { lane = a; },
     setup: async () => {
       await plugin.setup(io);
-      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: aaRows(), duplicateSlugs: [] });
+      store.set(skey(AA_STATE_KEY), { fetchedAt: new Date(now).toISOString(), rows: snapshotRows, duplicateSlugs: [] });
       await plugin.onConfigChanged(config, { companyId: 'acme' });
     },
     tick: () => jobs.get('quota-refresh')({}),
@@ -83,6 +83,7 @@ function drive({ config = {}, accounts, agentGets = {} }) {
       issueOverrideModel: null, deadlineMs: 1500, ...extra,
     }),
     api: routeKey => plugin.onApiRequest({ companyId: 'acme', routeKey }),
+    updateCapacity: fn => fn(store.get(skey({ ...AA_STATE_KEY, stateKey: 'capacity-v1' }))),
     killIo: () => {
       for (const k of ['config', 'state', 'secrets', 'http', 'agents', 'issues']) {
         io[k] = new Proxy({}, { get: () => { throw new Error(`io-forbidden:${k}`); } });
@@ -98,7 +99,7 @@ const AHEAD = () => [claudeLane(0.9, 48)];
 const BEHIND = () => [claudeLane(0.5, 48)];
 
 test('hook: an ahead pool serves one run, then defers the next with the guard\'s retry interval', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.killIo();
@@ -125,7 +126,7 @@ test('hook: a pool that is behind plan is never held', async () => {
 });
 
 test('hook: the cap releases when the run finishes and the next tick republishes the pool', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
@@ -139,7 +140,7 @@ test('hook: the cap releases when the run finishes and the next tick republishes
 
 test('hook: the guard releases when time catches the plan up', async () => {
   // 90% spent with 48h left is ahead; with 5h left the linear plan is at 97%.
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   assert.equal((await d.hook('run-1')).kind, 'decide');
@@ -159,11 +160,11 @@ test('hook: enabled=false restores the old behaviour (no cap)', async () => {
 
 test('hook: a custom margin and retry interval are honoured', async () => {
   // A 25-point margin: 18.6 points ahead is within it, so no cap.
-  const wide = drive({ config: { enforce: true, pacing: { guard: { marginPct: 0.25 } } }, accounts: AHEAD() });
+  const wide = drive({ config: { enforce: true, pacing: { holdAheadPts: null, guard: { marginPct: 0.25 } } }, accounts: AHEAD() });
   await wide.setup();
   await wide.tick();
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await wide.hook(id)).kind, 'decide', id);
-  const slow = drive({ config: { enforce: true, pacing: { guard: { retryAfterMs: 120000 } } }, accounts: AHEAD() });
+  const slow = drive({ config: { enforce: true, pacing: { holdAheadPts: null, guard: { retryAfterMs: 120000 } } }, accounts: AHEAD() });
   await slow.setup();
   await slow.tick();
   await slow.hook('run-1');
@@ -171,7 +172,7 @@ test('hook: a custom margin and retry interval are honoured', async () => {
 });
 
 test('hook: with a second pool behind plan, the run goes there; with none left it defers', async () => {
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
   await d.setup();
   await d.tick();
   const models = [];
@@ -191,7 +192,7 @@ test('hook: a run the event-time path already decided does not hold the pool aga
   // The host fires agent.run.started at claim, the event-time path decides
   // the run, a tick publishes the view with that decision counted in the
   // pool, and only then does the hook resolve the same run.
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 30000);
@@ -204,7 +205,7 @@ test('hook: a run the event-time path already decided does not hold the pool aga
 
 test('event-time shadow path holds the pool at its cap: the third concurrent run records no decision', async () => {
   // A 0.9h mean run turns the share into 1.67 slots: cap 2.
-  const d = drive({ config: { concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD() });
+  const d = drive({ config: { concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 }, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 60000);
@@ -218,7 +219,7 @@ test('event-time shadow path holds the pool at its cap: the third concurrent run
 });
 
 test('shadow tick agrees with the hook: it holds the second run and decides it once a slot frees', async () => {
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   d.setNow(TICK + 60000);
@@ -238,7 +239,7 @@ test('shadow tick does not count the run being decided against its own pool', as
   // run-a started before any tick, so only its model ties it to the pool.
   // The census counts it there; the pool is at its cap of 1 only because of
   // run-a itself, so the guard must not hold it.
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   d.setNow(TICK + 60000);
   await d.fire({
@@ -253,7 +254,7 @@ test('shadow tick does not count the run being decided against its own pool', as
 });
 
 test('shadow tick holds both of two running runs on a one-slot pool: the pool really is full', async () => {
-  const d = drive({ config: {}, accounts: AHEAD() });
+  const d = drive({ config: { pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   d.setNow(TICK + 60000);
   for (const [i, id] of ['run-a', 'run-b'].entries()) {
@@ -276,7 +277,7 @@ test('plugin loop: six contended hours hold the ahead pool at its cap and refill
   const RETRY_MIN = 5;
   const RUN_MIN = 54;
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 } }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 0.9 }, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   const running = new Map(); // runId -> finish minute
@@ -332,7 +333,7 @@ test('runs the hook deferred do not hold the pool: it refills once the real runs
   // two waiting runs would hold an idle one-slot pool at its cap until the
   // host gave up on them.
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   let at = TICK + 30000;
@@ -363,8 +364,9 @@ test('a lane without ready credentials is outside the pool: its position does no
   // no ready credential, so it can serve nothing. The pool is a1 alone.
   // Readiness exclusion is opt-in: this pins the flag on (off mode admits
   // both lanes, covered by the credential-readiness parity corpus).
-  const ready = claudeLane(0.6, 48);
-  const unready = { ...claudeLane(0.99, 48), accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
+  const ready = claudeLane(0.6, 48, { models: ['claude-opus-5-5'] });
+  const unready = { ...claudeLane(0.99, 48, { models: ['claude-sonnet-5-5'] }),
+    accountKey: 'a2', lane: 'claude-2', credentialAvailability: { version: 1, models: [] } };
   const d = drive({ config: { enforce: true, credentialReadiness: { enforce: true } }, accounts: [ready, unready] });
   await d.setup();
   await d.tick();
@@ -377,7 +379,7 @@ test('a lane without ready credentials is outside the pool: its position does no
 
 test('a deferred run that later runs anyway (the hook keeps it) counts as executing again', async () => {
   const agentGets = { 'agent-9': { adapterConfig: { model: 'claude-opus-5-5' } } };
-  const d = drive({ config: { enforce: true }, accounts: AHEAD(), agentGets });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD(), agentGets });
   await d.setup();
   await d.tick();
   let at = TICK + 30000;
@@ -399,7 +401,7 @@ test('a deferred run that later runs anyway (the hook keeps it) counts as execut
 
 test('an unmeasured lane in the pool makes the whole pool fail open', async () => {
   const unknownReset = { ...claudeLane(0.5, 48), accountKey: 'a2', lane: 'claude-2', weekly: { used: 0.5, resetsAt: null } };
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), unknownReset] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), unknownReset] });
   await d.setup();
   await d.tick();
   const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
@@ -408,7 +410,7 @@ test('an unmeasured lane in the pool makes the whole pool fail open', async () =
 });
 
 test('a paced pool plus a trial-full unpaced pool defers on the guard retry', async () => {
-  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: [claudeLane(0.9, 48), geminiLane(0.3, 48)] });
   await d.setup();
   await d.tick();
   for (const id of ['run-1', 'run-2', 'run-3']) assert.equal((await d.hook(id)).kind, 'decide', id);
@@ -435,7 +437,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
   // it is breaker-open, so it cannot serve and is not part of the pool. The
   // hook already built the pool from breaker-filtered rungs; the tick must too.
   const mk = () => [claudeLane(0.9, 48), { ...claudeLane(0.2, 48), accountKey: 'a2', lane: 'claude-2' }];
-  const probe = drive({ config: { enforce: true }, accounts: mk() });
+  const probe = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: mk() });
   await probe.setup();
   await probe.tick();
   const ladders = (await probe.api('ladder')).body.ladders;
@@ -447,7 +449,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
     recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 120000, errorText: 'auth_unavailable' }, TICK - 120000, cfg);
     recordArmFailure(seed, 'claude:a2', armId, { atMs: TICK - 60000, errorText: 'auth_unavailable' }, TICK - 60000, cfg);
   }
-  const d = drive({ config: { enforce: true }, accounts: mk() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: mk() });
   await d.setup();
   d.seed({ scopeKind: 'company', scopeId: 'acme', namespace: 'model-capacity', stateKey: 'breaker-v1' }, breakerStoreToJSON(seed, { nowMs: TICK, cfg }));
   await d.tick();
@@ -462,7 +464,7 @@ test('tick and hook agree on pool membership when a lane\'s every arm is breaker
 });
 
 test('/capacity reports the guard state per pool', async () => {
-  const d = drive({ config: { enforce: true }, accounts: AHEAD() });
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: null } }, accounts: AHEAD() });
   await d.setup();
   await d.tick();
   await d.hook('run-1');
@@ -507,7 +509,7 @@ test('a window that has just reset (reset one week out, clock skew of minutes) i
   await d.setup();
   await d.tick();
   const pool = (await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude');
-  assert.equal(pool.state, 'ahead', '30% used at hour 0 is ahead of plan');
+  assert.equal(pool.state, 'hard-held', '30% used at hour 0 is measured and exceeds the hard-hold band');
   assert.ok(Math.abs(pool.planAhead - 0.3) < 1e-9);
 });
 
@@ -546,4 +548,552 @@ test('manifest: the pacing.guard schema defaults match the code defaults', () =>
   assert.equal(g.properties.enabled.default, DEFAULT_PACE_GUARD.enabled);
   assert.equal(g.properties.marginPct.default, DEFAULT_PACE_GUARD.marginPct);
   assert.equal(g.properties.retryAfterMs.default, DEFAULT_PACE_GUARD.retryAfterMs);
+});
+
+test('weekly hard hold: hook and capacity keep a deeply ahead idle lane at zero until the plan catches up', async () => {
+  const d = drive({ config: { enforce: true }, accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  let cap = (await d.api('capacity')).body;
+  assert.equal(cap.paceGuard.holdAheadPts, 0.10);
+  assert.equal(cap.paceGuard.pools.find(p => p.pool === 'claude').cap, 0);
+  assert.match((await d.hook('held-first')).model, /^gemini/);
+  d.setAccounts([claudeLane(0.83, 30), geminiLane(0.3, 48)]);
+  d.setNow(TICK + 60000);
+  await d.tick();
+  cap = (await d.api('capacity')).body;
+  assert.notEqual(cap.paceGuard.pools.find(p => p.pool === 'claude').cap, 0);
+});
+
+test('weekly hard hold: a sole held role defers without a suspension diagnostic', async () => {
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: 0.10 } }, accounts: AHEAD() });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.deepEqual(cap.paceGuard.roleSafety, []);
+  assert.equal(cap.paceGuard.rawPools.find(p => p.pool === 'claude').cap, 0);
+  assert.deepEqual(cap.paceGuard.rawPools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
+  assert.equal((await d.hook('safety-first')).kind, 'defer');
+  assert.equal((await d.hook('safety-second')).kind, 'defer');
+});
+
+test('weekly plan prices only spendable quota above the configured level floor', async () => {
+  const d = drive({ config: { burnMode: { floors: { 'claude:*': 0.15 } } }, accounts: [claudeLane(0.4, 84)] });
+  await d.setup();
+  await d.tick();
+  const a = (await d.api('capacity')).body.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(a.planAhead - (-0.025)) < 1e-10, `plan ahead ${a.planAhead}`);
+  assert.ok(Math.abs(a.requiredRatePerHour - 0.45 / 84) < 1e-10, `required ${a.requiredRatePerHour}`);
+  assert.equal(a.planTargetUsedPct, 0.85);
+});
+
+test('weekly C* uses exactly the spendable weekly quota above the floor', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { burnMode: { floors: { 'claude:*': 0.15 } },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 2 } },
+    accounts: [claudeLane(0.399, 84.5, onlyOpus)],
+  });
+  await d.setup();
+  await d.tick();
+  await d.fire(runEvent('floor-measured-run', TICK + 60000));
+  await d.fire(runEvent('floor-measured-run', TICK + 120000, 'agent.run.finished'));
+  d.setNow(TICK + 0.5 * HOUR);
+  d.setAccounts([claudeLane(0.4, 84.5, { ...onlyOpus,
+    observedAt: new Date(TICK + 0.5 * HOUR).toISOString() })]);
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const account = capacity.accounts.find(a => a.accountId === 'claude:a1');
+  const perAccount = capacity.perAccount.find(a => a.accountId === 'claude:a1');
+  assert.equal(capacity.calibration, 'measured', JSON.stringify(perAccount));
+  assert.ok(Math.abs(account.spendableRemaining - 0.45) < 1e-10);
+  // One run spent 0.001 of the week. (0.45 / 84) / 0.001 * 2 = 75/7 slots;
+  // using the raw 0.60 remaining would incorrectly grant 100/7 slots.
+  assert.ok(Math.abs(perAccount.slots - 75 / 7) < 1e-9, `weekly floor C* slots ${perAccount.slots}, expected ${75 / 7}`);
+});
+
+test('weekly hard hold: a regenerating-meter floor cannot reduce the weekly target or block healthy work', async () => {
+  for (const regenUsed of [0.1, 0]) {
+    // Half the week elapsed, 30% weekly used: twenty points BEHIND plan.
+    // The 80% floor governs the regenerating balance, not the weekly quota.
+    const d = drive({ config: { enforce: true, burnMode: { floors: { 'claude:*': 0.8 } } },
+      accounts: [claudeLane(0.3, 84, { meterInfo: { weeklyUsed: regenUsed } }), geminiLane(0.3, 84)] });
+    await d.setup();
+    await d.tick();
+    const cap = (await d.api('capacity')).body;
+    const a = cap.accounts.find(a => a.accountId === 'claude:a1');
+    assert.equal(a.health, 'healthy');
+    assert.notEqual(a.burnMode, true, 'the account is ordinarily paced, not burn-exempt');
+    assert.equal(a.burnFloor.floor, 0.8);
+    assert.equal(a.burnFloor.remaining, 1 - regenUsed);
+    assert.equal(a.planTargetUsedPct, 1, 'a regenerating floor leaves the weekly endpoint at 100%');
+    assert.ok(Math.abs(a.planAhead - (-0.2)) < 1e-10, `plan ahead ${a.planAhead}`);
+    assert.ok(Math.abs(a.spendableRemaining - 0.7) < 1e-10, `spendable ${a.spendableRemaining}`);
+    assert.ok(Math.abs(a.requiredRatePerHour - 0.7 / 84) < 1e-10, `required ${a.requiredRatePerHour}`);
+    const pool = cap.paceGuard.rawPools.find(p => p.pool === 'claude');
+    assert.ok(!(pool.hardHeldAccountIds ?? []).includes('claude:a1'));
+    assert.equal(cap.paceGuard.roleSafety.length, 0, 'an eligible peer prevents empty-role safety from hiding a false hold');
+    // The peer's trial family can take two runs; healthy weekly capacity
+    // must still serve when those trial slots are occupied.
+    const runIds = [0, 1, 2].map(i => `regen-floor-${regenUsed}-${i}`);
+    const models = [];
+    for (const id of runIds) {
+      const out = await d.hook(id);
+      assert.equal(out.kind, 'decide');
+      models.push(out.model);
+    }
+    assert.ok(models.some(model => model.startsWith('claude')), `models ${models}`);
+
+    // The fix must not remove the regenerating meter's own exhaustion gate.
+    for (const id of runIds) await d.fire(runEvent(id, TICK + 30000, 'agent.run.finished'));
+    d.setAccounts([claudeLane(0.3, 84, { meterInfo: { weeklyUsed: 0.2 } }), geminiLane(0.3, 84)]);
+    d.setNow(TICK + 60000);
+    await d.tick();
+    assert.equal((await d.api('capacity')).body.accounts.find(a => a.accountId === 'claude:a1').health, 'exhausted');
+    assert.match((await d.hook(`regen-floor-reached-${regenUsed}`)).model, /^gemini/);
+  }
+});
+
+test('weekly hard hold: a regenerating-meter floor does not exempt a genuinely ahead weekly account', async () => {
+  const d = drive({ config: { enforce: true, burnMode: { floors: { 'claude:*': 0.8 } } },
+    accounts: [claudeLane(0.65, 84, { meterInfo: { weeklyUsed: 0.1 } }), geminiLane(0.3, 84)] });
+  await d.setup();
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  const a = cap.accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(a.health, 'healthy');
+  assert.ok(Math.abs(a.planAhead - 0.15) < 1e-10, `plan ahead ${a.planAhead}`);
+  assert.deepEqual(cap.paceGuard.rawPools.find(p => p.pool === 'claude').hardHeldAccountIds, ['claude:a1']);
+  assert.match((await d.hook('regen-weekly-ahead')).model, /^gemini/);
+});
+
+test('weekly hard hold: burn opt-in bypasses the hold without disabling it for ordinary accounts', async () => {
+  const d = drive({ config: { enforce: true, burnMode: { accounts: ['claude:*'] } },
+    accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  assert.match((await d.hook('burn-first')).model, /^claude/);
+  assert.equal((await d.api('capacity')).body.paceGuard.pools.find(p => p.pool === 'claude').state, 'burn');
+});
+
+for (const mode of ['shadow', 'enforce']) {
+  test(`weekly hard hold: an indistinguishable duplicate route stays closed (ranking=${mode})`, async () => {
+    const fixture = {
+      config: { enforce: true, taskRanking: { mode } },
+      snapshotRows: aaRows().map(row => ({ ...row, terminalbenchV40: 0.9, scicode: 0.9, lcr: 0.9,
+        ifbench: 0.9, omniscienceNonHallucination: 0.9, hle: 0.9, gpqa: 0.9, critpt: 0.9, gdpvalNormalized: 0.9 })),
+      accounts: [claudeLane(0.83, 104.16), claudeLane(0.1, 120, {
+        provider: 'devin', lane: 'devin-1', accountKey: 'd1', models: ['claude-opus-5-5'],
+      })],
+    };
+    const peerOnly = drive({ ...fixture, accounts: fixture.accounts.slice(1) });
+    await peerOnly.setup();
+    await peerOnly.tick();
+    assert.equal((await peerOnly.hook(`eligible-peer-${mode}`)).kind, 'decide',
+      'the peer has a ready, role-eligible arm in the full pass');
+    const d = drive(fixture);
+    await d.setup();
+    await d.tick();
+    const capacity = (await d.api('capacity')).body;
+    assert.ok(Math.abs(capacity.accounts.find(a => a.accountId === 'claude:a1').planAhead - 0.45) < 1e-10);
+    assert.ok(capacity.accounts.find(a => a.accountId === 'devin:d1').planAhead < 0);
+    const route = await d.hook(`duplicate-peer-${mode}`);
+    assert.equal(route.kind, 'defer', JSON.stringify(route));
+    assert.equal(route.model, undefined, 'the common model cannot prove the held native credential is excluded');
+    await d.tick();
+    const entry = (await d.api('shadow')).body.entries.find(e => e.runId === `duplicate-peer-${mode}`);
+    assert.equal(entry?.accountId, undefined, 'an internal duplicate account label is not a safe emission');
+    assert.equal(entry?.wouldModel, undefined);
+  });
+}
+
+test('weekly soft cap: an unservable unknown-reset sibling cannot reopen fixed-model capacity', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { enforce: true, concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+      roles: { keepAgentIds: ['fixed'] } },
+    accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const servable = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([servable]);
+  await d.tick();
+  const read = async () => {
+    const capacity = (await d.api('capacity')).body;
+    // Calibrate the fleet response and bind the pin; the tick owns all lane sizing and pace facts.
+    d.updateCapacity(cap => {
+      cap.target = 8; cap.calibration = 'measured';
+      cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+    });
+    const caps = (await d.api('caps')).body;
+    const pool = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+    return { capacity, summary: { lanes: pool?.lanes, cap: pool?.cap,
+      allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated } };
+  };
+  const before = await read();
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.summary, { lanes: 1, cap: 1, allocated: 1 });
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...servable, observedAt: new Date(TICK + 31 * 60000).toISOString() },
+    claudeLane(0.1, 84, { accountKey: 'empty', lane: 'claude-empty', models: [],
+      weekly: { used: 0.1, resetsAt: null }, observedAt: new Date(TICK + 31 * 60000).toISOString() })]);
+  await d.tick();
+  const after = await read();
+  const empty = after.capacity.accounts.find(a => a.accountId === 'claude:empty');
+  assert.equal(empty.health, 'healthy');
+  assert.deepEqual(empty.arms, [], 'the tick confirms the added lane has no servable arm');
+  assert.equal(after.capacity.perAccount.find(a => a.accountId === 'claude:empty').slots, 0);
+  assert.deepEqual(after.summary, { lanes: 1, cap: 1, allocated: 1 },
+    'a zero-slot lane with no served model must not erase the finite raw cap');
+});
+
+test('weekly soft cap: an unready configured reviewer sibling cannot enter raw pool membership', async () => {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({
+    config: { enforce: true, credentialReadiness: { enforce: true },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+      roles: { keepAgentIds: ['fixed', 'reviewer-1'] },
+      reviewerRouting: { agentIds: ['reviewer-1'], arms: [
+        { provider: 'claude', model: 'claude-opus-5-5', effort: 'max' },
+      ] } },
+    accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const ready = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([ready]);
+  await d.tick();
+  const read = async () => {
+    const capacity = (await d.api('capacity')).body;
+    d.updateCapacity(cap => {
+      cap.target = 8; cap.calibration = 'measured';
+      cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+    });
+    const caps = (await d.api('caps')).body;
+    const pool = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+    return { capacity, summary: { lanes: pool?.lanes, cap: pool?.cap,
+      allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated } };
+  };
+  const before = await read();
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.summary, { lanes: 1, cap: 1, allocated: 1 });
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...ready, observedAt: new Date(TICK + 31 * 60000).toISOString() },
+    claudeLane(0.1, 84, { ...onlyOpus, accountKey: 'unready', lane: 'claude-unready',
+      weekly: { used: 0.1, resetsAt: null }, observedAt: new Date(TICK + 31 * 60000).toISOString(),
+      credentialAvailability: { version: 1, models: [] } })]);
+  await d.tick();
+  const after = await read();
+  assert.equal(after.capacity.accounts.find(a => a.accountId === 'claude:unready').health, 'healthy');
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1'],
+    'the configured policy model is not an admission without ready credentials');
+  const ordinary = after.capacity.paceGuard.pools.find(p => p.pool === 'claude');
+  assert.deepEqual({ lanes: ordinary.lanes, cap: ordinary.cap }, { lanes: 1, cap: 1 });
+  assert.equal((await d.hook('ready-review-policy-peer')).kind, 'decide');
+  assert.equal((await d.hook('unready-review-policy-peer')).kind, 'defer');
+  await d.tick();
+  assert.equal((await d.api('shadow')).body.entries.find(e => e.runId === 'ready-review-policy-peer')?.accountId, 'claude:a1');
+  assert.deepEqual(after.summary, { lanes: 1, cap: 1, allocated: 1 },
+    'raw pool membership must apply the same reviewer credential-readiness gate as admission');
+});
+
+const policyReviewerConfig = () => ({
+  enforce: true, credentialReadiness: { enforce: true }, taskRanking: { mode: 'enforce' },
+  concurrency: { maxTotal: 75, meanRunDurationHours: 4 },
+  roles: { keepAgentIds: ['fixed', 'reviewer-1'] },
+  reviewerRouting: { agentIds: ['reviewer-1'], arms: [
+    { provider: 'claude', model: 'claude-opus-5-5', effort: 'max' },
+  ] },
+});
+const policyReviewerSibling = (over = {}) => claudeLane(0.1, 84, {
+  accountKey: 'policy-peer', lane: 'claude-policy-peer', models: ['claude-opus-5-5'],
+  weekly: { used: 0.1, resetsAt: null }, ...over,
+});
+
+async function policyReviewerSnapshot(d) {
+  const capacity = (await d.api('capacity')).body;
+  d.updateCapacity(cap => {
+    cap.target = 8; cap.calibration = 'measured';
+    cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+  });
+  const caps = (await d.api('caps')).body;
+  const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+  const review = capacity.reviewerPaceByAgent['reviewer-1'].pools.find(p => p.pool === 'claude');
+  return { capacity, raw: { lanes: raw?.lanes, cap: raw?.cap,
+    allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated },
+  review: { lanes: review?.lanes, cap: review?.cap } };
+}
+
+async function measuredPolicyReviewer({ breakerArmIds = [], config = policyReviewerConfig(), snapshotRows = aaRows() } = {}) {
+  const onlyOpus = { models: ['claude-opus-5-5'] };
+  const d = drive({ config, snapshotRows, accounts: [claudeLane(0.55, 84.5, onlyOpus)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }] });
+  await d.setup();
+  if (breakerArmIds.length > 0) {
+    const cfg = sanitizeBreakers();
+    const store = createBreakerStore();
+    for (const armId of breakerArmIds) {
+      for (const atMs of [TICK - 120000, TICK - 60000]) {
+        recordArmFailure(store, 'claude:policy-peer', armId, { atMs, errorText: 'auth_unavailable' }, atMs, cfg);
+      }
+    }
+    d.seed({ ...AA_STATE_KEY, stateKey: 'breaker-v1' }, breakerStoreToJSON(store, { nowMs: TICK, cfg }));
+  }
+  await d.tick();
+  d.setNow(TICK + 0.5 * HOUR);
+  const ready = claudeLane(0.58, 84.5, { ...onlyOpus, observedAt: new Date(TICK + 0.5 * HOUR).toISOString() });
+  d.setAccounts([ready]);
+  await d.tick();
+  const before = await policyReviewerSnapshot(d);
+  const account = before.capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.ok(Math.abs(account.planAhead - 0.08) < 1e-10);
+  assert.ok(Math.abs(account.measuredRatePerHour - 0.06) < 1e-10);
+  assert.ok(before.capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1);
+  assert.deepEqual(before.raw, { lanes: 1, cap: 1, allocated: 1 });
+  assert.deepEqual(before.review, { lanes: 1, cap: 1 });
+  return { d, ready };
+}
+
+async function addPolicyReviewerSibling({ d, ready }, sibling) {
+  const observedAt = new Date(TICK + 31 * 60000).toISOString();
+  d.setNow(TICK + 31 * 60000);
+  d.setAccounts([{ ...ready, observedAt }, ...(sibling ? [{ ...sibling, observedAt }] : [])]);
+  await d.tick();
+  return policyReviewerSnapshot(d);
+}
+
+test('weekly soft cap: a ready breaker-open policy sibling cannot enter raw membership', async t => {
+  const probe = drive({ config: policyReviewerConfig(), accounts: [
+    claudeLane(0.55, 84.5, { models: ['claude-opus-5-5'] }), policyReviewerSibling(),
+  ] });
+  await probe.setup();
+  await probe.tick();
+  const ladder = (await probe.api('ladder')).body.ladders['claude:policy-peer'];
+  const policyArms = ladder.policyReviewerArms ?? [];
+  assert.ok(policyArms.length > 0, 'the real ladder publishes configured reviewer arms');
+  const armIds = [...new Set([...(ladder.rungs ?? []), ...policyArms].map(a => a.armId))];
+  assert.ok(armIds.length > 0);
+  t.diagnostic(`seeded sibling breaker identities: ${armIds.join(', ')}`);
+  const fixture = await measuredPolicyReviewer({ breakerArmIds: armIds });
+  const after = await addPolicyReviewerSibling(fixture, policyReviewerSibling());
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+  const blocked = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+  assert.ok(blocked.rungs.length > 0, 'the real ladder retains diagnostic rows for blocked arms');
+  for (const row of blocked.rungs) {
+    assert.equal(row.breaker, 'open', `breaker ${row.armId}`);
+    assert.equal(row.credentialEvidence?.readyCredentials, 1, `ready ${row.armId}`);
+  }
+  assert.ok(blocked.policyReviewerArms.length > 0);
+  for (const row of blocked.policyReviewerArms) assert.equal(row.credentialEvidence?.readyCredentials, 1, `policy ready ${row.armId}`);
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 },
+    'ready credentials do not qualify a policy arm whose breaker is open');
+});
+
+test('weekly soft cap: a ready closed-breaker policy sibling remains a raw member', async () => {
+  const fixture = await measuredPolicyReviewer();
+  const after = await addPolicyReviewerSibling(fixture, policyReviewerSibling());
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1', 'claude:policy-peer']);
+  assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+    'a ready policy-only sibling with an unknown reset legitimately keeps the pool fail-open');
+});
+
+for (const unreadySibling of [false, true]) {
+  test(`weekly soft cap: live reviewer membership retains the ready lane's cap (unreadySibling=${unreadySibling})`, async () => {
+    const fixture = await measuredPolicyReviewer();
+    const sibling = unreadySibling ? policyReviewerSibling({ credentialAvailability: { version: 1, models: [] } }) : null;
+    const after = await addPolicyReviewerSibling(fixture, sibling);
+    assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 });
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+    const runIds = [`review-policy-${unreadySibling}-first`, `review-policy-${unreadySibling}-second`];
+    const decisions = [];
+    for (const runId of runIds) decisions.push(await fixture.d.hook(runId, { agentId: 'reviewer-1' }));
+    assert.equal(decisions[0].kind, 'decide');
+    await fixture.d.tick();
+    const entries = (await fixture.d.api('shadow')).body.entries;
+    for (const [i, decision] of decisions.entries()) {
+      if (decision.kind === 'decide') assert.equal(entries.find(e => e.runId === runIds[i])?.accountId, 'claude:a1');
+    }
+    assert.deepEqual({ review: after.review, decisions: decisions.map(d => d.kind) },
+      { review: { lanes: 1, cap: 1 }, decisions: ['decide', 'defer'] },
+      'an unready policy sibling cannot reopen the live reviewer pool or admit a second run');
+  });
+}
+
+const sonnetPolicyReviewerConfig = (excludeFamilies = {}, mode = 'enforce') => {
+  const config = policyReviewerConfig();
+  config.taskRanking.mode = mode;
+  config.roles = { ...config.roles, doerAgentIds: ['fixed', 'reviewer-1'],
+    thinkerAgentIds: ['reviewer-thinker'],
+    keepAgentIds: ['fixed', 'reviewer-1', 'reviewer-thinker', 'reviewer-other'], excludeFamilies };
+  config.reviewerRouting.agentIds = ['reviewer-1', 'reviewer-thinker', 'reviewer-other'];
+  config.reviewerRouting.arms.push({ provider: 'claude', model: 'claude-sonnet-5-5', effort: 'max' });
+  return config;
+};
+const sonnetPolicySibling = () => policyReviewerSibling({ models: ['claude-sonnet-5-5'] });
+
+async function policyReviewerRunPair(d, prefix, agentId = 'reviewer-1') {
+  const runIds = [`${prefix}-first`, `${prefix}-second`];
+  const decisions = [];
+  for (const runId of runIds) decisions.push(await d.hook(runId, { agentId }));
+  await d.tick();
+  const entries = (await d.api('shadow')).body.entries;
+  const admitted = decisions.flatMap((decision, i) => decision.kind === 'decide' ? [{ decision, runId: runIds[i] }] : []);
+  return { decisions: decisions.map(d => d.kind),
+    models: admitted.map(({ decision }) => decision.model),
+    accounts: admitted.map(({ runId }) => entries.find(e => e.runId === runId)?.accountId) };
+}
+
+test('policy exclusions: a sibling excluded by every role cannot erase the universal raw cap', async t => {
+  const config = sonnetPolicyReviewerConfig({ doer: ['sonnet'], thinker: ['sonnet'], other: ['sonnet'] });
+  const fixture = await measuredPolicyReviewer({ config });
+  const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+  const ladder = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+  assert.ok(ladder.policyReviewerArms.some(a => a.model === 'claude-sonnet-5-5'
+    && a.credentialEvidence?.readyCredentials === 1), 'the excluded model has ready policy evidence');
+  assert.equal(after.capacity.accounts.find(a => a.accountId === 'claude:policy-peer').health, 'healthy');
+  assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+  assert.deepEqual(after.review, { lanes: 1, cap: 1 });
+  const live = await policyReviewerRunPair(fixture.d, 'all-roles-excluded');
+  assert.deepEqual(live, { decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] });
+  t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 },
+    'no spendable role survives: a policy record alone must not reopen fixed capacity');
+});
+
+for (const survivingRole of ['doer', 'thinker', 'other']) {
+  test(`policy exclusions: universal membership survives when only ${survivingRole} can spend the sibling`, async () => {
+    const exclusions = { doer: ['sonnet'], thinker: ['sonnet'], other: ['sonnet'], [survivingRole]: [] };
+    const config = sonnetPolicyReviewerConfig(exclusions);
+    // Prefer Sonnet in this positive control so the admitted run proves the sibling is spendable.
+    config.reviewerRouting.arms.reverse();
+    const fixture = await measuredPolicyReviewer({ config });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+      'one relevant role is enough; another role must not narrow universal capacity');
+    const agentId = { doer: 'reviewer-1', thinker: 'reviewer-thinker', other: 'reviewer-other' }[survivingRole];
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent[agentId], ['claude:a1', 'claude:policy-peer']);
+    const pool = after.capacity.reviewerPaceByAgent[agentId].pools.find(p => p.pool === 'claude');
+    assert.deepEqual({ lanes: pool.lanes, cap: pool.cap }, { lanes: 2, cap: null });
+    if (survivingRole !== 'doer') {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+      assert.deepEqual(after.review, { lanes: 1, cap: 1 }, 'reviewer-local membership still obeys its own role fence');
+    }
+    const live = await policyReviewerRunPair(fixture.d, `only-${survivingRole}-allowed`, agentId);
+    assert.deepEqual(live, { decisions: ['decide', 'decide'], models: ['claude-sonnet-5-5', 'claude-sonnet-5-5'],
+      accounts: ['claude:policy-peer', 'claude:policy-peer'] });
+  });
+}
+
+test('policy exclusions: no sibling retains the reviewer cap independently of family overrides', async () => {
+  const fixture = await measuredPolicyReviewer({ config: sonnetPolicyReviewerConfig({ doer: ['sonnet'] }) });
+  const after = await addPolicyReviewerSibling(fixture, null);
+  assert.deepEqual(after.raw, { lanes: 1, cap: 1, allocated: 1 });
+  assert.deepEqual(after.review, { lanes: 1, cap: 1 });
+  assert.deepEqual(await policyReviewerRunPair(fixture.d, 'excluded-no-sibling'),
+    { decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] });
+});
+
+for (const token of ['sonnet', 'arm:claude-sonnet-5-5', 'arm:claude-sonnet-5-5@max']) {
+  test(`policy exclusions: reviewer-local and live membership honor ${token}`, async t => {
+    const fixture = await measuredPolicyReviewer({ config: sonnetPolicyReviewerConfig({ doer: [token] }) });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+    assert.deepEqual(after.raw, { lanes: 2, cap: null, allocated: 8 },
+      'other roles may spend Sonnet; a local reviewer exclusion is not a global hold');
+    const live = await policyReviewerRunPair(fixture.d, `local-${token}`);
+    t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+    assert.deepEqual({ review: after.review, ...live }, { review: { lanes: 1, cap: 1 },
+      decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] },
+    'the reviewer cannot borrow another role\'s sibling membership or admit a second run on a1');
+  });
+}
+
+for (const mode of ['shadow', 'enforce']) {
+  test(`policy membership mode: ${mode} ${mode === 'enforce' ? 'admits' : 'ignores'} a policy-only sibling`, async t => {
+    const config = sonnetPolicyReviewerConfig({}, mode);
+    config.reviewerRouting.arms.reverse();
+    const fixture = await measuredPolicyReviewer({ config,
+      snapshotRows: aaRows().filter(row => !row.slug.startsWith('claude-sonnet')) });
+    const after = await addPolicyReviewerSibling(fixture, sonnetPolicySibling());
+    const ladder = (await fixture.d.api('ladder')).body.ladders['claude:policy-peer'];
+    assert.equal(ladder.rungs.length, 0, 'no AA row supplies ordinary capacity for the Sonnet sibling');
+    assert.ok(ladder.policyReviewerArms.some(a => a.model === 'claude-sonnet-5-5'
+      && a.credentialEvidence?.readyCredentials === 1), 'the policy-only diagnostic record exists in both modes');
+    const live = await policyReviewerRunPair(fixture.d, `policy-only-${mode}`);
+    t.diagnostic(JSON.stringify({ raw: after.raw, review: after.review, live }));
+    if (mode === 'shadow') {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1']);
+      assert.deepEqual({ raw: after.raw, review: after.review, ...live },
+        { raw: { lanes: 1, cap: 1, allocated: 1 }, review: { lanes: 1, cap: 1 },
+          decisions: ['decide', 'defer'], models: ['claude-opus-5-5'], accounts: ['claude:a1'] },
+        'shadow policy diagnostics are not enforced capacity');
+    } else {
+      assert.deepEqual(after.capacity.reviewerAccountIdsByAgent['reviewer-1'], ['claude:a1', 'claude:policy-peer']);
+      assert.deepEqual({ raw: after.raw, review: after.review, ...live },
+        { raw: { lanes: 2, cap: null, allocated: 8 }, review: { lanes: 2, cap: null },
+          decisions: ['decide', 'decide'], models: ['claude-sonnet-5-5', 'claude-sonnet-5-5'],
+          accounts: ['claude:policy-peer', 'claude:policy-peer'] });
+    }
+  });
+}
+
+test('weekly hard hold: routing headroom cannot erase global holds or reopen fixed-model caps', async () => {
+  const d = drive({
+    config: { enforce: true, pacing: { guardHighPct: 0.99, guardRejoinPct: 0.98 },
+      concurrency: { maxTotal: 75, meanRunDurationHours: 2 }, roles: { keepAgentIds: ['fixed'] } },
+    accounts: [claudeLane(0.85, 120, {
+      fiveHour: { used: 0.96, resetsAt: new Date(TICK + 4 * HOUR).toISOString() },
+    }), geminiLane(0.1, 120)],
+    heartbeats: [{ agentId: 'fixed', queued: 8 }],
+  });
+  await d.setup();
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  const account = capacity.accounts.find(a => a.accountId === 'claude:a1');
+  assert.equal(account.health, 'healthy');
+  assert.equal(account.guardActive, false);
+  assert.ok(Math.abs(account.headroomPct - 0.04) < 1e-10, `headroom ${account.headroomPct}`);
+  assert.ok(capacity.perAccount.find(a => a.accountId === 'claude:a1').slots > 1, JSON.stringify(capacity.perAccount));
+  const route = await d.hook('low-headroom');
+  assert.equal(route.kind, 'decide');
+  assert.match(route.model, /^gemini/, 'the routing headroom exclusion still applies');
+  // Supply fleet calibration and an exact pin, never pool membership or lane slots.
+  d.updateCapacity(cap => {
+    cap.target = 8; cap.calibration = 'measured';
+    cap.keptByAgent.fixed = { accountId: 'claude:a1' };
+  });
+  const caps = (await d.api('caps')).body;
+  const raw = capacity.paceGuard.rawPools.find(p => p.pool === 'claude');
+  assert.deepEqual({ hardHeld: raw?.hardHeldAccountIds ?? [], cap: raw?.cap ?? null,
+    allocated: caps.agents.find(a => a.agentId === 'fixed')?.allocated },
+  { hardHeld: ['claude:a1'], cap: 0, allocated: 0 });
+});
+
+test('weekly hard hold: invalid threshold is rejected before it can replace routing policy', async () => {
+  const d = drive({ config: { enforce: true, pacing: { holdAheadPts: 'off' } }, accounts: AHEAD() });
+  await assert.rejects(d.setup(), /invalid-config/);
+});
+
+test('weekly hard hold: deferral exhaustion cannot bypass a hold below a custom soft-cap margin', async () => {
+  const d = drive({ config: { enforce: true, exhaustion: { enabled: true }, pacing: { guard: { marginPct: 1 } } },
+    accounts: [claudeLane(0.83, 104.6), geminiLane(0.3, 48)] });
+  await d.setup();
+  await d.tick();
+  await d.hook('trial-1');
+  await d.hook('trial-2');
+  for (let i = 0; i < 14; i++) {
+    const out = await d.hook(`waiting-${i}`, { issueId: 'same-work', agentDefaultModel: 'claude-opus-5-5' });
+    assert.equal(out.kind, 'defer', `attempt ${i}: ${JSON.stringify(out)}`);
+  }
 });

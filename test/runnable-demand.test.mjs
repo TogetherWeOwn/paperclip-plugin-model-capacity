@@ -72,7 +72,8 @@ async function drive(t, {
   if (missingHeartbeatQuery) delete io.agents;
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
   await plugin.setup(io);
-  await plugin.onConfigChanged({ roles: { keepAgentIds: cap.keepAgentIds }, ...config }, { companyId: COMPANY });
+  await plugin.onConfigChanged({ pacing: { holdAheadPts: null },
+    roles: { keepAgentIds: cap.keepAgentIds }, ...config }, { companyId: COMPANY });
   return {
     queuedCalls,
     caps: async () => {

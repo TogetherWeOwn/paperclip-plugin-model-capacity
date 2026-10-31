@@ -19,15 +19,17 @@
  * every pool is paced, is deferred. Below the cap, or when not ahead, the
  * guard changes nothing.
  *
- * Fail open: a pool with any lane of unknown plan position or share, whose
- * lanes include a reactive (unmetered) account, or that has no run duration
- * to convert shares into slots is never paced; the existing caps apply. The
- * minimum of 1 in flight keeps a lightly-ahead account serving instead of
- * stalling it; the price is that a deeply-ahead account (slots below 1) can
- * spend above plan until its headroom reserve takes it out.
+ * The ordinary cap fails open for unknown position/share, reactive pool
+ * members, or missing run duration. Independently, known weekly leads can
+ * still be hard-held without any slot calibration. The
+ * minimum of 1 applies only to the ordinary cap. A configured holdAheadPts
+ * adds an independent zero-slot hold on each known, deeply-ahead lane; burn
+ * and reactive lanes are exempt. Role emptiness never suspends a weekly hold.
  */
 
 import { isReactiveAccount } from './cliproxy.mjs';
+
+export const DEFAULT_HOLD_AHEAD_PTS = 0.10;
 
 export const DEFAULT_PACE_GUARD = Object.freeze({
   enabled: true,
@@ -55,6 +57,37 @@ export function normalizePaceGuard(raw) {
 }
 
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
+
+/**
+ * Whether a model emission can reach a globally weekly-held credential.
+ * The hard-held IDs must be computed globally, not from a role's candidates;
+ * accounts must be the complete feed inventory, including held accounts.
+ * Model lists are exact served IDs, not ladder or readiness lists. The model
+ * argument is the actual emitted ID, including any effort/context decoration.
+ * A missing held account or its unknown/malformed model set is unsafe. An
+ * explicitly empty model list is known empty. Provider and nominal account do
+ * not constrain reachability: the emitted model, not a label, selects a route.
+ * An empty hard-held set naturally bypasses the overlay when it is disabled.
+ */
+export function isWeeklyHeldModelRoute({ accounts, hardHeldAccountIds, provider, model } = {}) {
+  const held = new Set(hardHeldAccountIds ?? []);
+  if (held.size === 0) return false;
+  if (!Array.isArray(accounts) || typeof model !== 'string' || !model) return true;
+  // These suffixes decorate the same CLIProxy model route rather than
+  // selecting a different served model. Provider prefixes remain significant.
+  const undecorate = id => id.replace(/\[1m\]$/, '').replace(/\([^()]*\)$/, '');
+  const emitted = undecorate(model);
+  if (!emitted) return true;
+  for (const id of held) {
+    const matches = accounts.filter(a => a?.accountId === id);
+    if (matches.length !== 1) return true;
+    const account = matches[0];
+    if (account.burn === true || account.burnMode === true || isReactiveAccount(account)) continue;
+    if (!Array.isArray(account.models) || account.models.some(m => typeof m !== 'string' || !m)) return true;
+    if (account.models.some(m => undecorate(m) === emitted)) return true;
+  }
+  return false;
+}
 
 /**
  * required/measured when a lane is measurably burning faster than its plan
@@ -105,24 +138,38 @@ const mean = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
  *
  * Burn mode: lanes flagged `burn` leave the aggregation entirely (their
  * position, share and own in-flight count) and are never held. A pool whose
- * every lane burns is unpaced (cap null, state 'burn').
+ * every lane burns is unpaced (cap null, state 'burn'). Optional burnAccounts
+ * supplies the full burn inventory, including lanes excluded from this role;
+ * its laneInFlight values take precedence for overlapping account IDs. These
+ * extra views supply pressure and identity only, never ordinary allowance.
  */
-export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
+export function paceGuardPools(lanes, { pacing = null, poolKeyOf, burnAccounts = null } = {}) {
   const groups = new Map();
   for (const v of lanes ?? []) {
     const k = poolKeyOf(v);
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(v);
+    if (!groups.has(k)) groups.set(k, { lanes: [], burn: [] });
+    groups.get(k).lanes.push(v);
+  }
+  for (const v of burnAccounts ?? []) {
+    const k = poolKeyOf(v);
+    if (!groups.has(k)) groups.set(k, { lanes: [], burn: [] });
+    groups.get(k).burn.push(v);
   }
   const enabled = pacing?.enabled === true;
   const out = [];
-  for (const [key, all] of groups) {
-    const pool = all[0]?.pool ?? key;
-    const burners = all.filter(v => v?.burn === true);
-    const members = burners.length > 0 ? all.filter(v => v?.burn !== true) : all;
+  for (const [key, group] of groups) {
+    const all = group.lanes;
+    const pool = (all[0] ?? group.burn[0])?.pool ?? key;
+    const burnersById = new Map();
+    for (const v of all) if (v?.burn === true) burnersById.set(v.accountId, v);
+    for (const v of group.burn) burnersById.set(v.accountId, v);
+    const burners = burnAccounts == null ? all.filter(v => v?.burn === true) : [...burnersById.values()];
+    const members = burnAccounts == null
+      ? all.filter(v => v?.burn !== true)
+      : all.filter(v => !burnersById.has(v.accountId));
     // paceInFlight, when given, is the pooled count without the run being
     // decided (callers whose inFlight still includes it); else inFlight.
-    const pooled = Math.max(0, ...all.map(v => {
+    const pooled = Math.max(0, ...[...all, ...group.burn].map(v => {
       const n = finite(v.paceInFlight) ? v.paceInFlight : v.inFlight;
       return finite(n) ? n : 0;
     }));
@@ -142,6 +189,20 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     out.push(entry);
     if (!enabled) continue;
     if (members.length === 0) { entry.state = 'burn'; continue; }
+    // A known weekly lead needs neither calibration nor a duration estimate.
+    // Keep this gate independent of the soft cap's fail-open measurement rules.
+    // Numerical slack keeps 0.8 - 0.7 inside a ten-point band.
+    const hardHeld = members.filter(v => !isReactiveAccount(v) && finite(v.planAhead)
+      && finite(pacing.holdAheadPts) && v.planAhead - pacing.holdAheadPts > 1e-12);
+    const hardIds = new Set(hardHeld.map(v => v.accountId));
+    if (hardIds.size > 0) {
+      entry.hardHeldAccountIds = [...hardIds];
+      entry.pacedAccountIds = [...hardIds];
+      entry.ahead = true;
+      entry.paced = hardHeld.length === members.length;
+      entry.state = entry.paced ? 'hard-held' : 'lanes-paced';
+      if (entry.paced) { entry.cap = 0; entry.pacedSlots = 0; entry.planAhead = mean(hardHeld.map(v => v.planAhead)); }
+    }
     if (members.some(isReactiveAccount)) continue;
     // One lane of unknown position or share makes the whole pool unmeasured:
     // leaving it out would size the cap from the other lanes alone and
@@ -157,20 +218,20 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
       // review runs on a lane calibrated by cheap ones), shrink its slots by
       // required/measured so the cap follows the real burn.
       const factor = rateCorrection(v);
-      const slots = v.targetShare * hours * (ahead ? factor : 1);
+      const slots = hardIds.has(v.accountId) ? 0 : v.targetShare * hours * (ahead ? factor : 1);
       return {
-        accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: ahead ? slots : Math.max(1, slots), ahead, paced: false,
+        accountId: v.accountId, planAhead: v.planAhead, pacedSlots: slots, allowance: hardIds.has(v.accountId) ? 0 : ahead ? slots : Math.max(1, slots), ahead, paced: hardIds.has(v.accountId),
         ...(ahead && factor < 1 ? { rateCorrection: factor } : {}),
       };
     });
     entry.planAhead = mean(positions);
     entry.pacedSlots = laneVerdicts.reduce((s, l) => s + l.pacedSlots, 0);
     const single = members.length === 1;
-    const allowance = single ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
+    const allowance = single && hardIds.size === 0 ? entry.pacedSlots : laneVerdicts.reduce((s, l) => s + l.allowance, 0);
     // The epsilon keeps an exact integer of slots from rounding up on
     // float noise (0.2 x 10 is 2.0000000000000004).
-    entry.cap = Math.max(1, Math.ceil(allowance - 1e-9));
-    entry.ahead = laneVerdicts.some(l => l.ahead);
+    entry.cap = hardHeld.length === members.length ? 0 : Math.max(1, Math.ceil(allowance - 1e-9));
+    entry.ahead = hardIds.size > 0 || laneVerdicts.some(l => l.ahead);
     const atCap = inFlight >= entry.cap;
     if (entry.ahead && atCap) {
       for (const l of laneVerdicts) if (l.ahead) l.paced = true;
@@ -178,7 +239,7 @@ export function paceGuardPools(lanes, { pacing = null, poolKeyOf } = {}) {
     entry.pacedAccountIds = laneVerdicts.filter(l => l.paced).map(l => l.accountId);
     entry.paced = entry.pacedAccountIds.length > 0 && entry.pacedAccountIds.length === members.length;
     if (!single) entry.laneVerdicts = laneVerdicts;
-    entry.state = entry.paced ? 'paced'
+    entry.state = hardHeld.length === members.length ? 'hard-held' : entry.paced ? 'paced'
       : entry.pacedAccountIds.length > 0 ? 'lanes-paced'
         : entry.ahead ? 'ahead' : 'on-plan';
   }

@@ -35,7 +35,7 @@ async function drive({ nodes = [], queued = 0, cap = snapshot(), fail = false } 
     secrets: { resolve: async () => 'fixture-only' },
     http: { fetch: async (url, init) => { calls.push({ url, init }); if (fail) throw new Error('private-upstream-text'); return { status: 200, json: async () => response(nodes) }; } },
   });
-  await plugin.onConfigChanged({ roles: { keepAgentIds: ['reviewer'] },
+  await plugin.onConfigChanged({ pacing: { holdAheadPts: null }, roles: { keepAgentIds: ['reviewer'] },
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'meta', model: 'muse-wonder-full-1.0-contributor' }, { provider: 'codex', model: 'gpt-6.1-sol' }] },
     reviewDemand: { repositories: ['example/product'], tokenSecretRef: ref, requiredChecks: ['ci-ok', 'pr-lint'] },
   }, { companyId: 'acme' });
@@ -51,7 +51,8 @@ test('Meta exhausted plus 80 eligible heads scales reviewer using helper headroo
   assert.equal(row.queued, 81);
   assert.equal(row.reviewEligibleHeads, 80);
   assert.equal(row.heartbeatQueued, 1);
-  assert.ok(row.maxConcurrentRuns <= 8, 'helper pool slots are a hard ceiling');
+  assert.equal(row.running, 1, 'the existing Meta run remains outside the helper pools');
+  assert.ok(row.maxConcurrentRuns - row.running <= 8, 'eight helper slots bound new grants, not the separate Meta floor');
   assert.equal(d.calls[0].url, 'https://api.github.com/graphql');
 });
 
@@ -106,7 +107,11 @@ test('reviewer helper pools are shared once with fixed agents and other reviewer
     pacePools: cap.paceGuard.pools,
   });
   const rows = [...out.kept, ...out.routed];
-  assert.ok(rows.reduce((n, a) => n + a.allocated, 0) <= 8, JSON.stringify(rows));
+  assert.equal(rows.find(a => a.agentId === 'reviewer').running, 1);
+  for (const row of rows) assert.ok(row.allocated >= row.running, 'every physical running floor is retained');
+  // The recorded Meta run is not rematched into the six Codex + two Claude slots.
+  assert.ok(rows.reduce((n, a) => n + a.allocated - a.running, 0) <= 8, JSON.stringify(rows));
+  assert.ok(rows.reduce((n, a) => n + a.allocated, 0) <= 9, JSON.stringify(rows));
   assert.ok(rows.find(a => a.agentId === 'reviewer').allocated > 1);
 });
 

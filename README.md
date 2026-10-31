@@ -1,4 +1,4 @@
-# Model Capacity plugin (0.3.0 native-router source; not activated)
+# Model Capacity plugin (0.3.1 native-router source; not activated)
 
 Picks the model (and effort) for every run and sets how many agent runs
 should run in parallel, so every account's allowance is used before it
@@ -10,10 +10,10 @@ free-API quality data. Purely deterministic -- no classifiers, no vetoes.
 Run `npm run build:variants -- --out-dir <new-output-directory>` to produce two
 separately named npm tarballs, retaining plugin ID `togetherweown.model-capacity`:
 
-- **0.3.0-transitional**: fork-image transitional dual-capability build, exit
+- **0.3.1-transitional**: fork-image transitional dual-capability build, exit
   2026-11-30. Keeps the resolver body and `enforce` switch; native routing is
   governed independently by `router.enabled`. Never install on pristine upstream.
-- **0.3.0-clean**: `ai.connections.route` only; no resolver handler, hook
+- **0.3.1-clean**: `ai.connections.route` only; no resolver handler, hook
   capability, `modelRouting` declaration, `MODEL_ROUTING_ENV_KEYS` export, or
   `enforce` config field. It is the source worker's default variant.
 
@@ -27,8 +27,8 @@ ESM characterization test proves the shim dependency is cache-busted. These are
 **local package proofs**, not staging install/reinstall or G-T runtime evidence;
 those native staging gates remain required before any activation.
 
-The source package version is the base release line `0.3.0`; installable
-artifacts carry `0.3.0-transitional` or `0.3.0-clean` in BOTH version and tarball
+The source package version is the base release line `0.3.1`; installable
+artifacts carry `0.3.1-transitional` or `0.3.1-clean` in BOTH version and tarball
 filename. Do not install an unbuilt source checkout as a release artifact.
 Every worker boot logs its baked variant at WARN; transitional also logs
 `exit=2026-11-30`, even before a company is configured. Clean artifacts delete
@@ -181,20 +181,32 @@ failed/superseded ticks do not reset it.
 
 The integration pass merges already-reviewed mainline `dc86ae4` (PRs #74/#75),
 restoring the superseded-default defer guards and reviewer
-`suppressAccountFallback` inputs missing from the original port handoff. It
-introduces no new hook algorithm. The transitional resolver body now matches
-BOTH mainline and the supplied read-only 0.2.72 reference byte-for-byte, SHA256
+`suppressAccountFallback` inputs missing from the original port handoff. At that
+checkpoint the transitional resolver matched both mainline and the supplied
+read-only 0.2.72 reference: 20,712 bytes, SHA256
 `a88973e149e624c3331b089c710044326847273a86766a5f3af46c3255827da2`.
-Extraction is from the exact `async onResolveRunModel(params)` declaration
-through its closing property delimiter, with whitespace retained. The tarball
-regression pins that independent reference hash (not a hash of our own source)
-and checks the entire packaged transitional source after only the build-time
-factory lock. The stale handoff hash was `18864d3f6999532b854a43b39db1a0d18e2052af13b0bb116af94d9c8380f03d`;
-the new assertion failed on that hash before mainline reconciliation. Mainline's
-frozen default-parity corpus and reviewer/Devin regression suites also execute
-against the unpacked transitional artifact. This establishes source/package
-retention, NOT live fork-image install or production behavior proof; G-T and
-independent integration review remain open.
+The conservative weekly overlay adds exactly three mandatory emission guards
+(default, pinned-agent and stale-default), totaling 1,051 bytes. It does not
+claim that the resulting 21,763-byte hook is identical to the historical body.
+
+The retention verifier pins each insertion's literal bytes, unique occurrence
+and fixed historical/current byte offsets. Removing only those three spans
+must recover the unchanged historical length and fingerprint; reinserting them
+must reconstruct the complete current hook byte-for-byte. Strict extraction
+retains whitespace from the exact `async onResolveRunModel(params)` declaration
+through its closing property delimiter. Missing, changed, duplicated or moved
+guards, the unmodified historical body, and any other byte change are rejected;
+21,798 offline negative inputs exercise this boundary. No reference, archive,
+frozen harness or golden is repinned. The actual tarball regression also
+requires raw source/packaged-hook equality and equality of the entire packaged
+transitional source after only the build-time factory lock.
+
+Both unpacked variants pass native router/lifecycle smoke tests. Mainline's
+frozen default-parity corpus and reviewer/Devin regressions also run against the
+transitional artifact, alongside weekly-emission behavioral controls. These
+local package proofs establish neither live fork-image installation nor
+production behavior; G-T, exact-head independent integration review and the
+existing rollout gates remain separate requirements.
 
 Operator sequence (no deployment is authorized by this documentation):
 
@@ -692,11 +704,12 @@ must distinguish those from actual native staging installs and real traffic.
 - [x] Draft companion registry rows include every Q3 dependency, named Keeper
   writer, reserve uncertainty, caps disposition, residual and MCP audit gap.
   They are NOT applied host changes; remaining census work is explicit.
-- [x] **Reference/mainline hook source parity**: merge mainline PRs #74/#75
-  in a distinct integration commit; transitional artifact resolver hash matches
-  both main `dc86ae4` and the read-only 0.2.72 reference above, with an empty
-  byte diff. Test-first regression rejects the stale port handoff. Independent
-  integration review and live G-T behavior proof are still required below.
+- [ ] **Reference/mainline hook source parity disposition**: the distinct
+  integration of mainline PRs #74/#75 matched main `dc86ae4` and the read-only
+  0.2.72 reference with an empty byte diff. The later conservative weekly
+  emission guards change that body; the independent fingerprint regression
+  remains red, not repinned or waived. Its contract disposition, independent
+  integration review and live G-T behavior proof remain required.
 - [ ] Full-src reserve/caps-consumer/producer census and any required Q7 clean
   route retirement; local port-call-site tests are narrower evidence.
 - [ ] Staging evidence G-1, G-T (both handlers simultaneously on fork image,
@@ -746,6 +759,112 @@ contract used here. Upgrade the fixtures deliberately when upstream changes.
 
 The following controls were already merged in mainline PRs #74/#75. They
 remain opt-in; this port does not activate them or change their hook behavior.
+
+## Weekly ahead hard hold (compatibility paths only)
+
+`pacing.holdAheadPts` (default `0.10`; `null` opts out) holds an account at
+**zero new slots** when `weeklyUsed - linearTarget` exceeds that many percentage
+points of the whole weekly allowance, even while the account is idle. Equality
+is inside the band. The next tick releases the account when time or a reset
+brings its lead back within the band. Invalid values are rejected, not read as
+disabled. `pacing.guard.enabled: false` disables this layer and the ordinary
+pace cap together.
+
+The hold is evaluated on **each account's own weekly position**, never its
+pool average, and has two layers:
+
+1. **Weekly hard hold** as above.
+2. **Ordinary pace cap** above `pacing.guard.marginPct` (default `0.02`):
+   allowance is `targetShare * meanRunDurationHours` with measured rate
+   correction. A pool's cap is `max(1, ceil(sum(allowances)))`, except that
+   hard-held accounts contribute zero and an entirely hard-held non-burn pool
+   has cap **zero**.
+
+Burn-mode accounts explicitly opt into spending and bypass both layers.
+Reactive (unmetered) accounts are never weekly-held. A **known** weekly lead is
+sufficient for a hard hold even when run duration or target share is unknown;
+an unknown weekly position never creates one.
+
+**Conservative admission:** weekly holds never suspend for an empty role or a
+temporarily full alternative. A role with only held accounts waits; no restored
+allowance is lent or rematched to another role. Health, headroom, review reserves,
+role exclusions, readiness, current-price, trial and breaker gates retain their
+authority in every task-ranking mode. Compatibility suspension diagnostics remain
+empty (`paceGuard.roleSafety` and `holdSuspendedAccountIds`).
+
+**Shared model routes:** selecting an account label does not bind the proxy's
+credential. If an emitted model can reach any known weekly-held non-burn
+credential, the plugin refuses that emission and chooses an already-approved
+safe alternative or returns a bounded defer. Reviewer safety checks the actual
+admitted served ID, including its provider prefix and existing decorations,
+not just the configured policy's bare model name. Unknown serving inventory is
+not proof of safety. Defaults, effort changes, policy arms, duplicate passes and
+exhaustion fallback cannot reopen the same route. A burn credential sharing an
+indistinguishable route can therefore wait too; it remains burn-exempt, but does
+not authorize use of the held non-burn credential. Distinct safe emissions and
+burn-only routes remain usable. No credential aliases or proxy changes are made.
+
+Pool verdicts name `hardHeldAccountIds` and report state `hard-held` (all
+non-burn accounts held) or `lanes-paced` (mixed). Existing runs are never
+cancelled. `/caps` preserves running floors but cannot create new fixed-model
+or reviewer slots on a hard-held account. `paceGuard.rawPools` retains
+role-independent hold facts for global `/caps` consumers; `paceGuard.pools` is
+the doer-role admission view. Every running run continues charging its recorded
+account and pool, even after its route becomes held or ineligible; it is never
+rematched to a new candidate. Reviewer-local ordinary caps include other agents'
+ordinary pool pressure. Burn identity and running pressure survive role filters.
+Missing, empty or `unknown` agent metadata does not erase verified in-scope
+occupancy or create a synthetic demand recipient. Its known account charges are
+carried separately as `externalRunningByPool` (ordinary/burn totals and account
+counts); `unknownExternalRunning` refuses extra paid allocation when its charge
+cannot be established. Independent pool totals overlap this census and are not
+added again. An observed run-model charge outranks a non-enforced shadow guess
+for physical reporting, without rewriting the ledger, claiming credential
+affinity, or changing simulated water-filling reservations.
+
+When this layer is enabled, new fixed/reviewer grants require a feature-compatible
+snapshot from the current producer instance and configuration/admission generation,
+no older than 120 seconds and not future-dated. A failed refresh, old-policy,
+pre-feature or incompatible snapshot preserves running floors but grants no
+affected new slots, reporting `weekly-hold-evidence-unavailable`. Under the
+existing enabled-hold/relevant-fixed-or-reviewer-identity trigger, this final
+fence conservatively floors the whole publication, including ordinary, burn
+and free headroom. Those credentials are not relabelled weekly-held. Smoothing,
+reserved floors and review-demand credits cannot restore new slots; a successful
+compatible refresh restores eligibility. Opting out of the weekly layer, or
+having no relevant constrained identities, retains the existing freshness
+behavior. Configuration-generation changes still fence every new slot
+independently of the weekly-hold setting.
+
+**Plan endpoint:** the linear target is `elapsedFraction * (1 - configuredFloor)`,
+reaching **100% minus the explicit floor at reset**, with no additional pacing
+remainder. `burnMode.floors` matchers supply that level floor (also for accounts
+outside burn mode) only when the floor governs the weekly meter; when a
+regenerating bar is present the floor governs that bar instead and does not
+reduce the weekly target. No weekly floor means a zero floor for this plan.
+Required rate and concurrency need use
+`max(0, 1 - floor - weeklyUsed) / hoursToPaceReset`, while reported
+`remainingPct` stays the true raw remainder. `/capacity.accounts` exposes
+`planTargetUsedPct` and `spendableRemaining`. Credit fallback still paces its
+own credit balance. This is a target, not a guarantee: demand, task sizes,
+five-hour limits, review reserves, health and configured floors can still
+prevent using every remaining unit. No reserve, exhaustion guard, role
+exclusion or credential gate is weakened.
+
+**Where it applies.** These layers size the legacy allocator that
+`/caps` and the retained transitional resolver use. The native
+`ai.connections.route` callback selects with `pacing: null`
+(`src/router.mjs`) and has its own ahead and measured-rate-too-fast hold
+(`src/snapshot.mjs`); this weekly hold is **not** native admission protection
+and must not be described as such. Enabling the native router does not port it.
+Protection is limited to compatibility decisions and grants this plugin controls,
+not native or unrelated proxy traffic.
+`/caps` keeps its response shape in both build variants until the consumer
+census proves it empty.
+
+**Rollback:** set `pacing.holdAheadPts: null` (keep the ordinary pace cap) or
+`pacing.guard.enabled: false` (both layers). No state migration is involved and
+no running work is cancelled.
 
 ## Newest version per account (opt-in)
 

@@ -36,6 +36,8 @@ const lane = (provider, key, { models, used = 0.3, health = 'healthy' } = {}) =>
 });
 
 function drive({ config = {}, lanes = [], agentGets = {}, aa = baseAa(), ringSeed = null, runsSeed = null }) {
+  // Churn/health assertions do not depend on the removed weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

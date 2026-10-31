@@ -75,6 +75,8 @@ const started = (runId, atMs, extra = {}, type = 'agent.run.started') => ({
 const NO_GUARD = { pacing: { guard: { enabled: false } } };
 
 function drive({ nowMs, config = {}, laneAccounts = null, steps = null, issueGets = {}, agentGets = {}, failIssueGet = null, failAgentGet = null }) {
+  // Model attribution/ledger assertions do not rely on weekly role rescue.
+  config = { pacing: { holdAheadPts: null }, ...config };
   const store = new Map();
   const jobs = new Map();
   const handlers = new Map();

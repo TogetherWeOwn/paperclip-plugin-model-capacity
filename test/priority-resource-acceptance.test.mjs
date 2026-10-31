@@ -51,6 +51,7 @@ async function capsFor(spec, { issues, blockingPriority = true } = {}) {
   const heartbeatIds = new Set([...spec.keepAgentIds, ...reviews]);
   const ready = issues ?? spec.agents.map(a => issue(`root-${a.agentId}`, a.agentId));
   const raw = {
+    pacing: { holdAheadPts: null }, // synthetic priority graph, not weekly producer evidence
     ...(blockingPriority == null ? {} : { allocation: { blockingPriority } }),
     roles: { keepAgentIds: [...heartbeatIds], doerAgentIds: spec.agents.filter(a => !heartbeatIds.has(a.agentId)).map(a => a.agentId) },
     reviewerRouting: { agentIds: reviews, arms: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },

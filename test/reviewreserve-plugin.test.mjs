@@ -266,7 +266,7 @@ test('hook: a reserve defer retries on the pace-guard scale and names a co-holdi
   // holds: the defer must carry the guard retry (not the 60 s generic one)
   // and name both holds.
   const d = drive({
-    config: { ...REVIEW_CFG, pacing: { guard: { retryAfterMs: 600000 } } },
+    config: { ...REVIEW_CFG, pacing: { holdAheadPts: null, guard: { retryAfterMs: 600000 } } },
     accounts: [lane(0.9, 40), geminiLane(0.9, 48)],
   });
   await d.setup();
@@ -302,6 +302,33 @@ test('report: a reserve-held pool stays listed in paceGuard.pools', async () => 
   assert.ok((cap.reviewReserve.heldAccountIds ?? []).includes('claude:a1'), 'claude is reserve-held');
   const pool = (cap.paceGuard.pools ?? []).find(p => p.pool === 'claude');
   assert.ok(pool != null, 'a held pool is still listed in the pace-guard report');
+});
+
+test('weekly hard hold: reserve-applied role emptiness never releases a held lane', async () => {
+  const d = drive({
+    config: { enforce: true, reviewReserve: { agentIds: ['reviewer-1'], providers: ['gemini'] } },
+    accounts: [lane(0.83, 104.16), { ...geminiLane(0.3, 48),
+      fiveHour: { used: 0.5, resetsAt: new Date(TICK + 4 * HOUR).toISOString() } }],
+  });
+  await d.setup();
+  d.seed(RR_STATE_KEY, {
+    ...burnedState(2.0),
+    buckets: [2, 1].map(hoursAgo => ({ atMs: hourStart(TICK) - hoursAgo * HOUR,
+      burn: { 'gemini:g1': 2.0 }, runs: { 'gemini:g1': 10 } })),
+  });
+  await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'review-waiting',
+    payload: { run: { agentId: 'reviewer-1', provider: 'gemini', model: 'gemini-2-5-flash' } },
+    occurredAt: new Date(TICK - 60000).toISOString() });
+  await d.tick();
+  const capacity = (await d.api('capacity')).body;
+  assert.deepEqual(capacity.reviewReserve.heldAccountIds, ['gemini:g1']);
+  assert.ok(Math.abs(capacity.accounts.find(a => a.accountId === 'claude:a1').planAhead - 0.45) < 1e-10);
+  assert.ok(capacity.accounts.find(a => a.accountId === 'gemini:g1').planAhead < 0);
+  const route = await d.hook('non-review-safety');
+  assert.equal(route.kind, 'defer');
+  assert.equal(route.model, undefined, 'neither the reserved peer nor the weekly-held lane is emitted');
+  assert.equal((await d.hook('non-review-next')).kind, 'defer');
+  assert.deepEqual(capacity.paceGuard.roleSafety, []);
 });
 
 test('hook: a lone reserve hold still defers on the guard retry scale', async () => {
