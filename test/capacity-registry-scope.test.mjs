@@ -27,6 +27,13 @@ function feedWithOutsider(now) {
 // One tick per config; state carries over, as across a plugin upgrade.
 async function run(...configs) {
   const harness = stateHarness(), jobs = new Map();
+  // An earlier build's open breaker on the outsider's arm.
+  const outsiderArm = { accountId: `anthropic:${OUTSIDER}`, armId: `arm:${OUTSIDER_MODEL}` };
+  await harness.state.set({ scopeKind: 'company', scopeId: companyId, namespace: 'model-capacity', stateKey: 'breaker-v1' }, {
+    v: 1, seen: [], known: { [`${outsiderArm.accountId}|${outsiderArm.armId}`]: { ...outsiderArm, lastSeen: NOW } },
+    arms: { [`${outsiderArm.accountId}|${outsiderArm.armId}`]: { ...outsiderArm, state: 'open', openedAt: NOW - MINUTE,
+      cooloffHours: 6, opens: 1, fails: [NOW - MINUTE], probe: null, lastError: 'rate limited' } },
+  });
   let now = NOW, cfg = configs[0];
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
   await plugin.setup({

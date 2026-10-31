@@ -488,8 +488,9 @@ board routes or a host producer.
 With a `router` registry, the legacy capacity tick applies the same scope:
 only lane accounts whose `accountKey` is registered reach ladders, `/capacity`
 (`accounts`, `perAccount`, `taskRanking`, `unscored`, `modelInventory`,
-`capacityChange`) and `/ladder`. Pacing, rate history and capacity-change state
-that earlier builds saved for other feed accounts is dropped on the next tick.
+`capacityChange`, `armBreakers`) and `/ladder`. Pacing, rate history, breaker
+and capacity-change state that earlier builds saved for other feed accounts is
+dropped on the next tick.
 A company without a registry has no account identity to filter on, so its lane
 key is the tenant boundary: give each such company its own
 `cliproxy.laneKeySecretRef`, whose feed covers only that company's accounts. The

@@ -2723,6 +2723,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     {
       const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
       const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+      // Breakers saved, or recorded by in-flight runs, before the registry
+      // scope: an unregistered account gets no probe, so prune each tick.
+      if (registered) for (const map of [breakers.arms, breakers.known]) {
+        for (const [k, e] of Object.entries(map)) if (!inRegistry(e?.accountId)) delete map[k];
+      }
       const servable = [];
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         for (const r of ladder?.rungs ?? []) {
