@@ -112,14 +112,16 @@ test('exclusive burn non-targets cannot accumulate eligible-unpicked minutes or 
   assert.equal(s.rows().find(r=>r.accountKey==='two').minutesEligible,2,'after expiry the gap-capped ordinary eligibility returns');
 });
 
-test('excluded rows persisted by an earlier build are dropped from the view and the next tick',async()=>{
+test('unregistered rows persisted by an earlier build are dropped from the view and the next tick, whatever their status',async()=>{
   const s=start();await s.tick();
   const key=JSON.stringify(s.keyFor(companyId)),saved=s.store.get(key);
-  const leaked={...structuredClone(saved.scorecard.windows[0]),accountKey:'other-company',prefix:'other-company',status:'excluded-by-policy',pctUsedNow:40};
-  saved.scorecard.windows.push(leaked);s.store.set(key,saved);
+  // An earlier build's excluded row turns feed-unknown once the account leaves the feed.
+  for (const [accountKey,status] of [['other-company','excluded-by-policy'],['gone-company','feed-unknown']])
+    saved.scorecard.windows.push({...structuredClone(saved.scorecard.windows[0]),accountKey,prefix:accountKey,status,pctUsedNow:40});
+  s.store.set(key,saved);
   const restarted=createQuotaRefresh({state:s.state,logger:s.logger,keyFor:s.keyFor,clock:()=>NOW+MINUTE,getPolicy:()=>policy(NOW+MINUTE)});
-  assert.equal(scorecardView(saved).rows.some(r=>r.accountKey==='other-company'),false,'legacy row hidden before the next tick');
+  assert.equal(scorecardView(saved).rows.some(r=>r.accountKey.endsWith('-company')),false,'legacy rows hidden before the next tick');
   await restarted.refresh(companyId,s.cfg,{feed:s.feed(),ledger:new Map()});
-  assert.equal(s.store.get(key).scorecard.windows.some(r=>r.accountKey==='other-company'),false,'legacy row pruned on the next tick');
+  assert.equal(s.store.get(key).scorecard.windows.some(r=>r.accountKey.endsWith('-company')),false,'legacy rows pruned on the next tick');
   assert.ok(restarted.scorecard(companyId).rows.some(r=>r.accountKey==='one'));
 });

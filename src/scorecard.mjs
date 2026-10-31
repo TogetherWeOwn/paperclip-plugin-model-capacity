@@ -173,10 +173,11 @@ export function unregisteredFeedAccountCount(registry,feed) {
   return new Set((feed?.accounts ?? []).map(a=>a?.accountKey).filter(k=>typeof k==='string'&&!registered.has(k))).size;
 }
 
-/** Drop rows that only an unregistered feed account could have produced
- * (status excluded-by-policy), including ones persisted by earlier builds. */
-export function withoutUnregisteredRows(state) {
-  return state?.windows ? {...state,windows:state.windows.filter(r=>r.status!=='excluded-by-policy')} : state;
+/** Keep only rows for the company's registered accounts. Earlier builds
+ * persisted rows for other feed accounts, and a feed gap could have moved
+ * them to feed-unknown, so membership (not status) decides. */
+export function scopeScorecard(state,accountKeys) {
+  return state?.windows ? {...state,windows:state.windows.filter(r=>accountKeys.has(r.accountKey))} : state;
 }
 
 /** Advance one quota tick. Replayed/out-of-order ticks cannot add time or runs.
@@ -263,7 +264,7 @@ export function scorecardRows(state) {
 
 /** Same durable view for the dedicated route and folded capacity response. */
 export function scorecardView(envelope) {
-  return {atMs:envelope?.scorecard?.atMs ?? null,rows:scorecardRows(withoutUnregisteredRows(envelope?.scorecard)),
+  return {atMs:envelope?.scorecard?.atMs ?? null,rows:scorecardRows(scopeScorecard(envelope?.scorecard,new Set(Object.keys(envelope?.snapshot?.accounts ?? {})))),
     unregisteredFeedAccounts:envelope?.unregisteredFeedAccounts ?? null,
     burn:copy(envelope?.snapshot?.burn ?? null),warnings:copy(envelope?.scorecard?.warnings ?? [])};
 }
