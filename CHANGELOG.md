@@ -21,6 +21,13 @@
 ### Activation limits
 - Amendment A4 accepts the existing ledger/lifecycle interim attribution path for slice-4 code acceptance. A model-less lifecycle start remains visibly unattributed even with an agent-config-seeded ledger model, and its terminal cannot free another run's account pressure; a mutation-proven regression protects that fence. Native run-account metadata remains an upstream follow-up, not a code-acceptance blocker. G-1/G-T staging install/reinstall proofs belong to rollout. A distinct mainline integration restores already-reviewed PRs #74/#75 and establishes the §17 empty byte diff between the transitional resolver and the supplied 0.2.72 reference/mainline dc86ae4; independent integration review and live G-T behavior proof remain open. Router defaults off; no deployment or publish is part of this source change.
 
+## 0.2.76
+### Added
+- Opt-in exact-id included pricing and missing-AA canaries: `trials.unscoredServedIds` admits exact, provenance-tagged unscored served ids inside their existing account (legacy routing only; `Q` stays null), and `placement.freeCostServedIds` applies zero monetary cost to one exact served id until its timezone-explicit deadline. Free, still-ungraduated canaries get bounded rung-zero exploration preference until outcome graduation. Optional `placement.duplicateVersionPunctuationFolding` treats spellings such as `gpt-6-1-sol` and `gpt-6.1-sol` as duplicates without changing emitted ids.
+- Mandatory model bans on `gpt-6-sol` and `gpt-5.6-terra`, including prefixed/dashed spellings; `bannedModels` can only add bans.
+### Fixed
+- Reviewer routing applies one admission fence in all task modes: duplicate aggregator reviewer arms wait for a usable native reviewer route, paid reviewer runs share the account cap with pending free work, and unscored reviewer candidates obey the trial role, adapter, family-budget and current-price gates.
+
 ## 0.2.75
 ### Added
 - Opt-in per-account fallback for `doer` and `other` roles, preserving reviewer and other safety fences. Inspect admitted and suppressed rows in `/capacity.eligibility.accountFallback`; dashboard exclusions remain global. The fallback quality floor is a fleet-relative z-score, not an absolute benchmark.
@@ -35,7 +42,8 @@
 - Migrate the Artificial Analysis free feed to its paginated successor, normalize nested pricing and performance, and recover matching detailed benchmarks from the public leaderboard. Reject incomplete pages without publishing a partial API snapshot; report refresh failure to the job.
 - Preserve missing benchmark and cost observations with their original timestamps, while publishing a new intelligence-index major as a fresh generation without carrying prior-major data. Report pages, static arm coverage and previous snapshot age.
 
-## Unreleased
+## 0.2.70 – 0.2.72
+These versions shipped without separate entries. Blocking-priority allocation and `freeLanes` were merged before the 0.2.69 version bump, so they first shipped in that package.
 ### Added
 - Alert-only failure-cluster detector (default off): failed-run events feed per-account counters in plugin state; >= 3 allowlisted failures (`claude_auth_required`, `claude_transient_upstream`, `adapter_failed`) for one account inside a 15-minute event-time window creates or updates exactly one stable-origin managed alert issue and reports `error` through plugin health until the cluster clears. Writes happen on cluster enter/exit/count-band transitions only, never per run; `timed_out` runs are excluded and the account keeps the legacy ` on provider:account` extraction. Opt in with `failureClusterAlert: { enabled: true, assigneeAgentId }`; disabled or unassigned performs zero issue writes. Adds exactly `issues.create` + `issues.update` with create/update field allowlists and per-write ownership checks; no comment, checkout, wakeup, interaction, document or relation writes, no routing or enforce-flag change, no new job, egress, secret or env key.
 - Read-only `modelInventory` on `/capacity`: raw, canonical and emitted spellings of every reported model id side by side, per-account served present/absent/unknown (an absent served list reads unknown, fail-open as routing does), linked unscored/unservable/readiness evidence, and explicit unknown markers for protocol/tool/reasoning compatibility and configured-model coverage (other-agent adapter configuration is restricted). Pure reporting; routing reads nothing from it. No new capability, egress, secret or env key.
