@@ -2611,15 +2611,32 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       2 * 3600 * 1000,
     );
     if (!rawSnapshot || superseded()) return { status: 'superseded' };
+    // The pinned lane feed is shared by every company on the instance: with a
+    // router registry, only its accounts reach ladders and the capacity view
+    // (the native snapshot's accountKey join). Without a registry the lane key
+    // is the tenant boundary (README "Lane feed scope").
+    const registered = Array.isArray(config.router?.accounts)
+      ? new Set(config.router.accounts.map(a => a?.accountKey)) : null;
+    const feedAccounts = registered && Array.isArray(rawSnapshot.accounts)
+      ? rawSnapshot.accounts.filter(a => registered.has(a?.accountKey))
+      : rawSnapshot.accounts;
+    // State ids are `provider:accountKey[#lane]`, some with a `tick:` or
+    // `credit:` prefix; registry keys never contain ':' or '#'.
+    const inRegistry = id => {
+      const base = String(id ?? '').split('#')[0];
+      return registered.has(base.slice(base.lastIndexOf(':') + 1));
+    };
+    const scopeToRegistry = byId => registered
+      ? Object.fromEntries(Object.entries(byId).filter(([id]) => inRegistry(id))) : byId;
     // Burn accounts degraded only by the feed's utilization floor stay
     // allocatable until spent (see burnEligibleAccounts); level floors
     // (burnMode.floors) then take accounts at or below their floor out of
     // allocation (see applyBurnFloors). A copy, never a mutation: the lane
     // cache keeps the feed's own verdict.
-    const snapshot = Array.isArray(rawSnapshot?.accounts)
+    const snapshot = Array.isArray(feedAccounts)
       ? (() => {
-        const keys = uniqueAccountKeys(rawSnapshot.accounts);
-        return { ...rawSnapshot, accounts: applyBurnFloors(config.burnMode, burnEligibleAccounts(config.burnMode, rawSnapshot.accounts, keys), keys) };
+        const keys = uniqueAccountKeys(feedAccounts);
+        return { ...rawSnapshot, accounts: applyBurnFloors(config.burnMode, burnEligibleAccounts(config.burnMode, feedAccounts, keys), keys) };
       })()
       : rawSnapshot;
     if (snapshot.source === 'cliproxy-lane' && snapshot.servedModels == null) {
@@ -2706,6 +2723,11 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     {
       const breakersCfg = config.breakers ?? DEFAULT_BREAKERS;
       const breakers = breakerStores.get(companyId) ?? createBreakerStore();
+      // Breakers saved, or recorded by in-flight runs, before the registry
+      // scope: an unregistered account gets no probe, so prune each tick.
+      if (registered) for (const map of [breakers.arms, breakers.known]) {
+        for (const [k, e] of Object.entries(map)) if (!inRegistry(e?.accountId)) delete map[k];
+      }
       const servable = [];
       for (const [key, ladder] of Object.entries(ladders ?? {})) {
         for (const r of ladder?.rungs ?? []) {
@@ -2730,14 +2752,17 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx.logger.info('model-capacity: EEE rung challenges within noise', { companyId, withinNoise });
     }
 
-    const nextPacing = { ...pacingState };
-    const rateHistories = (await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {};
+    // Per-account state saved before the registry scope (earlier builds)
+    // is dropped, so no unregistered account resurfaces in this tick's views.
+    const nextPacing = scopeToRegistry({ ...pacingState });
+    const rateHistories = scopeToRegistry((await ctx.state.get(scopeKey(companyId, RATE_KEY))) ?? {});
     // Capacity-change diff (auto-heal): compare this feed against
     // the previous tick's summary so UPWARD transitions (new account, reset,
     // guard end, recovery) bypass the rung cooldown below. Downward
     // transitions keep today's debounce (no bypass).
     const prevChange = (await ctx.state.get(scopeKey(companyId, CAPACITY_CHANGE_KEY))) ?? null;
-    const prevSummaries = Array.isArray(prevChange?.accounts) ? prevChange.accounts : [];
+    const prevSummaries = (Array.isArray(prevChange?.accounts) ? prevChange.accounts : [])
+      .filter(s => !registered || inRegistry(s?.accountId));
     // Pre-step guard prediction (see predictGuard): the post-step guard flag
     // cannot be diffed before the step that sets it, so predict from this
     // tick's 5h reading against the previous guard state.
@@ -4903,7 +4928,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // the pulse. lastChange keeps the last non-empty diff for the same
     // reason -- it is the last change, not the current tick's diff.
     const prevLastChange = (prevChange != null && typeof prevChange.lastChange === 'object' && prevChange.lastChange !== null)
-      ? prevChange.lastChange
+      ? (registered ? Object.fromEntries(Object.entries(prevChange.lastChange).map(([k, v]) =>
+        [k, Array.isArray(v) ? v.filter(inRegistry) : v])) : prevChange.lastChange)
       : null;
     const prevSeq = Number.isFinite(prevLastChange?.seq) ? prevLastChange.seq : 0;
     const prevWakeAtMs = Number.isFinite(prevChange?.lastWakeAtMs)

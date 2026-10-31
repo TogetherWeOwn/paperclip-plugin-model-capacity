@@ -151,3 +151,26 @@ test('A2 default job maps bound pool UUIDs from verified tick config without ins
   assert.equal(JSON.stringify(s.quota.get(companyId)).includes(verified.poolId),false,'quota snapshot carries no attestation');
   assert.deepEqual(s.host.writes,[]);
 });
+
+test('unreadable agent bindings fail closed: no publish, previous snapshot kept, no shadow for possibly bound pools',async t=>{
+  const s=await start(t);await s.tick();const before=s.quota.get(companyId),writes=s.writes.length;
+  const shadowBefore=s.quota.status(companyId).shadow;
+  assert.deepEqual(shadowBefore.map(r=>r.atMs),[NOW,NOW]);
+  for(const agents of [null,{agents:[]},'[]']) {
+    s.setAgents(agents);s.setNow(NOW+MINUTE);
+    assert.deepEqual(await s.tick(),{status:'error',reason:'pool-bindings-unavailable'});
+    assert.equal(s.quota.get(companyId),before);
+    assert.equal(s.writes.length,writes,'nothing is written while bindings are unknown');
+    assert.deepEqual(s.quota.status(companyId).shadow,shadowBefore,'no shadow is simulated for pools that may be bound');
+  }
+  assert.equal(s.quota.status(companyId).lastFailure,'pool-bindings-unavailable');
+  assert.ok(s.logs.some(l=>l.level==='error' && l.details.reason==='pool-bindings-unavailable'));
+  s.setAgents([]);await s.tick();
+  assert.equal(s.quota.status(companyId).lastFailure,null,'a good tick clears the failure');
+});
+
+test('a config without a router is disabled and never touches state',async t=>{
+  const s=await start(t);
+  assert.deepEqual(await s.quota.refresh(companyId,{...s.cfg,router:undefined},{feed:quotaFeed(),ledger:new Map()}),{status:'disabled'});
+  assert.equal(s.writes.length,0);assert.equal(s.inspections,0);
+});

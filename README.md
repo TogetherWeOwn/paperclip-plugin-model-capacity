@@ -483,6 +483,20 @@ are percentages. API routes use the upstream declared plugin-local GET shape
 (`packages/shared/src/types/plugin.ts`, `PluginApiRouteDeclaration`), not custom
 board routes or a host producer.
 
+### Lane feed scope
+
+With a `router` registry, the legacy capacity tick applies the same scope:
+only lane accounts whose `accountKey` is registered reach ladders, `/capacity`
+(`accounts`, `perAccount`, `taskRanking`, `unscored`, `modelInventory`,
+`capacityChange`, `armBreakers`) and `/ladder`. Pacing, rate history, breaker
+and capacity-change state that earlier builds saved for other feed accounts is
+dropped on the next tick.
+A company without a registry has no account identity to filter on, so its lane
+key is the tenant boundary: give each such company its own
+`cliproxy.laneKeySecretRef`, whose feed covers only that company's accounts. The
+plugin has no separate `accounts` allowlist; the registry is the one account
+list, and a second hand-kept list would drift from it.
+
 `GET /api/plugins/<plugin-id>/api/scorecard?companyId=<company-id>` returns
 `{atMs, rows, unregisteredFeedAccounts, burn, warnings}`; the identical object is folded into `/capacity`
 as `scorecard`. Durable state is readable after worker restart before the first
