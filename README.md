@@ -798,7 +798,7 @@ A `superseded-version` suppression is an integration alarm; persistent
 `cross-account-excluded` suppression on a dead account warrants review.
 A capture without provenance cannot establish historical fidelity.
 
-## Exact-id included pricing and missing-AA canaries (unreleased, opt-in)
+## Exact-id included pricing and missing-AA canaries (0.2.76, opt-in)
 
 These controls admit an arm **inside its existing account**, not a second free
 account. They never enable live enforcement, acquire credentials, or add a job.
