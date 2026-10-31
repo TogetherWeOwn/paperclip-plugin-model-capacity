@@ -59,19 +59,112 @@ export function tierModelKey(model) {
   return lower.length > 0 ? lower : null;
 }
 
-/** First pricing-tier entry with any valid regex matching the key. */
-export function matchPricingTier(modelKey, pricingTiers) {
-  if (!modelKey) return null;
-  for (const entry of pricingTiers ?? []) {
-    for (const src of entry?.match ?? []) {
-      if (typeof src !== 'string' || src.length === 0) continue;
-      let hit = false;
-      try {
-        hit = new RegExp(src).test(modelKey);
-      } catch {
-        continue; // invalid regex never matches; feed bug, not a crash
+/**
+ * Feed regex bounds. The `match` strings come from the lane feed and run
+ * synchronously on the worker, so only patterns with bounded backtracking
+ * compile: no backreferences, lookaround or named groups, no quantified
+ * group, at most TIER_PATTERN_MAX_QUANTIFIERS quantifiers and at most one
+ * of them unbounded (`*`, `+`, or a `{n,m}` past TIER_PATTERN_MAX_REPEAT).
+ * Keys past
+ * TIER_MODEL_KEY_MAX_CHARS and patterns past the count and length caps
+ * never match, and one call tests at most TIER_PATTERNS_TOTAL_MAX
+ * patterns. Real feed patterns are short anchored literals with a few
+ * character classes (`^gpt-6[.-]1-sol`).
+ */
+export const TIER_PATTERN_MAX_CHARS = 200;
+export const TIER_PATTERNS_PER_ENTRY_MAX = 16;
+export const TIER_PATTERNS_TOTAL_MAX = 256;
+export const TIER_PATTERN_MAX_QUANTIFIERS = 2;
+export const TIER_PATTERN_MAX_REPEAT = 16;
+export const TIER_MODEL_KEY_MAX_CHARS = 128;
+
+/** True when the pattern's shape keeps backtracking bounded (see above). */
+export function isSafeTierPattern(src) {
+  if (typeof src !== 'string' || src.length === 0 || src.length > TIER_PATTERN_MAX_CHARS) return false;
+  let quantifiers = 0;
+  let unboundedCount = 0;
+  let inClass = false;
+  let prevGroupClose = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\') {
+      const next = src[i + 1];
+      if (next === undefined) return false;
+      if (!inClass && (/[1-9]/.test(next) || next === 'k')) return false; // backreference
+      i += 1;
+      prevGroupClose = false;
+      continue;
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false;
+      continue;
+    }
+    const quantifier = ch === '*' || ch === '+' || ch === '?' || ch === '{';
+    if (quantifier) {
+      // `?` straight after `(` opens a group modifier, handled at `(`.
+      if (prevGroupClose) return false; // quantified group: nested repetition
+      quantifiers += 1;
+      if (quantifiers > TIER_PATTERN_MAX_QUANTIFIERS) return false;
+      let unbounded = ch === '*' || ch === '+';
+      if (ch === '{') {
+        const close = src.indexOf('}', i);
+        if (close < 0) return false;
+        const m = /^\{(\d+)(,(\d*))?\}$/.exec(src.slice(i, close + 1));
+        if (!m) return false;
+        const max = m[2] === undefined ? Number(m[1]) : m[3] === '' ? Infinity : Number(m[3]);
+        if (max > TIER_PATTERN_MAX_REPEAT) unbounded = true;
+        i = close;
       }
-      if (hit) return entry;
+      if (unbounded && ++unboundedCount > 1) return false;
+      // A lazy/possessive suffix (`*?`) is part of this quantifier.
+      if (src[i + 1] === '?') i += 1;
+      prevGroupClose = false;
+      continue;
+    }
+    prevGroupClose = false;
+    if (ch === '[') inClass = true;
+    else if (ch === '(') {
+      if (src[i + 1] === '?') {
+        if (src[i + 2] !== ':') return false; // lookaround or named group
+        i += 2;
+      }
+    } else if (ch === ')') prevGroupClose = true;
+  }
+  return !inClass;
+}
+
+// Compiled feed patterns, shared across calls; null marks a refused or
+// invalid pattern. Bounded: cleared whole when it fills.
+const TIER_REGEX_CACHE_MAX = 1024;
+const tierRegexCache = new Map();
+
+function compiledTierPattern(src) {
+  if (tierRegexCache.has(src)) return tierRegexCache.get(src);
+  let re = null;
+  if (isSafeTierPattern(src)) {
+    try {
+      re = new RegExp(src);
+    } catch {
+      re = null; // invalid regex never matches; feed bug, not a crash
+    }
+  }
+  if (tierRegexCache.size >= TIER_REGEX_CACHE_MAX) tierRegexCache.clear();
+  tierRegexCache.set(src, re);
+  return re;
+}
+
+/** First pricing-tier entry with any safe, valid regex matching the key. */
+export function matchPricingTier(modelKey, pricingTiers) {
+  if (!modelKey || modelKey.length > TIER_MODEL_KEY_MAX_CHARS) return null;
+  if (!Array.isArray(pricingTiers)) return null;
+  let budget = TIER_PATTERNS_TOTAL_MAX;
+  for (const entry of pricingTiers) {
+    const match = Array.isArray(entry?.match) ? entry.match : [];
+    for (const src of match.slice(0, TIER_PATTERNS_PER_ENTRY_MAX)) {
+      if (typeof src !== 'string' || src.length === 0) continue;
+      if (budget-- <= 0) return null;
+      const re = compiledTierPattern(src);
+      if (re && re.test(modelKey)) return entry;
     }
   }
   return null;

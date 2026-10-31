@@ -73,6 +73,9 @@ export const LANE_ACCOUNTS_PATH_ALLOWLIST = Object.freeze([
 
 export const LANE_KEY_HEADER = 'X-Api-Key';
 
+/** Byte cap on the lane body; reads past it abort before parsing. */
+export const LANE_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 /**
  * Build the lane request. Only https URLs are allowed (this is a public
  * telemetry lane, never a link-local host address).

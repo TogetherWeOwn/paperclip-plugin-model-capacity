@@ -5,7 +5,7 @@ import { manifest, enforceManifest } from '../src/manifest.mjs';
 import { NativeApi, options, scratch, companyId } from './support/native-api.mjs';
 import { applyPoolSaga } from '../scripts/pool-saga.mjs';
 import { config, quotaFeed, stateHarness, NOW, MINUTE } from './support/quota.mjs';
-import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH } from '../src/cliproxy.mjs';
+import { DEFAULT_BASE_URL, DEFAULT_ACCOUNTS_PATH, LANE_MAX_RESPONSE_BYTES } from '../src/cliproxy.mjs';
 import { verifiedConfig } from './support/verified-pools.mjs';
 import { routeDecision } from '../src/router.mjs';
 import { syntheticRouterRequest } from '../src/quota-refresh.mjs';
@@ -15,21 +15,21 @@ async function start(t,{router=true,configure=true,withInspector=true,withPools=
   const host=new NativeApi();
   if(withPools)await applyPoolSaga({...options(host),activate:false,journalPath:await scratch(t)});
   host.writes=[];
-  const harness=stateHarness(),jobs=new Map(),events=new Map(),requests=[];let now=NOW,body=quotaFeed(),status=200,block=null;
+  const harness=stateHarness(),jobs=new Map(),events=new Map(),requests=[];let now=NOW,body=quotaFeed(),status=200,block=null,respond=null;
   const cfg=initialConfig??config();if(!router)delete cfg.router;
   const plugin=createModelCapacityPlugin({clock:()=>now,requirePinnedLaneHost:false,
     ...(withInspector?{inspectPools:async()=>({...options(host),expectedEnabled:false})}:{}),
   });
   const context={
     state:harness.state,logger:harness.logger,config:{get:async()=>cfg},secrets:{resolve:async()=> 'TEST_LANE_KEY'},
-    http:{fetch:async(url,init)=>{requests.push({url,init});if(block)await block;return {status,json:async()=>body};}},
+    http:{fetch:async(url,init)=>{requests.push({url,init});if(block)await block;if(respond)return respond(url,init);return {status,json:async()=>body};}},
     jobs:{register:(key,fn)=>jobs.set(key,fn)},events:{on:(key,fn)=>events.set(key,fn)},
     agents:{get:async()=>null,list:async()=>[]},issues:{get:async()=>null,list:async()=>[]},
   };
   await plugin.setup(context);if(configure)await plugin.onConfigChanged(cfg,{companyId});
   return {...harness,plugin,host,cfg,jobs,requests,context,
     tick:()=>jobs.get('quota-refresh')({}),capacity:()=>plugin.onApiRequest({companyId,routeKey:'capacity'}),
-    setNow:n=>{now=n;},setBody:v=>{body=v;},setStatus:v=>{status=v;},blockOn:p=>{block=p;},
+    setNow:n=>{now=n;},setBody:v=>{body=v;},setStatus:v=>{status=v;},setResponse:fn=>{respond=fn;},blockOn:p=>{block=p;},
   };
 }
 
@@ -142,6 +142,31 @@ test('network/malformed responses retain publication; repeated failures are rate
   const warnings=s.logs.filter(l=>l.details?.reason==='cliproxy-http-503');assert.equal(warnings.length,1);
   s.setStatus(200);s.setBody({accounts:'bad'});await assert.rejects(s.tick());
   assert.equal((await s.capacity()).body.nativeRouter.snapshotAtMs,NOW);
+});
+
+test('lane fetch never follows redirects and refuses a 3xx before reading the body',async t=>{
+  const s=await start(t);await s.tick();assert.equal(s.requests[0].init.redirect,'manual');
+  let read=false;s.setNow(NOW+MINUTE);
+  s.setResponse(()=>({status:302,redirected:false,headers:new Headers({location:'https://elsewhere.invalid/'}),json:async()=>{read=true;return quotaFeed(NOW+MINUTE);}}));
+  await assert.rejects(s.tick());
+  assert.ok(s.logs.some(l=>l.details?.reason==='cliproxy-redirect-refused'));
+  s.setResponse(()=>({status:200,redirected:true,json:async()=>{read=true;return quotaFeed(NOW+MINUTE);}}));
+  await assert.rejects(s.tick());
+  assert.equal(read,false);assert.equal((await s.capacity()).body.nativeRouter.snapshotAtMs,NOW);
+});
+
+test('lane body past the byte cap is refused without being read whole',async t=>{
+  const s=await start(t);s.setNow(NOW+MINUTE);let pulled=0;
+  const endless=new ReadableStream({pull(c){pulled+=1;c.enqueue(new Uint8Array(1024*1024).fill(32));}});
+  s.setResponse(()=>new Response(endless,{status:200}));
+  await assert.rejects(s.tick());
+  assert.ok(s.logs.some(l=>l.details?.reason==='cliproxy-response-too-large'));
+  assert.ok(pulled<=LANE_MAX_RESPONSE_BYTES/(1024*1024)+2,`stopped after ${pulled} chunks`);
+  let read=false;
+  s.setResponse(()=>({status:200,headers:new Headers({'content-length':String(LANE_MAX_RESPONSE_BYTES+1)}),body:{getReader(){read=true;}},json:async()=>{read=true;}}));
+  await assert.rejects(s.tick());assert.equal(read,false);
+  s.setResponse(()=>new Response(JSON.stringify(quotaFeed(NOW+MINUTE)),{status:200}));await s.tick();
+  assert.equal((await s.capacity()).body.nativeRouter.snapshotAtMs,NOW+MINUTE);
 });
 
 test('legacy configuration keeps the old hook behavior and does not require native pool inspection',async t=>{

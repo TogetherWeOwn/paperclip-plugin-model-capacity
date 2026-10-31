@@ -320,6 +320,41 @@ test('measured fleet success graduates a trial family', async () => {
   assert.equal(capacity.body.trialTransitions, 2);
 });
 
+test('a run recorded under a reserved model name never touches Object.prototype', async () => {
+  const at = TICK - 5 * 60000;
+  const { run } = drive({
+    nowMs: TICK,
+    config: { trials: { minRuns: 2, minSuccessRate: 0.5 } },
+    laneAccounts: [kimiAcct()],
+    issueGets: {
+      'iss-p': { assigneeAdapterOverrides: { adapterConfig: { model: '__proto__' } } },
+      'iss-c': { assigneeAdapterOverrides: { adapterConfig: { model: 'openai/constructor' } } },
+    },
+    steps: [{
+      now: TICK,
+      fire: [
+        started('run-p1', at, { issueId: 'iss-p', adapterType: 'claude-code' }),
+        { ...started('run-p1', at + 60000, { issueId: 'iss-p' }), type: 'agent.run.finished' },
+        started('run-c1', at, { issueId: 'iss-c', adapterType: 'claude-code' }),
+        { ...started('run-c1', at + 60000, { issueId: 'iss-c' }), type: 'agent.run.failed' },
+      ],
+    }],
+  });
+  try {
+    const { capacity } = await run();
+    assert.equal(({}).finished, undefined);
+    assert.equal(({}).failed, undefined);
+    assert.equal(Object.finished, undefined);
+    assert.equal(Object.hasOwn(capacity.body.trialFamilies, '__proto__'), false);
+    assert.equal(Object.hasOwn(capacity.body.trialFamilies, 'constructor'), false);
+  } finally {
+    delete Object.prototype.finished;
+    delete Object.prototype.failed;
+    delete Object.finished;
+    delete Object.failed;
+  }
+});
+
 test('water-filling spreads ten decisions across three equal metered accounts', async () => {
   // Herding regression test end to end: three metered lanes with identical
   // quota signals and identical (proven) arms. The old static argmax order
