@@ -472,8 +472,10 @@ before config normalization. It cannot emit a direct queue/RESP request.
 
 The native quota job now persists `src/scorecard.mjs` accounting in the same
 `router-quota-v1` envelope as its immutable quota snapshot. Every minute it joins
-registry + lane meter/Keeper usage + observed ledger model evidence, including
-feed accounts excluded from the registry. Eligibility minutes require the same
+registry + lane meter/Keeper usage + observed ledger model evidence for the
+company's registered accounts only. The pinned lane feed is shared by every
+company on the instance, so feed accounts outside the registry appear only as
+the count `unregisteredFeedAccounts`. Eligibility minutes require the same
 runtime quality/outcome policy and quota/credential gates, evaluated job-side;
 callback retries never increment counters or write state. A cold policy cache is
 not evidence of eligibility. Inputs are quota ratios; public used/unused values
@@ -482,7 +484,7 @@ are percentages. API routes use the upstream declared plugin-local GET shape
 board routes or a host producer.
 
 `GET /api/plugins/<plugin-id>/api/scorecard?companyId=<company-id>` returns
-`{atMs, rows, burn, warnings}`; the identical object is folded into `/capacity`
+`{atMs, rows, unregisteredFeedAccounts, burn, warnings}`; the identical object is folded into `/capacity`
 as `scorecard`. Durable state is readable after worker restart before the first
 successful feed refresh; an uninitialized scorecard has `atMs:null, rows:[]`.
 Each account retains eight reset windows, with two-period-capped incremental
