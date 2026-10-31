@@ -98,6 +98,7 @@ export async function drive({ raw = config(), accounts = [lane('one')], aaRows =
     hook: (runId, extra = {}) => plugin.onResolveRunModel({ runId, companyId: 'acme',
       agentId: 'doer', issueId: null, adapterType: 'claude-code', invocationSource: 'test',
       agentDefaultModel: null, issueOverrideModel: null, previous: null, deadlineMs: 1500, ...extra }),
+    fireEvent: event => events.get(event.type)(event),
     fire: (runId, agentId, fields = {}, type = 'agent.run.started') => events.get(type)({
       type, companyId: 'acme', entityId: runId, occurredAt: new Date(now).toISOString(),
       payload: { run: { agentId, provider: 'claude', ...fields } },
