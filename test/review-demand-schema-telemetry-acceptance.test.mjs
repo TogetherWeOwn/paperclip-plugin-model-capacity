@@ -98,12 +98,12 @@ async function capsFixture({ running = 0, pause = false } = {}) {
     http: { fetch: async (url, init) => {
       assert.equal(url, 'https://api.github.com/graphql');
       calls.push(JSON.parse(init.body).variables);
-      return { status: 200, json: async () => {
+      return { status: 200, text: async () => {
         censusResolved = true;
-        return { data: { repository: { pullRequests: {
+        return JSON.stringify({ data: { repository: { pullRequests: {
           nodes: Array.from({ length: 8 }, (_, i) => pull(i + 1)),
           pageInfo: { hasNextPage: false, endCursor: null },
-        } } } };
+        } } } });
       } };
     } },
   });

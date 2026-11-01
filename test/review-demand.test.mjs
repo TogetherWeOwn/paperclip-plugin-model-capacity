@@ -33,7 +33,7 @@ async function drive({ nodes = [], queued = 0, cap = snapshot(), fail = false } 
     issues: { list: async () => [] }, agents: { getQueuedRunCounts: async () => [{ agentId: 'reviewer', queued }] },
     jobs: { register() {} }, events: { on() {} }, logger: { info() {}, error() {} },
     secrets: { resolve: async () => 'fixture-only' },
-    http: { fetch: async (url, init) => { calls.push({ url, init }); if (fail) throw new Error('private-upstream-text'); return { status: 200, json: async () => response(nodes) }; } },
+    http: { fetch: async (url, init) => { calls.push({ url, init }); if (fail) throw new Error('private-upstream-text'); return { status: 200, text: async () => JSON.stringify(response(nodes)) }; } },
   });
   await plugin.onConfigChanged({ roles: { keepAgentIds: ['reviewer'] },
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'meta', model: 'muse-wonder-full-1.0-contributor' }, { provider: 'codex', model: 'gpt-6.1-sol' }] },
@@ -135,7 +135,7 @@ for (const bad of [
   test('partial or malformed census never publishes a positive count', async () => {
     const read = createReviewDemandReader({ clock: () => NOW });
     const result = await read({ secrets: { resolve: async () => 'fixture-only' },
-      http: { fetch: async () => ({ status: 200, json: async () => bad }) } },
+      http: { fetch: async () => ({ status: 200, text: async () => JSON.stringify(bad) }) } },
     'acme', normalizeReviewDemand({ repositories: ['example/product'], tokenSecretRef: ref }));
     assert.equal(result.status, 'unavailable');
     assert.equal(result.eligibleHeads, 0);
@@ -147,9 +147,9 @@ test('census paginates and deduplicates heads, with company-scoped single-flight
   const read = createReviewDemandReader({ clock: () => NOW });
   const calls = [];
   const ctx = { secrets: { resolve: async (_ref, opts) => { calls.push(opts.companyId); return 'fixture-only'; } },
-    http: { fetch: async (_url, init) => ({ status: 200, json: async () => {
+    http: { fetch: async (_url, init) => ({ status: 200, text: async () => {
       const cursor = JSON.parse(init.body).variables.cursor;
-      return cursor ? response([pull(1), pull(2)]) : response([pull(1)], { hasNextPage: true, endCursor: 'page-2' });
+      return JSON.stringify(cursor ? response([pull(1), pull(2)]) : response([pull(1)], { hasNextPage: true, endCursor: 'page-2' }));
     } }) } };
   const cfg = normalizeReviewDemand({ repositories: ['example/product'], tokenSecretRef: ref });
   const [a, b] = await Promise.all([read(ctx, 'acme', cfg), read(ctx, 'acme', cfg)]);
@@ -168,7 +168,7 @@ test('a failed refresh replaces positive demand, while disabled configuration pe
     calls++;
     assert.equal(init.redirect, 'manual');
     if (fail) throw new Error('private-detail');
-    return { status: 200, json: async () => response([pull(1)]) };
+    return { status: 200, text: async () => JSON.stringify(response([pull(1)])) };
   } } };
   const cfg = normalizeReviewDemand({ repositories: ['example/product'], tokenSecretRef: ref });
   assert.equal((await read(ctx, 'acme', cfg)).eligibleHeads, 1);
@@ -193,7 +193,7 @@ test('fractional admitted slots combine within a shared reviewer pool', () => {
 test('a followed redirect response is refused even when it contains valid-looking demand', async () => {
   const read = createReviewDemandReader({ clock: () => NOW });
   const result = await read({ secrets: { resolve: async () => 'fixture-only' },
-    http: { fetch: async () => ({ status: 200, redirected: true, json: async () => response([pull(1)]) }) } },
+    http: { fetch: async () => ({ status: 200, redirected: true, text: async () => JSON.stringify(response([pull(1)])) }) } },
   'acme', normalizeReviewDemand({ repositories: ['example/product'], tokenSecretRef: ref }));
   assert.equal(result.status, 'unavailable');
 });
@@ -219,7 +219,7 @@ test('backward clock movement cannot pin a positive backlog cache', async () => 
   let calls = 0;
   const read = createReviewDemandReader({ clock: () => now });
   const ctx = { secrets: { resolve: async () => 'fixture-only' }, http: { fetch: async () => {
-    calls++; return { status: 200, json: async () => response([pull(1)]) };
+    calls++; return { status: 200, text: async () => JSON.stringify(response([pull(1)])) };
   } } };
   const cfg = normalizeReviewDemand({ repositories: ['example/product'], tokenSecretRef: ref });
   await read(ctx, 'acme', cfg);

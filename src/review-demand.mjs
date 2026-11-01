@@ -1,8 +1,11 @@
 // Plugin-owned read-only census. Native review history begins AFTER admission,
 // so it cannot measure the PR heads waiting outside a slot-metered gate.
+import { readBoundedText } from './bounded-body.mjs';
 const URL = 'https://api.github.com/graphql';
 const TTL_MS = 5 * 60_000;
 const MAX_PAGES = 50;
+// One page is at most 100 PRs x 100 check contexts; real pages are far smaller.
+export const REVIEW_DEMAND_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 async function bounded(operation, timeoutMs) {
   if (timeoutMs <= 0) throw new Error('timeout');
   let timer;
@@ -112,10 +115,11 @@ export function createReviewDemandReader({ clock = Date.now } = {}) {
             if (++pages > MAX_PAGES) throw new Error('page-limit');
             const body = await bounded(async () => {
               const res = await ctx.http.fetch(URL, { method: 'POST', redirect: 'manual',
+                maxResponseBytes: REVIEW_DEMAND_MAX_RESPONSE_BYTES,
                 headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'paperclip-model-capacity' },
                 body: JSON.stringify({ query: QUERY, variables: { owner, name, cursor } }) });
               if (res.status !== 200 || res.redirected === true) throw new Error('unavailable');
-              return res.json();
+              return JSON.parse(await readBoundedText(res, REVIEW_DEMAND_MAX_RESPONSE_BYTES));
             }, Math.min(10_000, deadline - Date.now()));
             assertCurrent();
             const prs = body?.data?.repository?.pullRequests;

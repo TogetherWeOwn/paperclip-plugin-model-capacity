@@ -30,7 +30,7 @@ function pull(number) {
 const page = nodes => ({ data: { repository: { pullRequests: {
   nodes, pageInfo: { hasNextPage: false, endCursor: null },
 } } } });
-const response = nodes => ({ status: 200, json: async () => page(nodes) });
+const response = nodes => ({ status: 200, text: async () => JSON.stringify(page(nodes)) });
 const routedConfig = (ids = ['reviewer']) => ({
   roles: { keepAgentIds: ids }, reviewReserve: { enabled: false },
   reviewerRouting: { agentIds: ids, arms: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },

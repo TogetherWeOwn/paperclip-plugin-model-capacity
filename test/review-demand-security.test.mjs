@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createReviewDemandReader, normalizeReviewDemand, validateReviewDemand } from '../src/review-demand.mjs';
+import { REVIEW_DEMAND_MAX_RESPONSE_BYTES, createReviewDemandReader, normalizeReviewDemand, validateReviewDemand } from '../src/review-demand.mjs';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
 
 // Independent boundary acceptance. Every secret, response and clock is a fixture;
@@ -29,7 +29,7 @@ function pull(number = 1) {
 const page = (nodes = [pull()], hasNextPage = false, endCursor = null) => ({
   data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor } } } },
 });
-const response = (body = page(), status = 200, extra = {}) => ({ status, json: async () => body, ...extra });
+const response = (body = page(), status = 200, extra = {}) => ({ status, text: async () => JSON.stringify(body), ...extra });
 function fixture({ fetch = async () => response(), resolve = async () => TOKEN } = {}) {
   const calls = { secrets: [], http: [], state: [], logs: [] };
   const ctx = {
@@ -112,7 +112,7 @@ for (const status of [301, 302, 303, 307, 308, 401, 403, 429, 500]) {
     let parsed = 0;
     const f = fixture({ fetch: async () => response(page(), status, {
       headers: new Headers({ Location: 'https://sink.example.com/graphql', 'Retry-After': '1' }),
-      json: async () => { parsed++; return page(); },
+      text: async () => { parsed++; return JSON.stringify(page()); },
     }) });
     assertClosed(await createReviewDemandReader({ clock: () => NOW })(f.ctx, 'tenant-a', config()));
     assert.equal(f.calls.secrets.length, 1);
@@ -123,7 +123,7 @@ for (const status of [301, 302, 303, 307, 308, 401, 403, 429, 500]) {
 
 for (const [label, fetch] of [
   ['network rejection', async () => { throw new Error(`private-upstream-${TOKEN}`); }],
-  ['invalid JSON', async () => response(null, 200, { json: async () => { throw new Error('private-json-detail'); } })],
+  ['invalid JSON', async () => response(null, 200, { text: async () => '{"private-json-detail' })],
   ['followed response', async () => response(page(), 200, { redirected: true })],
   ['GraphQL partial error', async () => response({ ...page(), errors: [{ message: `private-upstream-${TOKEN}` }] })],
   ['missing repository', async () => response({ data: { repository: null } })],
@@ -141,6 +141,23 @@ for (const [label, fetch] of [
     assert.doesNotMatch(JSON.stringify(result), /private-|fixture-not-a-credential/);
   });
 }
+
+test('security: the census asks the host for a byte cap and refuses an oversized page before parsing', async () => {
+  let parsed = 0;
+  const declared = response(page(), 200, {
+    headers: new Headers({ 'content-length': String(REVIEW_DEMAND_MAX_RESPONSE_BYTES + 1) }),
+    text: async () => { parsed++; return JSON.stringify(page()); },
+  });
+  const endless = new Response(new ReadableStream({
+    pull(controller) { controller.enqueue(new Uint8Array(64 * 1024)); },
+  }), { status: 200 });
+  for (const res of [declared, endless]) {
+    const f = fixture({ fetch: async () => res });
+    assertClosed(await createReviewDemandReader({ clock: () => NOW })(f.ctx, 'tenant-a', config()));
+    assert.equal(f.calls.http[0][1].maxResponseBytes, REVIEW_DEMAND_MAX_RESPONSE_BYTES);
+  }
+  assert.equal(parsed, 0);
+});
 
 test('security: second-page failure discards first-page positives and remaining repositories', async () => {
   let pages = 0;
@@ -160,9 +177,9 @@ test('security: page requests are sequential and the total 50-page budget spans 
     await flush();
     const { name } = JSON.parse(init.body).variables;
     count++;
-    return response(null, 200, { json: async () => {
+    return response(null, 200, { text: async () => {
       active--;
-      return page([pull(count)], name === 'b' || count < 25, `cursor-${count}`);
+      return JSON.stringify(page([pull(count)], name === 'b' || count < 25, `cursor-${count}`));
     } });
   } });
   assertClosed(await createReviewDemandReader({ clock: () => NOW })(f.ctx, 'tenant-a', config({ repositories: ['example/a', 'example/b'] })));
