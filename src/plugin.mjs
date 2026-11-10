@@ -2558,13 +2558,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
   function capsRunningCensus(ledger, accounts, freeLanes, nowMs, horizonMs) {
     const byId = new Map(accounts.map(a => [a.accountId, a]));
     const agents = new Map();
+    const runningCensusRecords = [];
     let running = 0, unassignedRunning = 0, pending = 0;
     for (const r of ledger.values()) {
       if (r?.unverified === true) continue;
-      if (r?.status !== 'running') {
-        if (r?.enforced === true && isInflight(r, nowMs, horizonMs)) pending += 1;
-        continue;
-      }
+      const executing = r?.status === 'running';
+      if (!executing && !(r?.enforced === true && isInflight(r, nowMs, horizonMs))) continue;
+      // Minimal ledger evidence lets a later storage-outage view union by runId,
+      // including pending -> running and terminal overlays, without guessing overlap.
+      runningCensusRecords.push({ runId: r.runId, agentId: r.agentId, status: r.status,
+        startedAt: r.startedAt, decidedAt: r.decidedAt, enforced: r.enforced,
+        decidedAccount: r.decidedAccount, actualAccount: r.actualAccount });
+      if (!executing) { pending += 1; continue; }
       running += 1;
       if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') {
         unassignedRunning += 1;
@@ -2577,7 +2582,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       else entry.running += 1;
       if (byId.get(r.actualAccount ?? r.decidedAccount)?.guardActive === true) entry.overPace = true;
     }
-    return { agentRunning: Object.fromEntries(agents), physicalOccupancy: { running, unassignedRunning, pending } };
+    return { agentRunning: Object.fromEntries(agents), physicalOccupancy: { running, unassignedRunning, pending }, runningCensusRecords };
   }
 
   // ONE quota consumer. Both the native snapshot and the retained hook tick
@@ -4811,7 +4816,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // records with status 'running' (started, no terminal); unverified
     // records never proved alive since startup and stay excluded. Burn side
     // (actualAccount) outranks the decision guess for the over-pace check.
-    const { agentRunning, physicalOccupancy } = capsRunningCensus(
+    const { agentRunning, physicalOccupancy, runningCensusRecords } = capsRunningCensus(
       ledger, accountViews, config.freeLanes, nowMs, staleHorizonMs);
     // With routing enabled, capacity must pass the same admission as a
     // configured reviewer. Otherwise retain the legacy non-trial role access.
@@ -5124,7 +5129,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       agentRunning,
       // Omit the additive zero census to preserve empty historical snapshots.
       // Nonzero occupancy must survive a later ledger-store outage/restart.
-      ...(physicalOccupancy.running > 0 || physicalOccupancy.pending > 0 ? { physicalOccupancy } : {}),
+      ...(physicalOccupancy.running > 0 || physicalOccupancy.pending > 0
+        ? { physicalOccupancy, runningCensusRecords } : {}),
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
@@ -6884,23 +6890,37 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           censusAvailable = false; // Retain the last running facts, never new authority.
         }
         const refreshCensus = () => {
-          const ledger = ledgers.get(companyId);
-          if (!ledger?.size) return;
-          const latest = capsRunningCensus(ledger, cap.accounts ?? [], resolved?.freeLanes, clock(),
+          const ledger = ledgers.get(companyId) ?? createLedger();
+          if (censusAvailable && ledger.size === 0) return;
+          const identified = Array.isArray(cap.runningCensusRecords);
+          // Rebuild from the immutable snapshot on EVERY refresh: never add an
+          // overlay to a previously merged count. This view is not loaded ledger
+          // authority and must not be persisted over the unavailable ledger.
+          const view = !censusAvailable && identified
+            ? mergeLedger(ledgerFromJSON(cap.runningCensusRecords), ledger) : ledger;
+          const latest = capsRunningCensus(view, cap.accounts ?? [], resolved?.freeLanes, clock(),
             liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000);
-          if (censusAvailable) {
+          if (censusAvailable || identified) {
             ({ agentRunning: runningByAgent, physicalOccupancy } = latest);
           } else {
-            // Partial memory is positive evidence, not a complete census. Keep
-            // persisted floors too; without storage there is no new admission.
-            for (const [id, row] of Object.entries(latest.agentRunning)) {
-              const old = runningByAgent[id] ?? {};
-              runningByAgent = { ...runningByAgent, [id]: { ...row,
-                running: Math.max(row.running, old.running ?? 0),
-                freeRunning: Math.max(row.freeRunning ?? 0, old.freeRunning ?? 0) } };
-            }
+            // Legacy snapshots have no identities to prove overlap. Sum their
+            // saved floors and partial positive evidence conservatively; this
+            // can over-report overlap until storage recovers, never grant room.
+            const saved = cap.agentRunning ?? {};
+            runningByAgent = Object.fromEntries([...new Set([
+              ...Object.keys(saved), ...Object.keys(latest.agentRunning),
+            ])].map(id => {
+              const old = saved[id] ?? {}, row = latest.agentRunning[id] ?? {};
+              return [id, { running: (old.running ?? 0) + (row.running ?? 0),
+                freeRunning: (old.freeRunning ?? 0) + (row.freeRunning ?? 0),
+                overPace: old.overPace === true || row.overPace === true }];
+            }));
+            const savedPhysical = cap.physicalOccupancy ?? {
+              running: Object.values(saved).reduce((n, r) => n + (r.running ?? 0) + (r.freeRunning ?? 0), 0),
+              unassignedRunning: 0, pending: 0,
+            };
             physicalOccupancy = Object.fromEntries(Object.keys(latest.physicalOccupancy).map(key =>
-              [key, Math.max(physicalOccupancy[key] ?? 0, latest.physicalOccupancy[key])]));
+              [key, (savedPhysical[key] ?? 0) + latest.physicalOccupancy[key]]));
           }
         };
         refreshCensus();

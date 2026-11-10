@@ -112,6 +112,34 @@ for (const agentId of ['triage', 'unknown']) {
   });
 }
 
+test('storage-outage census preserves saved free attribution and deduplicates its overlapping start', async () => {
+  const first = await drive({ records: [
+    { runId: 'saved-free', agentId: 'triage', status: 'running', startedAt: NOW, enforced: true,
+      decidedAccount: 'nvidia-nim:n1', freeProvider: 'nvidia-nim', unverified: false },
+  ] });
+  const d = await drive({ state: first.store, initialTick: false });
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  for (const runId of ['saved-free', 'distinct']) {
+    await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+      occurredAt: new Date(NOW).toISOString(), payload: { agentId: 'triage' } });
+  }
+  for (let i = 0; i < 3; i++) {
+    const body = await d.api('caps');
+    const row = body.agents.find(a => a.agentId === 'triage');
+    assert.equal(row.running, 2);
+    assert.equal(row.freeAllocated, 1, 'only the saved decided run has proved free attribution');
+    assert.equal(row.allocated, 2);
+    assert.equal(row.maxConcurrentRuns, 2);
+    assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 0 });
+    assert.equal(body.agents.reduce((n, a) => n + a.allocated - a.running, 0), 0);
+    assert.equal(body.capsError, 'admission-unavailable');
+  }
+});
+
 test('unknown ordinary occupancy cannot be replaced by an additive free grant at the physical ceiling', async () => {
   const d = await drive({ config: { concurrency: { maxTotal: 1 } }, records: [
     { runId: 'unmapped-running', agentId: 'unknown', status: 'running', startedAt: NOW, unverified: false },

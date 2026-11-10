@@ -857,6 +857,121 @@ test('/caps preserves memory-only positive running evidence when ledger storage 
   assert.equal(body.capsError, 'admission-unavailable');
 });
 
+async function outageDrive({ config = {}, records = [], legacy = false } = {}) {
+  const d = await boundaryDrive({ config, records });
+  if (records.length === 0) await d.fire(runEvent('saved', TICK, 'worker'));
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured', ...(legacy ? { runningCensusRecords: undefined } : {}) });
+  d.reboot(); await d.setup();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  return { d, get };
+}
+
+for (const burn of [false, true]) {
+  test(`/caps outage unions disjoint saved and memory runs (${burn ? 'burn' : 'ordinary'}) without refresh inflation`, async () => {
+    const { d, get } = await outageDrive({ config: burn ? { burnMode: { accounts: ['claude:a1'] } } : {} });
+    await d.fire(runEvent('distinct', TICK, 'worker'));
+    for (let i = 0; i < 3; i++) {
+      const body = (await d.api('caps')).body;
+      const row = body.agents.find(a => a.agentId === 'worker');
+      assert.equal(row.running, 2);
+      assert.equal(row.allocated, 2);
+      assert.equal(row.maxConcurrentRuns, 2);
+      assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 0 });
+      assert.equal(newSlots(body), 0);
+      assert.equal(body.capsError, 'admission-unavailable');
+    }
+    // Recovery uses the real ledger union, not the anonymous fallback bound.
+    d.io.state.get = get;
+    const recovered = (await d.api('caps')).body;
+    assert.equal(recovered.physicalOccupancy.running, 2);
+    assert.equal(recovered.agents.find(a => a.agentId === 'worker').running, 2);
+  });
+}
+
+test('/caps outage deduplicates overlapping starts and observes terminals from the memory ledger', async () => {
+  const { d } = await outageDrive();
+  await d.fire(runEvent('saved', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(body.physicalOccupancy.running, 1);
+    assert.equal(newSlots(body), 0);
+  }
+  await d.fire(runEvent('saved', TICK, 'worker', 'agent.run.finished'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.physicalOccupancy.running, 0);
+  assert.equal(newSlots(body), 0);
+});
+
+test('/caps outage reconciles a saved pending reservation with its memory-only start once', async () => {
+  const { d } = await outageDrive({ records: [{ runId: 'pending', agentId: 'worker', status: 'decided',
+    enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1', unverified: false }] });
+  const before = (await d.api('caps')).body;
+  assert.equal(before.physicalOccupancy.pending, 1);
+  await d.fire(runEvent('pending', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps outage refresh includes unnamed starts during hold I/O without inventing attribution', async () => {
+  const { d } = await outageDrive();
+  const get = d.io.state.get;
+  let started = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !started) {
+      started = true;
+      await d.fire(runEvent('unnamed', TICK, 'unknown'));
+    }
+    return get(key);
+  };
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 1, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.ok(body.agents.every(a => a.agentId !== 'unknown'));
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps legacy count-only outage conservatively retains saved plus partial memory floors', async () => {
+  const { d } = await outageDrive({ legacy: true });
+  await d.fire(runEvent('distinct', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2);
+    assert.equal(body.physicalOccupancy.running, 2);
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps legacy overlap bound is stable and disappears when the ledger recovers', async () => {
+  const { d, get } = await outageDrive({ legacy: true });
+  // Old snapshots may also predate the additive physical census.
+  d.seedCaps({ physicalOccupancy: undefined });
+  await d.fire(runEvent('saved', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2,
+      'without saved identities overlap cannot be proved; retain the conservative bound');
+    assert.equal(body.physicalOccupancy.running, 2);
+    assert.equal(newSlots(body), 0);
+  }
+  d.io.state.get = get;
+  const recovered = (await d.api('caps')).body;
+  assert.equal(recovered.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(recovered.physicalOccupancy.running, 1);
+  assert.equal(newSlots(recovered), 0, 'ledger recovery alone does not restore worker admission authority');
+});
+
 test('/caps unavailable issues publishes starts observed during the failed read', async () => {
   const d = await boundaryDrive();
   await d.fire(runEvent('first', TICK, 'worker'));
