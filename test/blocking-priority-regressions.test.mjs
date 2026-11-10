@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
@@ -24,7 +25,7 @@ async function drive({ issues, config = enabled, cap = null, failStatus = null }
   const reads = [];
   if (cap) store.set(JSON.stringify(key('capacity-v1')), cap);
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     config: { get: async () => ({ ...config, cliproxy: {
       laneKeySecretRef: { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' },
     } }) },
@@ -52,13 +53,14 @@ async function drive({ issues, config = enabled, cap = null, failStatus = null }
     jobs: { register: (name, fn) => { jobs.set(name, fn); } },
     events: { on: (name, fn) => { handlers.set(name, fn); } },
     logger: { info() {}, error() {} },
-  });
+  };
   store.set(JSON.stringify(key('aa-snapshot-v1')), {
     fetchedAt: new Date(NOW).toISOString(), duplicateSlugs: [],
     rows: [{ slug: 'gpt-6.1-sol', intelligenceIndex: 62, intelligenceIndexCostPerTask: 30,
       price1mInputTokens: 5, price1mOutputTokens: 25 }],
   });
-  await plugin.onConfigChanged(config, { companyId: COMPANY });
+  if (cap) await setupCapsAdmission(plugin, io, { raw: config, cap, companyId: COMPANY, nowMs: NOW });
+  else { await plugin.setup(io); await plugin.onConfigChanged(config, { companyId: COMPANY }); }
   const api = async routeKey => {
     const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey });
     assert.equal(response.status, 200);

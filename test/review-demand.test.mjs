@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
@@ -28,17 +29,19 @@ async function drive({ nodes = [], queued = 0, cap = snapshot(), fail = false } 
   const store = new Map([['capacity-v1', cap]]);
   const calls = [];
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     state: { get: async k => store.get(k.stateKey), set: async (k, v) => store.set(k.stateKey, v) },
     issues: { list: async () => [] }, agents: { getQueuedRunCounts: async () => [{ agentId: 'reviewer', queued }] },
     jobs: { register() {} }, events: { on() {} }, logger: { info() {}, error() {} },
     secrets: { resolve: async () => 'fixture-only' },
     http: { fetch: async (url, init) => { calls.push({ url, init }); if (fail) throw new Error('private-upstream-text'); return { status: 200, text: async () => JSON.stringify(response(nodes)) }; } },
-  });
-  await plugin.onConfigChanged({ roles: { keepAgentIds: ['reviewer'] },
+  };
+  const raw = { roles: { keepAgentIds: ['reviewer'] },
     reviewerRouting: { agentIds: ['reviewer'], arms: [{ provider: 'meta', model: 'muse-wonder-full-1.0-contributor' }, { provider: 'codex', model: 'gpt-6.1-sol' }] },
     reviewDemand: { repositories: ['example/product'], tokenSecretRef: ref, requiredChecks: ['ci-ok', 'pr-lint'] },
-  }, { companyId: 'acme' });
+  };
+  if (cap.atMs > NOW) { await plugin.setup(io); await plugin.onConfigChanged(raw, { companyId: 'acme' }); }
+  else await setupCapsAdmission(plugin, io, { raw, cap, nowMs: NOW });
   const read = async () => (await plugin.onApiRequest({ companyId: 'acme', routeKey: 'caps' })).body;
   return { read, calls };
 }

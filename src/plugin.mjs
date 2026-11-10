@@ -2514,17 +2514,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     let pending = ledgerLoads.get(companyId);
     if (!pending) {
       pending = (async () => {
-        const persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
-        let ledger;
-        if (persisted.size > 0) {
-          ledger = mergeLedger(persisted, ledgers.get(companyId));
-        } else {
-          const legacy = migrateLegacy({
+        let persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
+        if (persisted.size === 0) {
+          persisted = migrateLegacy({
             runs: await ctx.state.get(scopeKey(companyId, LEGACY_RUNS_KEY)),
             ringEntries: await ctx.state.get(scopeKey(companyId, LEGACY_RING_KEY)),
           });
-          ledger = mergeLedger(legacy, ledgers.get(companyId));
         }
+        // Capacity can contain starts observed after the last ledger persist.
+        // Recover those run facts too, including on a successful nonempty load,
+        // so the next tick cannot erase them. This restores pressure, not the
+        // saved worker's admission policy; current-worker fences still apply.
+        const capacity = await ctx.state.get(scopeKey(companyId, CAPACITY_KEY));
+        const saved = ledgerFromJSON(capacity?.runningCensusRecords);
+        const ledger = mergeLedger(mergeLedger(saved, persisted), ledgers.get(companyId));
         ledgers.set(companyId, ledger);
         ledgerReady.add(companyId);
         loadedOk.add(companyId);
@@ -2551,6 +2554,37 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       ctx.logger.error('model-capacity: ledger load failed, memory-only', { companyId, error: error?.message ?? String(error) });
       return ensureLedger(companyId);
     }
+  }
+
+  // Agent identity controls publication, not physical occupancy. Count each
+  // ledger row once; a decided reservation stops being pending when it starts.
+  function capsRunningCensus(ledger, accounts, freeLanes, nowMs, horizonMs) {
+    const byId = new Map(accounts.map(a => [a.accountId, a]));
+    const agents = new Map();
+    const runningCensusRecords = [];
+    let running = 0, unassignedRunning = 0, pending = 0;
+    for (const r of ledger.values()) {
+      if (r?.unverified === true) continue;
+      const executing = r?.status === 'running';
+      if (!executing && !(r?.enforced === true && isInflight(r, nowMs, horizonMs))) continue;
+      // These rows also recover canonical ledger records after a partial tick
+      // write. Keep the whole record: identity/occupancy alone cannot restore
+      // trial family charges, enforced free classification or decision evidence.
+      runningCensusRecords.push({ ...r });
+      if (!executing) { pending += 1; continue; }
+      running += 1;
+      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') {
+        unassignedRunning += 1;
+        continue;
+      }
+      let entry = agents.get(r.agentId);
+      if (!entry) { entry = { running: 0, overPace: false }; agents.set(r.agentId, entry); }
+      const account = byId.get(r.enforced ? r.decidedAccount : r.actualAccount);
+      if (freeProvider(account, freeLanes) != null) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
+      else entry.running += 1;
+      if (byId.get(r.actualAccount ?? r.decidedAccount)?.guardActive === true) entry.overPace = true;
+    }
+    return { agentRunning: Object.fromEntries(agents), physicalOccupancy: { running, unassignedRunning, pending }, runningCensusRecords };
   }
 
   // ONE quota consumer. Both the native snapshot and the retained hook tick
@@ -4195,7 +4229,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         });
       }
     }
-    const reconciledUnverified = reconcileLedger(ledger, { nowMs, verifyWindowMs: staleHorizonMs });
+    // The tick's accounting timestamp predates awaited reads. Reconcile at
+    // observation time so a start received during those reads is not future.
+    const reconciledUnverified = reconcileLedger(ledger, { nowMs: clock(), verifyWindowMs: staleHorizonMs });
     // Trial budgets are read fresh from the ledger per candidate and for
     // the live view below (decisions write through, so no carried copy).
     // In-flight census, single pass over the ledger: each record counts at
@@ -4761,10 +4797,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
-    // idempotent) on the next run. Trim bounds the persisted blob at
-    // maxRecords: old terminal, old unverified, and stale-horizon records
-    // first, then oldest activity -- live pressure always survives.
-    trimLedger(ledger, { nowMs, maxRecords: config.shadowMaxEntries, staleHorizonMs });
+    // idempotent) on the next run. Trim bounds inactive history, never
+    // verified executing pressure or pending reservations.
+    trimLedger(ledger, { nowMs: clock(), maxRecords: config.shadowMaxEntries, staleHorizonMs });
     if (!loadedOk.has(companyId)) {
       throw new Error('model-capacity: refusing ledger persist without a successful load');
     }
@@ -4784,25 +4819,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // records with status 'running' (started, no terminal); unverified
     // records never proved alive since startup and stay excluded. Burn side
     // (actualAccount) outranks the decision guess for the over-pace check.
-    const overPaceAccounts = new Set(
-      accountViews.filter(v => v?.guardActive === true).map(v => v.accountId));
-    // Map accumulator: agentIds are ledger/issue strings, and indexing a
-    // plain object with '__proto__' would write Object.prototype worker-wide
-    // (and read it back as NaN counts). fromEntries below defines own data
-    // properties even for '__proto__', so the snapshot reads back safely.
-    const agentRunningById = new Map();
-    for (const r of ledger.values()) {
-      if (r?.status !== 'running' || r?.unverified === true) continue;
-      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
-      let entry = agentRunningById.get(r.agentId);
-      if (!entry) { entry = { running: 0, overPace: false }; agentRunningById.set(r.agentId, entry); }
-      const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
-      if (free) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
-      else entry.running += 1;
-      const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
-      if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
-    }
-    const agentRunning = Object.fromEntries(agentRunningById);
+    const { agentRunning, physicalOccupancy, runningCensusRecords } = capsRunningCensus(
+      ledger, accountViews, config.freeLanes, nowMs, staleHorizonMs);
     // With routing enabled, capacity must pass the same admission as a
     // configured reviewer. Otherwise retain the legacy non-trial role access.
     const reviewerLive = liveViews.get(companyId);
@@ -5112,6 +5130,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
+      // Omit the additive zero census to preserve empty historical snapshots.
+      // Nonzero occupancy must survive a later ledger-store outage/restart.
+      ...(physicalOccupancy.running > 0 || physicalOccupancy.pending > 0
+        ? { physicalOccupancy, runningCensusRecords } : {}),
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
@@ -6859,11 +6881,63 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const calibration = cap.calibration ?? 'weak';
         const target = cap.target ?? null;
         const paidTarget = cap.freeLanes ? cap.paidTarget : target;
-        // Weak calibration means no target at all: no caps, never zeros
-        // masquerading as a recommendation.
-        const freeRunningFloor = cap.freeLanes && Object.values(cap.agentRunning ?? {}).some(r => r.freeRunning > 0);
-        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !freeRunningFloor) {
-          return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
+        let runningByAgent = cap.agentRunning ?? {};
+        let physicalOccupancy = cap.physicalOccupancy ?? { running: 0, unassignedRunning: 0, pending: 0 };
+        let censusAvailable = true;
+        try {
+          await loadLedger(companyId);
+        } catch {
+          censusAvailable = false; // Retain the last running facts, never new authority.
+        }
+        const refreshCensus = () => {
+          const ledger = ledgers.get(companyId) ?? createLedger();
+          const identified = Array.isArray(cap.runningCensusRecords);
+          if (censusAvailable && ledger.size === 0 && !identified) return;
+          // Rebuild from the immutable snapshot on EVERY refresh, even when an
+          // older ledger loaded successfully. This union is reporting evidence,
+          // not worker admission authority or a replacement persisted ledger.
+          const view = identified
+            ? mergeLedger(ledgerFromJSON(cap.runningCensusRecords), ledger) : ledger;
+          const latest = capsRunningCensus(view, cap.accounts ?? [], resolved?.freeLanes, clock(),
+            liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000);
+          if (censusAvailable || identified) {
+            ({ agentRunning: runningByAgent, physicalOccupancy } = latest);
+          } else {
+            // Legacy snapshots have no identities to prove overlap. Sum their
+            // saved floors and partial positive evidence conservatively; this
+            // can over-report overlap until storage recovers, never grant room.
+            const saved = cap.agentRunning ?? {};
+            runningByAgent = Object.fromEntries([...new Set([
+              ...Object.keys(saved), ...Object.keys(latest.agentRunning),
+            ])].map(id => {
+              const old = saved[id] ?? {}, row = latest.agentRunning[id] ?? {};
+              return [id, { running: (old.running ?? 0) + (row.running ?? 0),
+                freeRunning: (old.freeRunning ?? 0) + (row.freeRunning ?? 0),
+                overPace: old.overPace === true || row.overPace === true }];
+            }));
+            const savedPhysical = cap.physicalOccupancy ?? {
+              running: Object.values(saved).reduce((n, r) => n + (r.running ?? 0) + (r.freeRunning ?? 0), 0),
+              unassignedRunning: 0, pending: 0,
+            };
+            physicalOccupancy = Object.fromEntries(Object.keys(latest.physicalOccupancy).map(key =>
+              [key, (savedPhysical[key] ?? 0) + latest.physicalOccupancy[key]]));
+          }
+        };
+        refreshCensus();
+        const maxTotal = resolved?.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal;
+        // Reuse the retained hook's two-minute evidence window and the existing
+        // config/worker fences. Age invalidates admission, not running facts.
+        const admissionCurrent = () => censusAvailable
+          && Number.isFinite(atMs) && clock() >= atMs && clock() - atMs <= 120_000
+          && cap.reviewAdmissionGeneration === configGenerationOf(companyId)
+          && liveViews.get(companyId)?.atMs === atMs
+          && liveIsCurrent(companyId, liveViews.get(companyId))
+          && (cap.reviewAdmissionEpoch == null || cap.reviewAdmissionEpoch === reviewAdmissionEpoch);
+        // Weak calibration has no new target, but still reports running floors.
+        const hasRunningFloor = Object.values(runningByAgent).some(r => r.running > 0 || r.freeRunning > 0);
+        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !hasRunningFloor) {
+          return { status: 200, body: { atMs, calibration, target: null, agents: [],
+            ...(physicalOccupancy.running > 0 || physicalOccupancy.pending > 0 ? { physicalOccupancy } : {}) } };
         }
         // Agents with queued/ready work: assigned non-terminal issues
         // (todo + in_progress), grouped by assignee and weighted by count.
@@ -6880,7 +6954,15 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // Sanitized: callers get a stable code, never upstream text.
           // Details go server-side only.
           ctx.logger.error('model-capacity: caps issues read failed', { companyId, error: error?.message ?? String(error) });
-          return { status: 200, body: { atMs, calibration, target, agents: [], capsError: 'issues-unavailable' } };
+          refreshCensus();
+          const agents = Object.entries(runningByAgent).map(([agentId, r]) => {
+            const running = (r.running ?? 0) + (r.freeRunning ?? 0);
+            return { agentId, running, queued: 0, demand: running, allocated: running,
+              maxConcurrentRuns: running, reason: 'floor-running',
+              ...(cap.freeLanes ? { freeAllocated: r.freeRunning ?? 0 } : {}) };
+          }).filter(a => a.running > 0);
+          return { status: 200, body: { atMs, calibration, target: null, agents, physicalOccupancy,
+            capsError: 'issues-unavailable' } };
         }
         // Demand-aware caps: C* splits across agents in proportion to
         // CURRENT demand (running + queued), never historical share. Below
@@ -6889,7 +6971,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // cap lands below an agent's running count -- throttling existing
         // runs while the fleet idles is the failure this replaces.
         const blockingPriority = priorityRequested && priorities != null;
-        const runningByAgent = cap.agentRunning ?? {};
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
         // Review identities do not depend on model routing: fixed-model
         // reviewers receive the census too, but can use only their own pool.
@@ -6906,166 +6987,199 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const reviewDemand = reviewDemandConfig && !reviewAdmissionFresh
           ? { status: 'unavailable', eligibleHeads: 0, reason: 'review-admission-stale' }
           : await readReviewDemand(ctx, companyId, reviewDemandConfig);
-        const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent), ...reviewIds]);
-        if (heartbeat.ok) {
-          for (const agentId of heartbeat.counts.keys()) {
-            if (heartbeatIds.has(agentId)) agentIds.add(agentId);
-          }
-        }
-        const baseInputs = [...agentIds].map(agentId => ({
-          agentId,
-          running: runningByAgent[agentId]?.running ?? 0,
-          queued: heartbeatIds.has(agentId)
-            ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
-            : (counts.get(agentId) ?? 0),
-          overPace: runningByAgent[agentId]?.overPace === true,
-          ...(blockingPriority ? { allocationWeight: priorities.get(agentId)?.weight ?? 1 } : {}),
-        }));
-        const allocationInput = {
-          target: paidTarget ?? 0,
-          blockingPriority,
-          maxTotal: cap.maxTotal ?? 75,
-          demandFactor: cap.demandFactor ?? 1,
-          keepAgentIds: [...keptIds],
-          keptByAgent: cap.keptByAgent ?? {},
-          accounts: cap.accounts ?? [],
-          perAccount: cap.perAccount ?? [],
-          pacePools: cap.paceGuard?.pools ?? [],
-          unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
-          reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
-            reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
-              ? cap.reviewerAccountIdsByAgent[id] : []])),
-        };
-        // Probe the SAME account/pool/fleet guards without committing slots.
-        // Weight each once-only head share by usable post-heartbeat capacity:
-        // empty admissions and spent pools cannot strand a sibling's backlog.
-        const reviewShares = new Map();
-        if (reviewDemand.eligibleHeads > 0) {
-          const probe = allocateKeptAndRoutedCaps({ ...allocationInput, agents: baseInputs.map(a => ({ ...a,
-            // Priority competition happens AFTER heads join demand. Letting
-            // other queued work spend this feasibility probe can hide heads
-            // before the real weighted split; all running still reserves room.
-            queued: reviewIds.has(a.agentId) ? a.queued + reviewDemand.eligibleHeads : blockingPriority ? 0 : a.queued,
-          })) });
-          const queuedOf = new Map(baseInputs.map(a => [a.agentId, a.queued]));
-          const funded = [...probe.kept, ...probe.routed].filter(a => reviewIds.has(a.agentId))
-            .map(a => ({ id: a.agentId, slots: Math.max(0, a.allocated - a.running - queuedOf.get(a.agentId)) }))
-            .filter(a => a.slots > 0);
-          const slots = funded.reduce((sum, a) => sum + a.slots, 0);
-          const shares = funded.map(a => ({ ...a, exact: reviewDemand.eligibleHeads * a.slots / slots }));
-          for (const a of shares) reviewShares.set(a.id, Math.floor(a.exact));
-          let remainder = reviewDemand.eligibleHeads - [...reviewShares.values()].reduce((sum, n) => sum + n, 0);
-          shares.sort((a, b) => (b.exact % 1) - (a.exact % 1) || a.id.localeCompare(b.id));
-          for (const a of shares) {
-            if (remainder-- <= 0) break;
-            reviewShares.set(a.id, reviewShares.get(a.id) + 1);
-          }
-        }
-        const capInputs = baseInputs.map(a => ({ ...a, queued: a.queued + (reviewShares.get(a.agentId) ?? 0) }));
-        const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
-          heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
-        ]));
-        const allocated = allocateKeptAndRoutedCaps({ ...allocationInput, agents: capInputs });
-        const keptCaps = allocated.kept;
-        const unheld = allocated.routed;
-        // Hysteresis (#3): wants follow the instantaneous queue, so served
-        // caps fall on a half-life instead of tracking every dip (increases
-        // pass at once; a cap under demand would throttle real work). The
-        // hold state is advisory for routed agents; kept-agent pool ceilings
-        // are hard and must not be smoothed upward.
-        const nowMs = clock();
-        let agents = [...keptCaps, ...unheld];
+        let prevHold = {};
         try {
-          const prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
+          prevHold = (await ctx.state.get(scopeKey(companyId, CAPS_HOLD_KEY)))?.agents ?? {};
+        } catch (error) {
+          ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
+        }
+        const publish = () => {
+          refreshCensus();
+          const physicalCeiling = Math.max(0,
+            maxTotal - physicalOccupancy.unassignedRunning - physicalOccupancy.pending);
+          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
+          const namedFreeRunning = Object.values(freeRunning).reduce((sum, n) => sum + n, 0);
+          // Reserve free executing floors before paid allocation, holds and
+          // reserved floors. Recombine against the full physical ceiling below.
+          const paidCeiling = Math.max(0, physicalCeiling - namedFreeRunning);
+          const includeFree = cap.freeLanes != null || namedFreeRunning > 0;
+          const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent), ...reviewIds]);
+          if (heartbeat.ok) {
+            for (const agentId of heartbeat.counts.keys()) {
+              if (heartbeatIds.has(agentId)) agentIds.add(agentId);
+            }
+          }
+          const baseInputs = [...agentIds].map(agentId => ({
+            agentId,
+            running: runningByAgent[agentId]?.running ?? 0,
+            queued: heartbeatIds.has(agentId)
+              ? (heartbeat.ok ? (heartbeat.counts.get(agentId) ?? 0) : 0)
+              : (counts.get(agentId) ?? 0),
+            overPace: runningByAgent[agentId]?.overPace === true,
+            ...(blockingPriority ? { allocationWeight: priorities.get(agentId)?.weight ?? 1 } : {}),
+          }));
+          const allocationInput = {
+            target: paidTarget ?? 0,
+            blockingPriority,
+            maxTotal: paidCeiling,
+            demandFactor: cap.demandFactor ?? 1,
+            keepAgentIds: [...keptIds],
+            keptByAgent: cap.keptByAgent ?? {},
+            accounts: cap.accounts ?? [],
+            perAccount: cap.perAccount ?? [],
+            pacePools: cap.paceGuard?.pools ?? [],
+            unavailableAccountIds: cap.breakerUnavailableAccountIds ?? [],
+            reviewerAccountIdsByAgent: Object.fromEntries([...routedReviewIds].map(id => [id,
+              reviewAdmissionFresh && Array.isArray(cap.reviewerAccountIdsByAgent?.[id])
+                ? cap.reviewerAccountIdsByAgent[id] : []])),
+          };
+          // Probe the SAME account/pool/fleet guards without committing slots.
+          // Weight each once-only head share by usable post-heartbeat capacity:
+          // empty admissions and spent pools cannot strand a sibling's backlog.
+          const reviewShares = new Map();
+          if (reviewDemand.eligibleHeads > 0 && paidCeiling > 0) {
+            const probe = allocateKeptAndRoutedCaps({ ...allocationInput, agents: baseInputs.map(a => ({ ...a,
+              // Priority competition happens AFTER heads join demand. Letting
+              // other queued work spend this feasibility probe can hide heads
+              // before the real weighted split; all running still reserves room.
+              queued: reviewIds.has(a.agentId) ? a.queued + reviewDemand.eligibleHeads : blockingPriority ? 0 : a.queued,
+            })) });
+            const queuedOf = new Map(baseInputs.map(a => [a.agentId, a.queued]));
+            const funded = [...probe.kept, ...probe.routed].filter(a => reviewIds.has(a.agentId))
+              .map(a => ({ id: a.agentId, slots: Math.max(0, a.allocated - a.running - queuedOf.get(a.agentId)) }))
+              .filter(a => a.slots > 0);
+            const slots = funded.reduce((sum, a) => sum + a.slots, 0);
+            const shares = funded.map(a => ({ ...a, exact: reviewDemand.eligibleHeads * a.slots / slots }));
+            for (const a of shares) reviewShares.set(a.id, Math.floor(a.exact));
+            let remainder = reviewDemand.eligibleHeads - [...reviewShares.values()].reduce((sum, n) => sum + n, 0);
+            shares.sort((a, b) => (b.exact % 1) - (a.exact % 1) || a.id.localeCompare(b.id));
+            for (const a of shares) {
+              if (remainder-- <= 0) break;
+              reviewShares.set(a.id, reviewShares.get(a.id) + 1);
+            }
+          }
+          const capInputs = baseInputs.map(a => ({ ...a, queued: a.queued + (reviewShares.get(a.agentId) ?? 0) }));
+          const demandSourceOf = new Map([...agentIds].map(agentId => [agentId,
+            heartbeatIds.has(agentId) ? (heartbeat.ok ? 'heartbeat-runs' : 'heartbeat-runs-unavailable') : 'issues',
+          ]));
+          const allocated = allocateKeptAndRoutedCaps({ ...allocationInput, agents: capInputs });
+          const keptCaps = allocated.kept;
+          const unheld = allocated.routed;
+          // Hysteresis (#3): wants follow the instantaneous queue, so served
+          // caps fall on a half-life instead of tracking every dip (increases
+          // pass at once; a cap under demand would throttle real work). The
+          // hold state is advisory for routed agents; kept-agent pool ceilings
+          // are hard and must not be smoothed upward.
+          const nowMs = clock();
+          let agents = [...keptCaps, ...unheld];
           const held = holdCaps(unheld, prevHold, nowMs, {
-            halfLifeMs: (lastConfig.get(companyId)?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
-            staleMs: (lastConfig.get(companyId)?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
+            halfLifeMs: (resolved?.smoothing?.halfLifeMin ?? SMOOTHING_DEFAULTS.halfLifeMin) * 60000,
+            staleMs: (resolved?.smoothing?.staleHours ?? SMOOTHING_DEFAULTS.staleHours) * 3600000,
             ceiling: blockingPriority ? Math.min(allocated.routedCeiling,
               Math.max(0, Math.round(paidTarget) - keptCaps.reduce((sum, entry) => sum + entry.allocated, 0)))
               : allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
-          if (generation === configGenerationOf(companyId)) {
-            await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
+          // Reserved floors run LAST, after the allocator and the hold. Floors
+          // suspend during fleet-wide breaker cooling, and a kept-agent floor
+          // above its pool ceiling is blocked rather than violating pace.
+          const reservedFloors = resolved?.caps?.reservedFloors ?? {};
+          let floorsSuspended = false;
+          let floorSummary = {};
+          if (Object.keys(reservedFloors).length > 0) {
+            try {
+              const bstore = breakerStores.get(companyId) ?? createBreakerStore();
+              floorsSuspended = breakerSuspendsFloors(bstore, nowMs, resolved?.breakers ?? DEFAULT_BREAKERS);
+            } catch (error) {
+              ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
+            }
+            const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
+            // A configured floor cannot invent new slots or override the winner
+            // of a scarce priority split. Report the conflict, never hide it.
+            if (blockingPriority) {
+              for (const agent of agents) {
+                const floor = computeReservedFloor(agent.running, agent.queued, reservedFloors[agent.agentId]);
+                if (floor != null && floor > agent.allocated) blockedAgentIds.add(agent.agentId);
+              }
+            }
+            const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
+            for (const agent of keptCaps) {
+              const spec = reservedFloors[agent.agentId];
+              const input = inputsByAgent.get(agent.agentId);
+              const floor = input ? computeReservedFloor(input.running, input.queued, spec) : null;
+              const poolCeiling = allocated.keptCeilings.get(agent.agentId);
+              if (floor != null && floor > poolCeiling) blockedAgentIds.add(agent.agentId);
+            }
+            const floored = applyReservedFloors(agents, {
+              reservedFloors,
+              ceiling: paidCeiling,
+              blockedAgentIds: [...blockedAgentIds],
+            });
+            agents = floored.entries;
+            floorSummary = floored.floors;
           }
-        } catch (error) {
-          ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
-        }
-        // Reserved floors run LAST, after the allocator and the hold. Floors
-        // suspend during fleet-wide breaker cooling, and a kept-agent floor
-        // above its pool ceiling is blocked rather than violating pace.
-        const reservedFloors = resolved?.caps?.reservedFloors ?? {};
-        let floorsSuspended = false;
-        let floorSummary = {};
-        if (Object.keys(reservedFloors).length > 0) {
-          try {
-            const bstore = breakerStores.get(companyId) ?? createBreakerStore();
-            floorsSuspended = breakerSuspendsFloors(bstore, nowMs, resolved?.breakers ?? DEFAULT_BREAKERS);
-          } catch (error) {
-            ctx.logger.error('model-capacity: caps breaker read failed', { companyId, error: error?.message ?? String(error) });
+          if (includeFree) {
+            // Observed free floors do not depend on persisted free headroom.
+            const freeEnabled = freeLaneConfigs.get(companyId)?.enabled === true;
+            agents = freeLaneCaps(agents, freeRunning, freeEnabled ? (cap.freeLanes?.target ?? 0) : 0,
+              freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], physicalCeiling);
           }
-          const blockedAgentIds = new Set(floorsSuspended ? Object.keys(reservedFloors) : []);
-          // A configured floor cannot invent new slots or override the winner
-          // of a scarce priority split. Report the conflict, never hide it.
-          if (blockingPriority) {
-            for (const agent of agents) {
-              const floor = computeReservedFloor(agent.running, agent.queued, reservedFloors[agent.agentId]);
-              if (floor != null && floor > agent.allocated) blockedAgentIds.add(agent.agentId);
+          // Hysteresis, reserved floors and free additions cannot create physical
+          // slack. Only executing floors may exceed the configured process limit.
+          const admissionUnavailable = !admissionCurrent()
+            || ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0));
+          if (admissionUnavailable) agents = agents.map(a => ({ ...a, allocated: a.running,
+            reason: 'admission-unavailable', reviewEligibleHeads: 0 }));
+          agents = applyReservedFloors(agents, { ceiling: physicalCeiling }).entries;
+          for (const a of agents) {
+            a.maxConcurrentRuns = a.allocated;
+            if (includeFree) a.freeAllocated = Math.min(a.freeAllocated ?? 0,
+              Math.max(0, a.allocated - (runningByAgent[a.agentId]?.running ?? 0)));
+            if (a.floor != null && a.allocated < a.floor) {
+              a.floorBlocked = true;
+              floorSummary[a.agentId] = { floor: a.floor, applied: false, blocked: true };
             }
           }
-          const inputsByAgent = new Map(capInputs.map(agent => [agent.agentId, agent]));
-          for (const agent of keptCaps) {
-            const spec = reservedFloors[agent.agentId];
-            const input = inputsByAgent.get(agent.agentId);
-            const floor = input ? computeReservedFloor(input.running, input.queued, spec) : null;
-            const poolCeiling = allocated.keptCeilings.get(agent.agentId);
-            if (floor != null && floor > poolCeiling) blockedAgentIds.add(agent.agentId);
+          for (const agent of agents) {
+            agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
+            if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
+            if (reviewIds.has(agent.agentId) && reviewDemand.status !== 'disabled') {
+              agent.heartbeatQueued = heartbeat.ok ? (heartbeat.counts.get(agent.agentId) ?? 0) : 0;
+              agent.reviewEligibleHeads = admissionUnavailable ? 0 : (reviewShares.get(agent.agentId) ?? 0);
+              agent.demandSource = `heartbeat-runs+review-heads${reviewDemand.status === 'ok' ? '' : '-unavailable'}`;
+            }
           }
-          const floored = applyReservedFloors(agents, {
-            reservedFloors,
-            ceiling: cap.maxTotal ?? 75,
-            blockedAgentIds: [...blockedAgentIds],
-          });
-          agents = floored.entries;
-          floorSummary = floored.floors;
-        }
-        if (cap.freeLanes) {
-          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
-          // Free running and headroom stay outside the paid allocation above.
-          const freeEnabled = freeLaneConfigs.get(companyId)?.enabled === true;
-          agents = freeLaneCaps(agents, freeRunning, freeEnabled ? cap.freeLanes.target : 0,
-            freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], cap.maxTotal ?? 75);
-        }
-        for (const agent of agents) {
-          agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
-          if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
-          if (reviewIds.has(agent.agentId) && reviewDemand.status !== 'disabled') {
-            agent.heartbeatQueued = heartbeat.ok ? (heartbeat.counts.get(agent.agentId) ?? 0) : 0;
-            agent.reviewEligibleHeads = reviewShares.get(agent.agentId) ?? 0;
-            agent.demandSource = `heartbeat-runs+review-heads${reviewDemand.status === 'ok' ? '' : '-unavailable'}`;
+          // Reader invalidation alone cannot revoke a result already resolved
+          // before hold-state I/O. Fence the entire publication: an old config
+          // may preserve running work, but cannot authorize ANY new slots.
+          if (generation !== configGenerationOf(companyId)) {
+            const floors = agents.filter(a => a.running + a.queued > 0).map(a => ({ ...a,
+                allocated: a.running, maxConcurrentRuns: a.running,
+                demand: a.running + a.queued, reason: 'configuration-changed', reviewEligibleHeads: 0,
+                demandSource: demandSourceOf.get(a.agentId) ?? 'issues',
+              }));
+            return { hold: held.hold, response: { status: 200, body: { atMs, calibration, target: null, agents: floors,
+              capsError: 'configuration-changed',
+              reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
+              reservedFloors: {}, floorsSuspended: false, physicalOccupancy } } };
+          }
+          return { hold: held.hold, response: { status: 200, body: { atMs, calibration, target: admissionUnavailable ? null : target,
+            agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended, physicalOccupancy,
+            ...(admissionUnavailable ? { capsError: 'admission-unavailable' } : {}),
+            ...(priorityRequested ? { allocation: { blockingPriority,
+              ...(allocated.resourceStatus ? { resourceStatus: allocated.resourceStatus } : {}),
+              ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
+          } } };
+        };
+        const initial = publish();
+        if (generation === configGenerationOf(companyId) && admissionCurrent()) {
+          try {
+            await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: clock(), agents: initial.hold });
+          } catch (error) {
+            ctx.logger.error('model-capacity: caps hold unavailable', { companyId, error: error?.message ?? String(error) });
           }
         }
-        // Reader invalidation alone cannot revoke a result already resolved
-        // before hold-state I/O. Fence the entire publication: an old config
-        // may preserve running work, but cannot authorize ANY new slots.
-        if (generation !== configGenerationOf(companyId)) {
-          const paidFloors = baseInputs.map(a => ({ ...a, allocated: a.running, maxConcurrentRuns: a.running }));
-          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
-          const floors = (cap.freeLanes
-            ? freeLaneCaps(paidFloors, freeRunning, 0, [], cap.maxTotal ?? 75) : paidFloors)
-            .filter(a => a.running + a.queued > 0).map(a => ({ ...a,
-              demand: a.running + a.queued, reason: 'configuration-changed', reviewEligibleHeads: 0,
-            }));
-          return { status: 200, body: { atMs, calibration, target: null, agents: floors,
-            capsError: 'configuration-changed',
-            reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
-            reservedFloors: {}, floorsSuspended: false } };
-        }
-        return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended,
-          ...(priorityRequested ? { allocation: { blockingPriority,
-            ...(allocated.resourceStatus ? { resourceStatus: allocated.resourceStatus } : {}),
-            ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
-        } };
+        return publish().response;
       }
       return { status: 404, body: { error: 'unknown-route' } };
     },

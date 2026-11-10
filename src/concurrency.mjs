@@ -730,7 +730,7 @@ export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75
   const list = (entries ?? []).map(e => ({ ...e }));
   const specs = new Map(Object.entries(reservedFloors ?? {}));
   const blocked = new Set(blockedAgentIds ?? []);
-  const cap = Math.max(1, Math.floor(ceiling ?? 75));
+  const cap = Math.max(0, Math.floor(ceiling ?? 75));
   const applied = [];
   // Map accumulator, same '__proto__' discipline as the allocator above:
   // agentIds are host strings, and indexing a plain object with
@@ -772,18 +772,30 @@ export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75
     if (summary && !summary.blocked && summary.floor != null) return Math.max(summary.floor, running);
     return running;
   };
-  let guard = list.length * 400;
-  while (sum() > cap && guard-- > 0) {
-    let best = -1;
-    let bestNew = 0;
-    for (let i = 0; i < list.length; i++) {
-      const fresh = list[i].allocated - protectLine(list[i]);
-      if (fresh > bestNew) { best = i; bestNew = fresh; }
-    }
-    if (best < 0) break;
-    list[best].allocated -= 1;
-    list[best].maxConcurrentRuns = list[best].allocated;
+  const excess = Math.max(0, sum() - cap);
+  const fresh = list.map(e => Math.max(0, e.allocated - protectLine(e)));
+  const remaining = Math.max(0, fresh.reduce((s, n) => s + n, 0) - excess);
+  // Level the largest unprotected shares in bulk. Binary search finds the
+  // last complete level; the partial level retains the one-slot algorithm's
+  // index-stable tie break, without work proportional to configured caps.
+  let low = 0, high = fresh.reduce((largest, n) => Math.max(largest, n), 0);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (fresh.reduce((s, n) => s + Math.min(n, middle), 0) <= remaining) low = middle;
+    else high = middle - 1;
   }
+  let partial = remaining - fresh.reduce((s, n) => s + Math.min(n, low), 0);
+  const kept = fresh.map(n => Math.min(n, low));
+  for (let i = list.length - 1; i >= 0 && partial > 0; i--) {
+    if (fresh[i] > low) { kept[i]++; partial--; }
+  }
+  list.forEach((e, i) => {
+    const trim = fresh[i] - kept[i];
+    if (trim > 0) {
+      e.allocated -= trim;
+      e.maxConcurrentRuns = e.allocated;
+    }
+  });
   return { entries: list, applied, floors: Object.fromEntries(floorMap) };
 }
 

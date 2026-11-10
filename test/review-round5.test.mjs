@@ -9,7 +9,7 @@ import { withSyntheticReadiness } from './synthetic-readiness.mjs';
 
 // Review round 5 probes, one regression test each:
 // (1) E-calibration must count actual burn, not shadow picks;
-// (2) trimLedger must shed dead weight and hard-bound the persisted blob;
+// (2) trimLedger must hard-bound inactive history without erasing live pressure;
 // (3) GET /shadow must honor the requested limit with a separately computed size;
 // (4) concurrent first-ticks must share one ledger load, not race.
 
@@ -57,15 +57,36 @@ test('(2) trim sheds old terminal, old unverified, and stale records, and hard-b
   assert.ok(ledger.has('live'), 'live record retained');
 });
 
-test('(2) trim hard-bounds an over-cap ledger, newest activity survives', () => {
+test('(2) trim hard-bounds inactive history, newest activity survives', () => {
+  const nowMs = 1_760_000_000_000;
+  const ledger = createLedger();
+  for (let i = 0; i < 8; i++) {
+    recordStart(ledger, { runId: `r${i}`, agentId: 'a' }, nowMs - (8 - i) * 60_000);
+    recordTerminal(ledger, { runId: `r${i}` }, 'finished', nowMs - (8 - i) * 1000);
+  }
+  trimLedger(ledger, { nowMs, maxRecords: 5, staleHorizonMs: 2 * 3600 * 1000 });
+  assert.equal(ledger.size, 5);
+  for (const id of ['r3', 'r4', 'r5', 'r6', 'r7']) assert.ok(ledger.has(id), `${id} (newest) retained`);
+});
+
+test('(2) active overflow survives persistence; terminal activity restores the history bound', () => {
   const nowMs = 1_760_000_000_000;
   const ledger = createLedger();
   for (let i = 0; i < 8; i++) {
     recordStart(ledger, { runId: `r${i}`, agentId: 'a' }, nowMs - (8 - i) * 60_000);
   }
-  trimLedger(ledger, { nowMs, maxRecords: 5, staleHorizonMs: 2 * 3600 * 1000 });
-  assert.equal(ledger.size, 5);
-  for (const id of ['r3', 'r4', 'r5', 'r6', 'r7']) assert.ok(ledger.has(id), `${id} (newest) retained`);
+  // The old hard-bound fixture used eight executing runs: evicting three of
+  // those would manufacture three free slots. Only history is discardable.
+  const trim = () => trimLedger(ledger, { nowMs, maxRecords: 5, staleHorizonMs: 2 * 3600 * 1000 });
+  trim();
+  assert.equal(ledgerToJSON(ledger).length, 8);
+  for (let i = 0; i < 8; i++) assert.equal(ledger.get(`r${i}`).status, 'running');
+  for (let i = 0; i < 4; i++) recordTerminal(ledger, { runId: `r${i}` }, 'finished', nowMs - 4 + i);
+  trim();
+  assert.equal(ledgerToJSON(ledger).length, 5);
+  for (let i = 0; i < 3; i++) assert.ok(!ledger.has(`r${i}`), 'oldest inactive records evicted');
+  for (let i = 4; i < 8; i++) assert.equal(ledger.get(`r${i}`).status, 'running');
+  assert.ok(ledger.has('r3'), 'newest inactive record fits beside the four live rows');
 });
 
 const SECRET = { type: 'secret_ref', secretId: '11111111-2222-3333-4444-555555555555' };

@@ -23,6 +23,46 @@ const decide = (runId, accountId, at, extra = {}) => ({
   runId, agentId: 'agent-9', accountId, enforced: false, ...extra,
 });
 
+test('retained census G2: shadow-only decisions remain bounded while verified live and pending rows survive', () => {
+  const nowMs = 10000;
+  const shadowRows = Array.from({ length: 105 }, (_, i) => ({ runId: `shadow-${i}`,
+    decidedAccount: 'kimi:k1', enforced: false, decidedAt: nowMs - i,
+    ...(i % 2 ? { status: 'decided' } : {}) }));
+  const options = { nowMs, maxRecords: 100, staleHorizonMs: HORIZON };
+  const shadow = ledgerFromJSON(shadowRows);
+  assert.equal(inflightByAccount(shadow, { nowMs, horizonMs: HORIZON }).byAccount['kimi:k1'], 105,
+    'account-pressure intentionally includes shadow decisions before trimming');
+  trimLedger(shadow, options);
+  assert.equal(shadow.size, 100, '105 fresh non-enforced shadow decisions have no protected physical occupancy');
+  for (let i = 0; i < 100; i++) assert.ok(shadow.has(`shadow-${i}`));
+  const live = Array.from({ length: 105 }, (_, i) => ({ runId: `live-${i}`,
+    startedAt: nowMs - 1000, status: 'running', unverified: false }));
+  const mixed = ledgerFromJSON([...live, ...shadowRows,
+    { runId: 'pending', enforced: true, decidedAt: nowMs - 1000 },
+    { runId: 'unverified', status: 'running', startedAt: nowMs, unverified: true },
+    { runId: 'expired', status: 'running', startedAt: nowMs - HORIZON },
+    { runId: 'future', status: 'running', startedAt: nowMs + 1 },
+  ]);
+  trimLedger(mixed, options);
+  assert.equal(mixed.size, 106, 'only executing rows and a fresh enforced reservation can exceed the bound');
+  assert.ok(mixed.has('pending'));
+  assert.ok(![...mixed.keys()].some(k => k.startsWith('shadow-')));
+  const restarted = ledgerFromJSON(ledgerToJSON(mixed));
+  reconcileLedger(restarted, { nowMs, verifyWindowMs: HORIZON });
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 106);
+  recordStart(restarted, { runId: 'pending' }, nowMs);
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 106, 'pending to running is one identity');
+  for (const runId of restarted.keys()) recordTerminal(restarted, { runId }, 'finished', nowMs);
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 100, 'terminal cleanup restores the history cap');
+  const below = ledgerFromJSON([...live.slice(0, 2), ...shadowRows]);
+  trimLedger(below, options);
+  assert.equal(below.size, 100);
+  assert.ok(below.has('live-0') && below.has('live-1'), 'newer shadows cannot evict older live rows');
+});
+
 test('attribution is decided-first, never the model guess', () => {
   const ledger = createLedger();
   recordDecision(ledger, decide('r1', 'kimi:k1', 1000), 1000);
@@ -229,6 +269,44 @@ test('property: random interleavings preserve the four invariants', () => {
     // decidedSince stays consistent: post-horizon decisions are all present.
     assert.ok(decidedSince(ledger, now - HORIZON).length >= 0);
   }
+});
+
+test('history pressure retains verified live rows even when they alone exceed the valid bound', () => {
+  const ledger = createLedger();
+  for (let i = 0; i < 105; i++) recordStart(ledger, { runId: `live-${i}` }, 1000);
+  for (let i = 0; i < 150; i++) recordTerminal(ledger, { runId: `terminal-${i}` }, 'finished', 2000);
+  trimLedger(ledger, { nowMs: 3000, maxRecords: 100, staleHorizonMs: HORIZON });
+  assert.equal(ledger.size, 105, 'the bound is for discardable history, not physical occupancy');
+  assert.equal(inflightByAccount(ledger, { nowMs: 3000, horizonMs: HORIZON }).unattributed, 105);
+});
+
+test('merge lifecycle precedence is terminal then running then pending in either source order', () => {
+  for (const [baseStatus, overlayStatus, expected] of [
+    ['finished', 'running', 'finished'], ['running', 'cancelled', 'cancelled'],
+    ['running', 'decided', 'running'], ['decided', 'running', 'running'],
+  ]) {
+    const base = ledgerFromJSON([{ runId: 'r', status: baseStatus, startedAt: 1000 }]);
+    const overlay = ledgerFromJSON([{ runId: 'r', status: overlayStatus, decidedAt: 900 }]);
+    assert.equal(mergeLedger(base, overlay).get('r').status, expected);
+  }
+});
+
+test('identity promotion preserves conflicting known identity and enforced decision precedence', () => {
+  for (const agentId of ['unknown', '', null, 'original']) {
+    const base = ledgerFromJSON([{ runId: 'r', agentId, status: 'running',
+      startedAt: 1000, decidedAccount: 'kimi:k1', enforced: true }]);
+    const overlay = ledgerFromJSON([{ runId: 'r', agentId: 'worker', status: 'running',
+      startedAt: 1000, decidedAccount: 'kimi:k2', enforced: false }]);
+    const merged = mergeLedger(base, overlay).get('r');
+    assert.equal(merged.agentId, agentId === 'original' ? 'original' : 'worker');
+    assert.equal(merged.decidedAccount, 'kimi:k1');
+    assert.equal(merged.enforced, true);
+    recordStart(base, { runId: 'r', agentId: 'conflict' }, 1001);
+    assert.equal(merged.agentId, agentId === 'original' ? 'original' : 'worker');
+  }
+  const ledger = ledgerFromJSON([{ runId: 'r', agentId: 'unknown' }]);
+  recordStart(ledger, { runId: 'r', agentId: 'worker' }, 1000);
+  assert.equal(ledger.get('r').agentId, 'worker', 'direct start recording also promotes unknown identity');
 });
 
 test('merge keeps base records the overlay never saw', () => {

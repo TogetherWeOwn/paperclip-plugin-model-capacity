@@ -271,14 +271,14 @@ test('#3 /caps holds the served wants: a dip does not drop the cap on the spot',
   assert.ok(high && high.allocated >= 12, JSON.stringify(high));
   // Five minutes later the queue has dipped to 3 (live: 16 -> 13 -> 9).
   queue.todo = many(3);
-  d.setNow(T0 + 30 * MIN);
+  await d.step({ at: T0 + 30 * MIN, step: 2 });
   const dip = eng(await d.caps());
   assert.equal(dip.baseAllocated ?? dip.allocated, 3, 'the unheld want is the new demand');
   assert.ok(dip.allocated > 3, `held above the dip: ${dip.allocated}`);
   assert.ok(dip.allocated <= high.allocated);
   assert.equal(dip.reason, 'held');
   // Hours later the hold has decayed to the want.
-  d.setNow(T0 + 6 * 60 * MIN);
+  await d.step({ at: T0 + 6 * 60 * MIN, step: 2 });
   const later = eng(await d.caps());
   assert.equal(later.allocated, 3);
 });

@@ -247,6 +247,12 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
     setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
     seed: (k, v) => { store.set(skey(k), v); },
+    seedCaps: patch => {
+      const key = skey({ ...LEDGER_SKEY, stateKey: 'capacity-v1' });
+      store.set(key, { ...store.get(key), ...patch });
+    },
+    reconfigure: async next => { config = next; await plugin.onConfigChanged(config, { companyId: 'acme' }); },
+    io,
     // Fresh plugin on the same io store: the next tick cold-loads persisted
     // state (proves the persisted breaker form works, like review-breaker).
     reboot: () => { plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false }); },
@@ -637,6 +643,644 @@ test('/capacity trips the serving account on balance exhaustion, not the shadow 
     'every known codex arm opens and no foreign decided arm seeds state there');
   const metaOpen = cap.armBreakers.filter(e => e.accountId === metaAcct && e.status === 'open');
   assert.deepEqual(metaOpen, [], 'no meta arm trips on a codex-served failure');
+});
+
+// High synthetic targets isolate publication safety from pacing/calibration.
+// Admission metadata is retained from a real tick, never fabricated by tests.
+async function boundaryDrive({ maxTotal = 4, config = {}, records = [] } = {}) {
+  const d = drive({ nowMs: TICK, config: { enforce: true, concurrency: { maxTotal }, ...config },
+    issueLists: { todo: Array.from({ length: 8 }, (_, i) => ({ id: `q${i}`, assigneeAgentId: 'worker' })) } });
+  d.seed(LEDGER_SKEY, records);
+  await d.setup();
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  return d;
+}
+const newSlots = body => body.agents.reduce((n, a) => n + a.allocated - a.running, 0);
+
+const deferred = () => {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+};
+
+test('retained census F1: a start during deferred tick I/O remains physical occupancy', async () => {
+  const d = await boundaryDrive({ maxTotal: 1 });
+  const entered = deferred(), release = deferred();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'aa-snapshot-v1') { entered.resolve(); await release.promise; }
+    return get(key);
+  };
+  const tick = d.tick();
+  await entered.promise;
+  d.setNow(TICK + 100);
+  await d.fire(runEvent('during-read', TICK + 100, 'worker'));
+  release.resolve();
+  await tick;
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  const body = (await d.api('caps')).body;
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(newSlots(body), 0);
+  assert.equal((await get(LEDGER_SKEY)).find(r => r.runId === 'during-read').unverified, false);
+
+  const control = await boundaryDrive({ maxTotal: 1, records: [
+    { runId: 'future', status: 'running', agentId: 'worker', startedAt: TICK + 10_000 },
+    { runId: 'unanchored', status: 'running', agentId: 'worker' },
+  ] });
+  assert.equal((await control.api('caps')).body.physicalOccupancy.running, 0);
+  assert.equal(newSlots((await control.api('caps')).body), 1, 'unverifiable carried rows do not consume room');
+});
+
+test('retained census F2: valid bounded history pressure cannot erase executing or pending occupancy', async () => {
+  const records = [
+    ...['a', 'b'].map(runId => ({ runId, agentId: 'worker', status: 'running', startedAt: TICK - 1000 })),
+    { runId: 'pending', status: 'decided', enforced: true, decidedAt: TICK - 1000, decidedAccount: 'claude:a1' },
+    { runId: 'expired', status: 'running', startedAt: TICK - 3 * HOUR },
+    { runId: 'old-terminal', status: 'finished', terminalAt: TICK - 25 * HOUR },
+    ...Array.from({ length: 150 }, (_, i) => ({ runId: `terminal-${i}`, status: 'finished', terminalAt: TICK - i })),
+  ];
+  const d = await boundaryDrive({ maxTotal: 3, config: { shadow: { maxEntries: 100 } }, records });
+  const body = (await d.api('caps')).body;
+  assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 1 });
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2);
+  assert.equal(newSlots(body), 0);
+  const saved = await d.io.state.get(LEDGER_SKEY);
+  assert.equal(saved.length, 100);
+  for (const id of ['a', 'b', 'pending']) assert.ok(saved.some(r => r.runId === id), id);
+  for (const id of ['expired', 'old-terminal']) assert.ok(!saved.some(r => r.runId === id), id);
+  await d.fire(runEvent('pending', TICK, 'unknown'));
+  const started = (await d.api('caps')).body;
+  assert.deepEqual(started.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(started), 0, 'pending to running is one physical slot');
+  for (const id of ['a', 'b', 'pending']) await d.fire(runEvent(id, TICK, 'worker', 'agent.run.finished'));
+  assert.equal(newSlots((await d.api('caps')).body), 3, 'terminal observations release exactly the occupied room');
+
+  // Live pressure itself can exceed the history setting. Persist identities
+  // rather than silently evict executing rows, even across a worker restart.
+  const overflow = await boundaryDrive({ maxTotal: 3, config: { shadow: { maxEntries: 100 } }, records: [
+    ...Array.from({ length: 105 }, (_, i) => ({ runId: `live-${i}`, agentId: 'worker', status: 'running', startedAt: TICK - 1000 })),
+    ...records.filter(r => r.status === 'finished'),
+  ] });
+  assert.equal((await overflow.io.state.get(LEDGER_SKEY)).length, 105, 'only live identities exceed the history bound');
+  overflow.reboot(); await overflow.setup(); await overflow.tick();
+  overflow.seedCaps({ target: 20, calibration: 'measured' });
+  const over = (await overflow.api('caps')).body;
+  assert.deepEqual(over.physicalOccupancy, { running: 105, unassignedRunning: 0, pending: 0 });
+  assert.equal(over.agents.find(a => a.agentId === 'worker').running, 105);
+  assert.equal(newSlots(over), 0, 'over-capacity executing floors never authorize a grant');
+  overflow.setNow(TICK + 3 * MIN); overflow.setLane(0.3);
+  for (let i = 0; i < 105; i++) await overflow.fire(runEvent(`live-${i}`, TICK + 3 * MIN, 'worker', 'agent.run.finished'));
+  const capacityKey = { ...LEDGER_SKEY, stateKey: 'capacity-v1' };
+  const previous = await overflow.io.state.get(capacityKey);
+  const persist = overflow.io.state.set;
+  overflow.io.state.set = async (key, value) => {
+    if (key.stateKey === 'ledger-v1') throw Error('ledger write unavailable');
+    return persist(key, value);
+  };
+  await assert.rejects(overflow.tick(), /quota-refresh-failed/);
+  assert.strictEqual(await overflow.io.state.get(capacityKey), previous, 'failed ledger persist cannot publish new capacity');
+  assert.equal(newSlots((await overflow.api('caps')).body), 0, 'expired saved admission cannot turn released floors into grants');
+  overflow.io.state.set = persist;
+  await overflow.tick();
+  overflow.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal((await overflow.io.state.get(LEDGER_SKEY)).length, 100, 'terminal history returns to the hard bound');
+  const finished = (await overflow.api('caps')).body;
+  assert.equal(finished.physicalOccupancy.running, 0);
+  assert.equal(newSlots(finished), 3, 'only actual terminal observations release capacity');
+});
+
+test('retained census F3: successfully loaded stale ledger unions snapshot identities with terminal precedence', async () => {
+  const d = await boundaryDrive({ maxTotal: 4 });
+  await d.fire(runEvent('overlap', TICK, 'worker'));
+  const set = d.io.state.set;
+  let inserted = false;
+  d.io.state.set = async (key, value) => {
+    await set(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      await d.fire(runEvent('snapshot-only', TICK, 'other'));
+      await d.fire(runEvent('unnamed', TICK, 'unknown'));
+    }
+  };
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal((await d.io.state.get(LEDGER_SKEY)).length, 1, 'start is after the older nonempty persist');
+  d.reboot(); await d.setup();
+  await d.fire(runEvent('overlap', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(body.agents.find(a => a.agentId === 'other').running, 1);
+    assert.equal(newSlots(body), 0, 'snapshot union is reporting, not restart admission authority');
+  }
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  const fresh = (await d.api('caps')).body;
+  assert.deepEqual(fresh.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(fresh), 1, 'a fresh compatible tick preserves recovered pressure and only genuine slack');
+  await d.fire(runEvent('snapshot-only', TICK, 'other', 'agent.run.finished'));
+  await d.fire(runEvent('overlap', TICK, 'worker', 'agent.run.finished'));
+  await d.fire(runEvent('snapshot-only', TICK, 'other'));
+  const ended = (await d.api('caps')).body;
+  assert.deepEqual(ended.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(ended), 3, 'terminal observations release room without resurrection by snapshot or late start');
+});
+
+test('retained census G1: snapshot-only trial retains its family charge after restart and a fresh tick', async () => {
+  const d = drive({ nowMs: TICK,
+    config: { enforce: true, pacing: { guard: { enabled: false } },
+      trials: { maxInFlightPerFamily: 1, maxInFlightPerAccount: 10 } },
+    accounts: [{ lane: 'kimi-k1', provider: 'kimi', accountKey: 'k1', health: 'healthy',
+      meter: 'reactive', quality: 'reactive', models: ['kimi-k3-256k'],
+      observedAt: new Date(TICK).toISOString() }],
+    agentGets: { worker: { adapterType: 'claude-code' } },
+    snapshotRows: aaRows([{ slug: 'kimi-k3', intelligenceIndex: 55,
+      intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 }]),
+  });
+  // Keep a nonempty persisted ledger: this is a union, not legacy migration.
+  d.seed(LEDGER_SKEY, [{ runId: 'old', status: 'finished', terminalAt: TICK }]);
+  await d.setup(); await d.tick();
+  assert.equal((await d.hook('initial-trial', 'worker')).kind, 'decide');
+  await d.tick();
+  const family = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'initial-trial').family;
+  assert.ok(family, 'family comes from a real admission, not a fabricated snapshot');
+  await d.fire(runEvent('initial-trial', TICK, 'worker', 'agent.run.finished', { provider: 'kimi' }));
+  await d.tick();
+  const persist = d.io.state.set;
+  let inserted = false;
+  d.io.state.set = async (key, value) => {
+    await persist(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      assert.equal((await d.hook('late-trial', 'worker')).kind, 'decide');
+      await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.started', { provider: 'kimi' }));
+    }
+  };
+  await d.tick();
+  assert.ok(!(await d.io.state.get(LEDGER_SKEY)).some(r => r.runId === 'late-trial'));
+  const snapshot = await d.io.state.get({ ...LEDGER_SKEY, stateKey: 'capacity-v1' });
+  const saved = snapshot.runningCensusRecords.find(r => r.runId === 'late-trial');
+  d.reboot(); await d.setup();
+  // A duplicate observed start overlaps the snapshot without a second charge.
+  await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.started', { provider: 'kimi' }));
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.equal(cap.physicalOccupancy.running, 1);
+  assert.equal((await d.hook('blocked-trial', 'worker')).kind, 'defer', 'saturated family must reject an actual new admission');
+  const recovered = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'late-trial');
+  assert.equal(saved.trial, true, 'snapshot keeps the actual enforced trial classification');
+  assert.equal(recovered.trial, true);
+  assert.equal(recovered.family, family);
+  assert.equal(saved.family, family);
+  assert.equal(cap.trialFamilies[family].inFlight, 1);
+  assert.equal(cap.trialFamilies[family].budget, 0);
+  await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.finished', { provider: 'kimi' }));
+  await d.tick();
+  assert.equal((await d.api('capacity')).body.trialFamilies[saved.family].inFlight, 0);
+  assert.equal((await d.hook('released-trial', 'worker')).kind, 'decide', 'terminal releases the family slot');
+});
+
+test('retained census F4: unknown and empty identities promote without replacing conflicting known identity', async () => {
+  for (const agentId of ['unknown', '']) {
+    for (const pending of [false, true]) {
+      const { d } = await outageDrive({ records: [{ runId: 'promote', agentId,
+        ...(pending ? { status: 'decided', enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1' }
+          : { status: 'running', startedAt: TICK }) }] });
+      await d.fire(runEvent('promote', TICK, 'worker'));
+      for (let i = 0; i < 3; i++) {
+        const body = (await d.api('caps')).body;
+        assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+        assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+        assert.equal(newSlots(body), 0);
+      }
+    }
+  }
+  const { d } = await outageDrive({ records: [{ runId: 'conflict', agentId: 'original', status: 'running', startedAt: TICK }] });
+  await d.fire(runEvent('conflict', TICK, 'worker'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.physicalOccupancy.running, 1);
+  assert.equal(body.agents.find(a => a.agentId === 'original').running, 1);
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.running ?? 0, 0);
+  assert.equal(newSlots(body), 0);
+});
+
+for (const agentId of [undefined, null, '', 'unknown']) {
+  test(`/caps conserves unnamed physical occupancy (${String(agentId)}) at the hard fleet limit`, async () => {
+    const d = await boundaryDrive({ maxTotal: 2 });
+    await d.fire(runEvent('named', TICK, 'worker'));
+    await d.fire(runEvent('unnamed', TICK, agentId, 'agent.run.started', { provider: 'unmapped-provider' }));
+    for (const tick of [false, true]) {
+      if (tick) { await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' }); }
+      const body = (await d.api('caps')).body;
+      assert.equal(body.physicalOccupancy.running, 2);
+      assert.equal(body.physicalOccupancy.unassignedRunning, 1);
+      assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+      assert.equal(newSlots(body), 0, 'executing pressure is not apparent slack');
+      assert.ok(body.agents.every(a => a.agentId === 'worker'), 'no invented identity or attribution');
+      if (tick) {
+        const row = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'unnamed');
+        assert.equal(row.actualAccount ?? null, null, 'occupancy does not invent a serving account');
+      }
+    }
+  });
+}
+
+test('/caps burn mode never exempts executing work from the physical fleet boundary', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: { burnMode: { accounts: ['claude:a1'] } } });
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.accounts.find(a => a.accountId === 'claude:a1').burnMode, true);
+  await d.fire(runEvent('burn-running', TICK, 'unknown', 'agent.run.started', {
+    model: 'claude-haiku-5-5', accountId: 'claude:a1',
+  }));
+  assert.equal(newSlots((await d.api('caps')).body), 0);
+});
+
+test('/caps large reserved floors cannot outlive the ceiling balancer iteration budget', async () => {
+  const d = await boundaryDrive({ maxTotal: 1,
+    config: { caps: { reservedFloors: { worker: { base: 10_000, perQueued: 1, max: 10_000 } } } } });
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  assert.equal(newSlots((await d.api('caps')).body), 0);
+});
+
+test('/caps counts overlapping named and unnamed work once and leaves exactly the physical slack', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(newSlots(body), 2);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 3);
+});
+
+test('/caps preserves over-ceiling named floors and does not grant more work', async () => {
+  const d = await boundaryDrive({ maxTotal: 2 });
+  for (let i = 0; i < 3; i++) await d.fire(runEvent(`named-${i}`, TICK, 'worker'));
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 3);
+  assert.equal(newSlots(body), 0);
+});
+
+test('/caps pending-to-running transition reserves one slot, not zero or two', async () => {
+  const d = await boundaryDrive({ records: [{ runId: 'pending', agentId: 'unknown', status: 'decided',
+    enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1', unverified: false }] });
+  const before = (await d.api('caps')).body;
+  assert.equal(before.physicalOccupancy.pending, 1);
+  assert.equal(newSlots(before), 3);
+  await d.fire(runEvent('pending', TICK, 'unknown'));
+  const after = (await d.api('caps')).body;
+  assert.equal(after.physicalOccupancy.pending, 0);
+  assert.equal(after.physicalOccupancy.unassignedRunning, 1);
+  assert.equal(newSlots(after), 3);
+});
+
+test('/caps holds and reserved floors cannot bypass physical pressure or a zero remaining ceiling', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: { caps: { reservedFloors: { worker: { base: 4, perQueued: 1, max: 4 } } } } });
+  d.seed({ ...LEDGER_SKEY, stateKey: 'caps-hold-v1' }, { atMs: TICK, agents: { worker: { value: 20, atMs: TICK } } });
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.reservedFloors.worker.blocked, true);
+});
+
+for (const [label, patch] of [
+  ['future', { atMs: TICK + 1 }],
+  ['old generation', { reviewAdmissionGeneration: -1 }],
+  ['other worker', { reviewAdmissionEpoch: 'other-worker' }],
+  ['legacy persisted facts', { reviewAdmissionGeneration: undefined, reviewAdmissionEpoch: undefined }],
+]) {
+  test(`/caps ${label} facts preserve running but cannot authorize grants`, async () => {
+    const d = await boundaryDrive();
+    await d.fire(runEvent('named', TICK, 'worker'));
+    d.seedCaps(patch);
+    const body = (await d.api('caps')).body;
+    assert.equal(body.capsError, 'admission-unavailable');
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(newSlots(body), 0);
+  });
+}
+
+test('/caps uses the retained hook freshness window without expiring executing floors', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  d.setNow(TICK + 120_000);
+  assert.equal(newSlots((await d.api('caps')).body), 3, 'fresh compatible negative control');
+  d.setNow(TICK + 120_001);
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'admission-unavailable');
+  assert.equal(body.target, null);
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+});
+
+test('/caps rejects pre-existing config and restart authority even with identical counters and clocks', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  d.reboot(); await d.setup();
+  assert.equal(newSlots((await d.api('caps')).body), 0, 'same generation is not same worker');
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal(newSlots((await d.api('caps')).body), 3);
+  await d.reconfigure({ enforce: true, concurrency: { maxTotal: 1 } });
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(newSlots(body), 0, 'old maxTotal and target do not survive reconfiguration');
+});
+
+test('/caps unavailable demand or calibration never loses named running floors', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  d.seedCaps({ target: null, calibration: 'weak' });
+  assert.equal((await d.api('caps')).body.agents.find(a => a.agentId === 'worker').allocated, 1);
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  d.io.issues.list = async () => { throw Error('unavailable'); };
+  d.setNow(TICK + 20_000);
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'issues-unavailable');
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
+});
+
+test('/caps unavailable calibration preserves unnamed physical census diagnostics', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  d.seedCaps({ target: null, calibration: 'weak' });
+  const body = (await d.api('caps')).body;
+  assert.equal(body.target, null);
+  assert.deepEqual(body.agents, []);
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+});
+
+test('/caps configuration changes retain physical census diagnostics without new grants', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const get = d.io.state.get;
+  let changed = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !changed) {
+      changed = true;
+      await d.reconfigure({ enforce: true, concurrency: { maxTotal: 1 } });
+    }
+    return get(key);
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'configuration-changed');
+  assert.equal(newSlots(body), 0);
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+});
+
+test('/caps recomputes exhausted kept admission after a finish during hold I/O', async () => {
+  const d = await boundaryDrive({ config: { roles: { keepAgentIds: ['worker'] } } });
+  d.io.agents.getQueuedRunCounts = async () => [{ agentId: 'worker', queued: 8 }];
+  d.seedCaps({ keptByAgent: { worker: { accountId: 'claude:a1' } },
+    perAccount: [{ accountId: 'claude:a1', slots: 0 }] });
+  await d.fire(runEvent('ending', TICK, 'worker'));
+  const get = d.io.state.get;
+  let finished = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !finished) {
+      finished = true;
+      await d.fire(runEvent('ending', TICK, 'worker', 'agent.run.finished'));
+    }
+    return get(key);
+  };
+  const row = (await d.api('caps')).body.agents.find(a => a.agentId === 'worker');
+  assert.equal(row.running, 0);
+  assert.equal(row.allocated, 0, 'finished floors cannot become grants on an exhausted pool');
+});
+
+test('/caps preserves memory-only positive running evidence when ledger storage fails', async () => {
+  const d = await boundaryDrive();
+  d.reboot(); await d.setup();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  await d.fire(runEvent('memory-only', TICK, 'worker'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(body.physicalOccupancy.running, 1);
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.capsError, 'admission-unavailable');
+});
+
+async function outageDrive({ config = {}, records = [], legacy = false } = {}) {
+  const d = await boundaryDrive({ config, records });
+  if (records.length === 0) await d.fire(runEvent('saved', TICK, 'worker'));
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured', ...(legacy ? { runningCensusRecords: undefined } : {}) });
+  d.reboot(); await d.setup();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  return { d, get };
+}
+
+for (const burn of [false, true]) {
+  test(`/caps outage unions disjoint saved and memory runs (${burn ? 'burn' : 'ordinary'}) without refresh inflation`, async () => {
+    const { d, get } = await outageDrive({ config: burn ? { burnMode: { accounts: ['claude:a1'] } } : {} });
+    await d.fire(runEvent('distinct', TICK, 'worker'));
+    for (let i = 0; i < 3; i++) {
+      const body = (await d.api('caps')).body;
+      const row = body.agents.find(a => a.agentId === 'worker');
+      assert.equal(row.running, 2);
+      assert.equal(row.allocated, 2);
+      assert.equal(row.maxConcurrentRuns, 2);
+      assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 0 });
+      assert.equal(newSlots(body), 0);
+      assert.equal(body.capsError, 'admission-unavailable');
+    }
+    // Recovery uses the real ledger union, not the anonymous fallback bound.
+    d.io.state.get = get;
+    const recovered = (await d.api('caps')).body;
+    assert.equal(recovered.physicalOccupancy.running, 2);
+    assert.equal(recovered.agents.find(a => a.agentId === 'worker').running, 2);
+  });
+}
+
+test('/caps outage deduplicates overlapping starts and observes terminals from the memory ledger', async () => {
+  const { d } = await outageDrive();
+  await d.fire(runEvent('saved', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(body.physicalOccupancy.running, 1);
+    assert.equal(newSlots(body), 0);
+  }
+  await d.fire(runEvent('saved', TICK, 'worker', 'agent.run.finished'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.physicalOccupancy.running, 0);
+  assert.equal(newSlots(body), 0);
+});
+
+test('/caps outage reconciles a saved pending reservation with its memory-only start once', async () => {
+  const { d } = await outageDrive({ records: [{ runId: 'pending', agentId: 'worker', status: 'decided',
+    enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1', unverified: false }] });
+  const before = (await d.api('caps')).body;
+  assert.equal(before.physicalOccupancy.pending, 1);
+  await d.fire(runEvent('pending', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps outage refresh includes unnamed starts during hold I/O without inventing attribution', async () => {
+  const { d } = await outageDrive();
+  const get = d.io.state.get;
+  let started = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !started) {
+      started = true;
+      await d.fire(runEvent('unnamed', TICK, 'unknown'));
+    }
+    return get(key);
+  };
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 1, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.ok(body.agents.every(a => a.agentId !== 'unknown'));
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps legacy count-only outage conservatively retains saved plus partial memory floors', async () => {
+  const { d } = await outageDrive({ legacy: true });
+  await d.fire(runEvent('distinct', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2);
+    assert.equal(body.physicalOccupancy.running, 2);
+    assert.equal(newSlots(body), 0);
+  }
+});
+
+test('/caps legacy overlap bound is stable and disappears when the ledger recovers', async () => {
+  const { d, get } = await outageDrive({ legacy: true });
+  // Old snapshots may also predate the additive physical census.
+  d.seedCaps({ physicalOccupancy: undefined });
+  await d.fire(runEvent('saved', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2,
+      'without saved identities overlap cannot be proved; retain the conservative bound');
+    assert.equal(body.physicalOccupancy.running, 2);
+    assert.equal(newSlots(body), 0);
+  }
+  d.io.state.get = get;
+  const recovered = (await d.api('caps')).body;
+  assert.equal(recovered.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(recovered.physicalOccupancy.running, 1);
+  assert.equal(newSlots(recovered), 0, 'ledger recovery alone does not restore worker admission authority');
+});
+
+test('/caps unavailable issues publishes starts observed during the failed read', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('first', TICK, 'worker'));
+  let started = false;
+  d.setNow(TICK + 20_000);
+  d.io.issues.list = async () => {
+    if (!started) { started = true; await d.fire(runEvent('second', TICK, 'worker')); }
+    throw Error('issues unavailable');
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'issues-unavailable');
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 2);
+  assert.equal(body.physicalOccupancy.running, 2);
+});
+
+for (const weighted of [false, true]) {
+  test(`/caps physical pressure preserves ${weighted ? 'weighted priority' : 'feasible reserved floors'}`, async () => {
+    const d = await boundaryDrive({ config: weighted
+      ? { allocation: { blockingPriority: true } }
+      : { caps: { reservedFloors: { a: { base: 2, perQueued: 100, max: 2 } } } } });
+    d.io.issues.list = async ({ status }) => status !== 'todo' ? [] : ['a', 'b'].flatMap(agentId =>
+      Array.from({ length: 8 }, (_, i) => ({ id: `${agentId}-${i}`, assigneeAgentId: agentId,
+        status: 'todo', priority: agentId === 'a' ? 'high' : 'low', blockedBy: [] })));
+    d.setNow(TICK + 20_000);
+    await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+    await d.fire(runEvent('unknown-1', TICK, 'unknown'));
+    if (weighted) await d.fire(runEvent('unknown-2', TICK, 'unknown'));
+    const body = (await d.api('caps')).body;
+    const rows = new Map(body.agents.map(a => [a.agentId, a]));
+    assert.deepEqual(['a', 'b'].map(id => rows.get(id).allocated), weighted ? [2, 0] : [2, 1]);
+    assert.equal(newSlots(body), weighted ? 2 : 3);
+    if (!weighted) assert.equal(rows.get('a').floorBlocked ?? false, false);
+  });
+}
+
+test('/caps freshness crossed during hold I/O cannot redecorate positive admitted review shares', async () => {
+  const d = await boundaryDrive({ config: {
+    roles: { keepAgentIds: ['worker'] },
+    reviewerRouting: { agentIds: ['worker'], arms: [{ provider: 'claude', model: 'claude-haiku-5-5' }] },
+    reviewDemand: { repositories: ['example/product'], tokenSecretRef: SECRET, requiredChecks: ['ci-ok'] },
+  } });
+  const fetch = d.io.http.fetch;
+  const oid = 'a'.repeat(40);
+  d.io.http.fetch = async (url, ...args) => url !== 'https://api.github.com/graphql' ? fetch(url, ...args)
+    : { status: 200, text: async () => JSON.stringify({ data: { repository: { pullRequests: {
+      nodes: [{ number: 1, isDraft: false, mergeable: 'MERGEABLE', headRefOid: oid,
+        commits: { nodes: [{ commit: { oid, statusCheckRollup: { contexts: {
+          nodes: [{ __typename: 'CheckRun', name: 'ci-ok', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+          pageInfo: { hasNextPage: false },
+        } } } }] } }], pageInfo: { hasNextPage: false, endCursor: null },
+    } } } }) };
+  d.setNow(TICK + 60_000);
+  await d.reconfigure(await d.io.config.get());
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured',
+    perAccount: [{ accountId: 'claude:a1', slots: 8 }],
+    reviewerAccountIdsByAgent: { worker: ['claude:a1'] } });
+  const control = (await d.api('caps')).body;
+  assert.ok(control.agents.find(a => a.agentId === 'worker'), JSON.stringify(control));
+  assert.equal(control.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 1,
+    'fresh compatible control actually admits a head');
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1') d.setNow(TICK + 180_001);
+    return get(key);
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'admission-unavailable');
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 0);
+});
+
+test('/caps zero physical room cannot fund a fixed-reviewer head in the feasibility probe', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: {
+    roles: { keepAgentIds: ['worker'] }, reviewReserve: { agentIds: ['worker'] },
+    reviewDemand: { repositories: ['example/product'], tokenSecretRef: SECRET, requiredChecks: ['ci-ok'] },
+  } });
+  d.io.agents.getQueuedRunCounts = async () => [];
+  const fetch = d.io.http.fetch;
+  const oid = 'a'.repeat(40);
+  d.io.http.fetch = async (url, ...args) => url !== 'https://api.github.com/graphql' ? fetch(url, ...args)
+    : { status: 200, text: async () => JSON.stringify({ data: { repository: { pullRequests: {
+      nodes: [{ number: 1, isDraft: false, mergeable: 'MERGEABLE', headRefOid: oid,
+        commits: { nodes: [{ commit: { oid, statusCheckRollup: { contexts: {
+          nodes: [{ __typename: 'CheckRun', name: 'ci-ok', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+          pageInfo: { hasNextPage: false },
+        } } } }] } }], pageInfo: { hasNextPage: false, endCursor: null },
+    } } } }) };
+  d.setNow(TICK + 60_000);
+  await d.reconfigure(await d.io.config.get());
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured',
+    keptByAgent: { worker: { accountId: 'claude:a1' } }, perAccount: [{ accountId: 'claude:a1', slots: 8 }] });
+  const control = (await d.api('caps')).body;
+  assert.equal(control.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 1,
+    'a fresh fixed reviewer with physical room actually admits a head');
+  await d.fire(runEvent('unnamed', TICK + 60_000, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.reviewDemand.eligibleHeads, 1, 'census remains available');
+  assert.equal(body.capsError, undefined, 'zero room is not stale evidence');
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.reviewEligibleHeads ?? 0, 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.queued ?? 0, 0);
+  assert.equal(newSlots(body), 0);
 });
 
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {

@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
@@ -53,7 +54,7 @@ async function capsFixture({ cap = admissionSnapshot(), raw = routedConfig(), he
   const calls = [];
   const holdReached = deferred();
   const plugin = createModelCapacityPlugin({ clock: () => T0, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     state: { get: async k => {
       if (k.stateKey === 'caps-hold-v1' && holdGate) {
         holdReached.resolve();
@@ -70,8 +71,8 @@ async function capsFixture({ cap = admissionSnapshot(), raw = routedConfig(), he
       calls.push(JSON.parse(init.body).variables);
       return response(Array.from({ length: heads }, (_, i) => pull(i + 1)));
     } },
-  });
-  await plugin.onConfigChanged(raw, { companyId: 'acme' });
+  };
+  await setupCapsAdmission(plugin, io, { raw, cap, nowMs: T0 });
   return { calls, holdReached, plugin, raw, store,
     read: async () => {
       const result = await plugin.onApiRequest({ companyId: 'acme', routeKey: 'caps' });

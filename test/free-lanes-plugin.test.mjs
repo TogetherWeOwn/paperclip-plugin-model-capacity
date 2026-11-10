@@ -92,6 +92,99 @@ test('a started event for self does not consume its slot, and duplicate hook cal
   assert.notEqual((await d.hook({ runId: 'r4' })).model, MODEL);
 });
 
+for (const agentId of ['triage', 'unknown']) {
+  test(`genuine free occupancy (${agentId}) consumes physical room without becoming paid pressure`, async () => {
+    const d = await drive({ config: { concurrency: { maxTotal: 2 } }, records: [
+      { runId: 'free-running', agentId, status: 'running', startedAt: NOW, enforced: true,
+        decidedAccount: 'nvidia-nim:n1', freeProvider: 'nvidia-nim', unverified: false },
+    ] });
+    const capacity = await d.api('capacity');
+    assert.equal(capacity.inFlightByAccount['nvidia-nim:n1'], 1);
+    const caps = await d.api('caps');
+    const namedRunning = caps.agents.reduce((n, a) => n + a.running, 0);
+    assert.equal(namedRunning, agentId === 'triage' ? 1 : 0);
+    assert.equal(caps.physicalOccupancy.running, 1);
+    assert.equal(caps.physicalOccupancy.unassignedRunning, agentId === 'triage' ? 0 : 1);
+    assert.equal(caps.agents.reduce((n, a) => n + a.allocated - a.running, 0), 1);
+    assert.equal(caps.agents.find(a => a.agentId === 'builder')?.freeAllocated, 0);
+    assert.ok(caps.agents.every(a => a.agentId !== 'unknown'));
+    assert.equal(capacity.agentRunning.triage?.running ?? 0, 0, 'free running is not paid running');
+  });
+}
+
+test('storage-outage census preserves saved free attribution and deduplicates its overlapping start', async () => {
+  const first = await drive({ records: [
+    { runId: 'saved-free', agentId: 'triage', status: 'running', startedAt: NOW, enforced: true,
+      decidedAccount: 'nvidia-nim:n1', freeProvider: 'nvidia-nim', unverified: false },
+  ] });
+  const d = await drive({ state: first.store, initialTick: false });
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  for (const runId of ['saved-free', 'distinct']) {
+    await d.fire({ type: 'agent.run.started', companyId: 'acme', entityId: runId,
+      occurredAt: new Date(NOW).toISOString(), payload: { agentId: 'triage' } });
+  }
+  for (let i = 0; i < 3; i++) {
+    const body = await d.api('caps');
+    const row = body.agents.find(a => a.agentId === 'triage');
+    assert.equal(row.running, 2);
+    assert.equal(row.freeAllocated, 1, 'only the saved decided run has proved free attribution');
+    assert.equal(row.allocated, 2);
+    assert.equal(row.maxConcurrentRuns, 2);
+    assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 0 });
+    assert.equal(body.agents.reduce((n, a) => n + a.allocated - a.running, 0), 0);
+    assert.equal(body.capsError, 'admission-unavailable');
+  }
+});
+
+test('retained census G1 free: snapshot-only free classification survives restart without charging paid trials', async () => {
+  const first = await drive({ records: [{ runId: 'old', status: 'finished', terminalAt: NOW }] });
+  const set = first.io.state.set;
+  let inserted = false;
+  let decision;
+  first.io.state.set = async (key, value) => {
+    await set(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      decision = await first.hook({ runId: 'late-free' });
+      assert.equal(decision.model, MODEL);
+      await first.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'late-free',
+        occurredAt: new Date(NOW).toISOString(), payload: { run: { agentId: 'triage', provider: 'nvidia-nim', model: MODEL } } });
+    }
+  };
+  await first.tick();
+  assert.ok(!first.store.get(skey('ledger-v1')).some(r => r.runId === 'late-free'));
+  const snapshot = first.store.get(skey('capacity-v1')).runningCensusRecords.find(r => r.runId === 'late-free');
+  assert.equal(snapshot.freeProvider, 'nvidia-nim');
+  assert.deepEqual(snapshot.freeAnswer, decision);
+  const d = await drive({ state: first.store });
+  const row = d.store.get(skey('ledger-v1')).find(r => r.runId === 'late-free');
+  assert.equal(row.freeProvider, 'nvidia-nim');
+  assert.equal(row.trial, true, 'free decisions retain their ladder classification too');
+  assert.deepEqual(await d.hook({ runId: 'late-free' }), decision, 'same free admission is idempotent after recovery');
+  const cap = await d.api('capacity');
+  assert.equal(cap.physicalOccupancy.running, 1);
+  assert.equal(cap.agentRunning.triage.freeRunning, 1);
+  assert.equal(cap.agentRunning.triage.running, 0);
+  assert.equal(cap.trialFamilies[row.family].inFlight, 0, 'genuine free work never charges the paid family');
+  const paid = await drive({ records: [{ ...row, runId: 'paid-control', freeProvider: undefined, freeAnswer: undefined }] });
+  assert.equal((await paid.api('capacity')).trialFamilies[row.family].inFlight, 1,
+    'without an enforced free classification the same trial does charge the paid budget');
+});
+
+test('unknown ordinary occupancy cannot be replaced by an additive free grant at the physical ceiling', async () => {
+  const d = await drive({ config: { concurrency: { maxTotal: 1 } }, records: [
+    { runId: 'unmapped-running', agentId: 'unknown', status: 'running', startedAt: NOW, unverified: false },
+  ] });
+  const caps = await d.api('caps');
+  assert.equal(caps.physicalOccupancy.unassignedRunning, 1);
+  assert.equal(caps.agents.reduce((n, a) => n + a.allocated, 0), 0);
+  assert.ok(caps.agents.every(a => a.freeAllocated === 0));
+});
+
 test('high-risk, reviewer, kept, retries and unsupported adapters cannot use the free lane via ordinary routing or exhaustion', async () => {
   for (const extra of [{ agentId: 'builder' }, { agentId: 'thinker' }, { previous: { runId: 'old', model: MODEL } },
     { issueId: null }, { adapterType: 'unsupported' }]) {
@@ -150,6 +243,67 @@ test('disabling free lanes takes effect immediately; enabling waits for fresh na
   await off.tick();
   assert.equal((await off.hook()).model, MODEL);
 });
+
+test('enabling free lanes preserves executing floors before a fresh tick without admitting new work', async () => {
+  const d = await drive({ free: { ...freeConfig, enabled: false }, records: [
+    { runId: 'already-running', agentId: 'triage', status: 'running', startedAt: NOW,
+      enforced: true, decidedAccount: 'nvidia-nim:n1', unverified: false },
+  ] });
+  const old = await d.api('capacity');
+  assert.equal(old.freeLanes, undefined);
+  assert.equal(old.accounts.find(a => a.accountId === 'nvidia-nim:n1').freeCost, true);
+  assert.equal(old.agentRunning.triage.running, 1);
+  await d.configure({ freeLanes: freeConfig });
+  const before = await d.api('caps');
+  const row = before.agents.find(a => a.agentId === 'triage');
+  assert.equal(before.capsError, 'admission-unavailable');
+  assert.equal(before.target, null);
+  assert.equal(row.running, 1);
+  assert.equal(row.allocated, 1);
+  assert.equal(row.maxConcurrentRuns, 1);
+  assert.equal(row.freeAllocated, 1);
+  assert.equal(before.agents.reduce((n, a) => n + a.allocated - a.running, 0), 0);
+  await d.tick();
+  const after = await d.api('caps');
+  assert.equal(after.agents.find(a => a.agentId === 'triage').running, 1);
+  assert.equal(after.agents.find(a => a.agentId === 'triage').freeAllocated, 3);
+  assert.ok(after.agents.reduce((n, a) => n + a.allocated - a.running, 0) > 0,
+    'fresh tick restores admission, not merely the old executing floor');
+});
+
+for (const weighted of [false, true]) {
+  for (const freeCount of [0, 2]) {
+    test(`named free occupancy ${freeCount} preserves paid ${weighted ? 'priority shares' : 'reserved floors'}`, async () => {
+      const d = await drive({ config: { concurrency: { maxTotal: 4 },
+        ...(weighted ? { allocation: { blockingPriority: true } }
+          : { caps: { reservedFloors: { a: { base: 2, perQueued: 100, max: 2 } } } }),
+      }, records: Array.from({ length: freeCount }, (_, i) => ({ runId: `free-${i}`, agentId: 'triage',
+        status: 'running', startedAt: NOW, enforced: true, decidedAccount: 'nvidia-nim:n1',
+        freeProvider: 'nvidia-nim', unverified: false })) });
+      d.io.issues.list = async ({ status }) => status !== 'todo' ? [] : ['a', 'b'].flatMap(agentId =>
+        Array.from({ length: 8 }, (_, i) => ({ id: `${agentId}-${i}`, assigneeAgentId: agentId,
+          status, priority: agentId === 'a' ? 'high' : 'low', blockedBy: [] })));
+      d.setNow(NOW + 20_000);
+      await d.tick();
+      d.store.set(skey('capacity-v1'), { ...d.store.get(skey('capacity-v1')),
+        target: 20, paidTarget: 20, calibration: 'measured' });
+      d.store.set(skey('caps-hold-v1'), { atMs: NOW + 20_000,
+        agents: { a: { value: 4, atMs: NOW + 20_000 }, b: { value: 4, atMs: NOW + 20_000 } } });
+      const caps = await d.api('caps');
+      const rows = new Map(caps.agents.map(a => [a.agentId, a]));
+      assert.equal(caps.capsError, undefined);
+      assert.deepEqual(['a', 'b'].map(id => rows.get(id).allocated),
+        freeCount ? [2, 0] : weighted ? [3, 1] : [2, 2]);
+      if (!weighted) assert.equal(rows.get('a').floorBlocked ?? false, false);
+      assert.equal(caps.agents.reduce((n, a) => n + a.allocated, 0), 4,
+        'free running is reserved once; recombination uses the full physical ceiling');
+      if (freeCount) {
+        assert.equal(rows.get('triage').running, freeCount);
+        assert.equal(rows.get('triage').freeAllocated, freeCount);
+      }
+    });
+  }
+}
 
 test('free running remains outside paid C* and paid running after the next tick', async () => {
   const d = await drive();
