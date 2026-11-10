@@ -23,6 +23,46 @@ const decide = (runId, accountId, at, extra = {}) => ({
   runId, agentId: 'agent-9', accountId, enforced: false, ...extra,
 });
 
+test('retained census G2: shadow-only decisions remain bounded while verified live and pending rows survive', () => {
+  const nowMs = 10000;
+  const shadowRows = Array.from({ length: 105 }, (_, i) => ({ runId: `shadow-${i}`,
+    decidedAccount: 'kimi:k1', enforced: false, decidedAt: nowMs - i,
+    ...(i % 2 ? { status: 'decided' } : {}) }));
+  const options = { nowMs, maxRecords: 100, staleHorizonMs: HORIZON };
+  const shadow = ledgerFromJSON(shadowRows);
+  assert.equal(inflightByAccount(shadow, { nowMs, horizonMs: HORIZON }).byAccount['kimi:k1'], 105,
+    'account-pressure intentionally includes shadow decisions before trimming');
+  trimLedger(shadow, options);
+  assert.equal(shadow.size, 100, '105 fresh non-enforced shadow decisions have no protected physical occupancy');
+  for (let i = 0; i < 100; i++) assert.ok(shadow.has(`shadow-${i}`));
+  const live = Array.from({ length: 105 }, (_, i) => ({ runId: `live-${i}`,
+    startedAt: nowMs - 1000, status: 'running', unverified: false }));
+  const mixed = ledgerFromJSON([...live, ...shadowRows,
+    { runId: 'pending', enforced: true, decidedAt: nowMs - 1000 },
+    { runId: 'unverified', status: 'running', startedAt: nowMs, unverified: true },
+    { runId: 'expired', status: 'running', startedAt: nowMs - HORIZON },
+    { runId: 'future', status: 'running', startedAt: nowMs + 1 },
+  ]);
+  trimLedger(mixed, options);
+  assert.equal(mixed.size, 106, 'only executing rows and a fresh enforced reservation can exceed the bound');
+  assert.ok(mixed.has('pending'));
+  assert.ok(![...mixed.keys()].some(k => k.startsWith('shadow-')));
+  const restarted = ledgerFromJSON(ledgerToJSON(mixed));
+  reconcileLedger(restarted, { nowMs, verifyWindowMs: HORIZON });
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 106);
+  recordStart(restarted, { runId: 'pending' }, nowMs);
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 106, 'pending to running is one identity');
+  for (const runId of restarted.keys()) recordTerminal(restarted, { runId }, 'finished', nowMs);
+  trimLedger(restarted, options);
+  assert.equal(restarted.size, 100, 'terminal cleanup restores the history cap');
+  const below = ledgerFromJSON([...live.slice(0, 2), ...shadowRows]);
+  trimLedger(below, options);
+  assert.equal(below.size, 100);
+  assert.ok(below.has('live-0') && below.has('live-1'), 'newer shadows cannot evict older live rows');
+});
+
 test('attribution is decided-first, never the model guess', () => {
   const ledger = createLedger();
   recordDecision(ledger, decide('r1', 'kimi:k1', 1000), 1000);

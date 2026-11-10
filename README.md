@@ -170,8 +170,14 @@ native run-account event/read contract ships; never add callback reservations.
 history, not physical execution. After TTL/horizon cleanup, trimming persists at
 most `max(shadow.maxEntries, verified live rows)` records: terminal/inactive
 history fills only the remaining room, oldest activity evicted first. Live rows
-include executing runs and fresh pending reservations; their identities must
-survive persistence and restart even when they alone exceed the history setting.
+include verified executing runs and fresh **enforced** pending reservations;
+non-enforced, unstarted shadow decisions remain discardable history even though
+the account-pressure census deliberately counts fresh decisions. Protected run
+identities must survive persistence and restart even when they alone exceed the
+history setting. Capacity census snapshots retain complete ledger records so
+partial-tick recovery preserves trial/family charges and enforced free-lane
+classification as well as physical occupancy; a saved recommendation is still
+not current-worker admission authority.
 This is an input-dependent bound, not an unconditional fixed-size blob. Existing
 reconciliation/freshness rules still expire unverifiable evidence; the history
 setting adds no new TTL. `/shadow` output retains its independent requested limit.

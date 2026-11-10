@@ -140,6 +140,41 @@ test('storage-outage census preserves saved free attribution and deduplicates it
   }
 });
 
+test('retained census G1 free: snapshot-only free classification survives restart without charging paid trials', async () => {
+  const first = await drive({ records: [{ runId: 'old', status: 'finished', terminalAt: NOW }] });
+  const set = first.io.state.set;
+  let inserted = false;
+  let decision;
+  first.io.state.set = async (key, value) => {
+    await set(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      decision = await first.hook({ runId: 'late-free' });
+      assert.equal(decision.model, MODEL);
+      await first.fire({ type: 'agent.run.started', companyId: 'acme', entityId: 'late-free',
+        occurredAt: new Date(NOW).toISOString(), payload: { run: { agentId: 'triage', provider: 'nvidia-nim', model: MODEL } } });
+    }
+  };
+  await first.tick();
+  assert.ok(!first.store.get(skey('ledger-v1')).some(r => r.runId === 'late-free'));
+  const snapshot = first.store.get(skey('capacity-v1')).runningCensusRecords.find(r => r.runId === 'late-free');
+  assert.equal(snapshot.freeProvider, 'nvidia-nim');
+  assert.deepEqual(snapshot.freeAnswer, decision);
+  const d = await drive({ state: first.store });
+  const row = d.store.get(skey('ledger-v1')).find(r => r.runId === 'late-free');
+  assert.equal(row.freeProvider, 'nvidia-nim');
+  assert.equal(row.trial, true, 'free decisions retain their ladder classification too');
+  assert.deepEqual(await d.hook({ runId: 'late-free' }), decision, 'same free admission is idempotent after recovery');
+  const cap = await d.api('capacity');
+  assert.equal(cap.physicalOccupancy.running, 1);
+  assert.equal(cap.agentRunning.triage.freeRunning, 1);
+  assert.equal(cap.agentRunning.triage.running, 0);
+  assert.equal(cap.trialFamilies[row.family].inFlight, 0, 'genuine free work never charges the paid family');
+  const paid = await drive({ records: [{ ...row, runId: 'paid-control', freeProvider: undefined, freeAnswer: undefined }] });
+  assert.equal((await paid.api('capacity')).trialFamilies[row.family].inFlight, 1,
+    'without an enforced free classification the same trial does charge the paid budget');
+});
+
 test('unknown ordinary occupancy cannot be replaced by an additive free grant at the physical ceiling', async () => {
   const d = await drive({ config: { concurrency: { maxTotal: 1 } }, records: [
     { runId: 'unmapped-running', agentId: 'unknown', status: 'running', startedAt: NOW, unverified: false },

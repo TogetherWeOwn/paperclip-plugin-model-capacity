@@ -2567,11 +2567,10 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       if (r?.unverified === true) continue;
       const executing = r?.status === 'running';
       if (!executing && !(r?.enforced === true && isInflight(r, nowMs, horizonMs))) continue;
-      // Minimal ledger evidence lets a later storage-outage view union by runId,
-      // including pending -> running and terminal overlays, without guessing overlap.
-      runningCensusRecords.push({ runId: r.runId, agentId: r.agentId, status: r.status,
-        startedAt: r.startedAt, decidedAt: r.decidedAt, enforced: r.enforced,
-        decidedAccount: r.decidedAccount, actualAccount: r.actualAccount });
+      // These rows also recover canonical ledger records after a partial tick
+      // write. Keep the whole record: identity/occupancy alone cannot restore
+      // trial family charges, enforced free classification or decision evidence.
+      runningCensusRecords.push({ ...r });
       if (!executing) { pending += 1; continue; }
       running += 1;
       if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') {

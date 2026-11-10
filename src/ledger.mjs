@@ -392,7 +392,11 @@ export function trimLedger(ledger, { nowMs, maxRecords = LEDGER_CAP, terminalTtl
   }
   if (ledger.size > maxRecords) {
     const activityOf = (r) => Math.max(r?.startedAt ?? 0, r?.decidedAt ?? 0, r?.terminalAt ?? 0);
-    const ordered = [...ledger.values()].filter(r => !isInflight(r, nowMs, staleHorizonMs ?? Infinity))
+    // Account-pressure isInflight deliberately includes shadow-only decisions.
+    // Only execution or an enforced pending reservation protects persistence.
+    const protectedOccupancy = r => (r?.status === 'running' || r?.enforced === true)
+      && isInflight(r, nowMs, staleHorizonMs ?? Infinity);
+    const ordered = [...ledger.values()].filter(r => !protectedOccupancy(r))
       .sort((a, b) => activityOf(a) - activityOf(b));
     for (const r of ordered) {
       if (ledger.size <= maxRecords) break;

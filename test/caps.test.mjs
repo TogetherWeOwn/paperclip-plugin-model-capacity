@@ -788,6 +788,60 @@ test('retained census F3: successfully loaded stale ledger unions snapshot ident
   assert.equal(newSlots(ended), 3, 'terminal observations release room without resurrection by snapshot or late start');
 });
 
+test('retained census G1: snapshot-only trial retains its family charge after restart and a fresh tick', async () => {
+  const d = drive({ nowMs: TICK,
+    config: { enforce: true, pacing: { guard: { enabled: false } },
+      trials: { maxInFlightPerFamily: 1, maxInFlightPerAccount: 10 } },
+    accounts: [{ lane: 'kimi-k1', provider: 'kimi', accountKey: 'k1', health: 'healthy',
+      meter: 'reactive', quality: 'reactive', models: ['kimi-k3-256k'],
+      observedAt: new Date(TICK).toISOString() }],
+    agentGets: { worker: { adapterType: 'claude-code' } },
+    snapshotRows: aaRows([{ slug: 'kimi-k3', intelligenceIndex: 55,
+      intelligenceIndexCostPerTask: 10, price1mInputTokens: 1, price1mOutputTokens: 4 }]),
+  });
+  // Keep a nonempty persisted ledger: this is a union, not legacy migration.
+  d.seed(LEDGER_SKEY, [{ runId: 'old', status: 'finished', terminalAt: TICK }]);
+  await d.setup(); await d.tick();
+  assert.equal((await d.hook('initial-trial', 'worker')).kind, 'decide');
+  await d.tick();
+  const family = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'initial-trial').family;
+  assert.ok(family, 'family comes from a real admission, not a fabricated snapshot');
+  await d.fire(runEvent('initial-trial', TICK, 'worker', 'agent.run.finished', { provider: 'kimi' }));
+  await d.tick();
+  const persist = d.io.state.set;
+  let inserted = false;
+  d.io.state.set = async (key, value) => {
+    await persist(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      assert.equal((await d.hook('late-trial', 'worker')).kind, 'decide');
+      await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.started', { provider: 'kimi' }));
+    }
+  };
+  await d.tick();
+  assert.ok(!(await d.io.state.get(LEDGER_SKEY)).some(r => r.runId === 'late-trial'));
+  const snapshot = await d.io.state.get({ ...LEDGER_SKEY, stateKey: 'capacity-v1' });
+  const saved = snapshot.runningCensusRecords.find(r => r.runId === 'late-trial');
+  d.reboot(); await d.setup();
+  // A duplicate observed start overlaps the snapshot without a second charge.
+  await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.started', { provider: 'kimi' }));
+  await d.tick();
+  const cap = (await d.api('capacity')).body;
+  assert.equal(cap.physicalOccupancy.running, 1);
+  assert.equal((await d.hook('blocked-trial', 'worker')).kind, 'defer', 'saturated family must reject an actual new admission');
+  const recovered = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'late-trial');
+  assert.equal(saved.trial, true, 'snapshot keeps the actual enforced trial classification');
+  assert.equal(recovered.trial, true);
+  assert.equal(recovered.family, family);
+  assert.equal(saved.family, family);
+  assert.equal(cap.trialFamilies[family].inFlight, 1);
+  assert.equal(cap.trialFamilies[family].budget, 0);
+  await d.fire(runEvent('late-trial', TICK, 'worker', 'agent.run.finished', { provider: 'kimi' }));
+  await d.tick();
+  assert.equal((await d.api('capacity')).body.trialFamilies[saved.family].inFlight, 0);
+  assert.equal((await d.hook('released-trial', 'worker')).kind, 'decide', 'terminal releases the family slot');
+});
+
 test('retained census F4: unknown and empty identities promote without replacing conflicting known identity', async () => {
   for (const agentId of ['unknown', '']) {
     for (const pending of [false, true]) {
