@@ -716,6 +716,39 @@ test('retained census F2: valid bounded history pressure cannot erase executing 
   assert.equal(newSlots(started), 0, 'pending to running is one physical slot');
   for (const id of ['a', 'b', 'pending']) await d.fire(runEvent(id, TICK, 'worker', 'agent.run.finished'));
   assert.equal(newSlots((await d.api('caps')).body), 3, 'terminal observations release exactly the occupied room');
+
+  // Live pressure itself can exceed the history setting. Persist identities
+  // rather than silently evict executing rows, even across a worker restart.
+  const overflow = await boundaryDrive({ maxTotal: 3, config: { shadow: { maxEntries: 100 } }, records: [
+    ...Array.from({ length: 105 }, (_, i) => ({ runId: `live-${i}`, agentId: 'worker', status: 'running', startedAt: TICK - 1000 })),
+    ...records.filter(r => r.status === 'finished'),
+  ] });
+  assert.equal((await overflow.io.state.get(LEDGER_SKEY)).length, 105, 'only live identities exceed the history bound');
+  overflow.reboot(); await overflow.setup(); await overflow.tick();
+  overflow.seedCaps({ target: 20, calibration: 'measured' });
+  const over = (await overflow.api('caps')).body;
+  assert.deepEqual(over.physicalOccupancy, { running: 105, unassignedRunning: 0, pending: 0 });
+  assert.equal(over.agents.find(a => a.agentId === 'worker').running, 105);
+  assert.equal(newSlots(over), 0, 'over-capacity executing floors never authorize a grant');
+  overflow.setNow(TICK + 3 * MIN); overflow.setLane(0.3);
+  for (let i = 0; i < 105; i++) await overflow.fire(runEvent(`live-${i}`, TICK + 3 * MIN, 'worker', 'agent.run.finished'));
+  const capacityKey = { ...LEDGER_SKEY, stateKey: 'capacity-v1' };
+  const previous = await overflow.io.state.get(capacityKey);
+  const persist = overflow.io.state.set;
+  overflow.io.state.set = async (key, value) => {
+    if (key.stateKey === 'ledger-v1') throw Error('ledger write unavailable');
+    return persist(key, value);
+  };
+  await assert.rejects(overflow.tick(), /quota-refresh-failed/);
+  assert.strictEqual(await overflow.io.state.get(capacityKey), previous, 'failed ledger persist cannot publish new capacity');
+  assert.equal(newSlots((await overflow.api('caps')).body), 0, 'expired saved admission cannot turn released floors into grants');
+  overflow.io.state.set = persist;
+  await overflow.tick();
+  overflow.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal((await overflow.io.state.get(LEDGER_SKEY)).length, 100, 'terminal history returns to the hard bound');
+  const finished = (await overflow.api('caps')).body;
+  assert.equal(finished.physicalOccupancy.running, 0);
+  assert.equal(newSlots(finished), 3, 'only actual terminal observations release capacity');
 });
 
 test('retained census F3: successfully loaded stale ledger unions snapshot identities with terminal precedence', async () => {

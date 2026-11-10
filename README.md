@@ -166,6 +166,20 @@ another run's observed account pressure. Model-attributed fixtures prove the ove
 mechanism, **not upstream availability of that metadata**. Exit the interim when a
 native run-account event/read contract ships; never add callback reservations.
 
+**Retained ledger size and occupancy:** `shadow.maxEntries` bounds discardable
+history, not physical execution. After TTL/horizon cleanup, trimming persists at
+most `max(shadow.maxEntries, verified live rows)` records: terminal/inactive
+history fills only the remaining room, oldest activity evicted first. Live rows
+include executing runs and fresh pending reservations; their identities must
+survive persistence and restart even when they alone exceed the history setting.
+This is an input-dependent bound, not an unconditional fixed-size blob. Existing
+reconciliation/freshness rules still expire unverifiable evidence; the history
+setting adds no new TTL. `/shadow` output retains its independent requested limit.
+Executing floors above the configured fleet ceiling remain reportable but yield
+zero new grants. A failed ledger write aborts the tick before fresh capacity is
+published; saved or stale recommendations do not independently authorize grants.
+Once runs terminate, the next trim returns inactive history to `maxEntries`.
+
 Per amendment A4, G-1 pristine-upstream and G-T fork-image staging proofs belong to
 **slice 5 rollout**, not slice-4 code acceptance. Slice 4 is accepted on code and
 local package/tests with `router.enabled` defaulting false. Do not claim native

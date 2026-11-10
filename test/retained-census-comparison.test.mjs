@@ -23,8 +23,12 @@ test('retained census: four discriminating Actions source comparisons', {
     for (const [label, sha] of [['before', before], ['corrected', after]]) {
       const source = join(dir, label);
       mkdirSync(source);
-      const archive = execFileSync('git', ['-C', root, 'archive', sha, 'src', 'scripts', 'package.json', 'test/synthetic-readiness.mjs']);
-      execFileSync('tar', ['-x', '-C', source], { input: archive });
+      // Write the archive directly to a file: source size must not be limited
+      // by execFileSync's stdout buffer (nor require buffering a tar in memory).
+      const archive = join(dir, `${label}.tar`);
+      execFileSync('git', ['-C', root, 'archive', '--output', archive, sha,
+        'src', 'scripts', 'package.json', 'test/synthetic-readiness.mjs'], { timeout: 20_000 });
+      execFileSync('tar', ['-xf', archive, '-C', source], { timeout: 20_000 });
       copyFileSync(join(root, 'test/caps.test.mjs'), join(source, 'test/caps.test.mjs'));
       for (const finding of ['F1', 'F2', 'F3', 'F4']) {
         const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap',
