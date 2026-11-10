@@ -19,6 +19,10 @@ test('retained census: four discriminating Actions source comparisons', {
   const after = event.pull_request?.head?.sha ?? process.env.GITHUB_SHA;
   assert.match(after, /^[a-f0-9]{40}$/);
   const dir = mkdtempSync(join(tmpdir(), 'retained-census-'));
+  // An independent test runner must not inherit the parent's internal child
+  // marker: Node otherwise skips it as a recursive node:test invocation.
+  const childEnv = { ...process.env };
+  delete childEnv.NODE_TEST_CONTEXT;
   try {
     for (const [label, sha] of [['before', before], ['corrected', after]]) {
       const source = join(dir, label);
@@ -33,7 +37,7 @@ test('retained census: four discriminating Actions source comparisons', {
       for (const finding of ['F1', 'F2', 'F3', 'F4']) {
         const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap',
           `--test-name-pattern=^retained census ${finding}:`, join(source, 'test/caps.test.mjs')], {
-          cwd: source, encoding: 'utf8', timeout: 20_000,
+          cwd: source, env: childEnv, encoding: 'utf8', timeout: 20_000,
         });
         console.log(`${finding} ${label} source=${sha} regression-input=${after}\n${result.stdout}\n${result.stderr}`);
         assert.ifError(result.error);
