@@ -26,8 +26,8 @@
  * only marks unverifiable records `unverified` (excluded from counting);
  * it NEVER deletes -- the shadow log is built from the same records and
  * survives restarts. Trimming (for the persist bound) drops old terminal,
- * old unverified, and stale-horizon records first, then oldest activity
- * past the cap -- live in-flight records are always newest and survive.
+ * old unverified, and stale-horizon records first, then oldest inactive
+ * activity past the history cap. Verified live pressure is never evicted.
  */
 
 export const LEDGER_TERMINAL_STATUSES = new Set(['finished', 'failed', 'cancelled']);
@@ -69,8 +69,9 @@ function ensure(ledger, runId) {
   return r;
 }
 
+const unknownAgent = v => v == null || v === '' || v === 'unknown';
 const fill = (r, k, v) => {
-  if (r[k] == null && v != null) r[k] = v;
+  if ((r[k] == null || (k === 'agentId' && unknownAgent(r[k]))) && v != null) r[k] = v;
 };
 
 /**
@@ -370,12 +371,10 @@ export function shadowEntries(ledger, { limit = 100 } = {}) {
  * Trim for persist: drop terminal records older than the TTL, then
  * unverified and stale-horizon non-terminal records (reconcile already
  * excludes both from counting, and a late start/terminal event re-creates
- * the record if the run proves alive again). Past the cap, evict
- * oldest-activity-first. The persisted blob is therefore HARD-bounded at
- * maxRecords: in practice only dead weight reaches the cap pass, because
- * live in-flight records are always the newest activity; if live pressure
- * alone ever exceeds the cap the oldest of it is shed first (fail-safe
- * against unbounded persist growth, at the cost of the stalest pressure).
+ * the record if the run proves alive again). Past the history cap, evict
+ * inactive records oldest-activity-first. If verified live pressure alone
+ * exceeds maxRecords, retain it: a history limit cannot create admission
+ * room by erasing executing work or pending reservations.
  */
 export function trimLedger(ledger, { nowMs, maxRecords = LEDGER_CAP, terminalTtlMs = LEDGER_TERMINAL_TTL_MS, staleHorizonMs = null } = {}) {
   const all = [...(ledger ?? new Map()).entries()];
@@ -393,7 +392,8 @@ export function trimLedger(ledger, { nowMs, maxRecords = LEDGER_CAP, terminalTtl
   }
   if (ledger.size > maxRecords) {
     const activityOf = (r) => Math.max(r?.startedAt ?? 0, r?.decidedAt ?? 0, r?.terminalAt ?? 0);
-    const ordered = [...ledger.values()].sort((a, b) => activityOf(a) - activityOf(b));
+    const ordered = [...ledger.values()].filter(r => !isInflight(r, nowMs, staleHorizonMs ?? Infinity))
+      .sort((a, b) => activityOf(a) - activityOf(b));
     for (const r of ordered) {
       if (ledger.size <= maxRecords) break;
       ledger.delete(r.runId);
@@ -415,7 +415,13 @@ export function mergeLedger(base, overlay) {
       continue;
     }
     for (const [k, v] of Object.entries(o)) {
-      if (v != null && (b[k] == null || k === 'status' || k === 'unverified')) b[k] = v;
+      if (k === 'status') {
+        // Terminal is sticky across sources; a stale pending observation also
+        // cannot downgrade positive executing evidence for the same run.
+        if (!isLedgerTerminal(b.status) && (isLedgerTerminal(v) || b.status !== 'running')) b.status = v;
+      } else if (k === 'agentId') {
+        if (unknownAgent(b.agentId) && !unknownAgent(v)) b.agentId = v;
+      } else if (v != null && (b[k] == null || k === 'unverified')) b[k] = v;
     }
     // The recordDecision precedence (first wins, enforced overwrites
     // event-time) applies at merge too: a persisted event-time decision

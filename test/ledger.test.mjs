@@ -231,6 +231,44 @@ test('property: random interleavings preserve the four invariants', () => {
   }
 });
 
+test('history pressure retains verified live rows even when they alone exceed the valid bound', () => {
+  const ledger = createLedger();
+  for (let i = 0; i < 105; i++) recordStart(ledger, { runId: `live-${i}` }, 1000);
+  for (let i = 0; i < 150; i++) recordTerminal(ledger, { runId: `terminal-${i}` }, 'finished', 2000);
+  trimLedger(ledger, { nowMs: 3000, maxRecords: 100, staleHorizonMs: HORIZON });
+  assert.equal(ledger.size, 105, 'the bound is for discardable history, not physical occupancy');
+  assert.equal(inflightByAccount(ledger, { nowMs: 3000, horizonMs: HORIZON }).unattributed, 105);
+});
+
+test('merge lifecycle precedence is terminal then running then pending in either source order', () => {
+  for (const [baseStatus, overlayStatus, expected] of [
+    ['finished', 'running', 'finished'], ['running', 'cancelled', 'cancelled'],
+    ['running', 'decided', 'running'], ['decided', 'running', 'running'],
+  ]) {
+    const base = ledgerFromJSON([{ runId: 'r', status: baseStatus, startedAt: 1000 }]);
+    const overlay = ledgerFromJSON([{ runId: 'r', status: overlayStatus, decidedAt: 900 }]);
+    assert.equal(mergeLedger(base, overlay).get('r').status, expected);
+  }
+});
+
+test('identity promotion preserves conflicting known identity and enforced decision precedence', () => {
+  for (const agentId of ['unknown', '', null, 'original']) {
+    const base = ledgerFromJSON([{ runId: 'r', agentId, status: 'running',
+      startedAt: 1000, decidedAccount: 'kimi:k1', enforced: true }]);
+    const overlay = ledgerFromJSON([{ runId: 'r', agentId: 'worker', status: 'running',
+      startedAt: 1000, decidedAccount: 'kimi:k2', enforced: false }]);
+    const merged = mergeLedger(base, overlay).get('r');
+    assert.equal(merged.agentId, agentId === 'original' ? 'original' : 'worker');
+    assert.equal(merged.decidedAccount, 'kimi:k1');
+    assert.equal(merged.enforced, true);
+    recordStart(base, { runId: 'r', agentId: 'conflict' }, 1001);
+    assert.equal(merged.agentId, agentId === 'original' ? 'original' : 'worker');
+  }
+  const ledger = ledgerFromJSON([{ runId: 'r', agentId: 'unknown' }]);
+  recordStart(ledger, { runId: 'r', agentId: 'worker' }, 1000);
+  assert.equal(ledger.get('r').agentId, 'worker', 'direct start recording also promotes unknown identity');
+});
+
 test('merge keeps base records the overlay never saw', () => {
   const base = createLedger();
   recordDecision(ledgerFromJSON(ledgerToJSON(base)), decide('x', 'kimi:k1', 1000), 1000);

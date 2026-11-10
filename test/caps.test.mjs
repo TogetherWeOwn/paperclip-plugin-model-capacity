@@ -658,6 +658,127 @@ async function boundaryDrive({ maxTotal = 4, config = {}, records = [] } = {}) {
 }
 const newSlots = body => body.agents.reduce((n, a) => n + a.allocated - a.running, 0);
 
+const deferred = () => {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+};
+
+test('retained census F1: a start during deferred tick I/O remains physical occupancy', async () => {
+  const d = await boundaryDrive({ maxTotal: 1 });
+  const entered = deferred(), release = deferred();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'aa-snapshot-v1') { entered.resolve(); await release.promise; }
+    return get(key);
+  };
+  const tick = d.tick();
+  await entered.promise;
+  d.setNow(TICK + 100);
+  await d.fire(runEvent('during-read', TICK + 100, 'worker'));
+  release.resolve();
+  await tick;
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  const body = (await d.api('caps')).body;
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(newSlots(body), 0);
+  assert.equal((await get(LEDGER_SKEY)).find(r => r.runId === 'during-read').unverified, false);
+
+  const control = await boundaryDrive({ maxTotal: 1, records: [
+    { runId: 'future', status: 'running', agentId: 'worker', startedAt: TICK + 10_000 },
+    { runId: 'unanchored', status: 'running', agentId: 'worker' },
+  ] });
+  assert.equal((await control.api('caps')).body.physicalOccupancy.running, 0);
+  assert.equal(newSlots((await control.api('caps')).body), 1, 'unverifiable carried rows do not consume room');
+});
+
+test('retained census F2: valid bounded history pressure cannot erase executing or pending occupancy', async () => {
+  const records = [
+    ...['a', 'b'].map(runId => ({ runId, agentId: 'worker', status: 'running', startedAt: TICK - 1000 })),
+    { runId: 'pending', status: 'decided', enforced: true, decidedAt: TICK - 1000, decidedAccount: 'claude:a1' },
+    { runId: 'expired', status: 'running', startedAt: TICK - 3 * HOUR },
+    { runId: 'old-terminal', status: 'finished', terminalAt: TICK - 25 * HOUR },
+    ...Array.from({ length: 150 }, (_, i) => ({ runId: `terminal-${i}`, status: 'finished', terminalAt: TICK - i })),
+  ];
+  const d = await boundaryDrive({ maxTotal: 3, config: { shadow: { maxEntries: 100 } }, records });
+  const body = (await d.api('caps')).body;
+  assert.deepEqual(body.physicalOccupancy, { running: 2, unassignedRunning: 0, pending: 1 });
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 2);
+  assert.equal(newSlots(body), 0);
+  const saved = await d.io.state.get(LEDGER_SKEY);
+  assert.equal(saved.length, 100);
+  for (const id of ['a', 'b', 'pending']) assert.ok(saved.some(r => r.runId === id), id);
+  for (const id of ['expired', 'old-terminal']) assert.ok(!saved.some(r => r.runId === id), id);
+  await d.fire(runEvent('pending', TICK, 'unknown'));
+  const started = (await d.api('caps')).body;
+  assert.deepEqual(started.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(started), 0, 'pending to running is one physical slot');
+  for (const id of ['a', 'b', 'pending']) await d.fire(runEvent(id, TICK, 'worker', 'agent.run.finished'));
+  assert.equal(newSlots((await d.api('caps')).body), 3, 'terminal observations release exactly the occupied room');
+});
+
+test('retained census F3: successfully loaded stale ledger unions snapshot identities with terminal precedence', async () => {
+  const d = await boundaryDrive({ maxTotal: 4 });
+  await d.fire(runEvent('overlap', TICK, 'worker'));
+  const set = d.io.state.set;
+  let inserted = false;
+  d.io.state.set = async (key, value) => {
+    await set(key, value);
+    if (key.stateKey === 'ledger-v1' && !inserted) {
+      inserted = true;
+      await d.fire(runEvent('snapshot-only', TICK, 'other'));
+      await d.fire(runEvent('unnamed', TICK, 'unknown'));
+    }
+  };
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal((await d.io.state.get(LEDGER_SKEY)).length, 1, 'start is after the older nonempty persist');
+  d.reboot(); await d.setup();
+  await d.fire(runEvent('overlap', TICK, 'worker'));
+  for (let i = 0; i < 3; i++) {
+    const body = (await d.api('caps')).body;
+    assert.deepEqual(body.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(body.agents.find(a => a.agentId === 'other').running, 1);
+    assert.equal(newSlots(body), 0, 'snapshot union is reporting, not restart admission authority');
+  }
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  const fresh = (await d.api('caps')).body;
+  assert.deepEqual(fresh.physicalOccupancy, { running: 3, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(fresh), 1, 'a fresh compatible tick preserves recovered pressure and only genuine slack');
+  await d.fire(runEvent('snapshot-only', TICK, 'other', 'agent.run.finished'));
+  await d.fire(runEvent('overlap', TICK, 'worker', 'agent.run.finished'));
+  await d.fire(runEvent('snapshot-only', TICK, 'other'));
+  const ended = (await d.api('caps')).body;
+  assert.deepEqual(ended.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+  assert.equal(newSlots(ended), 3, 'terminal observations release room without resurrection by snapshot or late start');
+});
+
+test('retained census F4: unknown and empty identities promote without replacing conflicting known identity', async () => {
+  for (const agentId of ['unknown', '']) {
+    for (const pending of [false, true]) {
+      const { d } = await outageDrive({ records: [{ runId: 'promote', agentId,
+        ...(pending ? { status: 'decided', enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1' }
+          : { status: 'running', startedAt: TICK }) }] });
+      await d.fire(runEvent('promote', TICK, 'worker'));
+      for (let i = 0; i < 3; i++) {
+        const body = (await d.api('caps')).body;
+        assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 0, pending: 0 });
+        assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+        assert.equal(newSlots(body), 0);
+      }
+    }
+  }
+  const { d } = await outageDrive({ records: [{ runId: 'conflict', agentId: 'original', status: 'running', startedAt: TICK }] });
+  await d.fire(runEvent('conflict', TICK, 'worker'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.physicalOccupancy.running, 1);
+  assert.equal(body.agents.find(a => a.agentId === 'original').running, 1);
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.running ?? 0, 0);
+  assert.equal(newSlots(body), 0);
+});
+
 for (const agentId of [undefined, null, '', 'unknown']) {
   test(`/caps conserves unnamed physical occupancy (${String(agentId)}) at the hard fleet limit`, async () => {
     const d = await boundaryDrive({ maxTotal: 2 });

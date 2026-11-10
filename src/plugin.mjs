@@ -2514,17 +2514,20 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     let pending = ledgerLoads.get(companyId);
     if (!pending) {
       pending = (async () => {
-        const persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
-        let ledger;
-        if (persisted.size > 0) {
-          ledger = mergeLedger(persisted, ledgers.get(companyId));
-        } else {
-          const legacy = migrateLegacy({
+        let persisted = ledgerFromJSON(await ctx.state.get(scopeKey(companyId, LEDGER_KEY)));
+        if (persisted.size === 0) {
+          persisted = migrateLegacy({
             runs: await ctx.state.get(scopeKey(companyId, LEGACY_RUNS_KEY)),
             ringEntries: await ctx.state.get(scopeKey(companyId, LEGACY_RING_KEY)),
           });
-          ledger = mergeLedger(legacy, ledgers.get(companyId));
         }
+        // Capacity can contain starts observed after the last ledger persist.
+        // Recover those run facts too, including on a successful nonempty load,
+        // so the next tick cannot erase them. This restores pressure, not the
+        // saved worker's admission policy; current-worker fences still apply.
+        const capacity = await ctx.state.get(scopeKey(companyId, CAPACITY_KEY));
+        const saved = ledgerFromJSON(capacity?.runningCensusRecords);
+        const ledger = mergeLedger(mergeLedger(saved, persisted), ledgers.get(companyId));
         ledgers.set(companyId, ledger);
         ledgerReady.add(companyId);
         loadedOk.add(companyId);
@@ -4227,7 +4230,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         });
       }
     }
-    const reconciledUnverified = reconcileLedger(ledger, { nowMs, verifyWindowMs: staleHorizonMs });
+    // The tick's accounting timestamp predates awaited reads. Reconcile at
+    // observation time so a start received during those reads is not future.
+    const reconciledUnverified = reconcileLedger(ledger, { nowMs: clock(), verifyWindowMs: staleHorizonMs });
     // Trial budgets are read fresh from the ledger per candidate and for
     // the live view below (decisions write through, so no carried copy).
     // In-flight census, single pass over the ledger: each record counts at
@@ -4793,10 +4798,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     });
     // The ledger persists AFTER every read above, so a throw anywhere
     // earlier retries the whole tick (including reconciliation, which is
-    // idempotent) on the next run. Trim bounds the persisted blob at
-    // maxRecords: old terminal, old unverified, and stale-horizon records
-    // first, then oldest activity -- live pressure always survives.
-    trimLedger(ledger, { nowMs, maxRecords: config.shadowMaxEntries, staleHorizonMs });
+    // idempotent) on the next run. Trim bounds inactive history, never
+    // verified executing pressure or pending reservations.
+    trimLedger(ledger, { nowMs: clock(), maxRecords: config.shadowMaxEntries, staleHorizonMs });
     if (!loadedOk.has(companyId)) {
       throw new Error('model-capacity: refusing ledger persist without a successful load');
     }
@@ -6882,21 +6886,18 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         let physicalOccupancy = cap.physicalOccupancy ?? { running: 0, unassignedRunning: 0, pending: 0 };
         let censusAvailable = true;
         try {
-          const ledger = await loadLedger(companyId);
-          if (ledger.size > 0) ({ agentRunning: runningByAgent, physicalOccupancy } = capsRunningCensus(
-            ledger, cap.accounts ?? [], resolved?.freeLanes, clock(),
-            liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000));
+          await loadLedger(companyId);
         } catch {
           censusAvailable = false; // Retain the last running facts, never new authority.
         }
         const refreshCensus = () => {
           const ledger = ledgers.get(companyId) ?? createLedger();
-          if (censusAvailable && ledger.size === 0) return;
           const identified = Array.isArray(cap.runningCensusRecords);
-          // Rebuild from the immutable snapshot on EVERY refresh: never add an
-          // overlay to a previously merged count. This view is not loaded ledger
-          // authority and must not be persisted over the unavailable ledger.
-          const view = !censusAvailable && identified
+          if (censusAvailable && ledger.size === 0 && !identified) return;
+          // Rebuild from the immutable snapshot on EVERY refresh, even when an
+          // older ledger loaded successfully. This union is reporting evidence,
+          // not worker admission authority or a replacement persisted ledger.
+          const view = identified
             ? mergeLedger(ledgerFromJSON(cap.runningCensusRecords), ledger) : ledger;
           const latest = capsRunningCensus(view, cap.accounts ?? [], resolved?.freeLanes, clock(),
             liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000);
