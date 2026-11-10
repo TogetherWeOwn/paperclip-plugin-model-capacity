@@ -730,7 +730,7 @@ export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75
   const list = (entries ?? []).map(e => ({ ...e }));
   const specs = new Map(Object.entries(reservedFloors ?? {}));
   const blocked = new Set(blockedAgentIds ?? []);
-  const cap = Math.max(1, Math.floor(ceiling ?? 75));
+  const cap = Math.max(0, Math.floor(ceiling ?? 75));
   const applied = [];
   // Map accumulator, same '__proto__' discipline as the allocator above:
   // agentIds are host strings, and indexing a plain object with
@@ -783,6 +783,16 @@ export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75
     if (best < 0) break;
     list[best].allocated -= 1;
     list[best].maxConcurrentRuns = list[best].allocated;
+  }
+  // The iteration budget bounds balancing work, not the ceiling itself.
+  // Large configured holds/floors still give back all unprotected excess.
+  let excess = sum() - cap;
+  for (const e of list) {
+    if (excess <= 0) break;
+    const trim = Math.min(excess, Math.max(0, e.allocated - protectLine(e)));
+    e.allocated -= trim;
+    e.maxConcurrentRuns = e.allocated;
+    excess -= trim;
   }
   return { entries: list, applied, floors: Object.fromEntries(floorMap) };
 }

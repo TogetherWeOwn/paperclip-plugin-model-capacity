@@ -92,6 +92,36 @@ test('a started event for self does not consume its slot, and duplicate hook cal
   assert.notEqual((await d.hook({ runId: 'r4' })).model, MODEL);
 });
 
+for (const agentId of ['triage', 'unknown']) {
+  test(`genuine free occupancy (${agentId}) consumes physical room without becoming paid pressure`, async () => {
+    const d = await drive({ config: { concurrency: { maxTotal: 2 } }, records: [
+      { runId: 'free-running', agentId, status: 'running', startedAt: NOW, enforced: true,
+        decidedAccount: 'nvidia-nim:n1', freeProvider: 'nvidia-nim', unverified: false },
+    ] });
+    const capacity = await d.api('capacity');
+    assert.equal(capacity.inFlightByAccount['nvidia-nim:n1'], 1);
+    const caps = await d.api('caps');
+    const namedRunning = caps.agents.reduce((n, a) => n + a.running, 0);
+    assert.equal(namedRunning, agentId === 'triage' ? 1 : 0);
+    assert.equal(caps.physicalOccupancy.running, 1);
+    assert.equal(caps.physicalOccupancy.unassignedRunning, agentId === 'triage' ? 0 : 1);
+    assert.equal(caps.agents.reduce((n, a) => n + a.allocated - a.running, 0), 1);
+    assert.equal(caps.agents.find(a => a.agentId === 'builder')?.freeAllocated, 0);
+    assert.ok(caps.agents.every(a => a.agentId !== 'unknown'));
+    assert.equal(capacity.agentRunning.triage?.running ?? 0, 0, 'free running is not paid running');
+  });
+}
+
+test('unknown ordinary occupancy cannot be replaced by an additive free grant at the physical ceiling', async () => {
+  const d = await drive({ config: { concurrency: { maxTotal: 1 } }, records: [
+    { runId: 'unmapped-running', agentId: 'unknown', status: 'running', startedAt: NOW, unverified: false },
+  ] });
+  const caps = await d.api('caps');
+  assert.equal(caps.physicalOccupancy.unassignedRunning, 1);
+  assert.equal(caps.agents.reduce((n, a) => n + a.allocated, 0), 0);
+  assert.ok(caps.agents.every(a => a.freeAllocated === 0));
+});
+
 test('high-risk, reviewer, kept, retries and unsupported adapters cannot use the free lane via ordinary routing or exhaustion', async () => {
   for (const extra of [{ agentId: 'builder' }, { agentId: 'thinker' }, { previous: { runId: 'old', model: MODEL } },
     { issueId: null }, { adapterType: 'unsupported' }]) {

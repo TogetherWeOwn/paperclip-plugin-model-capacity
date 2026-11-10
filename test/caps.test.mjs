@@ -247,6 +247,12 @@ function drive({ nowMs, config = {}, laneUsed = 0.3, issueLists = {}, accounts =
     setLane: used => { lane = laneBody(used, new Date(now).toISOString()); },
     setAccounts: list => { lane = { observedAt: new Date(now).toISOString(), accounts: list }; },
     seed: (k, v) => { store.set(skey(k), v); },
+    seedCaps: patch => {
+      const key = skey({ ...LEDGER_SKEY, stateKey: 'capacity-v1' });
+      store.set(key, { ...store.get(key), ...patch });
+    },
+    reconfigure: async next => { config = next; await plugin.onConfigChanged(config, { companyId: 'acme' }); },
+    io,
     // Fresh plugin on the same io store: the next tick cold-loads persisted
     // state (proves the persisted breaker form works, like review-breaker).
     reboot: () => { plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false }); },
@@ -637,6 +643,154 @@ test('/capacity trips the serving account on balance exhaustion, not the shadow 
     'every known codex arm opens and no foreign decided arm seeds state there');
   const metaOpen = cap.armBreakers.filter(e => e.accountId === metaAcct && e.status === 'open');
   assert.deepEqual(metaOpen, [], 'no meta arm trips on a codex-served failure');
+});
+
+// High synthetic targets isolate publication safety from pacing/calibration.
+// Admission metadata is retained from a real tick, never fabricated by tests.
+async function boundaryDrive({ maxTotal = 4, config = {}, records = [] } = {}) {
+  const d = drive({ nowMs: TICK, config: { enforce: true, concurrency: { maxTotal }, ...config },
+    issueLists: { todo: Array.from({ length: 8 }, (_, i) => ({ id: `q${i}`, assigneeAgentId: 'worker' })) } });
+  d.seed(LEDGER_SKEY, records);
+  await d.setup();
+  await d.tick();
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  return d;
+}
+const newSlots = body => body.agents.reduce((n, a) => n + a.allocated - a.running, 0);
+
+for (const agentId of [undefined, null, '', 'unknown']) {
+  test(`/caps conserves unnamed physical occupancy (${String(agentId)}) at the hard fleet limit`, async () => {
+    const d = await boundaryDrive({ maxTotal: 2 });
+    await d.fire(runEvent('named', TICK, 'worker'));
+    await d.fire(runEvent('unnamed', TICK, agentId, 'agent.run.started', { provider: 'unmapped-provider' }));
+    for (const tick of [false, true]) {
+      if (tick) { await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' }); }
+      const body = (await d.api('caps')).body;
+      assert.equal(body.physicalOccupancy.running, 2);
+      assert.equal(body.physicalOccupancy.unassignedRunning, 1);
+      assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+      assert.equal(newSlots(body), 0, 'executing pressure is not apparent slack');
+      assert.ok(body.agents.every(a => a.agentId === 'worker'), 'no invented identity or attribution');
+      if (tick) {
+        const row = (await d.io.state.get(LEDGER_SKEY)).find(r => r.runId === 'unnamed');
+        assert.equal(row.actualAccount ?? null, null, 'occupancy does not invent a serving account');
+      }
+    }
+  });
+}
+
+test('/caps burn mode never exempts executing work from the physical fleet boundary', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: { burnMode: { accounts: ['claude:a1'] } } });
+  const capacity = (await d.api('capacity')).body;
+  assert.equal(capacity.accounts.find(a => a.accountId === 'claude:a1').burnMode, true);
+  await d.fire(runEvent('burn-running', TICK, 'unknown', 'agent.run.started', {
+    model: 'claude-haiku-5-5', accountId: 'claude:a1',
+  }));
+  assert.equal(newSlots((await d.api('caps')).body), 0);
+});
+
+test('/caps large reserved floors cannot outlive the ceiling balancer iteration budget', async () => {
+  const d = await boundaryDrive({ maxTotal: 1,
+    config: { caps: { reservedFloors: { worker: { base: 10_000, perQueued: 1, max: 10_000 } } } } });
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  assert.equal(newSlots((await d.api('caps')).body), 0);
+});
+
+test('/caps counts overlapping named and unnamed work once and leaves exactly the physical slack', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(newSlots(body), 2);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 3);
+});
+
+test('/caps preserves over-ceiling named floors and does not grant more work', async () => {
+  const d = await boundaryDrive({ maxTotal: 2 });
+  for (let i = 0; i < 3; i++) await d.fire(runEvent(`named-${i}`, TICK, 'worker'));
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 3);
+  assert.equal(newSlots(body), 0);
+});
+
+test('/caps pending-to-running transition reserves one slot, not zero or two', async () => {
+  const d = await boundaryDrive({ records: [{ runId: 'pending', agentId: 'unknown', status: 'decided',
+    enforced: true, decidedAt: TICK, decidedAccount: 'claude:a1', unverified: false }] });
+  const before = (await d.api('caps')).body;
+  assert.equal(before.physicalOccupancy.pending, 1);
+  assert.equal(newSlots(before), 3);
+  await d.fire(runEvent('pending', TICK, 'unknown'));
+  const after = (await d.api('caps')).body;
+  assert.equal(after.physicalOccupancy.pending, 0);
+  assert.equal(after.physicalOccupancy.unassignedRunning, 1);
+  assert.equal(newSlots(after), 3);
+});
+
+test('/caps holds and reserved floors cannot bypass physical pressure or a zero remaining ceiling', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: { caps: { reservedFloors: { worker: { base: 4, perQueued: 1, max: 4 } } } } });
+  d.seed({ ...LEDGER_SKEY, stateKey: 'caps-hold-v1' }, { atMs: TICK, agents: { worker: { value: 20, atMs: TICK } } });
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.reservedFloors.worker.blocked, true);
+});
+
+for (const [label, patch] of [
+  ['future', { atMs: TICK + 1 }],
+  ['old generation', { reviewAdmissionGeneration: -1 }],
+  ['other worker', { reviewAdmissionEpoch: 'other-worker' }],
+  ['legacy persisted facts', { reviewAdmissionGeneration: undefined, reviewAdmissionEpoch: undefined }],
+]) {
+  test(`/caps ${label} facts preserve running but cannot authorize grants`, async () => {
+    const d = await boundaryDrive();
+    await d.fire(runEvent('named', TICK, 'worker'));
+    d.seedCaps(patch);
+    const body = (await d.api('caps')).body;
+    assert.equal(body.capsError, 'admission-unavailable');
+    assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+    assert.equal(newSlots(body), 0);
+  });
+}
+
+test('/caps uses the retained hook freshness window without expiring executing floors', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  d.setNow(TICK + 120_000);
+  assert.equal(newSlots((await d.api('caps')).body), 3, 'fresh compatible negative control');
+  d.setNow(TICK + 120_001);
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'admission-unavailable');
+  assert.equal(body.target, null);
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+});
+
+test('/caps rejects pre-existing config and restart authority even with identical counters and clocks', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  d.reboot(); await d.setup();
+  assert.equal(newSlots((await d.api('caps')).body), 0, 'same generation is not same worker');
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+  assert.equal(newSlots((await d.api('caps')).body), 3);
+  await d.reconfigure({ enforce: true, concurrency: { maxTotal: 1 } });
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(newSlots(body), 0, 'old maxTotal and target do not survive reconfiguration');
+});
+
+test('/caps unavailable demand or calibration never loses named running floors', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('named', TICK, 'worker'));
+  d.seedCaps({ target: null, calibration: 'weak' });
+  assert.equal((await d.api('caps')).body.agents.find(a => a.agentId === 'worker').allocated, 1);
+  d.seedCaps({ target: 20, calibration: 'measured' });
+  d.io.issues.list = async () => { throw Error('unavailable'); };
+  d.setNow(TICK + 20_000);
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'issues-unavailable');
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
 });
 
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {

@@ -2553,6 +2553,33 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     }
   }
 
+  // Agent identity controls publication, not physical occupancy. Count each
+  // ledger row once; a decided reservation stops being pending when it starts.
+  function capsRunningCensus(ledger, accounts, freeLanes, nowMs, horizonMs) {
+    const byId = new Map(accounts.map(a => [a.accountId, a]));
+    const agents = new Map();
+    let running = 0, unassignedRunning = 0, pending = 0;
+    for (const r of ledger.values()) {
+      if (r?.unverified === true) continue;
+      if (r?.status !== 'running') {
+        if (r?.enforced === true && isInflight(r, nowMs, horizonMs)) pending += 1;
+        continue;
+      }
+      running += 1;
+      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') {
+        unassignedRunning += 1;
+        continue;
+      }
+      let entry = agents.get(r.agentId);
+      if (!entry) { entry = { running: 0, overPace: false }; agents.set(r.agentId, entry); }
+      const account = byId.get(r.enforced ? r.decidedAccount : r.actualAccount);
+      if (freeProvider(account, freeLanes) != null) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
+      else entry.running += 1;
+      if (byId.get(r.actualAccount ?? r.decidedAccount)?.guardActive === true) entry.overPace = true;
+    }
+    return { agentRunning: Object.fromEntries(agents), physicalOccupancy: { running, unassignedRunning, pending } };
+  }
+
   // ONE quota consumer. Both the native snapshot and the retained hook tick
   // use this same fetched feed. Concurrent jobs in one config generation join;
   // config changes may admit a new request but the old generation cannot publish.
@@ -4784,25 +4811,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
     // records with status 'running' (started, no terminal); unverified
     // records never proved alive since startup and stay excluded. Burn side
     // (actualAccount) outranks the decision guess for the over-pace check.
-    const overPaceAccounts = new Set(
-      accountViews.filter(v => v?.guardActive === true).map(v => v.accountId));
-    // Map accumulator: agentIds are ledger/issue strings, and indexing a
-    // plain object with '__proto__' would write Object.prototype worker-wide
-    // (and read it back as NaN counts). fromEntries below defines own data
-    // properties even for '__proto__', so the snapshot reads back safely.
-    const agentRunningById = new Map();
-    for (const r of ledger.values()) {
-      if (r?.status !== 'running' || r?.unverified === true) continue;
-      if (typeof r.agentId !== 'string' || r.agentId.length === 0 || r.agentId === 'unknown') continue;
-      let entry = agentRunningById.get(r.agentId);
-      if (!entry) { entry = { running: 0, overPace: false }; agentRunningById.set(r.agentId, entry); }
-      const free = freeProvider(viewById.get(r.enforced ? r.decidedAccount : r.actualAccount), config.freeLanes) != null;
-      if (free) entry.freeRunning = (entry.freeRunning ?? 0) + 1;
-      else entry.running += 1;
-      const burnAccount = r.actualAccount ?? r.decidedAccount ?? null;
-      if (burnAccount != null && overPaceAccounts.has(burnAccount)) entry.overPace = true;
-    }
-    const agentRunning = Object.fromEntries(agentRunningById);
+    const { agentRunning, physicalOccupancy } = capsRunningCensus(
+      ledger, accountViews, config.freeLanes, nowMs, staleHorizonMs);
     // With routing enabled, capacity must pass the same admission as a
     // configured reviewer. Otherwise retain the legacy non-trial role access.
     const reviewerLive = liveViews.get(companyId);
@@ -5112,6 +5122,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
       // Per-agent running + over-pace burn flags for the demand-aware /caps
       // allocator below. Bounded by the live agent count.
       agentRunning,
+      physicalOccupancy,
       keepAgentIds: config.roles.keepAgentIds,
       keptByAgent,
       reviewerAccountIdsByAgent,
@@ -6859,10 +6870,29 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         const calibration = cap.calibration ?? 'weak';
         const target = cap.target ?? null;
         const paidTarget = cap.freeLanes ? cap.paidTarget : target;
-        // Weak calibration means no target at all: no caps, never zeros
-        // masquerading as a recommendation.
-        const freeRunningFloor = cap.freeLanes && Object.values(cap.agentRunning ?? {}).some(r => r.freeRunning > 0);
-        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !freeRunningFloor) {
+        let runningByAgent = cap.agentRunning ?? {};
+        let physicalOccupancy = cap.physicalOccupancy ?? { running: 0, unassignedRunning: 0, pending: 0 };
+        let censusAvailable = true;
+        try {
+          const ledger = await loadLedger(companyId);
+          if (ledger.size > 0) ({ agentRunning: runningByAgent, physicalOccupancy } = capsRunningCensus(
+            ledger, cap.accounts ?? [], resolved?.freeLanes, clock(),
+            liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000));
+        } catch {
+          censusAvailable = false; // Retain the last running facts, never new authority.
+        }
+        const maxTotal = resolved?.concurrency?.maxTotal ?? DEFAULT_CONCURRENCY.maxTotal;
+        // Reuse the retained hook's two-minute evidence window and the existing
+        // config/worker fences. Age invalidates admission, not running facts.
+        const admissionCurrent = () => censusAvailable
+          && Number.isFinite(atMs) && clock() >= atMs && clock() - atMs <= 120_000
+          && cap.reviewAdmissionGeneration === configGenerationOf(companyId)
+          && liveViews.get(companyId)?.atMs === atMs
+          && liveIsCurrent(companyId, liveViews.get(companyId))
+          && (cap.reviewAdmissionEpoch == null || cap.reviewAdmissionEpoch === reviewAdmissionEpoch);
+        // Weak calibration has no new target, but still reports running floors.
+        const hasRunningFloor = Object.values(runningByAgent).some(r => r.running > 0 || r.freeRunning > 0);
+        if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !hasRunningFloor) {
           return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
         }
         // Agents with queued/ready work: assigned non-terminal issues
@@ -6880,7 +6910,14 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // Sanitized: callers get a stable code, never upstream text.
           // Details go server-side only.
           ctx.logger.error('model-capacity: caps issues read failed', { companyId, error: error?.message ?? String(error) });
-          return { status: 200, body: { atMs, calibration, target, agents: [], capsError: 'issues-unavailable' } };
+          const agents = Object.entries(runningByAgent).map(([agentId, r]) => {
+            const running = (r.running ?? 0) + (r.freeRunning ?? 0);
+            return { agentId, running, queued: 0, demand: running, allocated: running,
+              maxConcurrentRuns: running, reason: 'floor-running',
+              ...(cap.freeLanes ? { freeAllocated: r.freeRunning ?? 0 } : {}) };
+          }).filter(a => a.running > 0);
+          return { status: 200, body: { atMs, calibration, target: null, agents, physicalOccupancy,
+            capsError: 'issues-unavailable' } };
         }
         // Demand-aware caps: C* splits across agents in proportion to
         // CURRENT demand (running + queued), never historical share. Below
@@ -6889,7 +6926,6 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // cap lands below an agent's running count -- throttling existing
         // runs while the fleet idles is the failure this replaces.
         const blockingPriority = priorityRequested && priorities != null;
-        const runningByAgent = cap.agentRunning ?? {};
         const keptIds = new Set(cap.keepAgentIds ?? Object.keys(cap.keptByAgent ?? {}));
         // Review identities do not depend on model routing: fixed-model
         // reviewers receive the census too, but can use only their own pool.
@@ -6985,7 +7021,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
               : allocated.routedCeiling,
           });
           agents = [...keptCaps, ...held.entries];
-          if (generation === configGenerationOf(companyId)) {
+          if (generation === configGenerationOf(companyId) && admissionCurrent()) {
             await ctx.state.set(scopeKey(companyId, CAPS_HOLD_KEY), { atMs: nowMs, agents: held.hold });
           }
         } catch (error) {
@@ -7036,6 +7072,45 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = freeLaneCaps(agents, freeRunning, freeEnabled ? cap.freeLanes.target : 0,
             freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], cap.maxTotal ?? 75);
         }
+        // Events can arrive during demand/hold I/O. Refresh physical pressure
+        // at publication without treating a missing identity as a runnable agent.
+        const latestLedger = ledgers.get(companyId);
+        if (censusAvailable && latestLedger?.size > 0) {
+          ({ agentRunning: runningByAgent, physicalOccupancy } = capsRunningCensus(
+            latestLedger, cap.accounts ?? [], resolved?.freeLanes, clock(),
+            liveViews.get(companyId)?.staleHorizonMs ?? 2 * 3600 * 1000));
+          const byId = new Map(agents.map(a => [a.agentId, a]));
+          for (const [id, counts] of Object.entries(runningByAgent)) {
+            if (!byId.has(id)) {
+              const row = { agentId: id, queued: 0, allocated: 0, reason: 'floor-running' };
+              agents.push(row); byId.set(id, row);
+            }
+          }
+          for (const a of agents) {
+            const counts = runningByAgent[a.agentId];
+            a.running = (counts?.running ?? 0) + (counts?.freeRunning ?? 0);
+            a.demand = a.running + a.queued;
+            a.allocated = Math.max(a.running, a.allocated);
+            if (cap.freeLanes) a.freeAllocated = Math.max(counts?.freeRunning ?? 0, a.freeAllocated ?? 0);
+          }
+        }
+        // Hysteresis, reserved floors and free additions cannot create physical
+        // slack. Only executing floors may exceed the configured process limit.
+        const admissionUnavailable = !admissionCurrent()
+          || ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0));
+        if (admissionUnavailable) agents = agents.map(a => ({ ...a, allocated: a.running,
+          reason: 'admission-unavailable', reviewEligibleHeads: 0 }));
+        agents = applyReservedFloors(agents, { ceiling: Math.max(0,
+          maxTotal - physicalOccupancy.unassignedRunning - physicalOccupancy.pending) }).entries;
+        for (const a of agents) {
+          a.maxConcurrentRuns = a.allocated;
+          if (cap.freeLanes) a.freeAllocated = Math.min(a.freeAllocated ?? 0,
+            Math.max(0, a.allocated - (runningByAgent[a.agentId]?.running ?? 0)));
+          if (a.floor != null && a.allocated < a.floor) {
+            a.floorBlocked = true;
+            floorSummary[a.agentId] = { floor: a.floor, applied: false, blocked: true };
+          }
+        }
         for (const agent of agents) {
           agent.demandSource = demandSourceOf.get(agent.agentId) ?? 'issues';
           if (blockingPriority && priorities.has(agent.agentId)) agent.allocationPriority = priorities.get(agent.agentId);
@@ -7049,11 +7124,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // before hold-state I/O. Fence the entire publication: an old config
         // may preserve running work, but cannot authorize ANY new slots.
         if (generation !== configGenerationOf(companyId)) {
-          const paidFloors = baseInputs.map(a => ({ ...a, allocated: a.running, maxConcurrentRuns: a.running }));
-          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
-          const floors = (cap.freeLanes
-            ? freeLaneCaps(paidFloors, freeRunning, 0, [], cap.maxTotal ?? 75) : paidFloors)
-            .filter(a => a.running + a.queued > 0).map(a => ({ ...a,
+          const floors = agents.filter(a => a.running + a.queued > 0).map(a => ({ ...a,
+              allocated: a.running, maxConcurrentRuns: a.running,
               demand: a.running + a.queued, reason: 'configuration-changed', reviewEligibleHeads: 0,
             }));
           return { status: 200, body: { atMs, calibration, target: null, agents: floors,
@@ -7061,7 +7133,9 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
             reservedFloors: {}, floorsSuspended: false } };
         }
-        return { status: 200, body: { atMs, calibration, target, agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended,
+        return { status: 200, body: { atMs, calibration, target: admissionUnavailable ? null : target,
+          agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended, physicalOccupancy,
+          ...(admissionUnavailable ? { capsError: 'admission-unavailable' } : {}),
           ...(priorityRequested ? { allocation: { blockingPriority,
             ...(allocated.resourceStatus ? { resourceStatus: allocated.resourceStatus } : {}),
             ...(!blockingPriority ? { error: 'priority-unavailable' } : {}) } } : {}),
