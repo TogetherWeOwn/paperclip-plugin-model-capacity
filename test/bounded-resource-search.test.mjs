@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocatePriorityResourceSlots } from '../src/priority-resources.mjs';
@@ -345,7 +346,7 @@ async function capsBodyFor(spec) {
     reviewReserve: { enabled: false },
   };
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     config: { get: async () => raw },
     state: {
       get: async key => store.get(key.stateKey) ?? null,
@@ -368,8 +369,8 @@ async function capsBodyFor(spec) {
     jobs: { register() {} },
     events: { on() {} },
     logger: { info() {}, error() {} },
-  });
-  await plugin.onConfigChanged(raw, { companyId: COMPANY });
+  };
+  await setupCapsAdmission(plugin, io, { raw, cap: store.get('capacity-v1'), companyId: COMPANY, nowMs: NOW });
   const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
   assert.equal(response.status, 200);
   assert.equal(response.body.capsError, undefined);

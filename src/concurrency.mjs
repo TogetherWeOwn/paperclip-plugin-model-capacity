@@ -772,28 +772,30 @@ export function applyReservedFloors(entries, { reservedFloors = {}, ceiling = 75
     if (summary && !summary.blocked && summary.floor != null) return Math.max(summary.floor, running);
     return running;
   };
-  let guard = list.length * 400;
-  while (sum() > cap && guard-- > 0) {
-    let best = -1;
-    let bestNew = 0;
-    for (let i = 0; i < list.length; i++) {
-      const fresh = list[i].allocated - protectLine(list[i]);
-      if (fresh > bestNew) { best = i; bestNew = fresh; }
+  const excess = Math.max(0, sum() - cap);
+  const fresh = list.map(e => Math.max(0, e.allocated - protectLine(e)));
+  const remaining = Math.max(0, fresh.reduce((s, n) => s + n, 0) - excess);
+  // Level the largest unprotected shares in bulk. Binary search finds the
+  // last complete level; the partial level retains the one-slot algorithm's
+  // index-stable tie break, without work proportional to configured caps.
+  let low = 0, high = fresh.reduce((largest, n) => Math.max(largest, n), 0);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (fresh.reduce((s, n) => s + Math.min(n, middle), 0) <= remaining) low = middle;
+    else high = middle - 1;
+  }
+  let partial = remaining - fresh.reduce((s, n) => s + Math.min(n, low), 0);
+  const kept = fresh.map(n => Math.min(n, low));
+  for (let i = list.length - 1; i >= 0 && partial > 0; i--) {
+    if (fresh[i] > low) { kept[i]++; partial--; }
+  }
+  list.forEach((e, i) => {
+    const trim = fresh[i] - kept[i];
+    if (trim > 0) {
+      e.allocated -= trim;
+      e.maxConcurrentRuns = e.allocated;
     }
-    if (best < 0) break;
-    list[best].allocated -= 1;
-    list[best].maxConcurrentRuns = list[best].allocated;
-  }
-  // The iteration budget bounds balancing work, not the ceiling itself.
-  // Large configured holds/floors still give back all unprotected excess.
-  let excess = sum() - cap;
-  for (const e of list) {
-    if (excess <= 0) break;
-    const trim = Math.min(excess, Math.max(0, e.allocated - protectLine(e)));
-    e.allocated -= trim;
-    e.maxConcurrentRuns = e.allocated;
-    excess -= trim;
-  }
+  });
   return { entries: list, applied, floors: Object.fromEntries(floorMap) };
 }
 

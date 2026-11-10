@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModelCapacityPlugin } from '../src/plugin.mjs';
@@ -71,8 +72,7 @@ async function drive(t, {
   };
   if (missingHeartbeatQuery) delete io.agents;
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup(io);
-  await plugin.onConfigChanged({ roles: { keepAgentIds: cap.keepAgentIds }, ...config }, { companyId: COMPANY });
+  await setupCapsAdmission(plugin, io, { raw: { roles: { keepAgentIds: cap.keepAgentIds }, ...config }, cap, companyId: COMPANY, nowMs: NOW });
   return {
     queuedCalls,
     caps: async () => {

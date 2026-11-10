@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { manifest } from '../src/manifest.mjs';
@@ -82,7 +83,7 @@ async function capsFixture({ running = 0, pause = false } = {}) {
     paceGuard: { pools: [{ pool: 'meta', cap: 0 }, { pool: 'codex', cap: 8 }] },
   }]]);
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     state: { get: async k => {
       if (k.stateKey === 'caps-hold-v1' && pause) {
         assert.equal(censusResolved, true, 'hold pause must occur after census resolution');
@@ -106,8 +107,8 @@ async function capsFixture({ running = 0, pause = false } = {}) {
         } } } });
       } };
     } },
-  });
-  await plugin.onConfigChanged(raw, { companyId: COMPANY });
+  };
+  await setupCapsAdmission(plugin, io, { raw, cap: store.get('capacity-v1'), companyId: COMPANY, nowMs: NOW });
   return { plugin, raw, calls, gate, reached, read: async () => {
     const result = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
     assert.equal(result.status, 200);

@@ -57,6 +57,29 @@ test('live failure: running 2 queued 105 reads cap 2 without the floor, >= 8 wit
   }
 });
 
+test('large ceiling reductions preserve largest-first balancing and stable ties', () => {
+  const rows = [10_000, 10_000].map((allocated, i) => ({ agentId: `a${i}`,
+    running: 0, queued: allocated, allocated, maxConcurrentRuns: allocated }));
+  assert.deepEqual(applyReservedFloors(rows, { ceiling: 75 }).entries.map(e => e.allocated), [37, 38]);
+  for (const amounts of [[13, 9, 6], [10, 10, 10], [9, 1, 15]]) {
+    for (let ceiling = 0; ceiling <= 35; ceiling++) {
+      const entries = amounts.map((allocated, i) => ({ agentId: `a${i}`, running: i,
+        queued: 20, allocated, maxConcurrentRuns: allocated }));
+      const expected = entries.map(e => ({ ...e }));
+      while (expected.reduce((s, e) => s + e.allocated, 0) > ceiling) {
+        let best = -1, fresh = 0;
+        expected.forEach((e, i) => { if (e.allocated - e.running > fresh) {
+          best = i; fresh = e.allocated - e.running;
+        } });
+        if (best < 0) break;
+        expected[best].allocated--;
+      }
+      assert.deepEqual(applyReservedFloors(entries, { ceiling }).entries.map(e => e.allocated),
+        expected.map(e => e.allocated), `${amounts} ceiling=${ceiling}`);
+    }
+  }
+});
+
 test('floor formula: base + queued/perQueued clamped, never above demand', () => {
   const spec = { base: 4, perQueued: 20, max: 8 };
   assert.equal(computeReservedFloor(0, 10, spec), 4);

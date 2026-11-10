@@ -793,6 +793,113 @@ test('/caps unavailable demand or calibration never loses named running floors',
   assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
 });
 
+test('/caps recomputes exhausted kept admission after a finish during hold I/O', async () => {
+  const d = await boundaryDrive({ config: { roles: { keepAgentIds: ['worker'] } } });
+  d.io.agents.getQueuedRunCounts = async () => [{ agentId: 'worker', queued: 8 }];
+  d.seedCaps({ keptByAgent: { worker: { accountId: 'claude:a1' } },
+    perAccount: [{ accountId: 'claude:a1', slots: 0 }] });
+  await d.fire(runEvent('ending', TICK, 'worker'));
+  const get = d.io.state.get;
+  let finished = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !finished) {
+      finished = true;
+      await d.fire(runEvent('ending', TICK, 'worker', 'agent.run.finished'));
+    }
+    return get(key);
+  };
+  const row = (await d.api('caps')).body.agents.find(a => a.agentId === 'worker');
+  assert.equal(row.running, 0);
+  assert.equal(row.allocated, 0, 'finished floors cannot become grants on an exhausted pool');
+});
+
+test('/caps preserves memory-only positive running evidence when ledger storage fails', async () => {
+  const d = await boundaryDrive();
+  d.reboot(); await d.setup();
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'ledger-v1') throw Error('storage unavailable');
+    return get(key);
+  };
+  await d.fire(runEvent('memory-only', TICK, 'worker'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.agents.find(a => a.agentId === 'worker').running, 1);
+  assert.equal(body.physicalOccupancy.running, 1);
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.capsError, 'admission-unavailable');
+});
+
+test('/caps unavailable issues publishes starts observed during the failed read', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('first', TICK, 'worker'));
+  let started = false;
+  d.setNow(TICK + 20_000);
+  d.io.issues.list = async () => {
+    if (!started) { started = true; await d.fire(runEvent('second', TICK, 'worker')); }
+    throw Error('issues unavailable');
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'issues-unavailable');
+  assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 2);
+  assert.equal(body.physicalOccupancy.running, 2);
+});
+
+for (const weighted of [false, true]) {
+  test(`/caps physical pressure preserves ${weighted ? 'weighted priority' : 'feasible reserved floors'}`, async () => {
+    const d = await boundaryDrive({ config: weighted
+      ? { allocation: { blockingPriority: true } }
+      : { caps: { reservedFloors: { a: { base: 2, perQueued: 100, max: 2 } } } } });
+    d.io.issues.list = async ({ status }) => status !== 'todo' ? [] : ['a', 'b'].flatMap(agentId =>
+      Array.from({ length: 8 }, (_, i) => ({ id: `${agentId}-${i}`, assigneeAgentId: agentId,
+        status: 'todo', priority: agentId === 'a' ? 'high' : 'low', blockedBy: [] })));
+    d.setNow(TICK + 20_000);
+    await d.tick(); d.seedCaps({ target: 20, calibration: 'measured' });
+    await d.fire(runEvent('unknown-1', TICK, 'unknown'));
+    if (weighted) await d.fire(runEvent('unknown-2', TICK, 'unknown'));
+    const body = (await d.api('caps')).body;
+    const rows = new Map(body.agents.map(a => [a.agentId, a]));
+    assert.deepEqual(['a', 'b'].map(id => rows.get(id).allocated), weighted ? [2, 0] : [2, 1]);
+    assert.equal(newSlots(body), weighted ? 2 : 3);
+    if (!weighted) assert.equal(rows.get('a').floorBlocked ?? false, false);
+  });
+}
+
+test('/caps freshness crossed during hold I/O cannot redecorate positive admitted review shares', async () => {
+  const d = await boundaryDrive({ config: {
+    roles: { keepAgentIds: ['worker'] },
+    reviewerRouting: { agentIds: ['worker'], arms: [{ provider: 'claude', model: 'claude-haiku-5-5' }] },
+    reviewDemand: { repositories: ['example/product'], tokenSecretRef: SECRET, requiredChecks: ['ci-ok'] },
+  } });
+  const fetch = d.io.http.fetch;
+  const oid = 'a'.repeat(40);
+  d.io.http.fetch = async (url, ...args) => url !== 'https://api.github.com/graphql' ? fetch(url, ...args)
+    : { status: 200, text: async () => JSON.stringify({ data: { repository: { pullRequests: {
+      nodes: [{ number: 1, isDraft: false, mergeable: 'MERGEABLE', headRefOid: oid,
+        commits: { nodes: [{ commit: { oid, statusCheckRollup: { contexts: {
+          nodes: [{ __typename: 'CheckRun', name: 'ci-ok', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+          pageInfo: { hasNextPage: false },
+        } } } }] } }], pageInfo: { hasNextPage: false, endCursor: null },
+    } } } }) };
+  d.setNow(TICK + 60_000);
+  await d.reconfigure(await d.io.config.get());
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured',
+    perAccount: [{ accountId: 'claude:a1', slots: 8 }],
+    reviewerAccountIdsByAgent: { worker: ['claude:a1'] } });
+  const control = (await d.api('caps')).body;
+  assert.ok(control.agents.find(a => a.agentId === 'worker'), JSON.stringify(control));
+  assert.equal(control.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 1,
+    'fresh compatible control actually admits a head');
+  const get = d.io.state.get;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1') d.setNow(TICK + 180_001);
+    return get(key);
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'admission-unavailable');
+  assert.equal(newSlots(body), 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 0);
+});
+
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {
   const d = drive({ nowMs: TICK, config: { enforce: true }, issueLists: { todo: [], in_progress: [] } });
   await d.setup();

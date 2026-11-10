@@ -297,8 +297,11 @@ test('caps: issues denial degrades to a sanitized code, never upstream text', as
   d.setLane(0.328);
   await d.tick();
   const caps = await d.api('caps');
-  assert.deepEqual(caps.body.agents, []);
+  assert.deepEqual(caps.body.agents, [{ agentId: 'agent-9', running: 2, queued: 0,
+    demand: 2, allocated: 2, maxConcurrentRuns: 2, reason: 'floor-running' }]);
+  assert.equal(caps.body.physicalOccupancy.running, 2);
   assert.equal(caps.body.capsError, 'issues-unavailable');
+  assert.ok(!JSON.stringify(caps.body).includes('connection refused'));
 });
 
 test('reviewReserve: rMin above rMax fails validation and normalizes to defaults', async () => {

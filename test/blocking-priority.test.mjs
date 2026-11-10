@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { allocateDemandCaps, allocateKeptAndRoutedCaps } from '../src/concurrency.mjs';
 import { createModelCapacityPlugin, resolveConfig, validateConfigShape } from '../src/plugin.mjs';
 import { manifest } from '../src/manifest.mjs';
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 
 const COMPANY = 'acme';
 const NOW = Date.parse('2026-10-25T12:00:00Z');
@@ -35,7 +36,7 @@ async function drive({ issues = chain(), config = {}, target = 1, running = {}, 
   ]);
   const reads = [];
   const plugin = createModelCapacityPlugin({ clock: () => now, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     state: {
       get: async key => store.get(key.stateKey) ?? null,
       set: async (key, value) => { store.set(key.stateKey, value); },
@@ -48,11 +49,12 @@ async function drive({ issues = chain(), config = {}, target = 1, running = {}, 
     } },
     agents: { getQueuedRunCounts: async () => queuedCounts },
     jobs: { register() {} }, events: { on() {} }, logger: { info() {}, error() {} },
-  });
-  await plugin.onConfigChanged(config, { companyId: COMPANY });
+  };
+  await setupCapsAdmission(plugin, io, { raw: config, cap, companyId: COMPANY, nowMs: NOW });
   return {
     reads, cap, store,
-    configure: config => plugin.onConfigChanged(config, { companyId: COMPANY }),
+    configure: async next => { config = next; await plugin.onConfigChanged(config, { companyId: COMPANY }); },
+    tick: async () => { cap.atMs = now; await setupCapsAdmission(plugin, io, { raw: config, cap, companyId: COMPANY, nowMs: now }); },
     advance: ms => { now += ms; },
     caps: async () => {
       const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
@@ -184,6 +186,7 @@ test('a new tick refreshes ready cards even inside the ordinary demand TTL', asy
   issues[0] = { ...issues[0], assigneeAgentId: 'replacement' };
   d.advance(5000);
   d.cap.atMs += 5000;
+  await d.tick();
   const rows = asMap((await d.caps()).agents);
   assert.equal(rows.has('operator'), false);
   assert.equal(rows.get('replacement').allocated, 1);
@@ -375,6 +378,7 @@ test('enabling after a legacy cached read refreshes the ready-card snapshot', as
   const d = await drive();
   await d.caps();
   await d.configure(enabled);
+  await d.tick();
   const body = await d.caps();
   assert.equal(body.allocation.blockingPriority, true);
   assert.equal(total(body.agents), 1);

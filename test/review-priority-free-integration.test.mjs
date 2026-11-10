@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocateKeptAndRoutedCaps } from '../src/concurrency.mjs';
@@ -185,14 +186,14 @@ function pull(number) {
       pageInfo: { hasNextPage: false },
     } } } }] } };
 }
-async function drive({ cap = capacity(), raw = config(), issues = [], heads = 0, heartbeats = [], barrierAt = null } = {}) {
+async function drive({ cap = capacity(), raw = config(), issues = [], heads = 0, heartbeats = [], barrierAt = null, prime = true } = {}) {
   const store = new Map([['capacity-v1', cap]]);
   const jobs = new Map();
   const reads = [];
   const barrier = { entered: deferred(), release: deferred() };
   let censusCalls = 0;
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     config: { get: async () => ({ ...raw, cliproxy: { laneKeySecretRef: REF } }) },
     state: { get: async key => {
       if (key.stateKey === 'caps-hold-v1' && barrierAt === 'hold') {
@@ -228,11 +229,12 @@ async function drive({ cap = capacity(), raw = config(), issues = [], heads = 0,
       ] }, NOW) };
     } },
     jobs: { register: (name, fn) => jobs.set(name, fn) }, events: { on() {} }, logger: { info() {}, error() {} },
-  });
+  };
   store.set('aa-snapshot-v1', { fetchedAt: new Date(NOW).toISOString(), duplicateSlugs: [], rows: [
     { slug: 'gpt-6.1-sol', intelligenceIndex: 62, intelligenceIndexCostPerTask: 30, price1mInputTokens: 5, price1mOutputTokens: 25 },
   ] });
-  await plugin.onConfigChanged(raw, { companyId: COMPANY });
+  if (!barrierAt && prime) await setupCapsAdmission(plugin, io, { raw, cap, companyId: COMPANY, nowMs: NOW });
+  else { await plugin.setup(io); await plugin.onConfigChanged(raw, { companyId: COMPANY }); }
   return { store, barrier, reads, censusCalls: () => censusCalls,
     configure: next => plugin.onConfigChanged(next, { companyId: COMPANY }),
     tick: () => jobs.get('quota-refresh')({ companyId: COMPANY }),
@@ -322,7 +324,7 @@ test('caps integration: role-demand overlay preserves cached issue counts and sa
   const subject = 'snapshot-subject';
   const raw = { ...config(), roles: { ...config().roles, keepAgentIds: [subject] },
     reviewerRouting: { ...config().reviewerRouting, agentIds: [subject] } };
-  const d = await drive({ raw, heads: 5, heartbeats: [{ agentId: subject, queued: 7 }], issues: [
+  const d = await drive({ raw, prime: false, heads: 5, heartbeats: [{ agentId: subject, queued: 7 }], issues: [
     issue('subject-one', subject, 'critical'), issue('subject-two', subject), issue('subject-three', subject),
     issue('worker-one', 'worker', 'high'), issue('worker-two', 'worker'),
     { ...issue('descendant', null), status: 'blocked', blockedBy: [{ id: 'subject-one' }] },
@@ -344,8 +346,8 @@ test('caps integration: role-demand overlay preserves cached issue counts and sa
   assert.equal(countMaps.length, 1, 'one original issue count Map is built and reused for the same tick');
   assert.equal(countMaps[0].get(subject), 3, 'five heads plus seven heartbeat runs must not replace three cached issue rows');
   assert.equal(countMaps[0].get('worker'), 2);
-  d.store.set('capacity-v1', capacity({ keepAgentIds: [subject], keptByAgent: { [subject]: { accountId: 'meta:spent' } },
-    reviewerAccountIdsByAgent: { [subject]: ['codex:a'] } }));
+  d.store.set('capacity-v1', { ...d.store.get('capacity-v1'), ...capacity({ keepAgentIds: [subject], keptByAgent: { [subject]: { accountId: 'meta:spent' } },
+    reviewerAccountIdsByAgent: { [subject]: ['codex:a'] } }) });
   const first = await d.caps();
   const second = await d.caps();
   assert.deepEqual(second.agents, first.agents, 'repeat caps uses the same original issue counts and priorities');

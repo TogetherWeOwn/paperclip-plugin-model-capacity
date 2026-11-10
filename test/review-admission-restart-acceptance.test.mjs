@@ -69,10 +69,10 @@ async function instance({ store, clock, used, raw = config() }) {
     event: (id, type) => events.get(type)({ type, companyId: COMPANY, entityId: id,
       occurredAt: new Date(clock()).toISOString(),
       payload: { run: { agentId: 'worker', provider: 'codex', model: 'gpt-6.1-sol' } } }),
-    caps: async () => {
+    caps: async (capsError = undefined) => {
       const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
       assert.equal(response.status, 200);
-      assert.equal(response.body.capsError, undefined);
+      assert.equal(response.body.capsError, capsError);
       assert.deepEqual(response.body.allocation, { blockingPriority: true });
       return response.body;
     },
@@ -126,7 +126,7 @@ test('restart before the next tick rejects previous-process admission despite a 
   assert.equal(b.feedCalls(), 0, 'startup must not silently replace the stored admission snapshot');
   const before = stateValue(d.store, 'capacity-v1');
   assert.deepEqual(before, d.snapshot);
-  const body = await b.caps();
+  const body = await b.caps('admission-unavailable');
   const row = reviewer(body);
   assert.equal(body.atMs, d.snapshot.atMs, 'the stale snapshot is still within the normal age window');
   assert.equal(row.queued, 5, 'rejection must preserve visible demand');
@@ -140,7 +140,7 @@ test('restart before the next tick rejects previous-process admission despite a 
 test('restart with unchanged config still requires its own fresh producer snapshot', async () => {
   const d = await producedSnapshot();
   const b = await instance(d);
-  const row = reviewer(await b.caps());
+  const row = reviewer(await b.caps('admission-unavailable'));
   assert.equal(b.ticks(), 0);
   assert.equal(row.allocated, row.running, 'persisted admission belongs to the producing process, not just numeric counter 1');
 });
@@ -149,7 +149,7 @@ test('same-process config invalidation rejects real previously-produced admissio
   const d = await producedSnapshot();
   assert.ok(reviewer(await d.a.caps()).allocated > 0);
   await d.a.configure(config('gpt-6.1-sol-unserved'));
-  const row = reviewer(await d.a.caps());
+  const row = reviewer(await d.a.caps('admission-unavailable'));
   assert.equal(row.queued, 5);
   assert.equal(row.allocated, row.running);
 });

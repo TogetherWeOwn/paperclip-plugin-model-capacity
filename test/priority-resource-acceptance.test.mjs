@@ -1,3 +1,4 @@
+import { setupCapsAdmission } from './synthetic-caps-admission.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { allocateKeptAndRoutedCaps } from '../src/concurrency.mjs';
@@ -59,7 +60,7 @@ async function capsFor(spec, { issues, blockingPriority = true } = {}) {
   const reads = [];
   let networkCalls = 0;
   const plugin = createModelCapacityPlugin({ clock: () => NOW, requirePinnedLaneHost: false });
-  await plugin.setup({
+  const io = {
     config: { get: async () => raw },
     state: {
       get: async key => store.get(key.stateKey) ?? null,
@@ -75,9 +76,9 @@ async function capsFor(spec, { issues, blockingPriority = true } = {}) {
     secrets: { resolve: async () => { throw new Error('no secret resolution expected'); } },
     http: { fetch: async () => { networkCalls++; throw new Error('no network expected'); } },
     jobs: { register() {} }, events: { on() {} }, logger: { info() {}, error() {} },
-  });
+  };
   assert.deepEqual(await plugin.onValidateConfig(raw), { ok: true });
-  await plugin.onConfigChanged(raw, { companyId: COMPANY });
+  await setupCapsAdmission(plugin, io, { raw, cap: store.get('capacity-v1'), companyId: COMPANY, nowMs: NOW });
   const response = await plugin.onApiRequest({ companyId: COMPANY, routeKey: 'caps' });
   assert.equal(response.status, 200);
   assert.equal(response.body.capsError, undefined);
