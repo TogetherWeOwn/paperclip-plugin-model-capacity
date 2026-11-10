@@ -793,6 +793,34 @@ test('/caps unavailable demand or calibration never loses named running floors',
   assert.equal(body.agents.find(a => a.agentId === 'worker').allocated, 1);
 });
 
+test('/caps unavailable calibration preserves unnamed physical census diagnostics', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  d.seedCaps({ target: null, calibration: 'weak' });
+  const body = (await d.api('caps')).body;
+  assert.equal(body.target, null);
+  assert.deepEqual(body.agents, []);
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+});
+
+test('/caps configuration changes retain physical census diagnostics without new grants', async () => {
+  const d = await boundaryDrive();
+  await d.fire(runEvent('unnamed', TICK, 'unknown'));
+  const get = d.io.state.get;
+  let changed = false;
+  d.io.state.get = async key => {
+    if (key.stateKey === 'caps-hold-v1' && !changed) {
+      changed = true;
+      await d.reconfigure({ enforce: true, concurrency: { maxTotal: 1 } });
+    }
+    return get(key);
+  };
+  const body = (await d.api('caps')).body;
+  assert.equal(body.capsError, 'configuration-changed');
+  assert.equal(newSlots(body), 0);
+  assert.deepEqual(body.physicalOccupancy, { running: 1, unassignedRunning: 1, pending: 0 });
+});
+
 test('/caps recomputes exhausted kept admission after a finish during hold I/O', async () => {
   const d = await boundaryDrive({ config: { roles: { keepAgentIds: ['worker'] } } });
   d.io.agents.getQueuedRunCounts = async () => [{ agentId: 'worker', queued: 8 }];
@@ -898,6 +926,38 @@ test('/caps freshness crossed during hold I/O cannot redecorate positive admitte
   assert.equal(body.capsError, 'admission-unavailable');
   assert.equal(newSlots(body), 0);
   assert.equal(body.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 0);
+});
+
+test('/caps zero physical room cannot fund a fixed-reviewer head in the feasibility probe', async () => {
+  const d = await boundaryDrive({ maxTotal: 1, config: {
+    roles: { keepAgentIds: ['worker'] }, reviewReserve: { agentIds: ['worker'] },
+    reviewDemand: { repositories: ['example/product'], tokenSecretRef: SECRET, requiredChecks: ['ci-ok'] },
+  } });
+  d.io.agents.getQueuedRunCounts = async () => [];
+  const fetch = d.io.http.fetch;
+  const oid = 'a'.repeat(40);
+  d.io.http.fetch = async (url, ...args) => url !== 'https://api.github.com/graphql' ? fetch(url, ...args)
+    : { status: 200, text: async () => JSON.stringify({ data: { repository: { pullRequests: {
+      nodes: [{ number: 1, isDraft: false, mergeable: 'MERGEABLE', headRefOid: oid,
+        commits: { nodes: [{ commit: { oid, statusCheckRollup: { contexts: {
+          nodes: [{ __typename: 'CheckRun', name: 'ci-ok', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+          pageInfo: { hasNextPage: false },
+        } } } }] } }], pageInfo: { hasNextPage: false, endCursor: null },
+    } } } }) };
+  d.setNow(TICK + 60_000);
+  await d.reconfigure(await d.io.config.get());
+  await d.tick(); d.seedCaps({ target: 20, calibration: 'measured',
+    keptByAgent: { worker: { accountId: 'claude:a1' } }, perAccount: [{ accountId: 'claude:a1', slots: 8 }] });
+  const control = (await d.api('caps')).body;
+  assert.equal(control.agents.find(a => a.agentId === 'worker').reviewEligibleHeads, 1,
+    'a fresh fixed reviewer with physical room actually admits a head');
+  await d.fire(runEvent('unnamed', TICK + 60_000, 'unknown'));
+  const body = (await d.api('caps')).body;
+  assert.equal(body.reviewDemand.eligibleHeads, 1, 'census remains available');
+  assert.equal(body.capsError, undefined, 'zero room is not stale evidence');
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.reviewEligibleHeads ?? 0, 0);
+  assert.equal(body.agents.find(a => a.agentId === 'worker')?.queued ?? 0, 0);
+  assert.equal(newSlots(body), 0);
 });
 
 test("tick accumulator isolates a '__proto__' agentId end to end", async () => {

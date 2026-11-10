@@ -6916,7 +6916,8 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
         // Weak calibration has no new target, but still reports running floors.
         const hasRunningFloor = Object.values(runningByAgent).some(r => r.running > 0 || r.freeRunning > 0);
         if ((target == null || calibration === 'weak') && !(cap.freeLanes?.target > 0) && !hasRunningFloor) {
-          return { status: 200, body: { atMs, calibration, target: null, agents: [] } };
+          return { status: 200, body: { atMs, calibration, target: null, agents: [],
+            ...(physicalOccupancy.running > 0 || physicalOccupancy.pending > 0 ? { physicalOccupancy } : {}) } };
         }
         // Agents with queued/ready work: assigned non-terminal issues
         // (todo + in_progress), grouped by assignee and weighted by count.
@@ -6976,6 +6977,12 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           refreshCensus();
           const physicalCeiling = Math.max(0,
             maxTotal - physicalOccupancy.unassignedRunning - physicalOccupancy.pending);
+          const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
+          const namedFreeRunning = Object.values(freeRunning).reduce((sum, n) => sum + n, 0);
+          // Reserve free executing floors before paid allocation, holds and
+          // reserved floors. Recombine against the full physical ceiling below.
+          const paidCeiling = Math.max(0, physicalCeiling - namedFreeRunning);
+          const includeFree = cap.freeLanes != null || namedFreeRunning > 0;
           const agentIds = new Set([...counts.keys(), ...Object.keys(runningByAgent), ...reviewIds]);
           if (heartbeat.ok) {
             for (const agentId of heartbeat.counts.keys()) {
@@ -6994,7 +7001,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           const allocationInput = {
             target: paidTarget ?? 0,
             blockingPriority,
-            maxTotal: physicalCeiling,
+            maxTotal: paidCeiling,
             demandFactor: cap.demandFactor ?? 1,
             keepAgentIds: [...keptIds],
             keptByAgent: cap.keptByAgent ?? {},
@@ -7010,7 +7017,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           // Weight each once-only head share by usable post-heartbeat capacity:
           // empty admissions and spent pools cannot strand a sibling's backlog.
           const reviewShares = new Map();
-          if (reviewDemand.eligibleHeads > 0) {
+          if (reviewDemand.eligibleHeads > 0 && paidCeiling > 0) {
             const probe = allocateKeptAndRoutedCaps({ ...allocationInput, agents: baseInputs.map(a => ({ ...a,
               // Priority competition happens AFTER heads join demand. Letting
               // other queued work spend this feasibility probe can hide heads
@@ -7085,17 +7092,16 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             }
             const floored = applyReservedFloors(agents, {
               reservedFloors,
-              ceiling: physicalCeiling,
+              ceiling: paidCeiling,
               blockedAgentIds: [...blockedAgentIds],
             });
             agents = floored.entries;
             floorSummary = floored.floors;
           }
-          if (cap.freeLanes) {
-            const freeRunning = Object.fromEntries(Object.entries(runningByAgent).map(([id, r]) => [id, r.freeRunning ?? 0]));
-            // Free running and headroom stay outside the paid allocation above.
+          if (includeFree) {
+            // Observed free floors do not depend on persisted free headroom.
             const freeEnabled = freeLaneConfigs.get(companyId)?.enabled === true;
-            agents = freeLaneCaps(agents, freeRunning, freeEnabled ? cap.freeLanes.target : 0,
+            agents = freeLaneCaps(agents, freeRunning, freeEnabled ? (cap.freeLanes?.target ?? 0) : 0,
               freeEnabled ? safeFreeAgentIds(liveViews.get(companyId), companyId) : [], physicalCeiling);
           }
           // Hysteresis, reserved floors and free additions cannot create physical
@@ -7107,7 +7113,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
           agents = applyReservedFloors(agents, { ceiling: physicalCeiling }).entries;
           for (const a of agents) {
             a.maxConcurrentRuns = a.allocated;
-            if (cap.freeLanes) a.freeAllocated = Math.min(a.freeAllocated ?? 0,
+            if (includeFree) a.freeAllocated = Math.min(a.freeAllocated ?? 0,
               Math.max(0, a.allocated - (runningByAgent[a.agentId]?.running ?? 0)));
             if (a.floor != null && a.allocated < a.floor) {
               a.floorBlocked = true;
@@ -7135,7 +7141,7 @@ export function createModelCapacityPlugin({ clock = Date.now, requirePinnedLaneH
             return { hold: held.hold, response: { status: 200, body: { atMs, calibration, target: null, agents: floors,
               capsError: 'configuration-changed',
               reviewDemand: { status: 'unavailable', eligibleHeads: 0, reason: 'configuration-changed' },
-              reservedFloors: {}, floorsSuspended: false } } };
+              reservedFloors: {}, floorsSuspended: false, physicalOccupancy } } };
           }
           return { hold: held.hold, response: { status: 200, body: { atMs, calibration, target: admissionUnavailable ? null : target,
             agents, reviewDemand, reservedFloors: floorSummary, floorsSuspended, physicalOccupancy,
