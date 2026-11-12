@@ -19,6 +19,12 @@ jobs:
           persist-credentials: false
           # Replay tests compare against the pinned pre-feature revision.
           fetch-depth: 0
+      - name: Fetch retained census comparison history
+        run: |
+          # The squash-merged PR's intermediate commits are not main ancestors.
+          git fetch --no-tags https://github.com/TogetherWeOwn/paperclip-plugin-model-capacity.git refs/pull/85/head:refs/remotes/origin/retained-census-history
+          git cat-file -e bb991eed932454ea4ac8d28d5b8ec11df64b8447^{commit}
+          git cat-file -e f00cb78eca815bb76ba7c1ea6dfd7ef53f8393db^{commit}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
