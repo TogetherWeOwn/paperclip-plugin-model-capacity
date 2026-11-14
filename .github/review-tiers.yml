@@ -1,0 +1,29 @@
+# Highest matching tier wins; unclassified paths default to sensitive.
+# Content overrides paths: endpoints or input parsing, auth, sessions, crypto,
+# keys, secrets, credentials, permissions, tenant isolation or personal data,
+# SQL, schema or migrations, dependencies or lockfiles, and CI are sensitive.
+# Weakened assertions, deleted tests or snapshots, and lowered gates are also
+# sensitive. Test paths below are low only for additive unit tests.
+# Security documentation and operational guidance remain sensitive.
+# QA reviews every change and checks the map, diff and content triggers;
+# Security reviews sensitive, unknown, triggered or escalated changes before QA.
+# This map does not install or activate automated enforcement.
+version: 1
+default_tier: sensitive
+tiers:
+  low:
+    - 'test/*.test.mjs'
+  ordinary: []
+  sensitive:
+    - '.github/**'
+    - 'AGENTS.md'
+    - '**/AGENTS.md'
+    - '.claude/**'
+    - '**/skills/**'
+    - 'package.json'
+    - 'package-lock.json'
+    - 'src/**'
+    - 'scripts/**'
+    - 'test/support/**'
+    - 'test/fixtures/**'
+    - 'config.example.json'
